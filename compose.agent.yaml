@@ -1,0 +1,35 @@
+services:
+  kimi-agent:
+    build:
+      context: .agent-container
+    working_dir: /workspace
+
+    # The repository is the ONLY host working tree exposed to the agent.
+    volumes:
+      - .:/workspace
+      - kimi-state:/home/agent/.kimi
+
+    environment:
+      LITELLM_API_KEY: "${LITELLM_API_KEY:?Set LITELLM_API_KEY first}"
+      LITELLM_BASE_URL: "${LITELLM_BASE_URL:?Set LITELLM_BASE_URL first}"
+      LITELLM_MODEL_ID: "${LITELLM_MODEL_ID:?Set LITELLM_MODEL_ID first}"
+      SAFE_CONTEXT: "${SAFE_CONTEXT:?Set SAFE_CONTEXT first}"
+
+    # Kimi Web binds 0.0.0.0 INSIDE the container,
+    # but Docker publishes it only to host loopback.
+    ports:
+      - "127.0.0.1:5494:5494"
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    # No Docker socket.
+    # No SSH directory.
+    # No host home directory.
+    # No cloud credential mounts.
+
+volumes:
+  kimi-state:
