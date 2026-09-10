@@ -1,0 +1,104 @@
+services:
+  model-proxy:
+    build:
+      context: ./proxy
+
+    environment:
+      NRP_API_KEY: "${LITELLM_API_KEY:?Set LITELLM_API_KEY in .env}"
+      NRP_UPSTREAM_ORIGIN: "${LITELLM_UPSTREAM_ORIGIN:?Set LITELLM_UPSTREAM_ORIGIN in .env}"
+      NRP_MODEL_CONTEXT: "${NRP_MODEL_CONTEXT:-1000000}"
+      NRP_FAIR_USE_PERCENT: "${NRP_FAIR_USE_PERCENT:-35}"
+      NRP_PARALLEL_CONTEXT_BUDGET: "${NRP_PARALLEL_CONTEXT_BUDGET:-320000}"
+      NRP_MODEL_MAX_CONCURRENCY: "${NRP_MODEL_MAX_CONCURRENCY:-16}"
+      NRP_SUBAGENT_MAX_CONCURRENCY: "${KIMI_SUBAGENT_CONCURRENCY:-5}"
+      NRP_SUBAGENT_CONTEXT: "${KIMI_SUBAGENT_CONTEXT:-64000}"
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:rw,nosuid,nodev
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  kimi-agent:
+    build:
+      context: .
+      dockerfile: container/Dockerfile
+
+    depends_on:
+      model-proxy:
+        condition: service_healthy
+
+    working_dir: /workspace
+    init: true
+
+    environment:
+      KIMI_CODE_HOME: /home/agent/.kimi-code
+      KIMI_DISABLE_TELEMETRY: "1"
+      KIMI_CODE_NO_AUTO_UPDATE: "1"
+      KIMI_TOKEN_COUNTING_STRATEGY: "measured+estimated"
+      KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL: "1"
+
+      KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY: "${KIMI_SUBAGENT_CONCURRENCY:-5}"
+      KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS: "${KIMI_SUBAGENT_CONCURRENCY:-5}"
+      KIMI_SUBAGENT_TIMEOUT_MS: "3600000"
+      KIMI_CODE_SWARM_TIMEOUT_MS: "3600000"
+
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN:-}"
+      COMFYUI_URL: "${COMFYUI_URL:-}"
+
+    volumes:
+      - "${WORKSPACE_PATH:?Set WORKSPACE_PATH in .env}:/workspace:rw"
+      - kimi-state:/home/agent/.kimi-code
+      - serena-state:/home/agent/.serena
+      - ./runtime/config.toml:/home/agent/.kimi-code/config.toml:ro
+      - ./runtime/mcp.json:/home/agent/.kimi-code/mcp.json:ro
+      - ./runtime/AGENTS.md:/home/agent/.kimi-code/AGENTS.md:ro
+      - ./runtime/skills:/opt/kimi-runtime/skills:ro
+      - ./runtime/agents:/opt/kimi-runtime/agents:ro
+      - ./tools:/opt/kimi-runtime/tools:ro
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=2g
+      - /home/agent/.cache:rw,nosuid,nodev,size=1g
+
+    ports:
+      - "127.0.0.1:5494:5494"
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    pids_limit: 2048
+    shm_size: "1gb"
+
+    command:
+      - kimi
+      - web
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5494"
+      - --no-open
+
+volumes:
+  kimi-state:
+  serena-state:

@@ -1,0 +1,88 @@
+{
+  "mcpServers": {
+    "github": {
+      "command": "github-mcp-server",
+      "args": [
+        "stdio",
+        "--read-only",
+        "--toolsets=context,repos,issues,pull_requests"
+      ],
+      "cwd": "/workspace",
+      "enabled": false,
+      "startupTimeoutMs": 30000,
+      "toolTimeoutMs": 120000
+    },
+
+    "nvidia-cuda-docs": {
+      "url": "https://api.copilot.nsight.ngc.nvidia.com/mcp/cuda-docs",
+      "enabled": true,
+      "startupTimeoutMs": 30000,
+      "toolTimeoutMs": 120000
+    },
+
+    "huggingface": {
+      "url": "https://huggingface.co/mcp",
+      "enabled": true,
+      "enabledTools": [
+        "hf_fs"
+      ],
+      "startupTimeoutMs": 30000,
+      "toolTimeoutMs": 120000
+    },
+
+    "context7": {
+      "url": "https://mcp.context7.com/mcp/oauth",
+      "enabled": false,
+      "startupTimeoutMs": 30000,
+      "toolTimeoutMs": 120000
+    },
+
+    "deepwiki": {
+      "url": "https://mcp.deepwiki.com/mcp",
+      "enabled": false,
+      "enabledTools": [
+        "read_wiki_structure",
+        "read_wiki_contents",
+        "ask_question"
+      ],
+      "startupTimeoutMs": 30000,
+      "toolTimeoutMs": 120000
+    },
+
+    "chrome-devtools": {
+      "command": "chrome-devtools-mcp",
+      "args": [
+        "--headless=true",
+        "--isolated=true",
+        "--no-usage-statistics",
+        "--no-performance-crux",
+        "--filesystem-root=/workspace",
+        "--screenshot-format=jpeg",
+        "--screenshot-quality=75",
+        "--screenshot-max-width=1600",
+        "--chrome-arg=--no-sandbox",
+        "--chrome-arg=--disable-setuid-sandbox"
+      ],
+      "cwd": "/workspace",
+      "enabled": false,
+      "startupTimeoutMs": 30000,
+      "toolTimeoutMs": 120000
+    },
+
+    "serena": {
+      "command": "serena",
+      "args": [
+        "start-mcp-server",
+        "--project-from-cwd",
+        "--context",
+        "agent",
+        "--open-web-dashboard",
+        "false"
+      ],
+      "cwd": "/workspace",
+      "enabled": false,
+      "startupTimeoutMs": 60000,
+      "toolTimeoutMs": 120000
+    }
+  }
+}

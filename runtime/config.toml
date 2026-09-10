@@ -1,0 +1,168 @@
+default_model = "qwen3-primary"
+
+default_permission_mode = "manual"
+default_plan_mode = false
+
+merge_all_available_skills = true
+extra_skill_dirs = ["/opt/kimi-runtime/skills"]
+extra_agent_dirs = ["/opt/kimi-runtime/agents"]
+
+# Keep built-ins while initially configuring the installation.
+# Once everything is stable, I would consider false to reduce prompt/tool noise.
+builtin_product_skills = true
+
+telemetry = false
+
+# ============================================================
+# NRP providers
+#
+# The two providers hit the same physical NRP qwen3 endpoint,
+# but through different policy-enforcement lanes.
+# ============================================================
+
+[providers.nrp-primary]
+type = "openai"
+base_url = "http://model-proxy:8080/primary/v1"
+api_key = "proxy-only"
+
+
+[providers.nrp-subagent]
+type = "openai"
+base_url = "http://model-proxy:8080/subagent/v1"
+api_key = "proxy-only"
+
+
+# ============================================================
+# Primary model: native-context-oriented default
+# ============================================================
+
+[models.qwen3-primary]
+provider = "nrp-primary"
+model = "qwen3"
+
+max_context_size = 262144
+max_input_size = 240000
+
+capabilities = [
+  "thinking",
+  "image_in",
+  "video_in",
+  "tool_use",
+]
+
+support_efforts = [
+  "low",
+  "medium",
+  "xhigh",
+]
+
+default_effort = "xhigh"
+
+display_name = "NRP Qwen3.8 Flash Next — Primary"
+
+
+# ============================================================
+# Explicit long-context primary
+#
+# Still travels through the exclusive primary lane.
+# ============================================================
+
+[models.qwen3-long]
+provider = "nrp-primary"
+model = "qwen3"
+
+max_context_size = 1000000
+max_input_size = 900000
+
+capabilities = [
+  "thinking",
+  "image_in",
+  "video_in",
+  "tool_use",
+]
+
+support_efforts = [
+  "low",
+  "medium",
+  "xhigh",
+]
+
+default_effort = "xhigh"
+
+display_name = "NRP Qwen3.8 Flash Next — Long Context"
+
+
+# ============================================================
+# NRP-safe subagent model
+#
+# 5 concurrent instances × 64K = 320K.
+# ============================================================
+
+[models.qwen3-subagent]
+provider = "nrp-subagent"
+model = "qwen3"
+
+max_context_size = 64000
+max_input_size = 55808
+
+capabilities = [
+  "thinking",
+  "image_in",
+  "video_in",
+  "tool_use",
+]
+
+support_efforts = [
+  "low",
+  "medium",
+  "xhigh",
+]
+
+default_effort = "xhigh"
+
+display_name = "NRP Qwen3.8 Flash Next — 64K Subagent"
+
+
+# ============================================================
+# HARD subagent binding
+#
+# This is important.
+#
+# Every Agent / AgentSwarm child is forced onto qwen3-subagent.
+# Kimi may not substitute "primary".
+# ============================================================
+
+[secondary_model]
+default_model = "qwen3-subagent"
+force = true
+default_effort = "xhigh"
+
+
+[thinking]
+enabled = true
+effort = "xhigh"
+
+
+[loop_control]
+# Unlimited agentic steps. Context/permissions remain the real boundaries.
+max_steps_per_turn = 0
+
+# Current default is 10; make it explicit.
+max_attempts_per_step = 10
+
+# Must be small enough to work inside the 64K subagent model.
+reserved_context_size = 8192
+
+
+[token_counting]
+strategy = "measured+estimated"
+
+
+[background]
+max_running_tasks = 5
+
+# Don't leave orphan processes after the session exits.
+keep_alive_on_exit = false
+
+# Long-running commands move to background rather than getting killed.
+bash_auto_background_on_timeout = true

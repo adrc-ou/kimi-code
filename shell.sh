@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 
 docker compose \
   --env-file .env \
-  up \
-  --build \
-  --remove-orphans
+  run \
+  --rm \
+  kimi-agent \
+  bash
