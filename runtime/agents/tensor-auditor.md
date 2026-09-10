@@ -7,7 +7,6 @@ tools:
   - Read
   - Grep
   - Glob
-  - Bash
   - Skill
   - mcp__huggingface__*
   - mcp__nvidia-cuda-docs__*

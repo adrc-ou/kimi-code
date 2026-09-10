@@ -2,15 +2,23 @@
 
 import asyncio
 import contextlib
+import json
 import os
 import random
+import tomllib
 from typing import AsyncIterator
 
 from aiohttp import ClientSession, ClientTimeout, web
 
 
 UPSTREAM = os.environ["NRP_UPSTREAM_ORIGIN"].rstrip("/")
+UPSTREAM_MODEL = os.environ["NRP_UPSTREAM_MODEL"]
 API_KEY = os.environ["NRP_API_KEY"]
+
+KIMI_CONFIG_PATH = os.environ.get(
+    "KIMI_CONFIG_PATH",
+    "/policy/kimi-config.toml",
+)
 
 SUBAGENT_LIMIT = int(
     os.environ.get("NRP_SUBAGENT_MAX_CONCURRENCY", "5")
@@ -28,14 +36,75 @@ PARALLEL_CONTEXT_BUDGET = int(
     os.environ.get("NRP_PARALLEL_CONTEXT_BUDGET", "320000")
 )
 
-SUBAGENT_CONTEXT = int(
-    os.environ.get("NRP_SUBAGENT_CONTEXT", "64000")
-)
-
 MODEL_MAX_CONCURRENCY = int(
     os.environ.get("NRP_MODEL_MAX_CONCURRENCY", "16")
 )
 
+
+def load_kimi_policy() -> tuple[int, int]:
+    with open(KIMI_CONFIG_PATH, "rb") as f:
+        config = tomllib.load(f)
+
+    secondary = config["secondary_model"]
+
+    if secondary.get("force") is not True:
+        raise RuntimeError(
+            "Kimi secondary_model.force must be true"
+        )
+
+    alias = secondary["default_model"]
+    model = config["models"][alias]
+
+    if model["provider"] != "nrp-subagent":
+        raise RuntimeError(
+            f"Forced secondary model {alias!r} does not use nrp-subagent"
+        )
+
+    context = int(model["max_context_size"])
+    max_input = int(model["max_input_size"])
+    reserve = int(
+        config["loop_control"]["reserved_context_size"]
+    )
+
+    if max_input + reserve > context:
+        raise RuntimeError(
+            "Subagent max_input_size + reserve exceeds "
+            "max_context_size"
+        )
+
+    return context
+
+SUBAGENT_CONTEXT = load_kimi_policy()
+
+INTERNAL_BEARER_TOKEN = "proxy-only"
+
+def authorize_client(request: web.Request) -> None:
+    expected = f"Bearer {INTERNAL_BEARER_TOKEN}"
+
+    if request.headers.get("Authorization") != expected:
+        raise web.HTTPUnauthorized()
+
+def rewrite_model(body: bytes, request: web.Request) -> bytes:
+    if request.method not in {"POST", "PUT", "PATCH"}:
+        return body
+
+    if request.content_type != "application/json":
+        return body
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+
+    if not isinstance(payload, dict) or "model" not in payload:
+        return body
+
+    payload["model"] = UPSTREAM_MODEL
+
+    return json.dumps(
+        payload,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 def validate_policy() -> None:
     hard_budget = MODEL_CONTEXT * FAIR_USE_PERCENT // 100
@@ -234,6 +303,7 @@ async def health(request: web.Request) -> web.Response:
 
 
 async def proxy(request: web.Request) -> web.StreamResponse:
+    authorize_client(request)
     lane = request.match_info["lane"]
 
     if lane not in {"primary", "subagent"}:
@@ -246,7 +316,10 @@ async def proxy(request: web.Request) -> web.StreamResponse:
     if request.query_string:
         upstream_url += f"?{request.query_string}"
 
-    body = await request.read()
+    body = rewrite_model(
+        await request.read(),
+        request,
+    )
 
     async with gate.slot(lane):
         attempt = 0
@@ -315,7 +388,8 @@ async def create_client(app: web.Application) -> None:
             total=None,
             sock_connect=60,
             sock_read=None,
-        )
+        ),
+        auto_decompress=False
     )
 
 
@@ -328,7 +402,7 @@ def main() -> None:
 
     app = web.Application(
         # Accommodate multimodal requests.
-        client_max_size=1024 ** 3,
+        client_max_size=256 * 1024 ** 2,
     )
 
     app.on_startup.append(create_client)

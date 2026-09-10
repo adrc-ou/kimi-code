@@ -34,7 +34,7 @@ RUN CGO_ENABLED=0 go build \
 
 FROM node:22-bookworm-slim
 
-ARG KIMI_CODE_VERSION=0.41.0
+ARG KIMI_CODE_VERSION=0.42.0
 ARG CHROME_DEVTOOLS_MCP_VERSION=1.9.0
 ARG PLAYWRIGHT_CLI_VERSION=0.1.19
 ARG SERENA_VERSION=1.7.0
@@ -62,8 +62,18 @@ RUN npm install -g \
       "chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}" \
       "@playwright/cli@${PLAYWRIGHT_CLI_VERSION}"
 
-# Install browser and Linux dependencies at image-build time.
-RUN playwright-cli install-browser --with-deps
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+ENV PLAYWRIGHT_SKIP_BROWSER_GC=1
+
+RUN mkdir -p /opt/ms-playwright \
+    && playwright-cli install-browser --with-deps \
+    && chmod -R a+rX /opt/ms-playwright
+
+RUN chrome_path="$(find /opt/ms-playwright \
+      -type f -name chrome \
+      | head -n 1)" \
+    && test -n "${chrome_path}" \
+    && ln -s "${chrome_path}" /usr/local/bin/agent-chromium
 
 # uv, used only to install Serena.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
@@ -95,10 +105,6 @@ RUN useradd \
       /home/agent/.serena \
       /workspace
 
-COPY container/entrypoint.sh /usr/local/bin/kimi-entrypoint.sh
-
-RUN chmod 0755 /usr/local/bin/kimi-entrypoint.sh
-
 USER agent
 
 ENV HOME=/home/agent
@@ -109,7 +115,5 @@ WORKDIR /workspace
 
 # Install Microsoft's Playwright Agent Skill in the generic skill path.
 RUN playwright-cli install --skills=agents --global
-
-ENTRYPOINT ["/usr/local/bin/kimi-entrypoint.sh"]
 
 CMD ["bash"]

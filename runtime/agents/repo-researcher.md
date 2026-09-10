@@ -7,7 +7,6 @@ tools:
   - Read
   - Grep
   - Glob
-  - Bash
   - WebSearch
   - FetchURL
   - Skill

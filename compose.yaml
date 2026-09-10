@@ -1,17 +1,20 @@
 services:
   model-proxy:
+    volumes:
+      - ./runtime/config.toml:/policy/kimi-config.toml:ro
     build:
       context: ./proxy
 
     environment:
+      KIMI_CONFIG_PATH: /policy/kimi-config.toml
       NRP_API_KEY: "${LITELLM_API_KEY:?Set LITELLM_API_KEY in .env}"
       NRP_UPSTREAM_ORIGIN: "${LITELLM_UPSTREAM_ORIGIN:?Set LITELLM_UPSTREAM_ORIGIN in .env}"
+      NRP_UPSTREAM_MODEL: "${LITELLM_MODEL_ID:?Set LITELLM_MODEL_ID in .env}"
       NRP_MODEL_CONTEXT: "${NRP_MODEL_CONTEXT:-1000000}"
       NRP_FAIR_USE_PERCENT: "${NRP_FAIR_USE_PERCENT:-35}"
       NRP_PARALLEL_CONTEXT_BUDGET: "${NRP_PARALLEL_CONTEXT_BUDGET:-320000}"
       NRP_MODEL_MAX_CONCURRENCY: "${NRP_MODEL_MAX_CONCURRENCY:-16}"
       NRP_SUBAGENT_MAX_CONCURRENCY: "${KIMI_SUBAGENT_CONCURRENCY:-5}"
-      NRP_SUBAGENT_CONTEXT: "${KIMI_SUBAGENT_CONTEXT:-64000}"
 
     read_only: true
 
