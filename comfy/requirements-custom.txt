@@ -1,0 +1,1 @@
+# Add only reviewed, version-pinned dependencies required by custom nodes.

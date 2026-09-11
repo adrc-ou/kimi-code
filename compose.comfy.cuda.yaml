@@ -1,0 +1,81 @@
+services:
+  comfyui:
+    image: adrc-comfyui-cuda:current
+    build:
+      context: .
+      dockerfile: comfy/Dockerfile.cuda
+      args:
+        COMFYUI_VERSION: "${COMFYUI_VERSION:?}"
+        COMFYUI_COMMIT: "${COMFYUI_COMMIT:?}"
+        APP_UID: "${LOCAL_UID:-1000}"
+        APP_GID: "${LOCAL_GID:-1000}"
+        TORCH_VERSION: "${TORCH_VERSION:?}"
+        TORCHVISION_VERSION: "${TORCHVISION_VERSION:?}"
+        TORCHAUDIO_VERSION: "${TORCHAUDIO_VERSION:?}"
+        PYTORCH_CUDA_INDEX_URL: "${PYTORCH_CUDA_INDEX_URL:?}"
+    gpus: all
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=8g
+    volumes:
+      - type: bind
+        source: "${WORKSPACE_PATH}/comfyui/models"
+        target: /opt/ComfyUI/models
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${WORKSPACE_PATH}/comfyui/custom_nodes"
+        target: /opt/ComfyUI/custom_nodes
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${WORKSPACE_PATH}/comfyui/input"
+        target: /data/input
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${WORKSPACE_PATH}/comfyui/output"
+        target: /data/output
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${WORKSPACE_PATH}/comfyui/temp"
+        target: /data/temp
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${WORKSPACE_PATH}/comfyui/user"
+        target: /data/user
+        bind:
+          create_host_path: false
+      - comfy-cache:/data/cache
+    ports:
+      - "127.0.0.1:8188:8188"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 4096
+    shm_size: "8gb"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=5)"
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
+
+  kimi-agent:
+    depends_on:
+      comfyui:
+        condition: service_healthy
+    environment:
+      COMFYUI_URL: "http://comfyui:8188"
+      COMFYUI_TOKEN: ""
+
+volumes:
+  comfy-cache:

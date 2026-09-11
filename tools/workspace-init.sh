@@ -5,6 +5,14 @@ workspace="${1:?usage: workspace-init.sh /path/to/workspace}"
 
 mkdir -p "${workspace}/.agent-state/logs"
 
+mkdir -p \
+  "${workspace}/comfyui/custom_nodes" \
+  "${workspace}/comfyui/input" \
+  "${workspace}/comfyui/models" \
+  "${workspace}/comfyui/output" \
+  "${workspace}/comfyui/temp" \
+  "${workspace}/comfyui/user/default/workflows"
+
 touch \
   "${workspace}/.agent-state/STATE.md" \
   "${workspace}/.agent-state/DEBUG_LEDGER.md" \

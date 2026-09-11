@@ -228,3 +228,24 @@ Allow the configured proxy to retry with backoff.
 
 Never work around NRP rate limits by opening additional connections, containers,
 credentials, or sessions.
+
+## ComfyUI development boundary
+
+The live ComfyUI service is available at `COMFYUI_URL`. If `COMFYUI_TOKEN` is
+set, helper clients must send it as a bearer token.
+
+Use `/opt/kimi-runtime/tools/comfyctl.py` and ComfyUI's machine-readable APIs for
+schema inspection, input upload, queue inspection, workflow execution, history,
+output download, and interruption.
+
+Custom-node source belongs under `/workspace/comfyui/custom_nodes`. Workflows
+belong under `/workspace/comfyui/user/default/workflows`. Both locations are
+intentionally writable.
+
+Do not modify the replaceable ComfyUI application or install packages at runtime.
+When a custom node needs another dependency, identify and pin the exact package
+version and report that `comfy/requirements-custom.txt` in the operator-managed
+harness must be reviewed and updated.
+
+Treat custom nodes as executable code. Inspect their source and dependency
+metadata before asking the operator to restart and load them.

@@ -15,7 +15,7 @@
 
     "nvidia-cuda-docs": {
       "url": "https://api.copilot.nsight.ngc.nvidia.com/mcp/cuda-docs",
-      "enabled": true,
+      "enabled": false,
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
     },
@@ -31,7 +31,7 @@
     },
 
     "context7": {
-      "url": "https://mcp.context7.com/mcp/oauth",
+      "url": "https://mcp.context7.com/mcp",
       "enabled": false,
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
@@ -39,7 +39,7 @@
 
     "deepwiki": {
       "url": "https://mcp.deepwiki.com/mcp",
-      "enabled": false,
+      "enabled": true,
       "enabledTools": [
         "read_wiki_structure",
         "read_wiki_contents",
@@ -65,7 +65,7 @@
         "--chrome-arg=--disable-setuid-sandbox"
       ],
       "cwd": "/workspace",
-      "enabled": false,
+      "enabled": true,
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
     },
@@ -81,7 +81,7 @@
         "false"
       ],
       "cwd": "/workspace",
-      "enabled": false,
+      "enabled": true,
       "startupTimeoutMs": 60000,
       "toolTimeoutMs": 120000
     }

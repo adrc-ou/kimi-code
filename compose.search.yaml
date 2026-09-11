@@ -1,0 +1,63 @@
+services:
+  searxng:
+    image: docker.io/searxng/searxng:2026.9.10-931fd9787@sha256:2fb0fa85096fe6df5c3ab98ecb4d6e0ee2ef66b8fb96ce6fce0f75b51c4bd90a
+    environment:
+      SEARXNG_BIND_ADDRESS: "0.0.0.0"
+      SEARXNG_PORT: "8080"
+      SEARXNG_SECRET: "${SEARXNG_SECRET:?Set SEARXNG_SECRET in .env}"
+      FORCE_OWNERSHIP: "false"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-cache:/var/cache/searxng
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  search-adapter:
+    image: adrc-search-adapter:current
+    build:
+      context: ./search-adapter
+    depends_on:
+      searxng:
+        condition: service_healthy
+    environment:
+      SEARXNG_URL: "http://searxng:8080"
+      SEARCH_ADAPTER_TOKEN: "search-internal-only"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  kimi-agent:
+    depends_on:
+      search-adapter:
+        condition: service_healthy
+    environment:
+      KIMI_WEB_SEARCH_BASE_URL: "http://search-adapter:8080/search"
+      KIMI_WEB_SEARCH_API_KEY: "search-internal-only"
+
+volumes:
+  searxng-cache:

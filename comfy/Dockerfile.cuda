@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1
+
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+FROM ${PYTHON_IMAGE}
+
+ARG COMFYUI_COMMIT
+ARG COMFYUI_VERSION
+ARG APP_UID=1000
+ARG APP_GID=1000
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
+ARG PYTORCH_CUDA_INDEX_URL
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV XDG_CACHE_HOME=/data/cache
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       ffmpeg \
+       git \
+       libgl1 \
+       libglib2.0-0 \
+       libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN test -n "${COMFYUI_COMMIT}" \
+    && git init /opt/ComfyUI \
+    && git -C /opt/ComfyUI remote add origin \
+       https://github.com/Comfy-Org/ComfyUI.git \
+    && git -C /opt/ComfyUI fetch \
+       --depth 1 \
+       origin "${COMFYUI_COMMIT}" \
+    && git -C /opt/ComfyUI checkout --detach FETCH_HEAD \
+    && test "$(git -C /opt/ComfyUI rev-parse HEAD)" = "${COMFYUI_COMMIT}"
+
+RUN test -n "${TORCH_VERSION}" \
+    && test -n "${TORCHVISION_VERSION}" \
+    && test -n "${TORCHAUDIO_VERSION}" \
+    && test -n "${PYTORCH_CUDA_INDEX_URL}" \
+    && python -m pip install --no-cache-dir \
+       "torch==${TORCH_VERSION}" \
+       "torchvision==${TORCHVISION_VERSION}" \
+       "torchaudio==${TORCHAUDIO_VERSION}" \
+       --index-url "${PYTORCH_CUDA_INDEX_URL}" \
+    && python -m pip install --no-cache-dir \
+       --requirement /opt/ComfyUI/requirements.txt
+
+COPY comfy/requirements-custom.txt /tmp/requirements-custom.txt
+
+RUN python -m pip install --no-cache-dir \
+      --requirement /tmp/requirements-custom.txt
+
+RUN groupadd --gid "${APP_GID}" comfy \
+    && useradd \
+       --create-home \
+       --uid "${APP_UID}" \
+       --gid "${APP_GID}" \
+       comfy \
+    && install -d -o comfy -g comfy \
+       /data/cache \
+       /data/input \
+       /data/output \
+       /data/temp \
+       /data/user \
+       /opt/ComfyUI/models \
+       /opt/ComfyUI/custom_nodes
+
+USER comfy
+WORKDIR /opt/ComfyUI
+
+LABEL org.opencontainers.image.version="${COMFYUI_VERSION}"
+LABEL org.opencontainers.image.revision="${COMFYUI_COMMIT}"
+
+CMD ["python", "main.py", "--listen", "0.0.0.0", "--port", "8188", "--disable-auto-launch", "--user-directory", "/data/user", "--input-directory", "/data/input", "--output-directory", "/data/output", "--temp-directory", "/data/temp"]

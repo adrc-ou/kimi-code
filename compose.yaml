@@ -1,5 +1,6 @@
 services:
   model-proxy:
+    image: adrc-model-proxy:current
     volumes:
       - ./runtime/config.toml:/policy/kimi-config.toml:ro
     build:
@@ -38,9 +39,16 @@ services:
       retries: 3
 
   kimi-agent:
+    image: adrc-kimi-agent:current
     build:
       context: .
       dockerfile: container/Dockerfile
+      args:
+        KIMI_CODE_VERSION: "${KIMI_CODE_VERSION:?}"
+        KIMI_CODE_ASSET_URL: "${KIMI_CODE_ASSET_URL:?}"
+        KIMI_CODE_ASSET_SHA256: "${KIMI_CODE_ASSET_SHA256:?}"
+        AGENT_UID: "${LOCAL_UID:-1000}"
+        AGENT_GID: "${LOCAL_GID:-1000}"
 
     depends_on:
       model-proxy:
@@ -54,8 +62,6 @@ services:
       KIMI_DISABLE_TELEMETRY: "1"
       KIMI_CODE_NO_AUTO_UPDATE: "1"
       KIMI_TOKEN_COUNTING_STRATEGY: "measured+estimated"
-      KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL: "1"
-
       KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY: "${KIMI_SUBAGENT_CONCURRENCY:-5}"
       KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS: "${KIMI_SUBAGENT_CONCURRENCY:-5}"
       KIMI_SUBAGENT_TIMEOUT_MS: "3600000"
@@ -63,9 +69,15 @@ services:
 
       GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN:-}"
       COMFYUI_URL: "${COMFYUI_URL:-}"
+      COMFYUI_TOKEN: "${COMFYUI_TOKEN:-}"
 
     volumes:
-      - "${WORKSPACE_PATH:?Set WORKSPACE_PATH in .env}:/workspace:rw"
+      - type: bind
+        source: "${WORKSPACE_PATH:?Set WORKSPACE_PATH in .env}"
+        target: /workspace
+        read_only: false
+        bind:
+          create_host_path: false
       - kimi-state:/home/agent/.kimi-code
       - serena-state:/home/agent/.serena
       - ./runtime/config.toml:/home/agent/.kimi-code/config.toml:ro

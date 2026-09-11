@@ -5,7 +5,9 @@ import contextlib
 import json
 import os
 import random
+import time
 import tomllib
+from email.utils import parsedate_to_datetime
 from typing import AsyncIterator
 
 from aiohttp import ClientSession, ClientTimeout, web
@@ -41,7 +43,7 @@ MODEL_MAX_CONCURRENCY = int(
 )
 
 
-def load_kimi_policy() -> tuple[int, int]:
+def load_kimi_policy() -> int:
     with open(KIMI_CONFIG_PATH, "rb") as f:
         config = tomllib.load(f)
 
@@ -78,11 +80,13 @@ SUBAGENT_CONTEXT = load_kimi_policy()
 
 INTERNAL_BEARER_TOKEN = "proxy-only"
 
+
 def authorize_client(request: web.Request) -> None:
     expected = f"Bearer {INTERNAL_BEARER_TOKEN}"
 
     if request.headers.get("Authorization") != expected:
         raise web.HTTPUnauthorized()
+
 
 def rewrite_model(body: bytes, request: web.Request) -> bytes:
     if request.method not in {"POST", "PUT", "PATCH"}:
@@ -106,12 +110,33 @@ def rewrite_model(body: bytes, request: web.Request) -> bytes:
         separators=(",", ":"),
     ).encode("utf-8")
 
+
 def validate_policy() -> None:
+    numeric_values = {
+        "NRP_MODEL_CONTEXT": MODEL_CONTEXT,
+        "NRP_FAIR_USE_PERCENT": FAIR_USE_PERCENT,
+        "NRP_PARALLEL_CONTEXT_BUDGET": PARALLEL_CONTEXT_BUDGET,
+        "NRP_MODEL_MAX_CONCURRENCY": MODEL_MAX_CONCURRENCY,
+        "NRP_SUBAGENT_MAX_CONCURRENCY": SUBAGENT_LIMIT,
+        "subagent max_context_size": SUBAGENT_CONTEXT,
+    }
+
+    for name, value in numeric_values.items():
+        if value <= 0:
+            raise RuntimeError(f"{name} must be positive; got {value}")
+
+    if FAIR_USE_PERCENT > 100:
+        raise RuntimeError(
+            "NRP_FAIR_USE_PERCENT must not exceed 100; "
+            f"got {FAIR_USE_PERCENT}"
+        )
+
     hard_budget = MODEL_CONTEXT * FAIR_USE_PERCENT // 100
 
     if PARALLEL_CONTEXT_BUDGET > hard_budget:
         raise RuntimeError(
-            "NRP_PARALLEL_CONTEXT_BUDGET exceeds the NRP 35% limit: "
+            "NRP_PARALLEL_CONTEXT_BUDGET exceeds the configured "
+            "fair-use limit: "
             f"{PARALLEL_CONTEXT_BUDGET} > {hard_budget}"
         )
 
@@ -264,24 +289,39 @@ def filtered_response_headers(headers) -> dict[str, str]:
     return result
 
 
+def clamp_retry_delay(seconds: float) -> float:
+    return min(300.0, max(1.0, seconds))
+
+
 def retry_delay(response, attempt: int) -> float:
     retry_after = response.headers.get("Retry-After")
 
     if retry_after:
         try:
-            return max(1.0, float(retry_after))
+            return clamp_retry_delay(float(retry_after))
         except ValueError:
-            pass
+            try:
+                when = parsedate_to_datetime(retry_after)
+                return clamp_retry_delay(when.timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                pass
 
     reset = response.headers.get("x-ratelimit-reset")
 
     if reset:
         try:
-            return max(1.0, float(reset))
+            value = float(reset)
+
+            # Accommodate delay seconds, Unix seconds, and Unix milliseconds.
+            if value > 100_000_000_000:
+                value /= 1000
+
+            seconds = value - time.time() if value > 10_000_000 else value
+            return clamp_retry_delay(seconds)
         except ValueError:
             pass
 
-    base = min(60.0, 2 ** min(attempt, 6))
+    base = min(60.0, 2 ** min(max(attempt - 1, 0), 6))
 
     return base + random.uniform(0.0, 1.0)
 
