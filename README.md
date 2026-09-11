@@ -60,8 +60,7 @@ under `/mnt/c`.
    identifier, context size, concurrency, and fair-use limits have been verified.
 
 The model identifier is the human-readable value exposed by the OU LiteLLM
-dashboard. The supplied identifier is currently mislabeled upstream but maps to
-Qwen3.8-Flash-Next.
+dashboard (not the upstream NRP model name/endpoint).
 
 ## Starting and stopping
 
