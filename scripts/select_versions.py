@@ -9,9 +9,9 @@ import json
 import os
 import re
 import shlex
+import ssl
 import subprocess
 import sys
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -23,6 +23,21 @@ COMFY_REPOSITORY = "Comfy-Org/ComfyUI"
 MAX_METADATA_BYTES = 4 * 1024 * 1024
 SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 KIMI_TAG_RE = re.compile(r"^@moonshot-ai/kimi-code@(\d+\.\d+\.\d+)$")
+
+
+def release_ssl_context() -> ssl.SSLContext:
+    """Use macOS's CA bundle when Python has no default trust anchors."""
+    context = ssl.create_default_context()
+    if (
+        sys.platform == "darwin"
+        and not os.environ.get("SSL_CERT_FILE")
+        and not os.environ.get("SSL_CERT_DIR")
+        and context.cert_store_stats()["x509_ca"] == 0
+    ):
+        system_bundle = Path("/etc/ssl/cert.pem")
+        if system_bundle.is_file():
+            context.load_verify_locations(cafile=str(system_bundle))
+    return context
 
 
 def github_json(path: str) -> Any:
@@ -37,12 +52,12 @@ def github_json(path: str) -> Any:
 
     request = urllib.request.Request(f"{GITHUB_API}{path}", headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=30, context=release_ssl_context()) as response:
             body = response.read(MAX_METADATA_BYTES + 1)
             if len(body) > MAX_METADATA_BYTES:
                 raise ValueError("response exceeds 4 MiB")
             return json.loads(body)
-    except (urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise SystemExit(f"Unable to fetch GitHub release metadata: {exc}") from exc
 
 
@@ -52,12 +67,12 @@ def read_text_url(url: str) -> str:
         headers={"User-Agent": "adrc-kimi-harness-version-selector"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=30, context=release_ssl_context()) as response:
             body = response.read(64 * 1024 + 1)
             if len(body) > 64 * 1024:
                 raise ValueError("checksum response exceeds 64 KiB")
             return body.decode("utf-8")
-    except (urllib.error.URLError, UnicodeDecodeError, ValueError) as exc:
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise SystemExit(f"Unable to fetch release checksum: {exc}") from exc
 
 

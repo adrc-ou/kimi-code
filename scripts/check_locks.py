@@ -19,6 +19,18 @@ def digest(path: Path) -> str:
 
 def main() -> None:
     lock = json.loads((ROOT / "dependencies.lock.json").read_text())
+    python = lock["downloads"]["macos-python"]
+    if not re.fullmatch(r"3\.12\.\d+", python["version"]):
+        raise SystemExit("managed MPS Python must remain on 3.12")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", python["digest"]):
+        raise SystemExit("invalid managed Python digest")
+    if not re.fullmatch(
+        r"https://github.com/astral-sh/python-build-standalone/releases/download/"
+        r"\d{8}/cpython-" + re.escape(python["version"])
+        + r"%2B\d{8}-aarch64-apple-darwin-install_only.tar.gz",
+        python["url"],
+    ):
+        raise SystemExit("managed Python must use a versioned official arm64 release")
     for value in lock["images"].values():
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
             raise SystemExit(f"invalid image digest: {value}")

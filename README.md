@@ -24,7 +24,7 @@ Both hosts need:
 
 - Docker Desktop with Docker Compose;
 - Git;
-- Python 3.12 for the locked native MPS tuple;
+- Python 3 for the host setup scripts;
 - enough free disk space for container images and models;
 - network access to GitHub, Python package indexes, Docker Hub, and configured
   model/MCP endpoints.
@@ -32,8 +32,21 @@ Both hosts need:
 The Mac additionally needs:
 
 - Apple Silicon and macOS 14 or newer;
-- an arm64 build of Python;
+- `curl` and `tar` (included with macOS);
 - Xcode command-line tools (`xcode-select --install`).
+
+For native ComfyUI, the launcher uses arm64 Python 3.12 from `PATH` when available.
+Otherwise it downloads the standalone build pinned in `dependencies.lock.json`
+from [Astral's official releases](https://github.com/astral-sh/python-build-standalone/releases),
+verifies its SHA-256, and installs it under
+`.local/runtime/<instance>/python/<digest>/`. Setup reuses this interpreter to
+create ComfyUI's dedicated virtual environment. No Homebrew, administrator
+access, shell profile changes, or system Python changes are needed. Each user
+should use their own writable harness checkout and workspace.
+
+To use an existing interpreter (including for offline setup), set
+`COMFYUI_MACOS_PYTHON` to its executable path. An explicit override must be
+arm64 Python 3.12; an invalid override fails instead of triggering a download.
 
 The Windows host additionally needs:
 
@@ -347,6 +360,13 @@ The host scripts report a file, line, and exit status for unexpected failures.
 `start.sh` also checks that Docker is ready before selecting releases. Optional
 ComfyUI path overrides may be left unset. `init-workspace.sh` creates the
 workspace layout and exits successfully without starting containers.
+
+The release selector uses Python's verified HTTPS context. On macOS, if Python
+has no default CA certificates, it loads the system bundle at `/etc/ssl/cert.pem`
+for both release metadata and checksum downloads. Existing trust stores and
+explicit `SSL_CERT_FILE` / `SSL_CERT_DIR` environment settings take precedence.
+For an organization-specific CA bundle, export `SSL_CERT_FILE=/path/to/ca-bundle.pem`
+before launching. Certificate and hostname verification remain enabled.
 
 After a controlled hardware acceptance run, update the matching compatibility
 entry from `locked` to `tested`, add the run identifier and certification date,
