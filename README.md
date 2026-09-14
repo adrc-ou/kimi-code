@@ -338,11 +338,15 @@ below `.local/comfy-macos/INSTANCE_ID`. Stop the matching stack before removing
 either directory. Never delete the workspace as part of cache cleanup.
 
 An ordinary `launcher.lock` file may remain after a crash; advisory locking
-makes an unlocked file harmless. On hosts using the directory fallback, the
-launcher removes a lock whose recorded PID is no longer alive. If it reports a
-live owner, inspect and stop that exact process first. Remove only the reported
-instance's `launcher.lock.d` after confirming the PID is absent; never remove
-the project, workspace, or the entire `.local` tree as lock recovery.
+makes an unlocked file harmless. Both macOS and WSL2 use Python's advisory
+locking support; no separate `flock` command is required. If a launcher reports
+another owner, stop that exact launcher first. Do not delete an active lock file
+or remove the project, workspace, or the entire `.local` tree as lock recovery.
+
+The host scripts report a file, line, and exit status for unexpected failures.
+`start.sh` also checks that Docker is ready before selecting releases. Optional
+ComfyUI path overrides may be left unset. `init-workspace.sh` creates the
+workspace layout and exits successfully without starting containers.
 
 After a controlled hardware acceptance run, update the matching compatibility
 entry from `locked` to `tested`, add the run identifier and certification date,

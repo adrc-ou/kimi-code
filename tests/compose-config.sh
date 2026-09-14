@@ -2,6 +2,12 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd -P)
+# Ignore operator configuration, even when this check runs in a configured clone.
+export COMPOSE_ENV_FILES=/dev/null
+export COMPOSE_DISABLE_ENV_FILE=1
+export LITELLM_UPSTREAM_ORIGIN=https://example.invalid
+export LITELLM_MODEL_ID=test-model
+export SEARXNG_SECRET=compose-fixture-only
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/kimi compose.XXXXXX")
 trap 'find "${fixture}" -depth -delete' EXIT
 mkdir -p "${fixture}/workspace/comfyui/"{models,custom_nodes,input,output,temp,user} "${fixture}/empty"

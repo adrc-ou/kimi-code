@@ -5,7 +5,7 @@ root=$(cd "$(dirname "$0")" && pwd -P)
 cd "${root}"
 # shellcheck disable=SC1091
 source tools/runtime.sh
-trap harness_unlock EXIT INT TERM
+harness_traps
 harness_init_readonly
 [[ -f "${HARNESS_STATE_FILE}" && -f "${HARNESS_RUNTIME_DIR}/runtime.env" ]] || {
   echo "No running runtime for this workspace. Run ./start.sh first." >&2

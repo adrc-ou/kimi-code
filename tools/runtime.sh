@@ -6,6 +6,15 @@ harness_die() {
   return 1
 }
 
+harness_traps() {
+  # Report the location, never the command: commands can contain credentials.
+  set -E
+  trap 'printf "Harness failed at %s:%s (exit %s).\n" "${BASH_SOURCE[0]}" "${LINENO}" "$?" >&2' ERR
+  trap harness_unlock EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
 harness_platform() {
   case "$(uname -s):$(uname -m)" in
     Darwin:arm64)
@@ -33,14 +42,10 @@ harness_resolve_bootstrap_env() {
   [[ -f "${HARNESS_ROOT}/.env" ]] || harness_die "Missing .env. Copy .env.example to .env and configure it." || return
   command -v docker >/dev/null 2>&1 || harness_die "Required command not found: docker" || return
   docker compose version >/dev/null
-  local output
-  output=$(docker compose --env-file "${HARNESS_ROOT}/.env" \
+  HARNESS_BOOTSTRAP_ENV=$(docker compose --env-file "${HARNESS_ROOT}/.env" \
     -f "${HARNESS_ROOT}/compose.bootstrap.yaml" config --environment)
-  HARNESS_RESOLVED_BOOTSTRAP=$(mktemp "${TMPDIR:-/tmp}/kimi-env.XXXXXX")
-  chmod 600 "${HARNESS_RESOLVED_BOOTSTRAP}"
-  printf '%s\n' "${output}" >"${HARNESS_RESOLVED_BOOTSTRAP}"
-  HARNESS_WORKSPACE_VALUE=$(python3 "${HARNESS_ROOT}/scripts/read_env.py" \
-    "${HARNESS_RESOLVED_BOOTSTRAP}" WORKSPACE_PATH)
+  HARNESS_WORKSPACE_VALUE=$(printf '%s\n' "${HARNESS_BOOTSTRAP_ENV}" | \
+    python3 "${HARNESS_ROOT}/scripts/read_env.py" /dev/stdin WORKSPACE_PATH)
   [[ -n "${HARNESS_WORKSPACE_VALUE}" ]] || harness_die "WORKSPACE_PATH must not be empty." || return
   case "${HARNESS_WORKSPACE_VALUE}" in
     /*) local candidate=${HARNESS_WORKSPACE_VALUE} ;;
@@ -54,9 +59,12 @@ harness_resolve_bootstrap_env() {
   [[ "${HARNESS_WORKSPACE}" != *$'\n'* ]] || harness_die "WORKSPACE_PATH contains a newline" || return
   export WORKSPACE_PATH=${HARNESS_WORKSPACE}
   local variable value
-  for variable in COMFYUI_MODELS_PATH COMFYUI_CUSTOM_NODES_PATH COMFYUI_INPUT_PATH COMFYUI_OUTPUT_PATH COMFYUI_TEMP_PATH COMFYUI_USER_PATH; do
-    value=$(python3 "${HARNESS_ROOT}/scripts/read_env.py" "${HARNESS_RESOLVED_BOOTSTRAP}" "${variable}" 2>/dev/null || true)
-    [[ -n "${value}" ]] && export "${variable}=${value}"
+  for variable in COMFYUI_MODELS_PATH COMFYUI_CUSTOM_NODES_PATH COMFYUI_INPUT_PATH COMFYUI_OUTPUT_PATH COMFYUI_TEMP_PATH COMFYUI_USER_PATH COMFYUI_MACOS_PYTHON COMPOSE_PROJECT_NAME LOCAL_UID LOCAL_GID; do
+    value=$(printf '%s\n' "${HARNESS_BOOTSTRAP_ENV}" | \
+      python3 "${HARNESS_ROOT}/scripts/read_env.py" /dev/stdin "${variable}" 2>/dev/null || true)
+    if [[ -n "${value}" ]]; then
+      export "${variable}=${value}"
+    fi
   done
 }
 
@@ -79,40 +87,39 @@ harness_instance() {
 
 harness_lock() {
   HARNESS_LOCK_PATH="${HARNESS_RUNTIME_DIR}/launcher.lock"
-  if command -v flock >/dev/null 2>&1; then
-    exec {HARNESS_LOCK_FD}>"${HARNESS_LOCK_PATH}"
-    if ! flock -n "${HARNESS_LOCK_FD}"; then
-      harness_die "Another launcher owns ${HARNESS_LOCK_PATH}" || return
-    fi
-    printf 'pid=%s\nstarted=%s\n' "$$" "$(date -u +%FT%TZ)" 1>&"${HARNESS_LOCK_FD}"
-    export HARNESS_LOCK_FD HARNESS_LOCK_PATH
-    return
+  # FD 9 is reserved for the launcher. Python's flock works on both macOS and
+  # Linux, including Apple's Bash 3.2, without racy PID-directory reclamation.
+  # Do not truncate the current owner's metadata before acquiring the lock.
+  exec 9>>"${HARNESS_LOCK_PATH}"
+  if ! python3 - "${HARNESS_LOCK_PATH}" "$$" <<'PY'
+import fcntl
+import os
+import sys
+from datetime import datetime, timezone
+
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(f"Another launcher owns {sys.argv[1]}") from None
+os.ftruncate(9, 0)
+os.write(9, f"pid={sys.argv[2]}\nstarted={datetime.now(timezone.utc).isoformat()}\n".encode())
+PY
+  then
+    exec 9>&-
+    return 1
   fi
-  HARNESS_LOCK_DIRECTORY="${HARNESS_LOCK_PATH}.d"
-  if ! mkdir "${HARNESS_LOCK_DIRECTORY}" 2>/dev/null; then
-    local owner=""
-    [[ -f "${HARNESS_LOCK_DIRECTORY}/pid" ]] && owner=$(sed -n '1p' "${HARNESS_LOCK_DIRECTORY}/pid")
-    if [[ "${owner}" =~ ^[0-9]+$ ]] && ! kill -0 "${owner}" 2>/dev/null; then
-      find "${HARNESS_LOCK_DIRECTORY}" -depth -delete
-      mkdir "${HARNESS_LOCK_DIRECTORY}"
-    else
-      harness_die "Another launcher owns ${HARNESS_LOCK_DIRECTORY} (pid ${owner:-unknown})" || return
-    fi
-  fi
-  printf '%s\n' "$$" >"${HARNESS_LOCK_DIRECTORY}/pid"
-  chmod 700 "${HARNESS_LOCK_DIRECTORY}"
-  export HARNESS_LOCK_DIRECTORY HARNESS_LOCK_PATH
+  HARNESS_LOCK_HELD=true
 }
 
 harness_unlock() {
-  if [[ -n "${HARNESS_LOCK_DIRECTORY:-}" && -d "${HARNESS_LOCK_DIRECTORY}" ]]; then
-    find "${HARNESS_LOCK_DIRECTORY}" -depth -delete
+  if [[ "${HARNESS_LOCK_HELD:-false}" == true ]]; then
+    python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_UN)' || true
+    exec 9>&-
+    HARNESS_LOCK_HELD=false
   fi
-  if [[ -n "${HARNESS_LOCK_FD:-}" ]]; then
-    flock -u "${HARNESS_LOCK_FD}" 2>/dev/null || true
-    eval "exec ${HARNESS_LOCK_FD}>&-"
+  if [[ -n "${HARNESS_RESOLVED_BOOTSTRAP:-}" ]]; then
+    find "${HARNESS_RESOLVED_BOOTSTRAP}" -delete 2>/dev/null || true
   fi
-  [[ -n "${HARNESS_RESOLVED_BOOTSTRAP:-}" ]] && find "${HARNESS_RESOLVED_BOOTSTRAP}" -delete 2>/dev/null || true
 }
 
 harness_compose_files() {
@@ -142,16 +149,25 @@ harness_validate_compose() {
 harness_init() {
   HARNESS_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
   export HARNESS_ROOT
+  umask 077
+  for command in docker git python3 shasum; do
+    command -v "${command}" >/dev/null 2>&1 || harness_die "Required command not found: ${command}" || return
+  done
   harness_platform
   harness_resolve_bootstrap_env
   harness_instance
   harness_lock
+  HARNESS_RESOLVED_BOOTSTRAP=$(mktemp "${HARNESS_RUNTIME_DIR}/bootstrap.XXXXXX")
+  printf '%s\n' "${HARNESS_BOOTSTRAP_ENV}" >"${HARNESS_RESOLVED_BOOTSTRAP}"
+  unset HARNESS_BOOTSTRAP_ENV
 }
 
 harness_init_readonly() {
   HARNESS_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
   export HARNESS_ROOT
+  umask 077
   harness_platform
   harness_resolve_bootstrap_env
   harness_instance
+  unset HARNESS_BOOTSTRAP_ENV
 }

@@ -1,3 +1,4 @@
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -10,8 +11,9 @@ class RuntimeLockTests(unittest.TestCase):
     def run_lock(self, runtime: Path) -> subprocess.CompletedProcess[str]:
         script = f"""
 set -euo pipefail
-source {ROOT / "tools" / "runtime.sh"}
-HARNESS_RUNTIME_DIR={runtime}
+source {shlex.quote(str(ROOT / "tools" / "runtime.sh"))}
+harness_traps
+HARNESS_RUNTIME_DIR={shlex.quote(str(runtime))}
 mkdir -p "$HARNESS_RUNTIME_DIR"
 harness_lock
 harness_unlock
@@ -34,12 +36,16 @@ harness_unlock
             runtime = Path(temporary)
             owner_script = f"""
 set -euo pipefail
-source {ROOT / "tools" / "runtime.sh"}
-HARNESS_RUNTIME_DIR={runtime}
+source {shlex.quote(str(ROOT / "tools" / "runtime.sh"))}
+harness_traps
+HARNESS_RUNTIME_DIR={shlex.quote(str(runtime))}
 mkdir -p "$HARNESS_RUNTIME_DIR"
 harness_lock
 printf ready
-sleep 30
+sleep 30 &
+sleeper=$!
+trap 'kill "$sleeper" 2>/dev/null || true; harness_unlock' EXIT
+wait "$sleeper"
 """
             owner = subprocess.Popen(
                 ["bash", "-c", owner_script],
@@ -50,9 +56,13 @@ sleep 30
             try:
                 assert owner.stdout is not None
                 self.assertEqual(owner.stdout.read(5), "ready")
+                metadata = (runtime / "launcher.lock").read_text()
                 contender = self.run_lock(runtime)
                 self.assertNotEqual(contender.returncode, 0)
                 self.assertIn("Another launcher owns", contender.stderr)
+                self.assertEqual((runtime / "launcher.lock").read_text(), metadata)
+                # The failed contender's EXIT trap must not release the owner.
+                self.assertNotEqual(self.run_lock(runtime).returncode, 0)
                 independent = self.run_lock(runtime / "independent")
                 self.assertEqual(independent.returncode, 0)
             finally:

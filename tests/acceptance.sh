@@ -6,7 +6,7 @@ root=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "${root}"
 # shellcheck disable=SC1091
 source tools/runtime.sh
-trap harness_unlock EXIT INT TERM
+harness_traps
 harness_init_readonly
 [[ "${HARNESS_BACKEND}" == "${expected_backend}" ]] || { echo "Host selects ${HARNESS_BACKEND}, not ${expected_backend}" >&2; exit 2; }
 set -a

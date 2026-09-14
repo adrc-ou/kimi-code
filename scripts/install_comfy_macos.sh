@@ -19,6 +19,7 @@ current="${base}/current"
 old_link="${base}/old.$$"
 new_link="${base}/current.$$"
 installed=false
+release_created=false
 
 mkdir -p "${releases}"
 
@@ -42,7 +43,7 @@ case "${release}" in
 esac
 
 cleanup() {
-  if [[ "${installed}" != true && -d "${release}" ]]; then
+  if [[ "${installed}" != true && "${release_created}" == true && -d "${release}" ]]; then
     find "${release}" -depth -delete
   fi
   if [[ -L "${new_link}" ]]; then
@@ -52,7 +53,9 @@ cleanup() {
     mv -- "${old_link}" "${current}"
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ -x "${current}/venv/bin/python" \
       && -f "${current}/FINGERPRINT" \
@@ -67,6 +70,7 @@ if [[ -e "${release}" ]]; then
   find "${release}" -depth -delete
 fi
 mkdir -p "${release}/app"
+release_created=true
 
 git init "${release}/app"
 git -C "${release}/app" remote add origin \

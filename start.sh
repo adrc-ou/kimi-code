@@ -5,7 +5,7 @@ root=$(cd "$(dirname "$0")" && pwd -P)
 cd "${root}"
 
 non_interactive=false
-if [[ "${1:-}" == "--non-interactive" ]]; then
+if [[ $# -eq 1 && "$1" == "--non-interactive" ]]; then
   non_interactive=true
 elif [[ $# -ne 0 ]]; then
   echo "usage: ./start.sh [--non-interactive]" >&2
@@ -18,8 +18,10 @@ done
 
 # shellcheck disable=SC1091
 source "${root}/tools/runtime.sh"
-trap harness_unlock EXIT INT TERM
+harness_traps
+echo "Preparing Kimi workspace..."
 harness_init
+docker info >/dev/null || { echo "Docker is not ready. Start Docker Desktop and retry." >&2; exit 1; }
 
 COMFY_PID=""
 COMFY_BRIDGE_PID=""
@@ -28,23 +30,28 @@ stack_started=false
 
 cleanup() {
   status=$?
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM ERR
+  set +e
   for pid in "${COMFY_BRIDGE_PID}" "${COMFY_PID}" "${COMPOSE_PID}"; do
-    [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null || true
+    if [[ -n "${pid}" ]]; then
+      kill "${pid}" 2>/dev/null || true
+    fi
   done
   for pid in "${COMFY_BRIDGE_PID}" "${COMFY_PID}" "${COMPOSE_PID}"; do
-    [[ -n "${pid}" ]] && wait "${pid}" 2>/dev/null || true
+    if [[ -n "${pid}" ]]; then
+      wait "${pid}" 2>/dev/null || true
+    fi
   done
   if [[ "${stack_started}" == true ]]; then
     harness_compose down --remove-orphans >/dev/null 2>&1 || true
   fi
-  for file in proxy-token search-token bridge-token nrp-api-key kimi-config.toml runtime.env bridge.crt bridge.key; do
+  for file in proxy-token search-token bridge-token nrp-api-key kimi-config.toml runtime.env bridge.crt bridge.key session.env compose/resolved.json; do
     [[ -f "${HARNESS_RUNTIME_DIR}/${file}" ]] && find "${HARNESS_RUNTIME_DIR}/${file}" -delete
   done
   harness_unlock
   exit "${status}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
 
 platform_key=${HARNESS_PLATFORM}
 platform_label=${HARNESS_PLATFORM_LABEL}
@@ -68,7 +75,9 @@ set +a
 state_file=${HARNESS_STATE_FILE}
 session_file=${HARNESS_SESSION_FILE}
 state_value() {
-  [[ -f "${state_file}" ]] && python3 scripts/read_env.py "${state_file}" "$1" 2>/dev/null || true
+  if [[ -f "${state_file}" ]]; then
+    python3 scripts/read_env.py "${state_file}" "$1" 2>/dev/null || true
+  fi
 }
 
 installed_kimi=""
@@ -125,6 +134,8 @@ if [[ "${backend}" == mps ]]; then
   COMFYUI_BRIDGE_CERT="${HARNESS_RUNTIME_DIR}/bridge.crt"
   COMFYUI_BRIDGE_KEY="${HARNESS_RUNTIME_DIR}/bridge.key"
   export COMFYUI_BRIDGE_CERT COMFYUI_BRIDGE_KEY
+  # shell.sh and acceptance.sh also need the certificate path for Compose.
+  printf 'export COMFYUI_BRIDGE_CERT=%q\n' "${COMFYUI_BRIDGE_CERT}" >>"${HARNESS_RUNTIME_DIR}/runtime.env"
   openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 2 \
     -config "${root}/runtime/openssl-bridge.cnf" \
     -keyout "${COMFYUI_BRIDGE_KEY}" -out "${COMFYUI_BRIDGE_CERT}" >/dev/null 2>&1
@@ -142,7 +153,7 @@ if [[ "${backend}" == mps ]]; then
 fi
 
 harness_compose build
-actual_kimi=$(harness_compose run --rm --no-deps kimi-agent kimi --version)
+actual_kimi=$(harness_compose run -T --rm --no-deps kimi-agent kimi --version)
 [[ "${actual_kimi}" == *"${KIMI_CODE_VERSION}"* ]] || { echo "Built Kimi version mismatch: ${actual_kimi}" >&2; exit 1; }
 if [[ "${backend}" == cuda ]]; then
   harness_compose run --rm --no-deps comfyui python -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name())'
@@ -201,7 +212,8 @@ echo "Press Ctrl-C to stop everything."
 echo
 
 python3 tools/verify_bind_paths.py verify "${workspace}" "${bind_manifest}"
-harness_compose up --remove-orphans --abort-on-container-exit &
+# searxng-init is expected to exit successfully during startup.
+harness_compose up --remove-orphans --abort-on-container-failure &
 COMPOSE_PID=$!
 stack_started=true
 while kill -0 "${COMPOSE_PID}" 2>/dev/null; do
