@@ -178,6 +178,10 @@ the agent identity. The launcher therefore requires host-side approval for
 and `.kimi-code/mcp.json`. Ordinary project `AGENTS.md` files remain writable
 workspace guidance and do not require this approval.
 
+Empty extension directories and a zero-byte MCP mount-point file left by Docker
+do not require approval. The MCP placeholder is mounted as an empty JSON object.
+Adding extension files or a nonempty MCP configuration requires approval.
+
 With the stack stopped, inspect and approve the current exact content:
 
 ```bash

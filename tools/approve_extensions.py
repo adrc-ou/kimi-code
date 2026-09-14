@@ -49,6 +49,10 @@ def inspect_path(workspace: Path, relative: str) -> dict[str, str]:
         if stat.S_ISDIR(info.st_mode):
             entries[f"{rel}/"] = "directory"
         elif stat.S_ISREG(info.st_mode):
+            # Docker may leave an empty file behind at a nested bind target.
+            # It declares no MCP servers; prepare replaces it with valid empty JSON.
+            if relative == ".kimi-code/mcp.json" and info.st_size == 0:
+                continue
             entries[rel] = sha256(item)
         else:
             raise ValueError(f"special extension object is not allowed: {rel}")
@@ -98,15 +102,23 @@ def approve(workspace: Path, manifest: Path) -> None:
 def require_approval(workspace: Path, manifest: Path) -> dict[str, object]:
     current = scan(workspace)
     if not manifest.is_file():
-        if any(current["extensions"].values()):
-            raise SystemExit("privileged project extensions require approval")
+        if any(
+            digest != "directory"
+            for entries in current["extensions"].values()
+            for digest in entries.values()
+        ):
+            raise SystemExit(
+                "privileged project extensions require approval; review with "
+                "./extensions.sh list, approve with ./extensions.sh approve, then rerun ./start.sh"
+            )
         return current
     approved = json.loads(manifest.read_text())
     if approved.get("workspace", {}).get("path") != current["workspace"]["path"]:
         raise SystemExit("extension approval belongs to a different workspace")
     if approved.get("extensions") != current["extensions"]:
         raise SystemExit(
-            "privileged project extensions changed; stop services and approve the new digest"
+            "privileged project extensions changed; stop services, review with "
+            "./extensions.sh list, approve with ./extensions.sh approve, then rerun ./start.sh"
         )
     return current
 
@@ -114,7 +126,7 @@ def require_approval(workspace: Path, manifest: Path) -> dict[str, object]:
 def copy_snapshot(source: Path, target: Path, relative: str) -> tuple[Path, str]:
     origin = source / relative
     destination = target / relative
-    if origin.is_file():
+    if origin.is_file() and not (relative == ".kimi-code/mcp.json" and origin.stat().st_size == 0):
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(origin, destination, follow_symlinks=False)
         os.chmod(destination, 0o600)
