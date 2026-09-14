@@ -126,7 +126,7 @@ services:
 
     tmpfs:
       - /tmp:rw,nosuid,nodev,size=2g
-      - /home/agent/.cache:rw,nosuid,nodev,size=1g
+      - /home/agent/.cache:rw,nosuid,nodev,size=1g,uid=${LOCAL_UID:-1000},gid=${LOCAL_GID:-1000},mode=0700
 
     ports:
       - "127.0.0.1:5494:5494"

@@ -82,4 +82,28 @@ if [[ "${1:-}" == --runtime ]]; then
   "${compose[@]}" run --rm --no-deps searxng-init
   "${compose[@]}" run --rm --no-deps --entrypoint /bin/sh searxng -ec \
     'test "$(stat -c "%u:%g:%a" /var/cache/searxng)" = 977:977:700; test "$(cat /var/cache/searxng/test-marker)" = preserved'
+
+  # Exercise the actual agent tmpfs configuration without building the agent
+  # or mounting operator configuration. Cover default and custom host identities.
+  for identity in 1000:1000 1234:2345; do
+    export LOCAL_UID=${identity%:*} LOCAL_GID=${identity#*:}
+    "${compose[@]}" config --format json | python3 -c '
+import json, os, sys
+services = json.load(sys.stdin)["services"]
+print(json.dumps({"services": {"cache-test": {
+    "image": services["searxng"]["image"],
+    "user": os.environ["LOCAL_UID"] + ":" + os.environ["LOCAL_GID"],
+    "read_only": True,
+    "network_mode": "none",
+    "cap_drop": ["ALL"],
+    "security_opt": ["no-new-privileges:true"],
+    "tmpfs": services["kimi-agent"]["tmpfs"],
+    "entrypoint": ["/bin/sh", "-ec"],
+    "command": ["test $(stat -c %u:%g:%a /home/agent/.cache) = $(id -u):$(id -g):700; "
+                "mkdir -p /home/agent/.cache/kimi-code/web/test/dist-web/assets; "
+                "echo ok > /home/agent/.cache/kimi-code/web/test/dist-web/assets/test"],
+}}}))
+' >"${fixture}/cache-test.json"
+    docker compose -p "${test_project}" -f "${fixture}/cache-test.json" run --rm cache-test
+  done
 fi
