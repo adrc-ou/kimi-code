@@ -3,12 +3,17 @@ services:
     image: docker.io/searxng/searxng:2026.9.10-931fd9787@sha256:2fb0fa85096fe6df5c3ab98ecb4d6e0ee2ef66b8fb96ce6fce0f75b51c4bd90a
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
-    command: ["install -d -o 977 -g 977 -m 700 /var/cache/searxng"]
+    command: ["mkdir -p /var/cache/searxng && chown 977:977 /var/cache/searxng && chmod 700 /var/cache/searxng"]
     volumes:
-      - searxng-cache:/var/cache/searxng
+      - type: volume
+        source: searxng-cache
+        target: /var/cache/searxng
+        volume:
+          nocopy: true
     read_only: true
     cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE]
+    # chmod needs FOWNER after chown, including on repeat starts.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
     security_opt: [no-new-privileges:true]
     pids_limit: 64
 
@@ -25,7 +30,11 @@ services:
     user: "977:977"
     volumes:
       - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
-      - searxng-cache:/var/cache/searxng
+      - type: volume
+        source: searxng-cache
+        target: /var/cache/searxng
+        volume:
+          nocopy: true
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev

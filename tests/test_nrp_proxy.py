@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ os.environ.update(
     {
         "NRP_UPSTREAM_ORIGIN": "https://example.invalid",
         "NRP_UPSTREAM_MODEL": "upstream-model",
-        "NRP_API_KEY": "a" * 32,
+        "NRP_API_KEY": "provider-fixture",
         "NRP_INTERNAL_TOKEN": "i" * 32,
         "NRP_CACHE_SALT": "c" * 43,
         "KIMI_CONFIG_PATH": str(ROOT / "runtime" / "config.toml"),
@@ -23,6 +24,38 @@ SPEC = importlib.util.spec_from_file_location("nrp_proxy", ROOT / "proxy" / "nrp
 assert SPEC and SPEC.loader
 PROXY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROXY)
+
+
+class SecretTests(unittest.TestCase):
+    def test_short_provider_key_is_accepted_at_startup(self):
+        self.assertEqual(PROXY.API_KEY, "provider-fixture")
+
+    def test_file_secret_takes_precedence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixture-key"
+            path.write_text("provider-fixture\n")
+            with patch.dict(os.environ, {"TEST_KEY_FILE": str(path), "TEST_KEY": "fallback"}):
+                self.assertEqual(
+                    PROXY.secret("TEST_KEY_FILE", "TEST_KEY", min_length=1),
+                    "provider-fixture",
+                )
+                with self.assertRaisesRegex(RuntimeError, "at least 32"):
+                    PROXY.secret("TEST_KEY_FILE", "TEST_KEY")
+            path.write_text(" \n")
+            with patch.dict(os.environ, {"TEST_KEY_FILE": str(path), "TEST_KEY": "fallback"}):
+                with self.assertRaises(RuntimeError):
+                    PROXY.secret("TEST_KEY_FILE", "TEST_KEY", min_length=1)
+
+    def test_empty_provider_key_and_short_internal_secrets_are_rejected(self):
+        for value in ("", " ", "\n"):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {"TEST_KEY_FILE": "", "TEST_KEY": value}
+            ), self.assertRaises(RuntimeError):
+                PROXY.secret("TEST_KEY_FILE", "TEST_KEY", min_length=1)
+        with patch.dict(os.environ, {"TEST_KEY_FILE": "", "TEST_KEY": "too-short"}):
+            with self.assertRaisesRegex(RuntimeError, "at least 32") as error:
+                PROXY.secret("TEST_KEY_FILE", "TEST_KEY")
+            self.assertNotIn("too-short", str(error.exception))
 
 
 class Response:

@@ -57,7 +57,7 @@ def main() -> None:
     args.runtime_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(args.runtime_dir, 0o700)
     values = read_values(args.resolved_env)
-    api_key = values.get("LITELLM_API_KEY", "")
+    api_key = values.get("LITELLM_API_KEY", "").strip()
     if not api_key:
         raise SystemExit("LITELLM_API_KEY must be set in .env")
     ephemeral = {

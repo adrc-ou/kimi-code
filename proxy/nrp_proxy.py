@@ -24,17 +24,21 @@ from aiohttp import (
 )
 
 
-def secret(file_variable: str, value_variable: str) -> str:
+def secret(file_variable: str, value_variable: str, *, min_length: int = 32) -> str:
     path = os.environ.get(file_variable, "")
-    value = Path(path).read_text().strip() if path else os.environ.get(value_variable, "")
-    if len(value) < 32:
-        raise RuntimeError(f"{file_variable} must reference a secret of at least 32 characters")
+    value = (Path(path).read_text() if path else os.environ.get(value_variable, "")).strip()
+    if len(value) < min_length:
+        raise RuntimeError(
+            f"{file_variable} must reference a secret of at least {min_length} characters"
+        )
     return value
 
 
 UPSTREAM = os.environ["NRP_UPSTREAM_ORIGIN"].rstrip("/")
 UPSTREAM_MODEL = os.environ["NRP_UPSTREAM_MODEL"]
-API_KEY = secret("NRP_API_KEY_FILE", "NRP_API_KEY")
+# Provider-issued keys have no harness-defined length; only our generated
+# internal credentials and private cache salt require at least 32 characters.
+API_KEY = secret("NRP_API_KEY_FILE", "NRP_API_KEY", min_length=1)
 INTERNAL_BEARER_TOKEN = secret("NRP_INTERNAL_TOKEN_FILE", "NRP_INTERNAL_TOKEN")
 CACHE_SALT = secret("NRP_CACHE_SALT_FILE", "NRP_CACHE_SALT")
 KIMI_CONFIG_PATH = os.environ.get("KIMI_CONFIG_PATH", "/policy/kimi-config.toml")

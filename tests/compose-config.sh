@@ -2,6 +2,10 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd -P)
+if [[ $# -gt 1 || ( $# -eq 1 && "$1" != --runtime ) ]]; then
+  echo "usage: tests/compose-config.sh [--runtime]" >&2
+  exit 2
+fi
 # Ignore operator configuration, even when this check runs in a configured clone.
 export COMPOSE_ENV_FILES=/dev/null
 export COMPOSE_DISABLE_ENV_FILE=1
@@ -9,7 +13,16 @@ export LITELLM_UPSTREAM_ORIGIN=https://example.invalid
 export LITELLM_MODEL_ID=test-model
 export SEARXNG_SECRET=compose-fixture-only
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/kimi compose.XXXXXX")
-trap 'find "${fixture}" -depth -delete' EXIT
+test_project="kimi-cache-test-$(basename "${fixture}" | tr '[:upper:] .' '[:lower:]--')"
+runtime_test=false
+cleanup() {
+  if [[ "${runtime_test}" == true ]]; then
+    docker compose -p "${test_project}" -f "${root}/compose.yaml" \
+      -f "${root}/compose.search.yaml" down --volumes --remove-orphans
+  fi
+  find "${fixture}" -depth -delete
+}
+trap cleanup EXIT
 mkdir -p "${fixture}/workspace/comfyui/"{models,custom_nodes,input,output,temp,user} "${fixture}/empty"
 touch "${fixture}/config.toml" "${fixture}/SYSTEM.md" "${fixture}/secret" "${fixture}/cert.crt"
 chmod 600 "${fixture}/"{config.toml,SYSTEM.md,secret,cert.crt}
@@ -58,3 +71,15 @@ printf '%s\n' \
   '        bind:' \
   '          create_host_path: false' >"${fixture}/approved.yaml"
 docker compose -f "${root}/compose.yaml" -f "${root}/compose.search.yaml" -f "${root}/compose.comfy.cuda.yaml" -f "${fixture}/approved.yaml" config --quiet
+
+if [[ "${1:-}" == --runtime ]]; then
+  runtime_test=true
+  compose=(docker compose -p "${test_project}" -f "${root}/compose.yaml" -f "${root}/compose.search.yaml")
+  # Both a fresh cache and one already owned by SearXNG must initialize.
+  "${compose[@]}" run --rm --no-deps searxng-init
+  "${compose[@]}" run --rm --no-deps --entrypoint /bin/sh searxng -ec \
+    'stat -c "%u:%g:%a" /var/cache/searxng; test "$(stat -c "%u:%g:%a" /var/cache/searxng)" = 977:977:700; echo preserved > /var/cache/searxng/test-marker'
+  "${compose[@]}" run --rm --no-deps searxng-init
+  "${compose[@]}" run --rm --no-deps --entrypoint /bin/sh searxng -ec \
+    'test "$(stat -c "%u:%g:%a" /var/cache/searxng)" = 977:977:700; test "$(cat /var/cache/searxng/test-marker)" = preserved'
+fi
