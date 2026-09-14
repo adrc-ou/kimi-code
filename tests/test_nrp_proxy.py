@@ -74,20 +74,33 @@ class RequestValidationTests(unittest.TestCase):
     def test_only_explicit_proxy_routes_are_registered(self):
         app = PROXY.create_app()
         routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
+
+        # aiohttp reports a dynamic resource by its canonical template; it does
+        # not expand the lane regex into one canonical path per allowed value.
+        # add_get also registers the corresponding HEAD route automatically.
         self.assertEqual(
             routes,
             {
                 ("GET", "/healthz"),
                 ("HEAD", "/healthz"),
-                ("POST", "/primary/v1/chat/completions"),
-                ("GET", "/primary/v1/models"),
-                ("HEAD", "/primary/v1/models"),
-                ("POST", "/long/v1/chat/completions"),
-                ("GET", "/long/v1/models"),
-                ("HEAD", "/long/v1/models"),
-                ("POST", "/subagent/v1/chat/completions"),
-                ("GET", "/subagent/v1/models"),
-                ("HEAD", "/subagent/v1/models"),
+                ("POST", "/{lane}/v1/chat/completions"),
+                ("GET", "/{lane}/v1/models"),
+                ("HEAD", "/{lane}/v1/models"),
+            },
+        )
+
+        # The canonical form omits the variable's regex, so verify separately
+        # that both dynamic resources retain the intended lane restriction.
+        dynamic_patterns = {
+            route.resource.get_info()["pattern"].pattern
+            for route in app.router.routes()
+            if route.resource.canonical.startswith("/{lane}/")
+        }
+        self.assertEqual(
+            dynamic_patterns,
+            {
+                r"/(?P<lane>primary|long|subagent)/v1/chat/completions",
+                r"/(?P<lane>primary|long|subagent)/v1/models",
             },
         )
 

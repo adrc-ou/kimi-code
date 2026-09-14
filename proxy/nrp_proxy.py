@@ -23,6 +23,7 @@ from aiohttp import (
     web,
 )
 
+DEBUG_HTTP = False
 
 def secret(file_variable: str, value_variable: str, *, min_length: int = 32) -> str:
     path = os.environ.get(file_variable, "")
@@ -57,8 +58,6 @@ MAX_OUTPUT_TOKENS = {
     "subagent": int(os.environ.get("NRP_SUBAGENT_MAX_OUTPUT_TOKENS", "8192")),
 }
 RETRYABLE = {429, 500, 502, 503, 504}
-
-DEBUG_HTTP = True
 
 SENSITIVE_HEADERS = {
     "authorization",
