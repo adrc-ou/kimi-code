@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.8.22
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.8.22@sha256:9874eb7afe5ca16c363fe80b294fe700e460df29a55532bbfea234a0f12eddb1
 
 FROM ${UV_IMAGE} AS uv-bin
 
@@ -8,9 +8,10 @@ FROM ${UV_IMAGE} AS uv-bin
 # Build the official GitHub MCP server as a native executable.
 # ------------------------------------------------------------
 
-FROM golang:1.27-bookworm AS github-mcp-builder
+FROM golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS github-mcp-builder
 
 ARG GITHUB_MCP_VERSION=v1.12.1
+ARG GITHUB_MCP_COMMIT=7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -18,11 +19,11 @@ RUN apt-get update \
        git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone \
-      --depth 1 \
-      --branch "${GITHUB_MCP_VERSION}" \
-      https://github.com/github/github-mcp-server.git \
-      /src/github-mcp-server
+RUN git init /src/github-mcp-server \
+    && git -C /src/github-mcp-server remote add origin https://github.com/github/github-mcp-server.git \
+    && git -C /src/github-mcp-server fetch --depth 1 origin "${GITHUB_MCP_COMMIT}" \
+    && git -C /src/github-mcp-server checkout --detach FETCH_HEAD \
+    && test "$(git -C /src/github-mcp-server rev-parse HEAD)" = "${GITHUB_MCP_COMMIT}"
 
 WORKDIR /src/github-mcp-server
 
@@ -36,14 +37,11 @@ RUN CGO_ENABLED=0 go build \
 # Agent image
 # ------------------------------------------------------------
 
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
 ARG KIMI_CODE_VERSION
 ARG KIMI_CODE_ASSET_URL
 ARG KIMI_CODE_ASSET_SHA256
-ARG CHROME_DEVTOOLS_MCP_VERSION=1.9.0
-ARG PLAYWRIGHT_CLI_VERSION=0.1.19
-ARG SERENA_VERSION=1.7.0
 ARG AGENT_UID=1000
 ARG AGENT_GID=1000
 
@@ -80,10 +78,12 @@ RUN test -n "${KIMI_CODE_VERSION}" \
     && rm /tmp/kimi-code.tar.gz \
     && kimi --version
 
-# Local browser tooling still requires Node.js.
-RUN npm install -g \
-      "chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}" \
-      "@playwright/cli@${PLAYWRIGHT_CLI_VERSION}"
+# Local browser tooling still requires Node.js. Install from the reviewed lock.
+WORKDIR /opt/node-tools
+COPY container/package.json container/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts \
+    && ln -s /opt/node-tools/node_modules/.bin/chrome-devtools-mcp /usr/local/bin/chrome-devtools-mcp \
+    && ln -s /opt/node-tools/node_modules/.bin/playwright-cli /usr/local/bin/playwright-cli
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_GC=1
@@ -102,37 +102,31 @@ RUN chrome_path="$(find /opt/ms-playwright \
 # image instead of executing a mutable remote installer script.
 COPY --from=uv-bin /uv /uvx /usr/local/bin/
 
-ENV UV_TOOL_DIR=/opt/uv-tools
-ENV UV_TOOL_BIN_DIR=/usr/local/bin
+COPY container/serena.lock /opt/locks/serena.lock
 
-RUN uv tool install \
-      --python 3.11 \
-      "serena-agent==${SERENA_VERSION}"
+RUN uv venv --python 3.11 /opt/serena \
+    && uv pip sync --python /opt/serena/bin/python --require-hashes /opt/locks/serena.lock \
+    && ln -s /opt/serena/bin/serena /usr/local/bin/serena
 
 COPY --from=github-mcp-builder \
      /out/github-mcp-server \
      /usr/local/bin/github-mcp-server
 
-# Never run Kimi as root. Replace the base image's node user so bind-mount
-# ownership follows the invoking Unix user on Linux/WSL.
-RUN userdel --remove node \
-    && groupdel node \
-    && groupadd --gid "${AGENT_GID}" agent \
-    && useradd \
-      --create-home \
-      --shell /bin/bash \
-      --uid "${AGENT_UID}" \
-      --gid "${AGENT_GID}" \
-      agent \
+COPY container/ensure-runtime-user.sh /usr/local/sbin/ensure-runtime-user
+
+# Reuse existing numeric identities when host UID/GID values collide with the
+# base image. Runtime execution uses the verified numeric identity.
+RUN chmod 0755 /usr/local/sbin/ensure-runtime-user \
+    && /usr/local/sbin/ensure-runtime-user agent "${AGENT_UID}" "${AGENT_GID}" /home/agent \
     && install -d \
-      -o agent \
-      -g agent \
+      -o "${AGENT_UID}" \
+      -g "${AGENT_GID}" \
       -m 700 \
       /home/agent/.kimi-code \
       /home/agent/.serena \
       /workspace
 
-USER agent
+USER ${AGENT_UID}:${AGENT_GID}
 
 ENV HOME=/home/agent
 ENV KIMI_CODE_HOME=/home/agent/.kimi-code

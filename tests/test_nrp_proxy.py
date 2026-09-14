@@ -8,19 +8,18 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
 ROOT = Path(__file__).resolve().parents[1]
 os.environ.update(
     {
         "NRP_UPSTREAM_ORIGIN": "https://example.invalid",
         "NRP_UPSTREAM_MODEL": "upstream-model",
-        "NRP_API_KEY": "test-only",
+        "NRP_API_KEY": "a" * 32,
+        "NRP_INTERNAL_TOKEN": "i" * 32,
+        "NRP_CACHE_SALT": "c" * 43,
         "KIMI_CONFIG_PATH": str(ROOT / "runtime" / "config.toml"),
     }
 )
-SPEC = importlib.util.spec_from_file_location(
-    "nrp_proxy", ROOT / "proxy" / "nrp_proxy.py"
-)
+SPEC = importlib.util.spec_from_file_location("nrp_proxy", ROOT / "proxy" / "nrp_proxy.py")
 assert SPEC and SPEC.loader
 PROXY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROXY)
@@ -39,25 +38,57 @@ class Request:
 
 
 class RequestValidationTests(unittest.TestCase):
+    def test_only_explicit_proxy_routes_are_registered(self):
+        app = PROXY.create_app()
+        routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
+        self.assertEqual(
+            routes,
+            {
+                ("GET", "/healthz"),
+                ("HEAD", "/healthz"),
+                ("POST", "/primary/v1/chat/completions"),
+                ("GET", "/primary/v1/models"),
+                ("HEAD", "/primary/v1/models"),
+                ("POST", "/long/v1/chat/completions"),
+                ("GET", "/long/v1/models"),
+                ("HEAD", "/long/v1/models"),
+                ("POST", "/subagent/v1/chat/completions"),
+                ("GET", "/subagent/v1/models"),
+                ("HEAD", "/subagent/v1/models"),
+            },
+        )
+
     def test_model_is_rewritten(self):
         body = PROXY.rewrite_model(
             json.dumps({"model": "local-alias", "messages": []}).encode(),
             Request(),
         )
         self.assertEqual(json.loads(body)["model"], "upstream-model")
+        self.assertEqual(json.loads(body)["cache_salt"], "c" * 43)
 
-    def test_malformed_json_is_unchanged(self):
-        body = b"{not-json"
-        self.assertEqual(PROXY.rewrite_model(body, Request()), body)
+    def test_malformed_json_is_rejected(self):
+        with self.assertRaises(PROXY.web.HTTPBadRequest):
+            PROXY.rewrite_model(b"{not-json", Request())
 
     def test_incorrect_internal_bearer_is_rejected(self):
         with self.assertRaises(PROXY.web.HTTPUnauthorized):
             PROXY.authorize_client(Request(headers={"Authorization": "Bearer wrong"}))
 
     def test_valid_internal_bearer_is_accepted(self):
-        PROXY.authorize_client(
-            Request(headers={"Authorization": "Bearer proxy-only"})
-        )
+        PROXY.authorize_client(Request(headers={"Authorization": f"Bearer {'i' * 32}"}))
+
+    def test_conflicting_output_limits_are_rejected(self):
+        with self.assertRaises(PROXY.web.HTTPBadRequest):
+            PROXY.rewrite_model(
+                json.dumps({"messages": [], "max_tokens": 2, "max_completion_tokens": 3}).encode(),
+                Request(),
+            )
+
+    def test_connection_nominated_header_is_removed(self):
+        request = Request(headers={"Connection": "X-Remove", "X-Remove": "secret", "X-Keep": "yes"})
+        headers = PROXY.filtered_request_headers(request)
+        self.assertNotIn("X-Remove", headers)
+        self.assertEqual(headers["X-Keep"], "yes")
 
     def test_policy_rejects_out_of_range_percentage(self):
         with patch.object(PROXY, "FAIR_USE_PERCENT", 101):
@@ -76,17 +107,13 @@ class RetryDelayTests(unittest.TestCase):
 
     def test_http_date_retry_after(self):
         with patch.object(PROXY.time, "time", return_value=1_000.0):
-            delay = PROXY.retry_delay(
-                Response({"Retry-After": "Thu, 01 Jan 1970 00:18:20 GMT"}), 1
-            )
+            delay = PROXY.retry_delay(Response({"Retry-After": "Thu, 01 Jan 1970 00:18:20 GMT"}), 1)
         self.assertEqual(delay, 100)
 
     def test_epoch_millisecond_reset(self):
         now = time.time()
         with patch.object(PROXY.time, "time", return_value=now):
-            delay = PROXY.retry_delay(
-                Response({"x-ratelimit-reset": str((now + 45) * 1000)}), 1
-            )
+            delay = PROXY.retry_delay(Response({"x-ratelimit-reset": str((now + 45) * 1000)}), 1)
         self.assertAlmostEqual(delay, 45, places=3)
 
 
@@ -157,6 +184,26 @@ class FairUseGateTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.gather(*tasks)
         self.assertEqual(maximum, 2)
+
+    async def test_ingress_rejects_beyond_active_and_queue_bound(self):
+        ingress = PROXY.IngressGate(active=1, queued=1)
+        release = asyncio.Event()
+
+        async def occupy():
+            async with ingress.slot():
+                await release.wait()
+
+        active = asyncio.create_task(occupy())
+        while ingress.pending != 1:
+            await asyncio.sleep(0)
+        queued = asyncio.create_task(occupy())
+        while ingress.pending != 2:
+            await asyncio.sleep(0)
+        with self.assertRaises(PROXY.web.HTTPServiceUnavailable):
+            async with ingress.slot():
+                pass
+        release.set()
+        await asyncio.gather(active, queued)
 
     @staticmethod
     async def _take_slot(gate, lane):

@@ -8,12 +8,10 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location(
-    "comfyctl", ROOT / "tools" / "comfyctl.py"
-)
+SPEC = importlib.util.spec_from_file_location("comfyctl", ROOT / "tools" / "comfyctl.py")
 assert SPEC and SPEC.loader
 COMFYCTL = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(COMFYCTL)
@@ -117,9 +115,7 @@ class ComfyctlTests(unittest.TestCase):
                 COMFYCTL.cmd_download(
                     argparse.Namespace(prompt_id="prompt-1", directory=str(output))
                 )
-            self.assertEqual(
-                (output / "9-images-result.png").read_bytes(), b"mock-image"
-            )
+            self.assertEqual((output / "9-images-result.png").read_bytes(), b"mock-image")
 
     def test_structured_workflow_error(self):
         record = {
@@ -129,6 +125,48 @@ class ComfyctlTests(unittest.TestCase):
             }
         }
         self.assertIn("boom", COMFYCTL.workflow_failure(record))
+
+    def test_rejects_untrusted_output_components(self):
+        for value in (
+            "../escape",
+            "/absolute",
+            "nested/name",
+            "nested\\name",
+            "..",
+            "CON",
+            "trailing.",
+            "unicode／slash",
+        ):
+            with self.assertRaises(SystemExit):
+                COMFYCTL.safe_component(value, "component")
+
+    def test_rejects_symlink_download_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            real = Path(directory) / "real"
+            real.mkdir()
+            link = Path(directory) / "link"
+            link.symlink_to(real, target_is_directory=True)
+            with self.assertRaisesRegex(SystemExit, "real directory"):
+                COMFYCTL.cmd_download(argparse.Namespace(prompt_id="prompt-1", directory=str(link)))
+
+    def test_download_does_not_overwrite_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            existing = output / "9-images-result.png"
+            existing.write_bytes(b"keep")
+            with contextlib.redirect_stdout(io.StringIO()):
+                COMFYCTL.cmd_download(argparse.Namespace(prompt_id="prompt-1", directory=directory))
+            self.assertEqual(existing.read_bytes(), b"keep")
+            self.assertEqual((output / "9-images-result-1.png").read_bytes(), b"mock-image")
+
+    def test_failed_download_removes_its_temporary_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(COMFYCTL, "MAX_TRANSFER_BYTES", 5):
+                with self.assertRaisesRegex(SystemExit, "MAX_TRANSFER_BYTES"):
+                    COMFYCTL.cmd_download(
+                        argparse.Namespace(prompt_id="prompt-1", directory=directory)
+                    )
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 if __name__ == "__main__":

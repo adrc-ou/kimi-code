@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "status": "locked",
+      "platform": "wsl2-x86_64",
+      "architecture": "linux/amd64",
+      "comfyui_version": "v0.35.0",
+      "comfyui_commit": "40c4fcdf513a4523e39d54a9d391908af8df8171",
+      "python": "3.12",
+      "torch": "2.11.0",
+      "torchvision": "0.26.0",
+      "torchaudio": "2.11.0",
+      "backend": "cu130",
+      "backend_lock_sha256": "9eddd15f6fb7a166087f7fd21b86dc87b638ebcf8e9b06ee8ad6f7e3fb1e7048",
+      "custom_requirements_sha256": "78f875579ae5e28c5f5a9549bd38b190d616a058711d23446263aa6c87a0b8da",
+      "requirements_lock_sha256": "64c47d8b5f59f66808269d0cc39a4015e4ab82e1b087d4edb19e4b4589b56160",
+      "custom_lock_sha256": "ea5f85436c25288774ecc63077adbff1923b88bfc8aff9ec0d67ad55af587b78",
+      "locked_at": "2026-09-11",
+      "certification_status": "pending controlled CUDA run",
+      "certification_command": "tests/acceptance.sh cuda"
+    },
+    {
+      "status": "locked",
+      "platform": "darwin-arm64",
+      "architecture": "darwin/arm64",
+      "comfyui_version": "v0.35.0",
+      "comfyui_commit": "40c4fcdf513a4523e39d54a9d391908af8df8171",
+      "python": "3.12",
+      "torch": "2.11.0",
+      "torchvision": "0.26.0",
+      "torchaudio": "2.11.0",
+      "backend": "mps",
+      "backend_lock_sha256": "9eddd15f6fb7a166087f7fd21b86dc87b638ebcf8e9b06ee8ad6f7e3fb1e7048",
+      "custom_requirements_sha256": "78f875579ae5e28c5f5a9549bd38b190d616a058711d23446263aa6c87a0b8da",
+      "requirements_lock_sha256": "6144672b48cf2e132d474040ce153972c3e9c40744b654c7ae33f64c6382a136",
+      "custom_lock_sha256": "ea5f85436c25288774ecc63077adbff1923b88bfc8aff9ec0d67ad55af587b78",
+      "locked_at": "2026-09-11",
+      "certification_status": "pending controlled MPS run",
+      "certification_command": "tests/acceptance.sh mps"
+    }
+  ]
+}

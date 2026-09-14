@@ -11,6 +11,17 @@ When changing NRP model, concurrency, context, or proxy behavior:
 - keep `secondary_model.force = true`;
 - verify proxy policy against the actual runtime Kimi configuration;
 - never place real model credentials in the kimi-agent container.
+- preserve strict `/primary`, `/long`, and `/subagent` route separation;
+- keep retries outside scarce fair-use permits during backoff;
+- keep the persistent private cache salt out of logs and tracked files.
+
+Generated runtime files belong only under `.local/runtime/<instance>/`. Do not
+write credentials, rendered provider configuration, approval manifests, bridge
+private keys, or launcher locks into the workspace.
+
+Project agents, skills, and MCP configuration must pass `extensions.sh`
+approval and remain mounted read-only during a running session. Ordinary
+project `AGENTS.md` guidance remains part of the writable workspace.
 
 Do not reintroduce legacy `.agent/`, `.agent-container/`, `SAFE_CONTEXT`,
 or `KIMI_MODEL_*` configuration.
@@ -41,3 +52,9 @@ Resolve selectable releases to immutable commits or verify their published
 SHA-256 digest. Keep GPU-framework and custom-node dependencies pinned and
 update them deliberately. Do not install unreviewed custom-node dependencies at
 service startup.
+
+Update `dependencies.lock.json`, the applicable hash-checked requirements lock,
+`container/package-lock.json`, and `comfy/compatibility.json` together with the
+dependency they describe. Every compatibility entry must have current backend,
+requirements, and custom-requirements digests plus backend-specific smoke-test
+evidence.

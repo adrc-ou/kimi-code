@@ -17,10 +17,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-
 GITHUB_API = "https://api.github.com"
 KIMI_REPOSITORY = "MoonshotAI/kimi-code"
 COMFY_REPOSITORY = "Comfy-Org/ComfyUI"
+MAX_METADATA_BYTES = 4 * 1024 * 1024
 SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 KIMI_TAG_RE = re.compile(r"^@moonshot-ai/kimi-code@(\d+\.\d+\.\d+)$")
 
@@ -38,8 +38,11 @@ def github_json(path: str) -> Any:
     request = urllib.request.Request(f"{GITHUB_API}{path}", headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            return json.load(response)
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            body = response.read(MAX_METADATA_BYTES + 1)
+            if len(body) > MAX_METADATA_BYTES:
+                raise ValueError("response exceeds 4 MiB")
+            return json.loads(body)
+    except (urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
         raise SystemExit(f"Unable to fetch GitHub release metadata: {exc}") from exc
 
 
@@ -50,8 +53,11 @@ def read_text_url(url: str) -> str:
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            return response.read().decode("utf-8")
-    except (urllib.error.URLError, UnicodeDecodeError) as exc:
+            body = response.read(64 * 1024 + 1)
+            if len(body) > 64 * 1024:
+                raise ValueError("checksum response exceeds 64 KiB")
+            return body.decode("utf-8")
+    except (urllib.error.URLError, UnicodeDecodeError, ValueError) as exc:
         raise SystemExit(f"Unable to fetch release checksum: {exc}") from exc
 
 
@@ -85,9 +91,7 @@ def release_list(repository: str) -> tuple[list[dict[str, Any]], str]:
     return releases, str(latest.get("tag_name", ""))
 
 
-def asset_checksum_metadata(
-    release: dict[str, Any], asset: dict[str, Any]
-) -> tuple[str, str]:
+def asset_checksum_metadata(release: dict[str, Any], asset: dict[str, Any]) -> tuple[str, str]:
     digest = str(asset.get("digest") or "")
     if digest.startswith("sha256:"):
         checksum = digest.removeprefix("sha256:")
@@ -140,9 +144,7 @@ def kimi_catalog(asset_name: str) -> tuple[list[dict[str, str]], str]:
         if not asset:
             continue
         asset_url = str(asset["browser_download_url"])
-        expected_prefix = (
-            "https://github.com/MoonshotAI/kimi-code/releases/download/"
-        )
+        expected_prefix = "https://github.com/MoonshotAI/kimi-code/releases/download/"
         if not asset_url.startswith(expected_prefix):
             raise SystemExit(f"Unexpected Kimi release URL: {asset_url}")
         checksum, checksum_url = asset_checksum_metadata(release, asset)
@@ -163,19 +165,26 @@ def kimi_catalog(asset_name: str) -> tuple[list[dict[str, str]], str]:
     return catalog, latest
 
 
-def comfy_catalog() -> tuple[list[dict[str, str]], str]:
-    releases, latest = release_list(COMFY_REPOSITORY)
-    catalog: list[dict[str, str]] = []
-    for release in releases:
-        if release.get("draft") or release.get("prerelease"):
+def comfy_catalog(platform_key: str) -> tuple[list[dict[str, str]], str]:
+    path = Path(__file__).resolve().parents[1] / "comfy" / "compatibility.json"
+    document = json.loads(path.read_text())
+    entries = document.get("entries", [])
+    if not isinstance(entries, list):
+        raise SystemExit("Invalid ComfyUI compatibility catalog")
+    catalog = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("platform") != platform_key:
             continue
-        tag = str(release.get("tag_name", ""))
-        if SEMVER_RE.fullmatch(tag):
-            catalog.append({"version": tag})
+        status = entry.get("status")
+        if status not in {"locked", "tested"}:
+            continue
+        version = str(entry.get("comfyui_version", ""))
+        commit = str(entry.get("comfyui_commit", ""))
+        if not SEMVER_RE.fullmatch(version) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise SystemExit("Invalid ComfyUI compatibility entry")
+        catalog.append({"version": version, "commit": commit, "status": status})
     catalog.sort(key=lambda item: semver_key(item["version"]), reverse=True)
-    if catalog and latest not in {item["version"] for item in catalog}:
-        latest = catalog[0]["version"]
-    return catalog, latest
+    return catalog, catalog[0]["version"] if catalog else ""
 
 
 def add_installed_entry(
@@ -196,9 +205,7 @@ def add_installed_entry(
     return [*catalog, {"version": installed}]
 
 
-def visible_choices(
-    catalog: list[dict[str, str]], installed: str
-) -> list[dict[str, str]]:
+def visible_choices(catalog: list[dict[str, str]], installed: str) -> list[dict[str, str]]:
     catalog = sorted(
         catalog,
         key=lambda item: semver_key(item["version"]),
@@ -238,8 +245,7 @@ def choose(
             raise SystemExit(str(exc)) from exc
         if override not in by_version:
             raise SystemExit(
-                f"Requested {product} version {override} is not available "
-                f"for {platform_label}"
+                f"Requested {product} version {override} is not available for {platform_label}"
             )
         return by_version[override]
 
@@ -250,9 +256,7 @@ def choose(
     if default_version not in {item["version"] for item in choices}:
         default_version = choices[0]["version"]
     default_index = next(
-        index
-        for index, item in enumerate(choices, start=1)
-        if item["version"] == default_version
+        index for index, item in enumerate(choices, start=1) if item["version"] == default_version
     )
 
     if non_interactive:
@@ -332,13 +336,9 @@ def main() -> None:
 
     state = load_state(args.state)
     kimi, latest_kimi = kimi_catalog(args.kimi_asset)
-    comfy, latest_comfy = comfy_catalog()
-    kimi = add_installed_entry(
-        kimi, args.installed_kimi, state, "Kimi Code"
-    )
-    comfy = add_installed_entry(
-        comfy, args.installed_comfy, state, "ComfyUI"
-    )
+    comfy, latest_comfy = comfy_catalog(args.platform_key)
+    kimi = add_installed_entry(kimi, args.installed_kimi, state, "Kimi Code")
+    comfy = add_installed_entry(comfy, args.installed_comfy, state, "ComfyUI")
 
     selected_kimi = choose(
         "Kimi Code",
@@ -359,12 +359,11 @@ def main() -> None:
         args.non_interactive,
     )
     selected_kimi["sha256"] = fetch_asset_checksum(selected_kimi)
-    commit = resolve_comfy_commit(selected_comfy["version"])
+    commit = selected_comfy["commit"]
 
     write_environment(
         args.output,
         {
-            "PLATFORM_KEY": args.platform_key,
             "KIMI_CODE_VERSION": selected_kimi["version"],
             "KIMI_CODE_ASSET_URL": selected_kimi["url"],
             "KIMI_CODE_ASSET_SHA256": selected_kimi["sha256"],

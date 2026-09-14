@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: install_comfy_macos.sh ROOT WORKSPACE VERSION COMMIT PYTHON" >&2
+if [[ $# -ne 6 ]]; then
+  echo "usage: install_comfy_macos.sh ROOT WORKSPACE VERSION COMMIT PYTHON INSTANCE" >&2
   exit 2
 fi
 
@@ -11,7 +11,9 @@ workspace=$2
 version=$3
 commit=$4
 python_command=$5
-base="${root}/.local/comfy-macos"
+instance_id=$6
+[[ "${instance_id}" =~ ^[0-9a-f]{16}$ ]] || { echo "invalid instance id" >&2; exit 2; }
+base="${root}/.local/comfy-macos/${instance_id}"
 releases="${base}/releases"
 current="${base}/current"
 old_link="${base}/old.$$"
@@ -27,14 +29,15 @@ fingerprint=$(
     printf '%s\n' "${version}" "${commit}" "${python_command}"
     shasum -a 256 \
       "${root}/comfy/backend.env" \
-      "${root}/comfy/requirements-custom.txt" \
+      "${root}/comfy/requirements-macos.lock" \
+      "${root}/comfy/requirements-custom.lock" \
       "${root}/scripts/install_comfy_macos.sh"
   } | shasum -a 256 | awk '{print $1}'
 )
 release="${releases}/${fingerprint}"
 
 case "${release}" in
-  "${root}"/.local/comfy-macos/releases/*) ;;
+  "${base}"/releases/*) ;;
   *) echo "Unsafe release path: ${release}" >&2; exit 1 ;;
 esac
 
@@ -73,20 +76,15 @@ git -C "${release}/app" checkout --detach FETCH_HEAD
 test "$(git -C "${release}/app" rev-parse HEAD)" = "${commit}"
 
 "${python_command}" -m venv "${release}/venv"
-"${release}/venv/bin/python" -m pip install --upgrade pip
-"${release}/venv/bin/python" -m pip install \
-  "torch==${TORCH_VERSION}" \
-  "torchvision==${TORCHVISION_VERSION}" \
-  "torchaudio==${TORCHAUDIO_VERSION}"
-"${release}/venv/bin/python" -m pip install \
-  --requirement "${release}/app/requirements.txt"
-"${release}/venv/bin/python" -m pip install \
-  --requirement "${root}/comfy/requirements-custom.txt"
+"${release}/venv/bin/python" -m pip install --require-hashes \
+  --requirement "${root}/comfy/requirements-macos.lock"
+"${release}/venv/bin/python" -m pip install --require-hashes \
+  --requirement "${root}/comfy/requirements-custom.lock"
 
 find "${release}/app/models" -depth -delete
 find "${release}/app/custom_nodes" -depth -delete
-ln -s "${workspace}/comfyui/models" "${release}/app/models"
-ln -s "${workspace}/comfyui/custom_nodes" "${release}/app/custom_nodes"
+ln -s "${COMFYUI_MODELS_PATH:-${workspace}/comfyui/models}" "${release}/app/models"
+ln -s "${COMFYUI_CUSTOM_NODES_PATH:-${workspace}/comfyui/custom_nodes}" "${release}/app/custom_nodes"
 
 "${release}/venv/bin/python" -c \
   'import torch; assert torch.backends.mps.is_available(), "MPS unavailable"'

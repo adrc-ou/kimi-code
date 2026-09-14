@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-11",
+  "images": {
+    "ghcr.io/astral-sh/uv:0.8.22": "sha256:9874eb7afe5ca16c363fe80b294fe700e460df29a55532bbfea234a0f12eddb1",
+    "golang:1.27-bookworm": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+    "node:22-bookworm-slim": "sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5",
+    "python:3.12-slim-bookworm": "sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254",
+    "python:3.13-alpine": "sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a",
+    "anchore/syft:v1.33.0": "sha256:f94e5d9fce1f2278491a8e3a63bd5f6ddb81fdfdbb8bf7a1637565c1d5344357",
+    "anchore/grype:v0.99.1": "sha256:aeaded256cc61f162774b1c0e19f44e1787d0ae7cdc8e8917e9ea2528375090e"
+  },
+  "sources": {
+    "github/github-mcp-server": "7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d"
+  },
+  "files": {
+    "proxy/requirements.lock": "sha256:476e040b96fd0542472a586a144c094c2136ae724ad4d5e8951b0f1293e61810",
+    "container/package-lock.json": "sha256:f292053c71df1147be8ee1f0a1ab40e10a22d6dd69b399832b8ad7d75e4df385",
+    "container/serena.lock": "sha256:cb1f3d408c0a91f34c8b3701cba1e789312f91e8f72880b42bf5dd1d197e1001",
+    "comfy/requirements-linux.lock": "sha256:64c47d8b5f59f66808269d0cc39a4015e4ab82e1b087d4edb19e4b4589b56160",
+    "comfy/requirements-macos.lock": "sha256:6144672b48cf2e132d474040ce153972c3e9c40744b654c7ae33f64c6382a136",
+    "comfy/requirements-custom.lock": "sha256:ea5f85436c25288774ecc63077adbff1923b88bfc8aff9ec0d67ad55af587b78",
+    "comfy/torch-cuda-constraints.txt": "sha256:5dcc60b9fe086dcb9e83107e1651484ae8be87d994ef4c549bb6584734d5610a"
+  }
+}

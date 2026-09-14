@@ -60,9 +60,7 @@
         "--filesystem-root=/workspace",
         "--screenshot-format=jpeg",
         "--screenshot-quality=75",
-        "--screenshot-max-width=1600",
-        "--chrome-arg=--no-sandbox",
-        "--chrome-arg=--disable-setuid-sandbox"
+        "--screenshot-max-width=1600"
       ],
       "cwd": "/workspace",
       "enabled": true,

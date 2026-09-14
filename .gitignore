@@ -1,4 +1,8 @@
 .env
 .local/
+**/__pycache__/
+**/*.pyc
+container/node_modules/
+*.zip
 
 .DS_Store

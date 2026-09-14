@@ -4,8 +4,11 @@ import argparse
 import json
 import mimetypes
 import os
+import re
+import ssl
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,11 +16,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-
 BASE_URL = os.environ.get("COMFYUI_URL", "").rstrip("/")
 AUTH_TOKEN = os.environ.get("COMFYUI_TOKEN", "")
 CONNECT_TIMEOUT = float(os.environ.get("COMFYUI_CONNECT_TIMEOUT", "10"))
 READ_TIMEOUT = float(os.environ.get("COMFYUI_READ_TIMEOUT", "60"))
+TOTAL_TIMEOUT = float(os.environ.get("COMFYUI_TOTAL_TIMEOUT", "1800"))
+MAX_JSON_BYTES = int(os.environ.get("COMFYUI_MAX_JSON_BYTES", str(16 * 1024 * 1024)))
+MAX_TRANSFER_BYTES = int(os.environ.get("COMFYUI_MAX_TRANSFER_BYTES", str(16 * 1024**3)))
+CA_FILE = os.environ.get("COMFYUI_CA_FILE", "")
 
 
 def require_base_url() -> str:
@@ -35,9 +41,11 @@ def headers() -> dict[str, str]:
 
 def open_request(request: urllib.request.Request, timeout: float | None = None):
     try:
+        context = ssl.create_default_context(cafile=CA_FILE or None)
         response = urllib.request.urlopen(
             request,
             timeout=timeout or CONNECT_TIMEOUT,
+            context=context,
         )
         socket = getattr(
             getattr(getattr(response, "fp", None), "raw", None),
@@ -48,7 +56,10 @@ def open_request(request: urllib.request.Request, timeout: float | None = None):
             socket.settimeout(READ_TIMEOUT)
         return response
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            body = exc.read(64 * 1024).decode("utf-8", errors="replace")
+        finally:
+            exc.close()
         raise SystemExit(f"HTTP {exc.code} from {request.full_url}\n{body}") from exc
     except urllib.error.URLError as exc:
         raise SystemExit(f"Unable to reach {request.full_url}: {exc}") from exc
@@ -68,7 +79,12 @@ def request_json(method: str, path: str, payload: Any = None) -> Any:
         method=method,
     )
     with open_request(request) as response:
-        body = response.read()
+        declared = response.headers.get("Content-Length")
+        if declared and int(declared) > MAX_JSON_BYTES:
+            raise SystemExit(f"JSON response from {url} exceeds the configured limit")
+        body = response.read(MAX_JSON_BYTES + 1)
+    if len(body) > MAX_JSON_BYTES:
+        raise SystemExit(f"JSON response from {url} exceeds the configured limit")
     if not body:
         return {}
     try:
@@ -160,11 +176,11 @@ def cmd_interrupt(_args: argparse.Namespace) -> None:
     print_json(request_json("POST", "/interrupt", {}))
 
 
-def multipart_file(path: Path, field_name: str, extra: dict[str, str]) -> tuple[bytes, str]:
+def multipart_file(path: Path, field_name: str, extra: dict[str, str]):
     boundary = f"----comfyctl-{uuid.uuid4().hex}"
-    chunks: list[bytes] = []
+    prefix: list[bytes] = []
     for name, value in extra.items():
-        chunks.extend(
+        prefix.extend(
             [
                 f"--{boundary}\r\n".encode(),
                 f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
@@ -173,27 +189,35 @@ def multipart_file(path: Path, field_name: str, extra: dict[str, str]) -> tuple[
             ]
         )
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    chunks.extend(
+    prefix.extend(
         [
             f"--{boundary}\r\n".encode(),
             (
-                f'Content-Disposition: form-data; name="{field_name}"; '
-                f'filename="{path.name}"\r\n'
+                f'Content-Disposition: form-data; name="{field_name}"; filename="{path.name}"\r\n'
             ).encode(),
             f"Content-Type: {mime}\r\n\r\n".encode(),
-            path.read_bytes(),
-            b"\r\n",
-            f"--{boundary}--\r\n".encode(),
         ]
     )
-    return b"".join(chunks), boundary
+    suffix = b"\r\n" + f"--{boundary}--\r\n".encode()
+    prefix_bytes = b"".join(prefix)
+
+    def content():
+        yield prefix_bytes
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                yield chunk
+        yield suffix
+
+    return content(), boundary, len(prefix_bytes) + path.stat().st_size + len(suffix)
 
 
 def cmd_upload(args: argparse.Namespace) -> None:
     path = Path(args.file)
     if not path.is_file():
         raise SystemExit(f"Input file does not exist: {path}")
-    body, boundary = multipart_file(
+    if path.stat().st_size > MAX_TRANSFER_BYTES:
+        raise SystemExit("Input file exceeds COMFYUI_MAX_TRANSFER_BYTES")
+    body, boundary, content_length = multipart_file(
         path,
         "image",
         {
@@ -204,6 +228,7 @@ def cmd_upload(args: argparse.Namespace) -> None:
     )
     request_headers = headers()
     request_headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    request_headers["Content-Length"] = str(content_length)
     request = urllib.request.Request(
         f"{require_base_url()}/upload/image",
         data=body,
@@ -211,7 +236,49 @@ def cmd_upload(args: argparse.Namespace) -> None:
         method="POST",
     )
     with open_request(request) as response:
-        print_json(json.loads(response.read()))
+        result = response.read(MAX_JSON_BYTES + 1)
+        if len(result) > MAX_JSON_BYTES:
+            raise SystemExit("ComfyUI upload response exceeds the configured JSON limit")
+        print_json(json.loads(result))
+
+
+def safe_component(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise SystemExit(f"ComfyUI returned a non-string {label}")
+    normalized = unicodedata.normalize("NFC", value)
+    reserved = {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+    if (
+        not normalized
+        or normalized in {".", ".."}
+        or Path(normalized).is_absolute()
+        or "/" in normalized
+        or "\\" in normalized
+        or any(character in normalized for character in '<>:"|?*\u2044\u2215\u29f8\uff0f\uff3c')
+        or any(ord(character) < 32 for character in normalized)
+        or normalized.endswith((".", " "))
+        or normalized.split(".", 1)[0].upper() in reserved
+        or not re.fullmatch(r"[^\x00-\x1f/\\]+", normalized)
+    ):
+        raise SystemExit(f"ComfyUI returned an unsafe {label}")
+    return normalized
+
+
+def collision_free_name(directory_fd: int, name: str) -> str:
+    stem, suffix = Path(name).stem, Path(name).suffix
+    for index in range(10000):
+        candidate = name if index == 0 else f"{stem}-{index}{suffix}"
+        try:
+            os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return candidate
+    raise SystemExit("Unable to allocate a collision-free output filename")
 
 
 def output_files(record: dict[str, Any]):
@@ -227,9 +294,7 @@ def output_files(record: dict[str, Any]):
 
 
 def cmd_download(args: argparse.Namespace) -> None:
-    history = request_json(
-        "GET", f"/history/{urllib.parse.quote(args.prompt_id, safe='')}"
-    )
+    history = request_json("GET", f"/history/{urllib.parse.quote(args.prompt_id, safe='')}")
     record = history.get(args.prompt_id, history)
     if not isinstance(record, dict) or not record:
         raise SystemExit(f"No history found for prompt {args.prompt_id}")
@@ -237,26 +302,78 @@ def cmd_download(args: argparse.Namespace) -> None:
     if failure:
         raise SystemExit(failure)
 
-    destination = Path(args.directory)
+    destination = Path(args.directory).absolute()
     destination.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink() or not destination.is_dir():
+        raise SystemExit("Download destination must be a real directory")
+    directory_fd = os.open(
+        destination,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
     downloaded = []
-    for node_id, output_kind, entry in output_files(record):
-        filename = Path(str(entry["filename"])).name
-        params = urllib.parse.urlencode(
-            {
-                "filename": entry["filename"],
-                "subfolder": entry.get("subfolder", ""),
-                "type": entry.get("type", "output"),
-            }
-        )
-        request = urllib.request.Request(
-            f"{require_base_url()}/view?{params}", headers=headers(), method="GET"
-        )
-        output_path = destination / f"{node_id}-{output_kind}-{filename}"
-        with open_request(request) as response, output_path.open("wb") as output:
-            while chunk := response.read(1024 * 1024):
-                output.write(chunk)
-        downloaded.append(str(output_path))
+    try:
+        for node_id, output_kind, entry in output_files(record):
+            filename = safe_component(entry["filename"], "filename")
+            safe_node = safe_component(node_id, "node id")
+            safe_kind = safe_component(output_kind, "output kind")
+            params = urllib.parse.urlencode(
+                {
+                    "filename": entry["filename"],
+                    "subfolder": entry.get("subfolder", ""),
+                    "type": entry.get("type", "output"),
+                }
+            )
+            request = urllib.request.Request(
+                f"{require_base_url()}/view?{params}", headers=headers(), method="GET"
+            )
+            requested_name = f"{safe_node}-{safe_kind}-{filename}"
+            temporary_name = f".{uuid.uuid4().hex}.part"
+            output_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                try:
+                    total = 0
+                    with open_request(request) as response:
+                        declared = response.headers.get("Content-Length")
+                        if declared and int(declared) > MAX_TRANSFER_BYTES:
+                            raise SystemExit("ComfyUI download exceeds COMFYUI_MAX_TRANSFER_BYTES")
+                        while chunk := response.read(1024 * 1024):
+                            total += len(chunk)
+                            if total > MAX_TRANSFER_BYTES:
+                                raise SystemExit(
+                                    "ComfyUI download exceeds COMFYUI_MAX_TRANSFER_BYTES"
+                                )
+                            os.write(output_fd, chunk)
+                    os.fsync(output_fd)
+                finally:
+                    os.close(output_fd)
+                while True:
+                    output_name = collision_free_name(directory_fd, requested_name)
+                    try:
+                        os.link(
+                            temporary_name,
+                            output_name,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                        break
+                    except FileExistsError:
+                        continue
+                os.unlink(temporary_name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            finally:
+                try:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            downloaded.append(str(destination / output_name))
+    finally:
+        os.close(directory_fd)
     if not downloaded:
         raise SystemExit("Workflow history contains no downloadable outputs")
     print_json({"downloaded": downloaded})
@@ -279,7 +396,7 @@ def main() -> None:
     command = sub.add_parser("run")
     command.add_argument("workflow")
     command.add_argument("--wait", action="store_true")
-    command.add_argument("--timeout", type=float, default=1800)
+    command.add_argument("--timeout", type=float, default=TOTAL_TIMEOUT)
     command.add_argument("--interval", type=float, default=2)
     command.set_defaults(func=cmd_run)
 
@@ -289,7 +406,7 @@ def main() -> None:
 
     command = sub.add_parser("wait")
     command.add_argument("prompt_id")
-    command.add_argument("--timeout", type=float, default=1800)
+    command.add_argument("--timeout", type=float, default=TOTAL_TIMEOUT)
     command.add_argument("--interval", type=float, default=2)
     command.set_defaults(func=cmd_wait)
 

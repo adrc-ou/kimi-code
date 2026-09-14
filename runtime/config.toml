@@ -23,13 +23,19 @@ telemetry = false
 [providers.nrp-primary]
 type = "openai"
 base_url = "http://model-proxy:8080/primary/v1"
-api_key = "proxy-only"
+api_key = "__MODEL_PROXY_TOKEN__"
+
+
+[providers.nrp-long]
+type = "openai"
+base_url = "http://model-proxy:8080/long/v1"
+api_key = "__MODEL_PROXY_TOKEN__"
 
 
 [providers.nrp-subagent]
 type = "openai"
 base_url = "http://model-proxy:8080/subagent/v1"
-api_key = "proxy-only"
+api_key = "__MODEL_PROXY_TOKEN__"
 
 
 # ============================================================
@@ -68,7 +74,7 @@ display_name = "NRP Qwen3.8 Flash Next — Primary"
 # ============================================================
 
 [models.qwen3-long]
-provider = "nrp-primary"
+provider = "nrp-long"
 model = "qwen3"
 
 max_context_size = 1000000

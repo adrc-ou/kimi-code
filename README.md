@@ -24,7 +24,7 @@ Both hosts need:
 
 - Docker Desktop with Docker Compose;
 - Git;
-- Python 3.10 or newer;
+- Python 3.12 for the locked native MPS tuple;
 - enough free disk space for container images and models;
 - network access to GitHub, Python package indexes, Docker Hub, and configured
   model/MCP endpoints.
@@ -73,15 +73,17 @@ Run:
 The launcher:
 
 1. detects macOS/MPS or Windows/WSL2/CUDA;
-2. fetches stable releases from the official Kimi Code and ComfyUI repositories;
+2. fetches official Kimi Code releases and loads the checked-in ComfyUI catalog;
 3. presents at most ten versions of each, newest first;
 4. marks the newest compatible release `(latest)`;
 5. marks the verified local version `(installed)` and includes it even when it
    is older than the normal list;
 6. fetches and verifies changed application versions;
-7. initializes the persistent workspace;
-8. verifies the selected GPU backend;
-9. starts the full stack attached to the terminal.
+7. acquires an instance lock and generates per-run proxy/search/bridge credentials;
+8. initializes and verifies the persistent workspace without following child symlinks;
+9. snapshots approved executable project extensions as read-only mounts;
+10. verifies the selected GPU backend;
+11. starts the segmented stack attached to the terminal.
 
 The installed version is the default choice. Selecting another version replaces
 the active Kimi image and ComfyUI application while preserving user data.
@@ -107,7 +109,11 @@ Services are available at:
 - Kimi Code: <http://127.0.0.1:5494>
 - ComfyUI: <http://127.0.0.1:8188>
 
-On macOS, native logs are written to `.local/logs/`.
+Generated secrets and native logs are kept under the instance-specific
+`.local/runtime/` directory and are excluded from Git. Ephemeral credentials,
+rendered provider configuration, and bridge certificates are deleted at normal
+shutdown. The private NRP cache salt persists so cached responses remain
+isolated across restarts.
 
 ## Persistent workspace contract
 
@@ -134,6 +140,42 @@ outside the workspace and replaceable.
 The optional `./init-workspace.sh` command initializes these directories without
 starting anything. It is not required because `start.sh` performs the same work.
 
+Workspace children used as host bind sources must be real directories. The
+launcher refuses symlinks and rechecks device/inode identity immediately before
+startup. To keep large data on another drive, set one or more explicit absolute
+paths in `.env`:
+
+```dotenv
+COMFYUI_MODELS_PATH=/absolute/path/to/models
+COMFYUI_CUSTOM_NODES_PATH=/absolute/path/to/custom_nodes
+COMFYUI_INPUT_PATH=/absolute/path/to/input
+COMFYUI_OUTPUT_PATH=/absolute/path/to/output
+COMFYUI_TEMP_PATH=/absolute/path/to/temp
+COMFYUI_USER_PATH=/absolute/path/to/user
+```
+
+Every configured path must already exist, be owned by the invoking user, and
+contain no symlinked component.
+
+## Executable project extensions
+
+Kimi agents, skills, and project MCP declarations can execute code or replace
+the agent identity. The launcher therefore requires host-side approval for
+`.kimi-code/agents`, `.agents/agents`, `.kimi-code/skills`, `.agents/skills`,
+and `.kimi-code/mcp.json`. Ordinary project `AGENTS.md` files remain writable
+workspace guidance and do not require this approval.
+
+With the stack stopped, inspect and approve the current exact content:
+
+```bash
+./extensions.sh list
+./extensions.sh approve
+```
+
+Approved content is copied to an operator-owned snapshot and mounted read-only
+for the next session. Stop the stack, edit the extension, review it, approve it
+again, and restart. Revoke all approval with `./extensions.sh revoke`.
+
 ## Version and dependency policy
 
 Kimi is downloaded from official Moonshot release assets. The launcher selects
@@ -141,21 +183,34 @@ the Linux arm64 asset on a Mac host and Linux x64 asset under WSL2, because Kimi
 itself runs in a Linux container. The SHA-256 digest published with the release
 is verified during the image build.
 
-ComfyUI releases use the same official source tags on both hosts. The host-specific
-part is the installation backend, not a separate ComfyUI version catalog. The
-selected tag is resolved to a full commit before installation.
+ComfyUI selection is limited to exact tuples in `comfy/compatibility.json`.
+Each tuple records the application commit, Python/GPU backend, dependency-lock
+digests, and certification evidence. A stable semantic version is not treated
+as compatible merely because of its tag. Entries marked `locked` have immutable
+dependency resolution but still require the recorded controlled hardware run;
+only entries marked `tested` may claim hardware certification.
 
 PyTorch versions are pinned separately in `comfy/backend.env`. They do not
 automatically move with ComfyUI releases because a framework upgrade can change
 CUDA driver requirements or MPS behavior. Review those pins deliberately.
 
-`comfy/requirements-custom.txt` is the operator-reviewed dependency boundary for
-custom nodes. Add exact package versions there and restart to rebuild/reinstall.
-Do not add automatic custom-node dependency installation to container startup.
+`comfy/requirements-linux.lock`, `comfy/requirements-macos.lock`, and
+`comfy/requirements-custom.lock` are complete, hash-checked Python resolution
+artifacts. `comfy/requirements-custom.txt` is the operator-reviewed input for
+custom nodes and accepts exact `name==version` pins only. After changing the
+input or certified ComfyUI version, regenerate the affected locks with `uv pip
+compile --generate-hashes` for Python 3.12 and the exact target platform. The
+CUDA lock must retain the reviewed direct-wheel URLs and hashes from
+`comfy/torch-cuda-constraints.txt`; the macOS lock uses
+`comfy/torch-constraints.txt`. Update digests in `dependencies.lock.json` and
+`comfy/compatibility.json`, then run the backend acceptance test. Do not add
+automatic custom-node dependency installation to container startup.
 
-No third-party source distribution, model, custom node, or Python package is
-vendored in this repository. Builds fetch dependencies from their official
-upstream locations.
+Base images are digest-pinned, the GitHub MCP source is commit-pinned, and npm
+browser tooling is installed with `npm ci` from `container/package-lock.json`.
+`dependencies.lock.json`, the compatibility catalog, and expiring vulnerability
+exceptions are checked in CI. No third-party source distribution, model, custom
+node, or Python package is vendored in this repository.
 
 `.dockerignore` excludes `.env`, `.local`, Git metadata, bytecode, and generated
 archives from the root build context. Do not remove the `.env` exclusion: the
@@ -175,15 +230,20 @@ python /opt/kimi-runtime/tools/comfyctl.py download PROMPT_ID /workspace/comfyui
 python /opt/kimi-runtime/tools/comfyctl.py interrupt
 ```
 
-`COMFYUI_CONNECT_TIMEOUT` and `COMFYUI_READ_TIMEOUT` may be set in the
-`kimi-agent` environment when the default 10-second connection and 60-second
-read timeouts are unsuitable. Workflow waiting has its own `--timeout` option.
+`COMFYUI_CONNECT_TIMEOUT`, `COMFYUI_READ_TIMEOUT`, and
+`COMFYUI_TOTAL_TIMEOUT` may be set in `.env` when the defaults are unsuitable.
+JSON and media transfers have separate `COMFYUI_MAX_JSON_BYTES` and
+`COMFYUI_MAX_TRANSFER_BYTES` limits. Native bridge body, WebSocket-message, and
+connection limits are also configurable in `.env`. Downloads are
+streamed to exclusive temporary files, fsynced, and atomically renamed without
+overwriting an existing result.
 
 On CUDA, Kimi connects directly over the private Compose network. On macOS,
-ComfyUI itself listens only on host loopback. An ephemeral authenticated
+ComfyUI itself listens only on host loopback. A short-lived TLS-authenticated
 HTTP/WebSocket bridge on port 8190 lets the container reach it through
-`host.docker.internal` without exposing an unauthenticated workflow API to the
-LAN.
+`host.docker.internal`. Its certificate covers the Docker host name and
+loopback, its private key never enters a container, and HTTP/WebSocket sizes and
+connections are bounded.
 
 ## MCP servers
 
@@ -215,11 +275,21 @@ The checked-in MCP declarations and Kimi configuration are mounted read-only.
 Edit this repository and restart to change declarations. OAuth and session state
 remain in Docker volumes.
 
+Chromium runs as the non-root agent with its process sandbox enabled and a
+reviewed seccomp profile. Do not add `--no-sandbox`, `SYS_ADMIN`, or an
+unconfined seccomp setting.
+
 ## Web search
 
-`compose.search.yaml` starts the official SearXNG image and a small local adapter.
-The adapter translates Kimi's `text_query` request and `search_results` response
-schema to SearXNG's JSON API. Neither service is published to the host.
+`compose.search.yaml` starts SearXNG as an unprivileged numeric user and a local
+adapter with bounded workers, queue, request, response, result, and field sizes.
+The adapter translates Kimi's schema to SearXNG's JSON API. Neither service is
+published to the host.
+
+Compose networks isolate the model proxy, search backend, and ComfyUI. Only
+Kimi joins the intended client-side networks; separate egress networks prevent
+the private networks from becoming a second flat service mesh. The real NRP key
+is mounted only into `model-proxy` as a file secret.
 
 ## Validation
 
@@ -227,8 +297,12 @@ Static and unit tests:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
-bash -n start.sh init-workspace.sh scripts/install_comfy_macos.sh tests/acceptance.sh
 python3 -m compileall -q proxy scripts search-adapter tools tests
+git ls-files '*.sh' -z | xargs -0 -n1 bash -n
+git ls-files '*.sh' -z | xargs -0 shellcheck
+ruff check .
+python3 scripts/check_locks.py
+npm ci --ignore-scripts --prefix container
 ```
 
 While the stack is running, use another terminal:
@@ -247,11 +321,41 @@ Then open a fresh Kimi session, run `/mcp`, and make one harmless call through
 each enabled server. Remote authentication cannot be validated without the
 operator's credentials.
 
+Use `./shell.sh` from a second terminal to open a shell in the running Kimi
+container. It resolves the same instance, Compose files, generated secrets, and
+verified external paths as the launcher.
+
+## Optional host limits and cleanup
+
+Service-local ingress, queue, metadata, transfer, PID, tmpfs, and log bounds are
+always enabled. CPU and RAM needs vary widely with compilers and model sizes, so
+host-wide ceilings are opt-in. Copy `compose.limits.yaml.example` to
+`compose.limits.yaml`, tune it for the machine, and restart.
+
+The launcher reports its instance ID. Generated runtime material for that
+instance lives below `.local/runtime/INSTANCE_ID`; native MPS environments live
+below `.local/comfy-macos/INSTANCE_ID`. Stop the matching stack before removing
+either directory. Never delete the workspace as part of cache cleanup.
+
+An ordinary `launcher.lock` file may remain after a crash; advisory locking
+makes an unlocked file harmless. On hosts using the directory fallback, the
+launcher removes a lock whose recorded PID is no longer alive. If it reports a
+live owner, inspect and stop that exact process first. Remove only the reported
+instance's `launcher.lock.d` after confirming the PID is absent; never remove
+the project, workspace, or the entire `.local` tree as lock recovery.
+
+After a controlled hardware acceptance run, update the matching compatibility
+entry from `locked` to `tested`, add the run identifier and certification date,
+and review those evidence changes with the lock digests. Do not label a tuple
+`tested` based only on dependency resolution or a successful image build.
+
 ## What Docker does and does not protect
 
-The agent runs without root privileges in a read-only container. The Docker
-socket and host filesystem are not mounted. Its writable bind mount is limited
-to `WORKSPACE_PATH`.
+The agent normally runs without root privileges in a read-only container. UID
+and GID collisions are resolved by reusing numeric base-image identities rather
+than deleting accounts. The Docker socket and host filesystem are not mounted.
+Its writable bind mount is limited to `WORKSPACE_PATH` and any explicitly
+validated external ComfyUI directories.
 
 The workspace is intentionally not protected from the agent. The agent also has
 network access, so Docker cannot prevent workspace exfiltration or unsafe

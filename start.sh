@@ -12,301 +12,201 @@ elif [[ $# -ne 0 ]]; then
   exit 2
 fi
 
-if [[ ! -f .env ]]; then
-  echo "Missing .env. Copy .env.example to .env and configure it." >&2
-  exit 1
-fi
-
-for command in docker git python3; do
-  if ! command -v "${command}" >/dev/null 2>&1; then
-    echo "Required command not found: ${command}" >&2
-    exit 1
-  fi
+for command in docker git python3 shasum; do
+  command -v "${command}" >/dev/null 2>&1 || { echo "Required command not found: ${command}" >&2; exit 1; }
 done
-docker compose version >/dev/null
 
-case "$(uname -s):$(uname -m)" in
-  Darwin:arm64)
-    platform_key=darwin-arm64
-    platform_label="macOS / Apple Silicon / MPS"
-    backend=mps
-    kimi_asset=kimi-code-linux-arm64.tar.gz
-    ;;
-  Linux:x86_64)
-    if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
-      platform_key=wsl2-x86_64
-      platform_label="Windows / WSL2 / NVIDIA CUDA"
-      backend=cuda
-      kimi_asset=kimi-code-linux-x64.tar.gz
-    else
-      echo "Unsupported host. This project supports Apple Silicon macOS and Windows/WSL2 x86-64." >&2
-      exit 1
-    fi
-    ;;
-  *)
-    echo "Unsupported host. On Windows, run ./start.sh inside WSL2, not Git Bash." >&2
-    exit 1
-    ;;
-esac
+# shellcheck disable=SC1091
+source "${root}/tools/runtime.sh"
+trap harness_unlock EXIT INT TERM
+harness_init
 
-workspace_value=$(python3 scripts/read_env.py .env WORKSPACE_PATH)
-if [[ -z "${workspace_value}" ]]; then
-  echo "WORKSPACE_PATH must not be empty." >&2
-  exit 1
-fi
-case "${workspace_value}" in
-  /*) workspace_candidate=${workspace_value} ;;
-  *) workspace_candidate="${root}/${workspace_value}" ;;
-esac
-mkdir -p -- "${workspace_candidate}"
-workspace=$(cd "${workspace_candidate}" && pwd -P)
+COMFY_PID=""
+COMFY_BRIDGE_PID=""
+COMPOSE_PID=""
+stack_started=false
 
-if [[ "${workspace}" == "/" \
-      || "${workspace}" == "${root}" \
-      || "${workspace}" == "${HOME}" ]]; then
-  echo "Refusing unsafe WORKSPACE_PATH: ${workspace}" >&2
-  exit 1
-fi
+cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  for pid in "${COMFY_BRIDGE_PID}" "${COMFY_PID}" "${COMPOSE_PID}"; do
+    [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null || true
+  done
+  for pid in "${COMFY_BRIDGE_PID}" "${COMFY_PID}" "${COMPOSE_PID}"; do
+    [[ -n "${pid}" ]] && wait "${pid}" 2>/dev/null || true
+  done
+  if [[ "${stack_started}" == true ]]; then
+    harness_compose down --remove-orphans >/dev/null 2>&1 || true
+  fi
+  for file in proxy-token search-token bridge-token nrp-api-key kimi-config.toml runtime.env bridge.crt bridge.key; do
+    [[ -f "${HARNESS_RUNTIME_DIR}/${file}" ]] && find "${HARNESS_RUNTIME_DIR}/${file}" -delete
+  done
+  harness_unlock
+  exit "${status}"
+}
+trap cleanup EXIT INT TERM
+
+platform_key=${HARNESS_PLATFORM}
+platform_label=${HARNESS_PLATFORM_LABEL}
+backend=${HARNESS_BACKEND}
+kimi_asset=${HARNESS_KIMI_ASSET}
+workspace=${HARNESS_WORKSPACE}
 
 export WORKSPACE_PATH=${workspace}
-if [[ "${backend}" == "mps" ]]; then
-  # macOS commonly uses group 20, which already exists in Debian images.
-  # Docker Desktop translates bind-mount ownership, so fixed container IDs are
-  # safer than mirroring macOS IDs.
-  export LOCAL_UID=1000
-  export LOCAL_GID=1000
+if [[ "${backend}" == mps ]]; then
+  export LOCAL_UID=1000 LOCAL_GID=1000
 else
   export LOCAL_UID=${LOCAL_UID:-$(id -u)}
   export LOCAL_GID=${LOCAL_GID:-$(id -g)}
 fi
 
-# shellcheck disable=SC1091
 set -a
+# shellcheck disable=SC1091
 source "${root}/comfy/backend.env"
 set +a
 
-mkdir -p "${root}/.local/state" "${root}/.local/logs"
-state_file="${root}/.local/state/${platform_key}.env"
-session_file="${root}/.local/state/${platform_key}.session.env"
-
+state_file=${HARNESS_STATE_FILE}
+session_file=${HARNESS_SESSION_FILE}
 state_value() {
-  local key=$1
-  if [[ -f "${state_file}" ]]; then
-    python3 scripts/read_env.py "${state_file}" "${key}" 2>/dev/null || true
-  fi
+  [[ -f "${state_file}" ]] && python3 scripts/read_env.py "${state_file}" "$1" 2>/dev/null || true
 }
 
 installed_kimi=""
 state_kimi=$(state_value KIMI_CODE_VERSION)
 if [[ -n "${state_kimi}" ]]; then
-  image_kimi=$(docker image inspect adrc-kimi-agent:current \
-    --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
-    2>/dev/null || true)
-  if [[ "${image_kimi}" == "${state_kimi}" ]]; then
-    installed_kimi=${state_kimi}
-  fi
+  image_kimi=$(docker image inspect "adrc-kimi-agent:${HARNESS_IMAGE_SUFFIX}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' 2>/dev/null || true)
+  [[ "${image_kimi}" == "${state_kimi}" ]] && installed_kimi=${state_kimi}
 fi
 
 installed_comfy=""
 state_comfy=$(state_value COMFYUI_VERSION)
 if [[ -n "${state_comfy}" ]]; then
-  if [[ "${backend}" == "mps" ]]; then
-    if [[ -x "${root}/.local/comfy-macos/current/venv/bin/python" \
-          && -f "${root}/.local/comfy-macos/current/VERSION" \
-          && "$(cat "${root}/.local/comfy-macos/current/VERSION")" == "${state_comfy}" ]]; then
-      installed_comfy=${state_comfy}
-    fi
+  if [[ "${backend}" == mps ]]; then
+    current="${root}/.local/comfy-macos/${HARNESS_INSTANCE_ID}/current"
+    [[ -x "${current}/venv/bin/python" && -f "${current}/VERSION" && "$(<"${current}/VERSION")" == "${state_comfy}" ]] && installed_comfy=${state_comfy}
   else
-    image_comfy=$(docker image inspect adrc-comfyui-cuda:current \
-      --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
-      2>/dev/null || true)
-    if [[ "${image_comfy}" == "${state_comfy}" ]]; then
-      installed_comfy=${state_comfy}
-    fi
+    image_comfy=$(docker image inspect "adrc-comfyui-cuda:${HARNESS_IMAGE_SUFFIX}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' 2>/dev/null || true)
+    [[ "${image_comfy}" == "${state_comfy}" ]] && installed_comfy=${state_comfy}
   fi
 fi
 
-if [[ -z "${GITHUB_RELEASES_TOKEN:-}" ]]; then
-  GITHUB_RELEASES_TOKEN=$(
-    python3 scripts/read_env.py .env GITHUB_RELEASES_TOKEN 2>/dev/null || true
-  )
-  export GITHUB_RELEASES_TOKEN
-fi
-
-selector=(
-  python3 scripts/select_versions.py
-  --platform-key "${platform_key}"
-  --platform-label "${platform_label}"
-  --kimi-asset "${kimi_asset}"
-  --state "${state_file}"
-  --output "${session_file}"
-  --installed-kimi "${installed_kimi}"
-  --installed-comfy "${installed_comfy}"
-)
-if [[ "${non_interactive}" == true ]]; then
-  selector+=(--non-interactive)
-fi
+GITHUB_RELEASES_TOKEN=$(python3 scripts/read_env.py "${HARNESS_RESOLVED_BOOTSTRAP}" GITHUB_RELEASES_TOKEN 2>/dev/null || true)
+export GITHUB_RELEASES_TOKEN
+selector=(python3 scripts/select_versions.py --platform-key "${platform_key}" --platform-label "${platform_label}" --kimi-asset "${kimi_asset}" --state "${state_file}" --output "${session_file}" --installed-kimi "${installed_kimi}" --installed-comfy "${installed_comfy}")
+[[ "${non_interactive}" == true ]] && selector+=(--non-interactive)
 "${selector[@]}"
 
-# This file is generated by scripts/select_versions.py with validated values.
-# shellcheck disable=SC1090
+# Generated by scripts/select_versions.py from validated values.
 set -a
+# shellcheck disable=SC1090
 source "${session_file}"
 set +a
 
-bash tools/workspace-init.sh "${workspace}"
+python3 tools/safe_workspace_init.py "${workspace}"
+python3 tools/resource_check.py "${workspace}"
+bind_manifest="${HARNESS_RUNTIME_DIR}/binds.json"
+bind_assignments=$(python3 tools/verify_bind_paths.py record "${workspace}" "${bind_manifest}")
+while IFS= read -r assignment; do
+  variable=${assignment%%=*}
+  export "${variable}=${assignment#*=}"
+done <<<"${bind_assignments}"
 
-compose_files=(-f compose.yaml -f compose.search.yaml)
-if [[ "${backend}" == "cuda" ]]; then
-  compose_files+=(-f compose.comfy.cuda.yaml)
+python3 tools/render_runtime.py --root "${root}" --runtime-dir "${HARNESS_RUNTIME_DIR}" --resolved-env "${HARNESS_RESOLVED_BOOTSTRAP}"
+set -a
+# shellcheck disable=SC1091
+source "${HARNESS_RUNTIME_DIR}/runtime.env"
+set +a
+
+approval_manifest="${HARNESS_RUNTIME_DIR}/extension-approval.json"
+python3 tools/approve_extensions.py prepare --workspace "${workspace}" --manifest "${approval_manifest}" --state-dir "${HARNESS_RUNTIME_DIR}" --output "${HARNESS_COMPOSE_DIR}/approved-extensions.yaml"
+
+if [[ "${backend}" == mps ]]; then
+  command -v openssl >/dev/null 2>&1 || { echo "Required command not found: openssl" >&2; exit 1; }
+  COMFYUI_BRIDGE_CERT="${HARNESS_RUNTIME_DIR}/bridge.crt"
+  COMFYUI_BRIDGE_KEY="${HARNESS_RUNTIME_DIR}/bridge.key"
+  export COMFYUI_BRIDGE_CERT COMFYUI_BRIDGE_KEY
+  openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 2 \
+    -config "${root}/runtime/openssl-bridge.cnf" \
+    -keyout "${COMFYUI_BRIDGE_KEY}" -out "${COMFYUI_BRIDGE_CERT}" >/dev/null 2>&1
+  chmod 600 "${COMFYUI_BRIDGE_KEY}" "${COMFYUI_BRIDGE_CERT}"
 fi
 
-compose() {
-  docker compose --env-file .env "${compose_files[@]}" "$@"
-}
+harness_compose_files
+harness_validate_compose
+python3 tools/verify_bind_paths.py verify "${workspace}" "${bind_manifest}"
 
-compose config --quiet
-
-if [[ "${backend}" == "mps" ]]; then
+if [[ "${backend}" == mps ]]; then
   mac_python=${COMFYUI_MACOS_PYTHON:-python3}
-  "${mac_python}" -c \
-    'import sys; assert sys.version_info >= (3, 10), "Python 3.10 or newer is required"'
-  bash scripts/install_comfy_macos.sh \
-    "${root}" \
-    "${workspace}" \
-    "${COMFYUI_VERSION}" \
-    "${COMFYUI_COMMIT}" \
-    "${mac_python}"
+  "${mac_python}" -c 'import sys; assert sys.version_info[:2] == (3, 12), "Certified MPS runtime requires Python 3.12"'
+  bash scripts/install_comfy_macos.sh "${root}" "${workspace}" "${COMFYUI_VERSION}" "${COMFYUI_COMMIT}" "${mac_python}" "${HARNESS_INSTANCE_ID}"
 fi
 
-compose build
-
-actual_kimi=$(compose run --rm --no-deps kimi-agent kimi --version)
-if [[ "${actual_kimi}" != *"${KIMI_CODE_VERSION}"* ]]; then
-  echo "Built Kimi version does not match ${KIMI_CODE_VERSION}: ${actual_kimi}" >&2
-  exit 1
+harness_compose build
+actual_kimi=$(harness_compose run --rm --no-deps kimi-agent kimi --version)
+[[ "${actual_kimi}" == *"${KIMI_CODE_VERSION}"* ]] || { echo "Built Kimi version mismatch: ${actual_kimi}" >&2; exit 1; }
+if [[ "${backend}" == cuda ]]; then
+  harness_compose run --rm --no-deps comfyui python -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name())'
 fi
 
-if [[ "${backend}" == "cuda" ]]; then
-  compose run --rm --no-deps comfyui python -c \
-    'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name())'
-fi
-
-# Commit version state only after both selected installations validate.
 cp -- "${session_file}" "${state_file}"
 chmod 600 "${state_file}"
-rm -f -- "${session_file}"
-
-COMFY_PID=""
-COMFY_BRIDGE_PID=""
-COMPOSE_PID=""
-
-cleanup() {
-  status=$?
-  trap - EXIT INT TERM
-
-  for pid in "${COMFY_BRIDGE_PID}" "${COMFY_PID}" "${COMPOSE_PID}"; do
-    if [[ -n "${pid}" ]]; then
-      kill "${pid}" 2>/dev/null || true
-    fi
-  done
-  for pid in "${COMFY_BRIDGE_PID}" "${COMFY_PID}" "${COMPOSE_PID}"; do
-    if [[ -n "${pid}" ]]; then
-      wait "${pid}" 2>/dev/null || true
-    fi
-  done
-
-  compose down --remove-orphans >/dev/null 2>&1 || true
-  exit "${status}"
-}
-trap cleanup EXIT INT TERM
+find "${session_file}" -delete
 
 wait_for_url() {
-  local url=$1
-  local token=${2:-}
-  local attempts=${3:-120}
+  local url=$1 token=${2:-} cafile=${3:-} attempts=${4:-120}
   local attempt
-  for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if URL_TO_CHECK="${url}" TOKEN_TO_CHECK="${token}" python3 - <<'PY' >/dev/null 2>&1
-import os
-import urllib.request
-
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if URL_TO_CHECK="${url}" TOKEN_TO_CHECK="${token}" CA_TO_CHECK="${cafile}" python3 - <<'PY' >/dev/null 2>&1
+import os, ssl, urllib.request
 headers = {}
-token = os.environ.get("TOKEN_TO_CHECK", "")
-if token:
-    headers["Authorization"] = f"Bearer {token}"
-request = urllib.request.Request(os.environ["URL_TO_CHECK"], headers=headers)
-urllib.request.urlopen(request, timeout=3).read(1)
+if os.environ.get("TOKEN_TO_CHECK"): headers["Authorization"] = f"Bearer {os.environ['TOKEN_TO_CHECK']}"
+context = ssl.create_default_context(cafile=os.environ.get("CA_TO_CHECK") or None)
+urllib.request.urlopen(urllib.request.Request(os.environ["URL_TO_CHECK"], headers=headers), timeout=3, context=context).read(1)
 PY
-    then
-      return 0
-    fi
+    then return 0; fi
     sleep 1
   done
   return 1
 }
 
-if [[ "${backend}" == "mps" ]]; then
-  comfy_home="${root}/.local/comfy-macos/current"
-  comfy_log="${root}/.local/logs/comfyui.log"
-  bridge_log="${root}/.local/logs/comfy-bridge.log"
-  COMFYUI_TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
-  export COMFYUI_TOKEN
-  export COMFYUI_URL=http://host.docker.internal:8190
-
+if [[ "${backend}" == mps ]]; then
+  comfy_home="${root}/.local/comfy-macos/${HARNESS_INSTANCE_ID}/current"
+  comfy_log="${HARNESS_RUNTIME_DIR}/comfyui.log"
+  bridge_log="${HARNESS_RUNTIME_DIR}/comfy-bridge.log"
   (
     cd "${comfy_home}/app"
-    exec env PYTORCH_ENABLE_MPS_FALLBACK=1 \
-      "${comfy_home}/venv/bin/python" main.py \
-      --listen 127.0.0.1 \
-      --port 8188 \
-      --disable-auto-launch \
-      --user-directory "${workspace}/comfyui/user" \
-      --input-directory "${workspace}/comfyui/input" \
-      --output-directory "${workspace}/comfyui/output" \
-      --temp-directory "${workspace}/comfyui/temp"
+    exec env PYTORCH_ENABLE_MPS_FALLBACK=1 "${comfy_home}/venv/bin/python" main.py \
+      --listen 127.0.0.1 --port 8188 --disable-auto-launch \
+      --user-directory "${COMFYUI_USER_PATH}" --input-directory "${COMFYUI_INPUT_PATH}" \
+      --output-directory "${COMFYUI_OUTPUT_PATH}" --temp-directory "${COMFYUI_TEMP_PATH}"
   ) >"${comfy_log}" 2>&1 &
   COMFY_PID=$!
-
-  if ! wait_for_url http://127.0.0.1:8188/system_stats "" 180; then
-    echo "ComfyUI did not become ready. See ${comfy_log}" >&2
-    exit 1
-  fi
-
-  COMFYUI_TOKEN=${COMFYUI_TOKEN} \
-    "${comfy_home}/venv/bin/python" scripts/comfy_bridge.py \
-      --host 0.0.0.0 \
-      --port 8190 \
-      --upstream http://127.0.0.1:8188 \
-      >"${bridge_log}" 2>&1 &
+  wait_for_url http://127.0.0.1:8188/system_stats "" "" 180 || { echo "ComfyUI did not become ready. See ${comfy_log}" >&2; exit 1; }
+  COMFYUI_TOKEN=${COMFYUI_TOKEN} "${comfy_home}/venv/bin/python" scripts/comfy_bridge.py \
+    --host 0.0.0.0 --port 8190 --upstream http://127.0.0.1:8188 \
+    --tls-cert "${COMFYUI_BRIDGE_CERT}" --tls-key "${COMFYUI_BRIDGE_KEY}" \
+    --max-body "${COMFYUI_BRIDGE_MAX_BODY:-536870912}" \
+    --max-ws-message "${COMFYUI_BRIDGE_MAX_WS_MESSAGE:-67108864}" \
+    --max-connections "${COMFYUI_BRIDGE_MAX_CONNECTIONS:-16}" >"${bridge_log}" 2>&1 &
   COMFY_BRIDGE_PID=$!
-
-  if ! wait_for_url http://127.0.0.1:8190/system_stats "${COMFYUI_TOKEN}" 30; then
-    echo "ComfyUI bridge did not become ready. See ${bridge_log}" >&2
-    exit 1
-  fi
+  wait_for_url https://127.0.0.1:8190/system_stats "${COMFYUI_TOKEN}" "${COMFYUI_BRIDGE_CERT}" 30 || { echo "ComfyUI bridge did not become ready. See ${bridge_log}" >&2; exit 1; }
 fi
 
 echo
 echo "Kimi Code: http://127.0.0.1:5494"
 echo "ComfyUI:   http://127.0.0.1:8188"
 echo "Backend:   ${backend}"
+echo "Instance:  ${HARNESS_INSTANCE_ID}"
 echo "Press Ctrl-C to stop everything."
 echo
 
-compose up --remove-orphans --abort-on-container-exit &
+python3 tools/verify_bind_paths.py verify "${workspace}" "${bind_manifest}"
+harness_compose up --remove-orphans --abort-on-container-exit &
 COMPOSE_PID=$!
-
+stack_started=true
 while kill -0 "${COMPOSE_PID}" 2>/dev/null; do
-  if [[ -n "${COMFY_PID}" ]] && ! kill -0 "${COMFY_PID}" 2>/dev/null; then
-    echo "Native ComfyUI exited unexpectedly; see .local/logs/comfyui.log" >&2
-    exit 1
-  fi
-  if [[ -n "${COMFY_BRIDGE_PID}" ]] && ! kill -0 "${COMFY_BRIDGE_PID}" 2>/dev/null; then
-    echo "ComfyUI bridge exited unexpectedly; see .local/logs/comfy-bridge.log" >&2
-    exit 1
-  fi
+  [[ -n "${COMFY_PID}" ]] && ! kill -0 "${COMFY_PID}" 2>/dev/null && { echo "Native ComfyUI exited; see ${HARNESS_RUNTIME_DIR}/comfyui.log" >&2; exit 1; }
+  [[ -n "${COMFY_BRIDGE_PID}" ]] && ! kill -0 "${COMFY_BRIDGE_PID}" 2>/dev/null && { echo "ComfyUI bridge exited; see ${HARNESS_RUNTIME_DIR}/comfy-bridge.log" >&2; exit 1; }
   sleep 1
 done
-
 wait "${COMPOSE_PID}"

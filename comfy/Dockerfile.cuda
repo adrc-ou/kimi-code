@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
 FROM ${PYTHON_IMAGE}
 
 ARG COMFYUI_COMMIT
@@ -37,30 +37,26 @@ RUN test -n "${COMFYUI_COMMIT}" \
     && git -C /opt/ComfyUI checkout --detach FETCH_HEAD \
     && test "$(git -C /opt/ComfyUI rev-parse HEAD)" = "${COMFYUI_COMMIT}"
 
+COPY comfy/requirements-linux.lock /tmp/requirements-linux.lock
+COPY comfy/requirements-custom.lock /tmp/requirements-custom.lock
+
 RUN test -n "${TORCH_VERSION}" \
     && test -n "${TORCHVISION_VERSION}" \
     && test -n "${TORCHAUDIO_VERSION}" \
     && test -n "${PYTORCH_CUDA_INDEX_URL}" \
-    && python -m pip install --no-cache-dir \
-       "torch==${TORCH_VERSION}" \
-       "torchvision==${TORCHVISION_VERSION}" \
-       "torchaudio==${TORCHAUDIO_VERSION}" \
-       --index-url "${PYTORCH_CUDA_INDEX_URL}" \
-    && python -m pip install --no-cache-dir \
-       --requirement /opt/ComfyUI/requirements.txt
+    && grep -q "torch-${TORCH_VERSION}%2Bcu130" /tmp/requirements-linux.lock \
+    && grep -q "torchvision-${TORCHVISION_VERSION}%2Bcu130" /tmp/requirements-linux.lock \
+    && grep -q "torchaudio-${TORCHAUDIO_VERSION}%2Bcu130" /tmp/requirements-linux.lock \
+    && python -m pip install --no-cache-dir --require-hashes \
+       --requirement /tmp/requirements-linux.lock \
+    && python -m pip install --no-cache-dir --require-hashes \
+       --requirement /tmp/requirements-custom.lock
 
-COPY comfy/requirements-custom.txt /tmp/requirements-custom.txt
+COPY container/ensure-runtime-user.sh /usr/local/sbin/ensure-runtime-user
 
-RUN python -m pip install --no-cache-dir \
-      --requirement /tmp/requirements-custom.txt
-
-RUN groupadd --gid "${APP_GID}" comfy \
-    && useradd \
-       --create-home \
-       --uid "${APP_UID}" \
-       --gid "${APP_GID}" \
-       comfy \
-    && install -d -o comfy -g comfy \
+RUN chmod 0755 /usr/local/sbin/ensure-runtime-user \
+    && /usr/local/sbin/ensure-runtime-user comfy "${APP_UID}" "${APP_GID}" /home/comfy \
+    && install -d -o "${APP_UID}" -g "${APP_GID}" \
        /data/cache \
        /data/input \
        /data/output \
@@ -69,7 +65,7 @@ RUN groupadd --gid "${APP_GID}" comfy \
        /opt/ComfyUI/models \
        /opt/ComfyUI/custom_nodes
 
-USER comfy
+USER ${APP_UID}:${APP_GID}
 WORKDIR /opt/ComfyUI
 
 LABEL org.opencontainers.image.version="${COMFYUI_VERSION}"

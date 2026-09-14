@@ -7,11 +7,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location(
-    "search_adapter", ROOT / "search-adapter" / "app.py"
-)
+SPEC = importlib.util.spec_from_file_location("search_adapter", ROOT / "search-adapter" / "app.py")
 assert SPEC and SPEC.loader
 ADAPTER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ADAPTER)
@@ -45,24 +42,24 @@ class SearchAdapterTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.upstream = ThreadingHTTPServer(("127.0.0.1", 0), SearchHandler)
-        cls.upstream_thread = threading.Thread(
-            target=cls.upstream.serve_forever, daemon=True
-        )
+        cls.upstream_thread = threading.Thread(target=cls.upstream.serve_forever, daemon=True)
         cls.upstream_thread.start()
         ADAPTER.SEARXNG_URL = f"http://127.0.0.1:{cls.upstream.server_port}"
         ADAPTER.INTERNAL_TOKEN = "adapter-test"
         ADAPTER.Handler.log_message = lambda *_args: None
-        cls.adapter = ThreadingHTTPServer(("127.0.0.1", 0), ADAPTER.Handler)
-        cls.adapter_thread = threading.Thread(
-            target=cls.adapter.serve_forever, daemon=True
+        cls.adapter = ADAPTER.BoundedHTTPServer(
+            ("127.0.0.1", 0), ADAPTER.Handler, workers=2, queued=2
         )
+        cls.adapter_thread = threading.Thread(target=cls.adapter.serve_forever, daemon=True)
         cls.adapter_thread.start()
         cls.url = f"http://127.0.0.1:{cls.adapter.server_port}/search"
 
     @classmethod
     def tearDownClass(cls):
         cls.adapter.shutdown()
+        cls.adapter.server_close()
         cls.upstream.shutdown()
+        cls.upstream.server_close()
         cls.adapter_thread.join()
         cls.upstream_thread.join()
 
@@ -90,7 +87,10 @@ class SearchAdapterTests(unittest.TestCase):
         )
         with self.assertRaises(urllib.error.HTTPError) as raised:
             urllib.request.urlopen(request)
-        self.assertEqual(raised.exception.code, 401)
+        try:
+            self.assertEqual(raised.exception.code, 401)
+        finally:
+            raised.exception.close()
 
 
 if __name__ == "__main__":

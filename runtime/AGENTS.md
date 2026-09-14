@@ -245,7 +245,14 @@ intentionally writable.
 Do not modify the replaceable ComfyUI application or install packages at runtime.
 When a custom node needs another dependency, identify and pin the exact package
 version and report that `comfy/requirements-custom.txt` in the operator-managed
-harness must be reviewed and updated.
+harness must be reviewed, its hash-checked lock regenerated, and the selected
+backend recertified.
 
 Treat custom nodes as executable code. Inspect their source and dependency
 metadata before asking the operator to restart and load them.
+
+Project `.kimi-code/agents`, `.agents/agents`, `.kimi-code/skills`,
+`.agents/skills`, and `.kimi-code/mcp.json` are host-approved snapshots while a
+session runs. Do not try to modify or bypass those mounts. Ask the operator to
+stop the stack, review the exact change with `./extensions.sh`, approve it, and
+restart. Ordinary project `AGENTS.md` files remain normal writable guidance.
