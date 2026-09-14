@@ -169,6 +169,9 @@ wait_for_url() {
   local url=$1 token=${2:-} cafile=${3:-} attempts=${4:-120}
   local attempt
   for ((attempt=1; attempt<=attempts; attempt++)); do
+    if [[ -n "${COMPOSE_PID:-}" ]] && ! kill -0 "${COMPOSE_PID}" 2>/dev/null; then
+      return 1
+    fi
     if URL_TO_CHECK="${url}" TOKEN_TO_CHECK="${token}" CA_TO_CHECK="${cafile}" python3 - <<'PY' >/dev/null 2>&1
 import os, ssl, urllib.request
 headers = {}
@@ -218,6 +221,13 @@ python3 tools/verify_bind_paths.py verify "${workspace}" "${bind_manifest}"
 harness_compose up --remove-orphans --abort-on-container-failure &
 COMPOSE_PID=$!
 stack_started=true
+if wait_for_url http://127.0.0.1:5494/ "" "" 90; then
+  if ! harness_compose exec -T kimi-agent /opt/serena/bin/python /opt/kimi-runtime/tools/check_services.py; then
+    echo "Service checks need attention. The stack remains running; see docs/verification.md and rerun ./doctor.sh." >&2
+  fi
+else
+  echo "Kimi web did not become ready for service checks; inspect the startup logs." >&2
+fi
 while kill -0 "${COMPOSE_PID}" 2>/dev/null; do
   [[ -n "${COMFY_PID}" ]] && ! kill -0 "${COMFY_PID}" 2>/dev/null && { echo "Native ComfyUI exited; see ${HARNESS_RUNTIME_DIR}/comfyui.log" >&2; exit 1; }
   [[ -n "${COMFY_BRIDGE_PID}" ]] && ! kill -0 "${COMFY_BRIDGE_PID}" 2>/dev/null && { echo "ComfyUI bridge exited; see ${HARNESS_RUNTIME_DIR}/comfy-bridge.log" >&2; exit 1; }

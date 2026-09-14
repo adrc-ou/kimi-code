@@ -85,6 +85,7 @@ services:
 
     environment:
       KIMI_CODE_HOME: /home/agent/.kimi-code
+      XDG_CONFIG_HOME: /home/agent/.cache/config
       KIMI_DISABLE_TELEMETRY: "1"
       KIMI_CODE_NO_AUTO_UPDATE: "1"
       KIMI_TOKEN_COUNTING_STRATEGY: "measured+estimated"
@@ -94,6 +95,8 @@ services:
       KIMI_CODE_SWARM_TIMEOUT_MS: "3600000"
 
       GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN:-}"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      CONTEXT7_API_KEY: "${CONTEXT7_API_KEY:-}"
       COMFYUI_URL: "${COMFYUI_URL:-}"
       COMFYUI_TOKEN: "${COMFYUI_TOKEN:-}"
       COMFYUI_CONNECT_TIMEOUT: "${COMFYUI_CONNECT_TIMEOUT:-10}"

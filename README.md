@@ -20,6 +20,11 @@ locally from a selected, exact commit fetched from the official
 
 ## Prerequisites
 
+For startup status checks, functional tool tests, and step-by-step optional
+account setup, see [the verification guide](docs/verification.md). `./start.sh`
+runs a quick service/MCP check; use `./doctor.sh --full` while it is running for
+read-only functional probes.
+
 Both hosts need:
 
 - Docker Desktop with Docker Compose;

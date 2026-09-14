@@ -62,6 +62,7 @@
     {
       "names": [
         "clone",
+        "chroot",
         "setns",
         "unshare"
       ],

@@ -12,9 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 class ConfigurationTests(unittest.TestCase):
     def test_checked_in_json_and_toml_parse(self):
         for path in ROOT.rglob("*.json"):
-            if "node_modules" not in path.parts:
+            if "node_modules" not in path.parts and ".local" not in path.parts:
                 json.loads(path.read_text())
         for path in ROOT.rglob("*.toml"):
+            if ".local" in path.parts:
+                continue
             with path.open("rb") as source:
                 tomllib.load(source)
 
@@ -27,7 +29,7 @@ class ConfigurationTests(unittest.TestCase):
             call
             for call in profile["syscalls"]
             if call.get("action") == "SCMP_ACT_ALLOW"
-            and {"clone", "setns", "unshare"}.issubset(call.get("names", []))
+            and {"clone", "chroot", "setns", "unshare"}.issubset(call.get("names", []))
             and not call.get("includes")
         ]
         self.assertTrue(allowed)

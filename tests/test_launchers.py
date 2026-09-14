@@ -23,6 +23,7 @@ class LauncherTests(unittest.TestCase):
         self.workspace = self.base / "workspace with spaces"
         for relative in (
             "start.sh", "init-workspace.sh", "shell.sh", "extensions.sh",
+            "doctor.sh",
             "tools/runtime.sh", "tools/safe_workspace_init.py", "tools/verify_bind_paths.py",
             "scripts/read_env.py", "scripts/install_comfy_macos.sh", "comfy/backend.env",
             "scripts/select_macos_python.sh",
@@ -217,6 +218,16 @@ cp "$TEST_ARCHIVE" "$2"
         result = self.run_script("shell.sh")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No running runtime", result.stderr)
+
+    def test_doctor_reports_missing_runtime(self):
+        result = self.run_script("doctor.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No prepared runtime", result.stderr)
+
+    def test_doctor_rejects_unknown_arguments(self):
+        result = self.run_script("doctor.sh", "--unknown")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage:", result.stderr)
 
     def test_failed_command_diagnostic_does_not_echo_its_arguments(self):
         self.command("docker", "exit 17\n")

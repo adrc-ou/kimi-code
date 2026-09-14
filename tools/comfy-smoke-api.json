@@ -4,6 +4,7 @@
     "inputs": {
       "width": 64,
       "height": 64,
+      "color": 0,
       "batch_size": 1
     }
   },

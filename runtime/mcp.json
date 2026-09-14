@@ -22,6 +22,7 @@
 
     "huggingface": {
       "url": "https://huggingface.co/mcp",
+      "bearerTokenEnvVar": "HF_TOKEN",
       "enabled": true,
       "enabledTools": [
         "hf_fs"
@@ -32,6 +33,7 @@
 
     "context7": {
       "url": "https://mcp.context7.com/mcp",
+      "bearerTokenEnvVar": "CONTEXT7_API_KEY",
       "enabled": false,
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
