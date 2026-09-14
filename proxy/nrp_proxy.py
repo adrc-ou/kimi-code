@@ -58,6 +58,78 @@ MAX_OUTPUT_TOKENS = {
 }
 RETRYABLE = {429, 500, 502, 503, 504}
 
+DEBUG_HTTP = True
+
+SENSITIVE_HEADERS = {
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "cookie",
+    "set-cookie",
+}
+
+
+def debug_headers(headers) -> dict[str, str]:
+    return {
+        name: "<REDACTED>" if name.lower() in SENSITIVE_HEADERS else value
+        for name, value in headers.items()
+    }
+
+
+def debug_body(body: bytes, *, redact_cache_salt: bool = False) -> str:
+    if not body:
+        return "<empty>"
+
+    try:
+        payload = json.loads(body)
+
+        if redact_cache_salt and isinstance(payload, dict) and "cache_salt" in payload:
+            payload["cache_salt"] = "<REDACTED>"
+
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body.decode("utf-8", errors="replace")
+
+
+def debug_http(
+    title: str,
+    *,
+    method: str | None = None,
+    url: str | None = None,
+    status: int | None = None,
+    headers=None,
+    body: bytes | None = None,
+    redact_cache_salt: bool = False,
+) -> None:
+    if not DEBUG_HTTP:
+        return
+
+    print("\n" + "=" * 80, flush=True)
+    print(title, flush=True)
+
+    if method is not None:
+        print(f"METHOD: {method}", flush=True)
+
+    if url is not None:
+        print(f"URL: {url}", flush=True)
+
+    if status is not None:
+        print(f"STATUS: {status}", flush=True)
+
+    if headers is not None:
+        print("HEADERS:", flush=True)
+        for name, value in debug_headers(headers).items():
+            print(f"  {name}: {value}", flush=True)
+
+    if body is not None:
+        print("BODY:", flush=True)
+        print(
+            debug_body(body, redact_cache_salt=redact_cache_salt),
+            flush=True,
+        )
+
+    print("=" * 80 + "\n", flush=True)
+
 
 def load_kimi_policy() -> int:
     with open(KIMI_CONFIG_PATH, "rb") as source:
@@ -305,81 +377,192 @@ async def models(request: web.Request) -> web.Response:
         {"object": "list", "data": [{"id": UPSTREAM_MODEL, "object": "model"}]}
     )
 
-
 async def chat(request: web.Request) -> web.StreamResponse:
     started = time.monotonic()
     authorize_client(request)
+
     if request.query_string:
         raise web.HTTPBadRequest(text="query strings are not supported")
-    if request.headers.get("Content-Encoding", "identity").lower() != "identity":
-        raise web.HTTPUnsupportedMediaType(text="compressed request bodies are not supported")
-    lane = request.match_info["lane"]
-    async with ingress.slot():
-        body = rewrite_model(await request.read(), request, lane)
-        return await forward_chat(request, lane, body, started)
 
+    if request.headers.get("Content-Encoding", "identity").lower() != "identity":
+        raise web.HTTPUnsupportedMediaType(
+            text="compressed request bodies are not supported"
+        )
+
+    lane = request.match_info["lane"]
+
+    async with ingress.slot():
+        inbound_body = await request.read()
+
+        debug_http(
+            "INBOUND REQUEST TO PROXY",
+            method=request.method,
+            url=str(request.rel_url),
+            headers=request.headers,
+            body=inbound_body,
+        )
+
+        outbound_body = rewrite_model(inbound_body, request, lane)
+
+        return await forward_chat(
+            request,
+            lane,
+            outbound_body,
+            started,
+        )
 
 async def forward_chat(
     request: web.Request, lane: str, body: bytes, started: float
 ) -> web.StreamResponse:
     attempt = 0
+    upstream_url = f"{UPSTREAM}/v1/chat/completions"
+
     while True:
         attempt += 1
+
         if request.transport is None or request.transport.is_closing():
             raise asyncio.CancelledError
+
         try:
             async with gate.slot(lane):
                 session: ClientSession = request.app["client"]
+
+                outbound_headers = filtered_request_headers(request)
+
+                debug_http(
+                    f"OUTBOUND REQUEST TO UPSTREAM - ATTEMPT {attempt}",
+                    method="POST",
+                    url=upstream_url,
+                    headers=outbound_headers,
+                    body=body,
+                    redact_cache_salt=True,
+                )
+
                 response = await session.post(
-                    f"{UPSTREAM}/v1/chat/completions",
+                    upstream_url,
                     data=body,
-                    headers=filtered_request_headers(request),
+                    headers=outbound_headers,
                     allow_redirects=False,
                 )
+
+                #
+                # Retryable upstream errors
+                #
                 if response.status in RETRYABLE:
                     delay = retry_delay(response, attempt)
-                    await response.content.read(MAX_ERROR_BYTES + 1)
+
+                    error_body = await response.content.read(
+                        MAX_ERROR_BYTES + 1
+                    )
+
+                    debug_http(
+                        f"UPSTREAM RESPONSE - ATTEMPT {attempt}",
+                        status=response.status,
+                        headers=response.headers,
+                        body=error_body,
+                    )
+
                     response.close()
+
                 else:
+                    #
+                    # This includes your current HTTP 403 case.
+                    #
                     if (
                         response.content_length is not None
                         and response.content_length > MAX_RESPONSE_BYTES
                     ):
                         response.close()
-                        raise web.HTTPBadGateway(text="upstream response exceeds byte limit")
+                        raise web.HTTPBadGateway(
+                            text="upstream response exceeds byte limit"
+                        )
+
                     downstream = web.StreamResponse(
-                        status=response.status, headers=filtered_response_headers(response.headers)
+                        status=response.status,
+                        headers=filtered_response_headers(response.headers),
                     )
+
                     await downstream.prepare(request)
+
                     output_bytes = 0
+
+                    # Only accumulate the response when debugging is enabled.
+                    # This lets us print the complete upstream body afterward.
+                    debug_response_body = bytearray() if DEBUG_HTTP else None
+
                     try:
                         async for chunk in response.content.iter_any():
                             output_bytes += len(chunk)
+
+                            if debug_response_body is not None:
+                                debug_response_body.extend(chunk)
+
                             if output_bytes > MAX_RESPONSE_BYTES:
                                 response.close()
+
                                 if request.transport is not None:
                                     request.transport.close()
+
                                 print(
-                                    f"response_limit lane={lane} input_bytes={len(body)} "
+                                    f"response_limit lane={lane} "
+                                    f"input_bytes={len(body)} "
                                     f"output_bytes={output_bytes}",
                                     flush=True,
                                 )
+
                                 return downstream
+
                             await downstream.write(chunk)
+
                     finally:
                         response.release()
+
                     await downstream.write_eof()
+
+                    if debug_response_body is not None:
+                        debug_http(
+                            f"UPSTREAM RESPONSE - ATTEMPT {attempt}",
+                            status=response.status,
+                            headers=response.headers,
+                            body=bytes(debug_response_body),
+                        )
+
                     print(
-                        f"request_complete lane={lane} input_bytes={len(body)} attempts={attempt} "
-                        f"elapsed_seconds={time.monotonic() - started:.3f}",
+                        f"request_complete lane={lane} "
+                        f"input_bytes={len(body)} "
+                        f"attempts={attempt} "
+                        f"elapsed_seconds="
+                        f"{time.monotonic() - started:.3f}",
                         flush=True,
                     )
-                    return downstream
-        except (TimeoutError, ClientConnectionError, ServerDisconnectedError):
-            delay = retry_delay(type("Retry", (), {"headers": {}})(), attempt)
-        print(f"upstream_retry lane={lane} attempt={attempt} delay={delay:.1f}s", flush=True)
-        await asyncio.sleep(delay)
 
+                    return downstream
+
+        except (
+            TimeoutError,
+            ClientConnectionError,
+            ServerDisconnectedError,
+        ) as exc:
+            if DEBUG_HTTP:
+                print(
+                    f"UPSTREAM CONNECTION ERROR: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+            delay = retry_delay(
+                type("Retry", (), {"headers": {}})(),
+                attempt,
+            )
+
+        print(
+            f"upstream_retry lane={lane} "
+            f"attempt={attempt} "
+            f"delay={delay:.1f}s",
+            flush=True,
+        )
+
+        await asyncio.sleep(delay)
 
 async def create_client(app: web.Application) -> None:
     app["client"] = ClientSession(
@@ -396,10 +579,16 @@ def create_app() -> web.Application:
     app = web.Application(client_max_size=MAX_REQUEST_BYTES)
     app.on_startup.append(create_client)
     app.on_cleanup.append(close_client)
+
     app.router.add_get("/healthz", health)
-    for lane in ("primary", "long", "subagent"):
-        app.router.add_post(f"/{lane}/v1/chat/completions", chat)
-        app.router.add_get(f"/{lane}/v1/models", models)
+    app.router.add_post(
+        "/{lane:primary|long|subagent}/v1/chat/completions",
+        chat,
+    )
+    app.router.add_get(
+        "/{lane:primary|long|subagent}/v1/models",
+        models,
+    )
     return app
 
 
