@@ -242,7 +242,7 @@ def main():
             failed |= status == "FAIL"
             manual |= status == "SETUP"
             print(f"{status:5} {kind} {name}: {detail}", flush=True)
-    print("Scope: harness MCP config only; project/plugin tools and model routing need Kimi checks.")
+    print("Scope: harness MCP config only; project/plugin tools + model routing need Kimi checks.")
     return 1 if failed else 2 if manual else 0
 
 
