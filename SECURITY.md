@@ -1,15 +1,15 @@
 # Security model
 
 This harness treats the workspace, project-supplied agent extensions, model
-responses, upstream HTTP responses, downloaded media, and custom ComfyUI nodes
+responses, upstream HTTP responses, downloaded media, and module application extensions
 as untrusted input. Host credentials and generated service credentials remain
 outside the workspace. Services receive only the credentials and networks they
 need.
 
 ## Supported deployment boundary
 
-The supported hosts are Apple Silicon macOS with Docker Desktop and native MPS,
-or x86-64 WSL2 with Docker Desktop, NVIDIA Container Toolkit, and CUDA. The
+The core supports macOS and Linux/WSL2 on arm64 or x86-64. Modules enforce their
+own platform requirements. The
 Compose services are a local single-user development environment; do not expose
 their ports on a shared or untrusted network.
 
@@ -28,11 +28,14 @@ mounted read-only. A content change requires review, approval, and restart.
 Ordinary `AGENTS.md` guidance remains writable and does not enter this approval
 boundary.
 
-Custom nodes are executable code. Inspect their source and dependency metadata
-before placing them in the custom-node directory. Add required packages as
-exact pins to `comfy/requirements-custom.txt`, regenerate the hash-checked lock,
-update recorded digests, and recertify both supported backends before release.
-Runtime dependency installation is intentionally unsupported.
+Modules under `modules/` are operator-trusted host code, like the launcher itself.
+Never load modules from the writable workspace. Stop the stack before installing,
+editing or removing modules. Selected runtime contributions are copied into
+private snapshots and mounted read-only; conflicting assets fail closed.
+Modules cannot replace core model policy through the manifest interface.
+Module hooks and Compose overlays must receive the same review as core changes.
+Native module applications run with the host user's permissions; see each
+module's documentation for its application-specific trust boundary.
 
 ## Dependency and vulnerability maintenance
 

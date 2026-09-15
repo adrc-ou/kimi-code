@@ -10,7 +10,6 @@ import os
 import re
 import shlex
 import ssl
-import subprocess
 import sys
 import urllib.parse
 import urllib.request
@@ -19,7 +18,6 @@ from typing import Any
 
 GITHUB_API = "https://api.github.com"
 KIMI_REPOSITORY = "MoonshotAI/kimi-code"
-COMFY_REPOSITORY = "Comfy-Org/ComfyUI"
 MAX_METADATA_BYTES = 4 * 1024 * 1024
 SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 KIMI_TAG_RE = re.compile(r"^@moonshot-ai/kimi-code@(\d+\.\d+\.\d+)$")
@@ -180,28 +178,6 @@ def kimi_catalog(asset_name: str) -> tuple[list[dict[str, str]], str]:
     return catalog, latest
 
 
-def comfy_catalog(platform_key: str) -> tuple[list[dict[str, str]], str]:
-    path = Path(__file__).resolve().parents[1] / "comfy" / "compatibility.json"
-    document = json.loads(path.read_text())
-    entries = document.get("entries", [])
-    if not isinstance(entries, list):
-        raise SystemExit("Invalid ComfyUI compatibility catalog")
-    catalog = []
-    for entry in entries:
-        if not isinstance(entry, dict) or entry.get("platform") != platform_key:
-            continue
-        status = entry.get("status")
-        if status not in {"locked", "tested"}:
-            continue
-        version = str(entry.get("comfyui_version", ""))
-        commit = str(entry.get("comfyui_commit", ""))
-        if not SEMVER_RE.fullmatch(version) or not re.fullmatch(r"[0-9a-f]{40}", commit):
-            raise SystemExit("Invalid ComfyUI compatibility entry")
-        catalog.append({"version": version, "commit": commit, "status": status})
-    catalog.sort(key=lambda item: semver_key(item["version"]), reverse=True)
-    return catalog, catalog[0]["version"] if catalog else ""
-
-
 def add_installed_entry(
     catalog: list[dict[str, str]],
     installed: str,
@@ -301,33 +277,6 @@ def choose(
         print(f"Enter a number from 1 to {len(choices)}.", file=sys.stderr)
 
 
-def resolve_comfy_commit(version: str) -> str:
-    result = subprocess.run(
-        [
-            "git",
-            "ls-remote",
-            "https://github.com/Comfy-Org/ComfyUI.git",
-            f"refs/tags/{version}",
-            f"refs/tags/{version}^{{}}",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    direct = ""
-    peeled = ""
-    for line in result.stdout.splitlines():
-        commit, ref = line.split("\t", 1)
-        if ref.endswith("^{}"):
-            peeled = commit
-        else:
-            direct = commit
-    commit = peeled or direct
-    if not re.fullmatch(r"[0-9a-f]{40}", commit):
-        raise SystemExit(f"Could not resolve ComfyUI tag {version}")
-    return commit
-
-
 def write_environment(path: Path, values: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f"{path.suffix}.tmp")
@@ -339,21 +288,17 @@ def write_environment(path: Path, values: dict[str, str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--platform-key", required=True)
     parser.add_argument("--platform-label", required=True)
     parser.add_argument("--kimi-asset", required=True)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--installed-kimi", default="")
-    parser.add_argument("--installed-comfy", default="")
     parser.add_argument("--non-interactive", action="store_true")
     args = parser.parse_args()
 
     state = load_state(args.state)
     kimi, latest_kimi = kimi_catalog(args.kimi_asset)
-    comfy, latest_comfy = comfy_catalog(args.platform_key)
     kimi = add_installed_entry(kimi, args.installed_kimi, state, "Kimi Code")
-    comfy = add_installed_entry(comfy, args.installed_comfy, state, "ComfyUI")
 
     selected_kimi = choose(
         "Kimi Code",
@@ -364,17 +309,7 @@ def main() -> None:
         os.environ.get("KIMI_CODE_VERSION", "").strip(),
         args.non_interactive,
     )
-    selected_comfy = choose(
-        "ComfyUI",
-        args.platform_label,
-        comfy,
-        latest_comfy,
-        args.installed_comfy,
-        os.environ.get("COMFYUI_VERSION", "").strip(),
-        args.non_interactive,
-    )
     selected_kimi["sha256"] = fetch_asset_checksum(selected_kimi)
-    commit = selected_comfy["commit"]
 
     write_environment(
         args.output,
@@ -382,8 +317,6 @@ def main() -> None:
             "KIMI_CODE_VERSION": selected_kimi["version"],
             "KIMI_CODE_ASSET_URL": selected_kimi["url"],
             "KIMI_CODE_ASSET_SHA256": selected_kimi["sha256"],
-            "COMFYUI_VERSION": selected_comfy["version"],
-            "COMFYUI_COMMIT": commit,
         },
     )
 

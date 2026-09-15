@@ -18,8 +18,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install aiohttp==3.14.3 ruff==0.13.2
-      - run: python -m unittest discover -s tests -v
-      - run: python -m compileall -q proxy scripts search-adapter tests tools
+      - run: |
+          python -m unittest discover -s tests -v
+          for suite in modules/*/tests; do
+            [ ! -d "$suite" ] || python -m unittest discover -s "$suite" -v
+          done
+      - run: python -m compileall -q proxy scripts search-adapter tests tools modules
       - run: ruff check .
       - run: python scripts/check_locks.py
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
@@ -77,20 +81,15 @@ jobs:
             --build-arg KIMI_CODE_ASSET_URL='${{ steps.kimi.outputs.url }}' \
             --build-arg KIMI_CODE_ASSET_SHA256='${{ steps.kimi.outputs.sha256 }}' .
 
-  build-cuda:
+  build-modules:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - run: |
-          set -a
-          source comfy/backend.env
-          set +a
-          docker buildx build --platform linux/amd64 -f comfy/Dockerfile.cuda \
-            --build-arg COMFYUI_VERSION=v0.35.0 \
-            --build-arg COMFYUI_COMMIT=40c4fcdf513a4523e39d54a9d391908af8df8171 \
-            --build-arg TORCH_VERSION --build-arg TORCHVISION_VERSION \
-            --build-arg TORCHAUDIO_VERSION --build-arg PYTORCH_CUDA_INDEX_URL .
+          for build in modules/*/tests/build.sh; do
+            [ ! -f "$build" ] || bash "$build"
+          done
 
   security:
     runs-on: ubuntu-latest

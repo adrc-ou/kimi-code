@@ -28,20 +28,10 @@ or `KIMI_MODEL_*` configuration.
 
 ## Persistent workspace contract
 
-ComfyUI application code belongs in its replaceable container image on CUDA or
-its replaceable native virtual environment on Apple Silicon.
-
-The following writable workspace paths must survive upgrades:
-
-- `comfyui/user/`
-- `comfyui/input/`
-- `comfyui/output/`
-- `comfyui/temp/`
-- `comfyui/models/`
-- `comfyui/custom_nodes/`
-
-Do not move model files, workflows, custom-node source, or user configuration
-into a container layer, anonymous volume, or `.local/comfy-macos/current`.
+Module application code belongs in replaceable images or private native runtimes.
+Persistent paths declared by modules must survive upgrades, deselection, and
+module deletion. Never remove user data during workspace initialization.
+Module-specific operating instructions belong inside the module.
 
 ## Dependency and release policy
 
@@ -54,7 +44,7 @@ update them deliberately. Do not install unreviewed custom-node dependencies at
 service startup.
 
 Update `dependencies.lock.json`, the applicable hash-checked requirements lock,
-`container/package-lock.json`, and `comfy/compatibility.json` together with the
+`container/package-lock.json`, and module dependency/compatibility metadata with the
 dependency they describe. Every compatibility entry must have current backend,
 requirements, and custom-requirements digests plus backend-specific smoke-test
 evidence.

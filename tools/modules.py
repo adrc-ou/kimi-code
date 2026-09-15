@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""Discover trusted harness modules and assemble session-only runtime assets."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import termios
+import tty
+from pathlib import Path
+
+if __package__:
+    from .safe_workspace_init import (
+        OPEN_DIR,
+        UnsafeWorkspace,
+        components,
+        initialize,
+        require_directory,
+    )
+else:
+    from safe_workspace_init import (
+        OPEN_DIR,
+        UnsafeWorkspace,
+        components,
+        initialize,
+        require_directory,
+    )
+
+ID = re.compile(r"[a-z][a-z0-9_]*\Z")
+ENV = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+BEGIN = "<!-- kimi-harness modules begin -->"
+END = "<!-- kimi-harness modules end -->"
+
+
+def discover(root):
+    result = []
+    directory = root / "modules"
+    if not directory.exists():
+        return result
+    for path in sorted(directory.iterdir()):
+        if not path.is_dir() or not (path / "module.json").exists():
+            continue
+        if path.is_symlink() or not ID.fullmatch(path.name):
+            raise ValueError(
+                "Module directories must be real directories with lowercase identifiers"
+            )
+        # No links or devices in executable module content, including runtime contributions.
+        for child in path.rglob("*"):
+            if child.is_symlink() or not (child.is_file() or child.is_dir()):
+                raise ValueError(f"Unsafe module entry: {child}")
+        doc = json.loads((path / "module.json").read_text())
+        if doc.get("schema_version") != 1 or not isinstance(doc.get("label"), str):
+            raise ValueError(f"Invalid module manifest: {path.name}")
+        if not doc["label"].strip() or any(ord(c) < 32 for c in doc["label"]):
+            raise ValueError("Invalid module label")
+        for relative in doc.get("workspace_directories", []):
+            components(relative)
+        if not (path / "module.sh").is_file():
+            raise ValueError("Module requires module.sh")
+        for image in doc.get("images", []):
+            if not re.fullmatch(r"[a-z0-9][a-z0-9._/-]*", image):
+                raise ValueError("Invalid image name")
+        for item in doc.get("environment", []):
+            if not ENV.fullmatch(item["name"]) or not isinstance(item.get("prompt"), str):
+                raise ValueError("Invalid module environment declaration")
+        result.append({**doc, "id": path.name, "path": path})
+    return result
+
+
+def compatible(module):
+    result = subprocess.run(
+        ["bash", str(module["path"] / "module.sh"), "compatible"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        timeout=30,
+    )
+    if result.returncode not in (0, 1):
+        raise ValueError(f"Compatibility probe failed: {module['id']}")
+    return result.returncode == 0
+
+
+def ordered(modules, previous):
+    return sorted(modules, key=lambda m: (m["id"] not in previous, m["label"].casefold(), m["id"]))
+
+
+def choose(modules, previous, non_interactive):
+    modules = ordered(modules, previous)
+    checked = {m["id"] for m in modules if m["id"] in previous}
+    override = os.environ.get("HARNESS_MODULES")
+    if override is not None:
+        checked = set(filter(None, override.split(",")))
+        if checked - {m["id"] for m in modules}:
+            raise ValueError("HARNESS_MODULES includes missing or incompatible modules")
+        return [m["id"] for m in modules if m["id"] in checked]
+    if not modules or non_interactive:
+        return [m["id"] for m in modules if m["id"] in checked]
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError(
+            "Module selection requires a terminal; use --non-interactive or HARNESS_MODULES"
+        )
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    focus = 0
+    try:
+        tty.setcbreak(fd)
+        print("Choose modules: ↑/↓ move, Space toggle, Enter continue", flush=True)
+        while True:
+            for i, module in enumerate(modules):
+                print(
+                    f"\033[2K{'>' if focus == i else ' '} "
+                    f"[{'X' if module['id'] in checked else ' '}] {module['label']}",
+                    flush=True,
+                )
+            key = os.read(fd, 1).decode()
+            if key in ("\r", "\n"):
+                break
+            if key in ("\x03", "\x04", ""):
+                raise KeyboardInterrupt
+            if key == "\x1b":
+                import select
+
+                if select.select([fd], [], [], 0.1)[0]:
+                    sequence = os.read(fd, 2)
+                    if sequence == b"[A":
+                        focus = (focus - 1) % len(modules)
+                    if sequence == b"[B":
+                        focus = (focus + 1) % len(modules)
+            elif key == " ":
+                name = modules[focus]["id"]
+                checked.symmetric_difference_update({name})
+            print(f"\033[{len(modules)}A", end="", flush=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    return [m["id"] for m in modules if m["id"] in checked]
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n")
+    path.chmod(0o600)
+
+
+def merge_guidance(workspace, text):
+    """Replace only our delimited section; preserve user guidance and reject links."""
+    import stat
+
+    fd = os.open(workspace, OPEN_DIR)
+    try:
+        require_directory(fd, str(workspace), os.getuid())
+        file = os.open(
+            "AGENTS.md", os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600, dir_fd=fd
+        )
+        try:
+            info = os.fstat(file)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+                raise UnsafeWorkspace("unsafe workspace AGENTS.md")
+            if info.st_size > 4 * 1024 * 1024:
+                raise UnsafeWorkspace("workspace AGENTS.md exceeds 4 MiB")
+            existing = os.read(file, info.st_size).decode()
+            if BEGIN in existing or END in existing:
+                if (
+                    existing.count(BEGIN) != 1
+                    or existing.count(END) != 1
+                    or existing.index(END) < existing.index(BEGIN)
+                ):
+                    raise UnsafeWorkspace(
+                        "invalid module guidance markers; preserve and repair AGENTS.md"
+                    )
+                a, tail = existing.split(BEGIN)
+                _, b = tail.split(END)
+                existing = a + b
+            content = existing
+            if text:
+                content += (
+                    ("" if not existing or existing.endswith("\n") else "\n")
+                    + BEGIN
+                    + "\n"
+                    + text
+                    + "\n"
+                    + END
+                )
+            if content != os.pread(file, info.st_size, 0).decode():
+                os.lseek(file, 0, 0)
+                os.write(file, content.encode())
+                os.ftruncate(file, len(content.encode()))
+                os.fsync(file)
+        finally:
+            os.close(file)
+    finally:
+        os.close(fd)
+
+
+def assemble(root, runtime, modules, workspace):
+    target = runtime / "assets"
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir()
+    mcp = {"mcpServers": {}}
+    for category in ("skills", "agents", "tools"):
+        (target / category).mkdir()
+    guidance = []
+    for source in [root / "runtime", *[m["path"] / "runtime" for m in modules]]:
+        for category in ("skills", "agents", "tools"):
+            directory = (
+                root / "tools"
+                if source == root / "runtime" and category == "tools"
+                else source / category
+            )
+            if directory.exists():
+                for item in directory.iterdir():
+                    if item.name == "__pycache__":
+                        continue
+                    dest = target / category / item.name
+                    if dest.exists():
+                        raise ValueError(f"Duplicate runtime asset: {category}/{item.name}")
+                    if item.is_dir():
+                        shutil.copytree(
+                            item, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
+                        )
+                    else:
+                        shutil.copy2(item, dest)
+        if (source / "mcp.json").exists():
+            entries = json.loads((source / "mcp.json").read_text())["mcpServers"]
+            if entries.keys() & mcp["mcpServers"].keys():
+                raise ValueError("Duplicate MCP server names")
+            mcp["mcpServers"].update(entries)
+    write_json(target / "mcp.json", mcp)
+    for module in modules:
+        initialize(workspace, module.get("workspace_directories", []))
+        if (module["path"] / "AGENTS.md").exists():
+            guidance.append(
+                f"## Module: {module['label']}\n\n" + (module["path"] / "AGENTS.md").read_text()
+            )
+    merge_guidance(workspace, "\n".join(guidance))
+
+
+def reconcile_installed(runtime, modules):
+    """Forget removed modules and remove only their private disposable installations."""
+    registry = runtime / "installed-modules.json"
+    previous = json.loads(registry.read_text()) if registry.exists() else {}
+    installed = {m["id"]: m.get("images", []) for m in modules}
+    for name, images in previous.items():
+        if name in installed:
+            continue
+        if not ID.fullmatch(name):
+            raise ValueError("Invalid stored module identifier")
+        data = runtime / "module-data" / name
+        if data.is_symlink():
+            raise ValueError("Module data must not be a symlink")
+        if data.exists():
+            shutil.rmtree(data)
+        for image in images:
+            if not re.fullmatch(r"[a-z0-9][a-z0-9._/-]*", image):
+                raise ValueError("Invalid stored image name")
+            tag = f"{image}:{os.environ['HARNESS_IMAGE_SUFFIX']}"
+            exists = (
+                subprocess.run(
+                    ["docker", "image", "inspect", tag],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                ).returncode
+                == 0
+            )
+            if exists:
+                subprocess.run(
+                    ["docker", "image", "rm", tag],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+    write_json(registry, installed)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=["select", "environment", "assemble"])
+    parser.add_argument("--non-interactive", action="store_true")
+    args = parser.parse_args()
+    root = Path(os.environ["HARNESS_ROOT"])
+    runtime = Path(os.environ["HARNESS_RUNTIME_DIR"])
+    modules = discover(root)
+    selection = runtime / "modules.json"
+    if args.action == "select":
+        previous = runtime / "last-modules.json"
+        previous = json.loads(previous.read_text()) if previous.exists() else []
+        selected = choose([m for m in modules if compatible(m)], previous, args.non_interactive)
+        write_json(selection, selected)
+        reconcile_installed(runtime, modules)
+        # Shell consumes identifiers only, never labels or arbitrary manifest strings.
+        (runtime / "modules.list").write_text("".join(name + "\n" for name in selected))
+        return
+    selected = json.loads(selection.read_text())
+    modules = [next(m for m in modules if m["id"] == name) for name in selected]
+    if args.action == "assemble":
+        assemble(root, runtime, modules, Path(os.environ["HARNESS_WORKSPACE"]))
+        return
+    if __package__:
+        from .render_runtime import read_values, write_secret
+    else:
+        from render_runtime import read_values, write_secret
+    import shlex
+
+    values = read_values(Path(os.environ["HARNESS_RESOLVED_BOOTSTRAP"]))
+    declared = {
+        key.removeprefix("export "): value for key, value in read_values(root / ".env").items()
+    }
+    session = {}
+    agent = {}
+    for module in modules:
+        for item in module.get("environment", []):
+            name = item["name"]
+            value = session.get(name, values.get(name, "") if name in declared else "")
+            if not value:
+                if args.non_interactive or not sys.stdin.isatty():
+                    raise ValueError(
+                        f"{module['label']} requires {name} in .env for non-interactive startup"
+                    )
+                print(
+                    f"{module['label']}: add {name} to .env to persist it; "
+                    "this value is for this session only."
+                )
+                while not value:
+                    prompt = f"{item['prompt']} ({name}): "
+                    value = getpass.getpass(prompt) if item.get("secret", True) else input(prompt)
+            if any(character in value for character in ("\n", "\r", "\x00")):
+                raise ValueError("Environment values must be single-line")
+            session[name] = value
+            if item.get("agent", False):
+                agent[name] = value.replace("$", "$$")
+    write_json(
+        runtime / "compose/module-environment.json",
+        {"services": {"kimi-agent": {"environment": agent}}},
+    )
+    write_secret(
+        runtime / "module.env", "".join(f"{k}={shlex.quote(v)}\n" for k, v in session.items())
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+    except (
+        ValueError,
+        OSError,
+        StopIteration,
+        UnsafeWorkspace,
+        subprocess.SubprocessError,
+    ) as error:
+        raise SystemExit(f"Module setup refused: {error}") from None

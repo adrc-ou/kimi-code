@@ -2,28 +2,28 @@
 set -euo pipefail
 
 expected_backend=${1:?usage: acceptance.sh mps|cuda}
-root=$(cd "$(dirname "$0")/.." && pwd -P)
+root=$(cd "$(dirname "$0")/../../.." && pwd -P)
 cd "${root}"
 # shellcheck disable=SC1091
 source tools/runtime.sh
 harness_traps
 harness_init_readonly
-[[ "${HARNESS_BACKEND}" == "${expected_backend}" ]] || { echo "Host selects ${HARNESS_BACKEND}, not ${expected_backend}" >&2; exit 2; }
 set -a
 # shellcheck disable=SC1091
-source comfy/backend.env
+source modules/comfyui/backend/backend.env
 # shellcheck disable=SC1090
 source "${HARNESS_STATE_FILE}"
 # shellcheck disable=SC1091
 source "${HARNESS_RUNTIME_DIR}/runtime.env"
 set +a
-python3 tools/verify_bind_paths.py verify "${HARNESS_WORKSPACE}" "${HARNESS_RUNTIME_DIR}/binds.json"
-bind_assignments=$(python3 tools/verify_bind_paths.py emit "${HARNESS_WORKSPACE}" "${HARNESS_RUNTIME_DIR}/binds.json")
+[[ "${COMFYUI_BACKEND:-}" == "${expected_backend}" ]] || { echo "Start a session with ComfyUI enabled for ${expected_backend}" >&2; exit 2; }
+python3 modules/comfyui/scripts/verify_bind_paths.py verify "${HARNESS_WORKSPACE}" "${HARNESS_RUNTIME_DIR}/module-data/comfyui/binds.json"
+bind_assignments=$(python3 modules/comfyui/scripts/verify_bind_paths.py emit "${HARNESS_WORKSPACE}" "${HARNESS_RUNTIME_DIR}/module-data/comfyui/binds.json")
 while IFS= read -r assignment; do
   variable=${assignment%%=*}
   export "${variable}=${assignment#*=}"
 done <<<"${bind_assignments}"
-[[ "${expected_backend}" == mps ]] && export COMFYUI_BRIDGE_CERT="${HARNESS_RUNTIME_DIR}/bridge.crt"
+[[ "${expected_backend}" == mps ]] && export COMFYUI_BRIDGE_CERT="${HARNESS_RUNTIME_DIR}/module-data/comfyui/bridge.crt"
 harness_compose_files
 harness_validate_compose
 
@@ -45,7 +45,7 @@ if [[ "${expected_backend}" == cuda ]]; then
   harness_compose exec comfyui sh -c 'test ! -r /run/secrets/nrp_api_key && ! getent hosts model-proxy'
   harness_compose exec comfyui python -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name())'
 else
-  .local/comfy-macos/"${HARNESS_INSTANCE_ID}"/current/venv/bin/python -c 'import torch; assert torch.backends.mps.is_available()'
+  "${HARNESS_RUNTIME_DIR}/module-data/comfyui/app/current"/venv/bin/python -c 'import torch; assert torch.backends.mps.is_available()'
 fi
 
 harness_compose exec kimi-agent sh -c \

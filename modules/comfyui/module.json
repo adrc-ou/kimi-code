@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "label": "ComfyUI",
+  "workspace_directories": [
+    "comfyui/custom_nodes",
+    "comfyui/input",
+    "comfyui/models",
+    "comfyui/output",
+    "comfyui/temp",
+    "comfyui/user/default/workflows"
+  ],
+  "environment": [],
+  "images": [
+    "adrc-comfyui-cuda"
+  ]
+}

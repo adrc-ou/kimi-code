@@ -1,22 +1,15 @@
-# NRP LiteLLM + Kimi Code + ComfyUI development harness
+# Modular NRP LiteLLM + Kimi Code development harness
 
 This project runs Kimi Code against OU Libraries' NRP-backed LiteLLM gateway,
 enforces the configured NRP concurrency policy, provides selected MCP servers
-and local SearXNG search, and starts a persistent ComfyUI development workspace.
+and local SearXNG search. Optional modules add application services and tools.
 
-The harness supports two GPU environments:
+The core runs on macOS (Intel or Apple Silicon) and Linux/WSL2 (x86-64 or
+arm64), with Docker and Compose. Modules determine their own host compatibility.
+The included [ComfyUI module](modules/comfyui/README.md) supports Apple Silicon
+MPS and Linux/WSL2 NVIDIA CUDA. Intel Macs can run the core without that module.
 
-| Host | Kimi, proxy, search, MCP tools | ComfyUI | GPU backend |
-| --- | --- | --- | --- |
-| Apple Silicon macOS | Docker Desktop | Native Python virtual environment | MPS |
-| Windows with NVIDIA | Docker Desktop using WSL2 | Docker container | CUDA |
-
-Docker Desktop does not expose Apple Metal/MPS to Linux containers. On macOS,
-only ComfyUI runs natively; the agent harness remains containerized.
-
-ComfyUI does not publish an official Docker image. The CUDA image is built
-locally from a selected, exact commit fetched from the official
-[`Comfy-Org/ComfyUI`](https://github.com/Comfy-Org/ComfyUI) repository.
+See [the module authoring contract](docs/modules.md) to add another module.
 
 ## Prerequisites
 
@@ -25,44 +18,14 @@ account setup, see [the verification guide](docs/verification.md). `./start.sh`
 runs a quick service/MCP check; use `./doctor.sh --full` while it is running for
 read-only functional probes.
 
-Both hosts need:
+Hosts need:
 
-- Docker Desktop with Docker Compose;
+- Docker with Docker Compose (Docker Desktop on macOS/Windows);
 - Git;
 - Python 3 for the host setup scripts;
 - enough free disk space for container images and models;
 - network access to GitHub, Python package indexes, Docker Hub, and configured
   model/MCP endpoints.
-
-The Mac additionally needs:
-
-- Apple Silicon and macOS 14 or newer;
-- `curl` and `tar` (included with macOS);
-- Xcode command-line tools (`xcode-select --install`).
-
-For native ComfyUI, the launcher uses arm64 Python 3.12 from `PATH` when available.
-Otherwise it downloads the standalone build pinned in `dependencies.lock.json`
-from [Astral's official releases](https://github.com/astral-sh/python-build-standalone/releases),
-verifies its SHA-256, and installs it under
-`.local/runtime/<instance>/python/<digest>/`. Setup reuses this interpreter to
-create ComfyUI's dedicated virtual environment. No Homebrew, administrator
-access, shell profile changes, or system Python changes are needed. Each user
-should use their own writable harness checkout and workspace.
-
-To use an existing interpreter (including for offline setup), set
-`COMFYUI_MACOS_PYTHON` to its executable path. An explicit override must be
-arm64 Python 3.12; an invalid override fails instead of triggering a download.
-
-The Windows host additionally needs:
-
-- current Windows 11 and WSL2 (`wsl --update`);
-- Docker Desktop's WSL2 backend and integration enabled;
-- a current NVIDIA Windows driver with the workstation GPU in WDDM mode.
-
-Do not install an NVIDIA Linux display driver inside WSL2. The Windows driver
-provides CUDA to WSL. Run this project from an Ubuntu/WSL shell, not Git Bash,
-and place both the repository and workspace in the WSL filesystem rather than
-under `/mnt/c`.
 
 ## Initial configuration
 
@@ -88,35 +51,31 @@ Run:
 ./start.sh
 ```
 
-The launcher:
+The launcher first shows compatible modules in a checkbox menu. Use ↑/↓ to
+move, Space to toggle, and Enter to continue. Last session's enabled modules
+appear first and are checked; each group is alphabetical by label. On the first
+run all modules are unchecked. If none are compatible, this step is skipped.
 
-1. detects macOS/MPS or Windows/WSL2/CUDA;
-2. fetches official Kimi Code releases and loads the checked-in ComfyUI catalog;
-3. presents at most ten versions of each, newest first;
-4. marks the newest compatible release `(latest)`;
-5. marks the verified local version `(installed)` and includes it even when it
-   is older than the normal list;
-6. fetches and verifies changed application versions;
-7. acquires an instance lock and generates per-run proxy/search/bridge credentials;
-8. initializes and verifies the persistent workspace without following child symlinks;
-9. snapshots approved executable project extensions as read-only mounts;
-10. verifies the selected GPU backend;
-11. starts the segmented stack attached to the terminal.
+Next comes the existing Kimi version menu, followed by each selected module's
+version menu. Missing required module variables are prompted for this session
+only; add them to `.env` yourself to persist them. Secret inputs are hidden.
 
-The installed version is the default choice. Selecting another version replaces
-the active Kimi image and ComfyUI application while preserving user data.
-
-Press Ctrl-C in the same terminal to stop every container and any native macOS
-ComfyUI processes. No shutdown script is required. Images, named volumes, model
-files, workflows, custom nodes, input, output, and user configuration remain.
+After all choices, the launcher initializes the workspace, installs selected
+versions, generates private runtime configuration, snapshots module assets and
+approved project extensions, and starts the segmented stack. Ctrl-C stops the
+containers and registered native module processes. Persistent workspace data
+is never removed when a module is unchecked or deleted.
 
 For repeatable automation, set explicit versions and disable prompts:
 
 ```bash
-KIMI_CODE_VERSION=0.42.0 \
-COMFYUI_VERSION=v0.35.0 \
-./start.sh --non-interactive
+HARNESS_MODULES= KIMI_CODE_VERSION=0.42.0 ./start.sh --non-interactive
 ```
+
+`HARNESS_MODULES` is a comma-separated list of module directory identifiers;
+an explicit empty value selects the core only. If omitted in non-interactive
+mode, the previous compatible selection is reused. Missing required module
+variables cause non-interactive startup to fail without printing their values.
 
 The requested versions must still exist in the compatible official release
 catalog. Release metadata failures stop startup instead of silently using stale
@@ -125,7 +84,7 @@ data.
 Services are available at:
 
 - Kimi Code: <http://127.0.0.1:5494>
-- ComfyUI: <http://127.0.0.1:8188>
+- Enabled modules document their own service URLs.
 
 Generated secrets and native logs are kept under the instance-specific
 `.local/runtime/` directory and are excluded from Git. Ephemeral credentials,
@@ -135,45 +94,15 @@ isolated across restarts.
 
 ## Persistent workspace contract
 
-`start.sh` creates:
+`start.sh` creates `.agent-state/` and its initial state files automatically.
+Each selected module declares additional relative workspace directories.
+Existing files and directories are preserved. Initialization rejects symlinked
+children rather than following them outside the workspace.
 
-```text
-WORKSPACE_PATH/
-├── .agent-state/
-└── comfyui/
-    ├── custom_nodes/
-    ├── input/
-    ├── models/
-    ├── output/
-    ├── temp/
-    └── user/
-        └── default/
-            └── workflows/
-```
-
-Kimi can read and write the entire workspace, including custom nodes and
-workflows. ComfyUI application code and Python environments are deliberately
-outside the workspace and replaceable.
-
-The optional `./init-workspace.sh` command initializes these directories without
-starting anything. It is not required because `start.sh` performs the same work.
-
-Workspace children used as host bind sources must be real directories. The
-launcher refuses symlinks and rechecks device/inode identity immediately before
-startup. To keep large data on another drive, set one or more explicit absolute
-paths in `.env`:
-
-```dotenv
-COMFYUI_MODELS_PATH=/absolute/path/to/models
-COMFYUI_CUSTOM_NODES_PATH=/absolute/path/to/custom_nodes
-COMFYUI_INPUT_PATH=/absolute/path/to/input
-COMFYUI_OUTPUT_PATH=/absolute/path/to/output
-COMFYUI_TEMP_PATH=/absolute/path/to/temp
-COMFYUI_USER_PATH=/absolute/path/to/user
-```
-
-Every configured path must already exist, be owned by the invoking user, and
-contain no symlinked component.
+Module `AGENTS.md` instructions appear in a managed section of the workspace's
+`AGENTS.md`. Restarting replaces only that section, keeping user guidance intact.
+Deselection removes the module's active instructions and runtime assets, while
+leaving its persistent data alone. No separate initialization command is needed.
 
 ## Executable project extensions
 
@@ -201,36 +130,13 @@ again, and restart. Revoke all approval with `./extensions.sh revoke`.
 ## Version and dependency policy
 
 Kimi is downloaded from official Moonshot release assets. The launcher selects
-the Linux arm64 asset on a Mac host and Linux x64 asset under WSL2, because Kimi
+the Linux asset matching the host CPU architecture, because Kimi
 itself runs in a Linux container. The SHA-256 digest published with the release
 is verified during the image build.
 
-ComfyUI selection is limited to exact tuples in `comfy/compatibility.json`.
-Each tuple records the application commit, Python/GPU backend, dependency-lock
-digests, and certification evidence. A stable semantic version is not treated
-as compatible merely because of its tag. Entries marked `locked` have immutable
-dependency resolution but still require the recorded controlled hardware run;
-only entries marked `tested` may claim hardware certification.
-
-PyTorch versions are pinned separately in `comfy/backend.env`. They do not
-automatically move with ComfyUI releases because a framework upgrade can change
-CUDA driver requirements or MPS behavior. Review those pins deliberately.
-
-`comfy/requirements-linux.lock`, `comfy/requirements-macos.lock`, and
-`comfy/requirements-custom.lock` are complete, hash-checked Python resolution
-artifacts. `comfy/requirements-custom.txt` is the operator-reviewed input for
-custom nodes and accepts exact `name==version` pins only. After changing the
-input or certified ComfyUI version, regenerate the affected locks with `uv pip
-compile --generate-hashes` for Python 3.12 and the exact target platform. The
-CUDA lock must retain the reviewed direct-wheel URLs and hashes from
-`comfy/torch-cuda-constraints.txt`; the macOS lock uses
-`comfy/torch-constraints.txt`. Update digests in `dependencies.lock.json` and
-`comfy/compatibility.json`, then run the backend acceptance test. Do not add
-automatic custom-node dependency installation to container startup.
-
 Base images are digest-pinned, the GitHub MCP source is commit-pinned, and npm
 browser tooling is installed with `npm ci` from `container/package-lock.json`.
-`dependencies.lock.json`, the compatibility catalog, and expiring vulnerability
+Core/module dependency locks, module compatibility catalogs, and vulnerability
 exceptions are checked in CI. No third-party source distribution, model, custom
 node, or Python package is vendored in this repository.
 
@@ -238,44 +144,14 @@ node, or Python package is vendored in this repository.
 archives from the root build context. Do not remove the `.env` exclusion: the
 LiteLLM credential must never be sent as Docker build-context data.
 
-## ComfyUI access from Kimi
-
-Inside the agent container, use:
-
-```bash
-python /opt/kimi-runtime/tools/comfyctl.py stats
-python /opt/kimi-runtime/tools/comfyctl.py queue
-python /opt/kimi-runtime/tools/comfyctl.py schema CheckpointLoaderSimple
-python /opt/kimi-runtime/tools/comfyctl.py upload /workspace/comfyui/input/example.png
-python /opt/kimi-runtime/tools/comfyctl.py run --wait /workspace/comfyui/user/default/workflows/example-api.json
-python /opt/kimi-runtime/tools/comfyctl.py download PROMPT_ID /workspace/comfyui/output/downloaded
-python /opt/kimi-runtime/tools/comfyctl.py interrupt
-```
-
-`COMFYUI_CONNECT_TIMEOUT`, `COMFYUI_READ_TIMEOUT`, and
-`COMFYUI_TOTAL_TIMEOUT` may be set in `.env` when the defaults are unsuitable.
-JSON and media transfers have separate `COMFYUI_MAX_JSON_BYTES` and
-`COMFYUI_MAX_TRANSFER_BYTES` limits. Native bridge body, WebSocket-message, and
-connection limits are also configurable in `.env`. Downloads are
-streamed to exclusive temporary files, fsynced, and atomically renamed without
-overwriting an existing result.
-
-On CUDA, Kimi connects directly over the private Compose network. On macOS,
-ComfyUI itself listens only on host loopback. A short-lived TLS-authenticated
-HTTP/WebSocket bridge on port 8190 lets the container reach it through
-`host.docker.internal`. Its certificate covers the Docker host name and
-loopback, its private key never enters a container, and HTTP/WebSocket sizes and
-connections are bounded.
-
 ## MCP servers
 
 Local stdio MCP servers are child processes launched by Kimi when a workspace
 session begins. They are not independent Compose services. Open a fresh session
-after changing `runtime/mcp.json`, then use `/mcp` to inspect connections.
+after changing core or module `runtime/mcp.json`, then use `/mcp` to inspect connections.
 
 Enabled by default:
 
-- Hugging Face (`hf_fs` only);
 - DeepWiki;
 - Chrome DevTools;
 - Serena.
@@ -283,7 +159,6 @@ Enabled by default:
 Disabled pending operator credentials or configuration:
 
 - GitHub;
-- NVIDIA CUDA Docs;
 - Context7.
 
 The Context7 URL is already set to `https://mcp.context7.com/mcp`. Configure and
@@ -293,7 +168,9 @@ and make one harmless read-only call before enabling the next.
 For GitHub, use a dedicated fine-grained read-only token restricted to required
 repositories. The Kimi process can access any token placed in its environment.
 
-The checked-in MCP declarations and Kimi configuration are mounted read-only.
+Core and selected module MCP declarations are merged into a private runtime snapshot
+and mounted read-only, alongside selected skills, agents, and helper tools.
+Duplicate asset or MCP names fail startup instead of overriding core definitions.
 Edit this repository and restart to change declarations. OAuth and session state
 remain in Docker volumes.
 
@@ -308,7 +185,7 @@ adapter with bounded workers, queue, request, response, result, and field sizes.
 The adapter translates Kimi's schema to SearXNG's JSON API. Neither service is
 published to the host.
 
-Compose networks isolate the model proxy, search backend, and ComfyUI. Only
+Compose networks isolate the model proxy, search backend, and module services. Only
 Kimi joins the intended client-side networks; separate egress networks prevent
 the private networks from becoming a second flat service mesh. The real NRP key
 is mounted only into `model-proxy` as a file secret.
@@ -327,17 +204,16 @@ python3 scripts/check_locks.py
 npm ci --ignore-scripts --prefix container
 ```
 
-While the stack is running, use another terminal:
+Run each installed module's test suite too:
 
 ```bash
-tests/acceptance.sh mps
+for suite in modules/*/tests; do
+  [ ! -d "$suite" ] || python3 -m unittest discover -s "$suite"
+done
+bash tests/compose-config.sh
 ```
 
-or:
-
-```bash
-tests/acceptance.sh cuda
-```
+Module hardware acceptance instructions live with each module.
 
 Then open a fresh Kimi session, run `/mcp`, and make one harmless call through
 each enabled server. Remote authentication cannot be validated without the
@@ -355,8 +231,8 @@ host-wide ceilings are opt-in. Copy `compose.limits.yaml.example` to
 `compose.limits.yaml`, tune it for the machine, and restart.
 
 The launcher reports its instance ID. Generated runtime material for that
-instance lives below `.local/runtime/INSTANCE_ID`; native MPS environments live
-below `.local/comfy-macos/INSTANCE_ID`. Stop the matching stack before removing
+instance lives below `.local/runtime/INSTANCE_ID`; replaceable native module installations live
+below `.local/runtime/INSTANCE_ID/module-data/<module>`. Stop the matching stack before removing
 either directory. Never delete the workspace as part of cache cleanup.
 
 An ordinary `launcher.lock` file may remain after a crash; advisory locking
@@ -367,8 +243,7 @@ or remove the project, workspace, or the entire `.local` tree as lock recovery.
 
 The host scripts report a file, line, and exit status for unexpected failures.
 `start.sh` also checks that Docker is ready before selecting releases. Optional
-ComfyUI path overrides may be left unset. `init-workspace.sh` creates the
-workspace layout and exits successfully without starting containers.
+module settings are documented with each module.
 
 The release selector uses Python's verified HTTPS context. On macOS, if Python
 has no default CA certificates, it loads the system bundle at `/etc/ssl/cert.pem`
@@ -377,26 +252,19 @@ explicit `SSL_CERT_FILE` / `SSL_CERT_DIR` environment settings take precedence.
 For an organization-specific CA bundle, export `SSL_CERT_FILE=/path/to/ca-bundle.pem`
 before launching. Certificate and hostname verification remain enabled.
 
-After a controlled hardware acceptance run, update the matching compatibility
-entry from `locked` to `tested`, add the run identifier and certification date,
-and review those evidence changes with the lock digests. Do not label a tuple
-`tested` based only on dependency resolution or a successful image build.
-
 ## What Docker does and does not protect
 
 The agent normally runs without root privileges in a read-only container. UID
 and GID collisions are resolved by reusing numeric base-image identities rather
 than deleting accounts. The Docker socket and host filesystem are not mounted.
 Its writable bind mount is limited to `WORKSPACE_PATH` and any explicitly
-validated external ComfyUI directories.
+validated module mounts.
 
 The workspace is intentionally not protected from the agent. The agent also has
 network access, so Docker cannot prevent workspace exfiltration or unsafe
 downloads. Use a dedicated workspace, retain manual approval mode, and monitor
 tool calls.
 
-ComfyUI custom nodes are executable Python code. On Windows they run in the
-ComfyUI container, which receives no LiteLLM credential and only the ComfyUI data
-mounts. On macOS, MPS requires native execution, so custom nodes run with the
-permissions of the macOS user. Review every third-party custom node before
-loading it and do not expose secrets in the ComfyUI process environment.
+Native module processes run with the host user's permissions. Read each module's
+security boundary before enabling it. Modules are operator-trusted harness code,
+not workspace-supplied plugins; install or edit them only while stopped.

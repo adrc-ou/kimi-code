@@ -23,7 +23,7 @@ class SafeWorkspaceInitTests(unittest.TestCase):
             outside = Path(directory) / "outside"
             root.mkdir()
             outside.mkdir()
-            (root / "comfyui").symlink_to(outside, target_is_directory=True)
+            (root / ".agent-state").symlink_to(outside, target_is_directory=True)
             with self.assertRaises(UnsafeWorkspace):
                 initialize(root)
 

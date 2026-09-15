@@ -18,7 +18,7 @@
       "custom_lock_sha256": "ea5f85436c25288774ecc63077adbff1923b88bfc8aff9ec0d67ad55af587b78",
       "locked_at": "2026-09-11",
       "certification_status": "pending controlled CUDA run",
-      "certification_command": "tests/acceptance.sh cuda"
+      "certification_command": "modules/comfyui/tests/acceptance.sh cuda"
     },
     {
       "status": "locked",
@@ -37,7 +37,7 @@
       "custom_lock_sha256": "ea5f85436c25288774ecc63077adbff1923b88bfc8aff9ec0d67ad55af587b78",
       "locked_at": "2026-09-11",
       "certification_status": "pending controlled MPS run",
-      "certification_command": "tests/acceptance.sh mps"
+      "certification_command": "modules/comfyui/tests/acceptance.sh mps"
     }
   ]
 }

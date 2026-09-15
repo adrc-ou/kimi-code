@@ -11,15 +11,7 @@ import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
 
-DIRECTORIES = (
-    ".agent-state/logs",
-    "comfyui/custom_nodes",
-    "comfyui/input",
-    "comfyui/models",
-    "comfyui/output",
-    "comfyui/temp",
-    "comfyui/user/default/workflows",
-)
+DIRECTORIES = (".agent-state/logs",)
 FILES = (
     ".agent-state/STATE.md",
     ".agent-state/DEBUG_LEDGER.md",
@@ -199,7 +191,7 @@ def update_git_exclude(root: Path, expected_uid: int) -> None:
         os.close(root_fd)
 
 
-def initialize(root: Path) -> None:
+def initialize(root: Path, directories=()) -> None:
     root.mkdir(parents=True, exist_ok=True)
     root = root.resolve(strict=True)
     if root == Path("/") or "\n" in str(root):
@@ -208,7 +200,7 @@ def initialize(root: Path) -> None:
     root_fd = os.open(root, OPEN_DIR)
     try:
         require_directory(root_fd, str(root), expected_uid)
-        for relative in DIRECTORIES:
+        for relative in (*DIRECTORIES, *directories):
             fd = open_directory(root_fd, relative, expected_uid, create=True)
             os.close(fd)
         for relative in FILES:

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "$0")/../../.." && pwd -P)
+fixture=${HARNESS_TEST_FIXTURE:?Run tests/compose-config.sh}
+mkdir -p "${fixture}/workspace/comfyui/"{models,custom_nodes,input,output,temp,user}
+for kind in models custom_nodes input output temp user; do
+  variable=$(printf 'COMFYUI_%s_PATH' "${kind}" | tr '[:lower:]' '[:upper:]')
+  export "${variable}=${fixture}/workspace/comfyui/${kind}"
+done
+export COMFYUI_TOKEN=test-bridge-token-with-at-least-32-characters
+export COMFYUI_BRIDGE_CERT="${fixture}/cert.crt"
+export COMFYUI_VERSION=v0.35.0
+export COMFYUI_COMMIT=40c4fcdf513a4523e39d54a9d391908af8df8171
+MODULE_DIR="${root}/modules/comfyui"
+# shellcheck disable=SC1091
+source "${MODULE_DIR}/module.sh"
+comfy_backend
+for backend in cuda mps; do
+  docker compose -f "${root}/compose.yaml" -f "${root}/compose.search.yaml" \
+    -f "${root}/modules/comfyui/compose.${backend}.yaml" config --quiet
+done

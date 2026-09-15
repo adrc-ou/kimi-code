@@ -37,8 +37,8 @@ RUN test -n "${COMFYUI_COMMIT}" \
     && git -C /opt/ComfyUI checkout --detach FETCH_HEAD \
     && test "$(git -C /opt/ComfyUI rev-parse HEAD)" = "${COMFYUI_COMMIT}"
 
-COPY comfy/requirements-linux.lock /tmp/requirements-linux.lock
-COPY comfy/requirements-custom.lock /tmp/requirements-custom.lock
+COPY modules/comfyui/backend/requirements-linux.lock /tmp/requirements-linux.lock
+COPY modules/comfyui/backend/requirements-custom.lock /tmp/requirements-custom.lock
 
 RUN test -n "${TORCH_VERSION}" \
     && test -n "${TORCHVISION_VERSION}" \

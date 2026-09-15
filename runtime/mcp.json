@@ -12,25 +12,6 @@
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
     },
-
-    "nvidia-cuda-docs": {
-      "url": "https://api.copilot.nsight.ngc.nvidia.com/mcp/cuda-docs",
-      "enabled": false,
-      "startupTimeoutMs": 30000,
-      "toolTimeoutMs": 120000
-    },
-
-    "huggingface": {
-      "url": "https://huggingface.co/mcp",
-      "bearerTokenEnvVar": "HF_TOKEN",
-      "enabled": true,
-      "enabledTools": [
-        "hf_fs"
-      ],
-      "startupTimeoutMs": 30000,
-      "toolTimeoutMs": 120000
-    },
-
     "context7": {
       "url": "https://mcp.context7.com/mcp",
       "bearerTokenEnvVar": "CONTEXT7_API_KEY",
@@ -38,7 +19,6 @@
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
     },
-
     "deepwiki": {
       "url": "https://mcp.deepwiki.com/mcp",
       "enabled": true,
@@ -50,7 +30,6 @@
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
     },
-
     "chrome-devtools": {
       "command": "chrome-devtools-mcp",
       "args": [
@@ -69,7 +48,6 @@
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
     },
-
     "serena": {
       "command": "serena",
       "args": [

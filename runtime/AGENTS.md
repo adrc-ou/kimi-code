@@ -56,27 +56,9 @@ conventions, and tests based on externally observable behavior.
 ## JavaScript / TypeScript
 
 Follow the repository's package manager, package.json scripts, formatter,
-linter, tsconfig, module conventions, and ComfyUI frontend conventions.
+linter, tsconfig, module conventions conventions.
 
 Do not add packages when the existing platform API is sufficient.
-
-## Tensor and model integration
-
-Never assume model-specific:
-
-- latent channel count;
-- image or video tensor layout;
-- temporal packing;
-- patch geometry;
-- VAE spatial or temporal compression;
-- dtype;
-- normalization range;
-- text encoder count;
-- context length;
-- scheduler/timestep convention.
-
-Derive these from current model configuration or authoritative implementation
-and record important boundaries in `.agent-state/TENSOR_CONTRACTS.md`.
 
 ## Verification
 
@@ -229,27 +211,7 @@ Allow the configured proxy to retry with backoff.
 Never work around NRP rate limits by opening additional connections, containers,
 credentials, or sessions.
 
-## ComfyUI development boundary
-
-The live ComfyUI service is available at `COMFYUI_URL`. If `COMFYUI_TOKEN` is
-set, helper clients must send it as a bearer token.
-
-Use `/opt/kimi-runtime/tools/comfyctl.py` and ComfyUI's machine-readable APIs for
-schema inspection, input upload, queue inspection, workflow execution, history,
-output download, and interruption.
-
-Custom-node source belongs under `/workspace/comfyui/custom_nodes`. Workflows
-belong under `/workspace/comfyui/user/default/workflows`. Both locations are
-intentionally writable.
-
-Do not modify the replaceable ComfyUI application or install packages at runtime.
-When a custom node needs another dependency, identify and pin the exact package
-version and report that `comfy/requirements-custom.txt` in the operator-managed
-harness must be reviewed, its hash-checked lock regenerated, and the selected
-backend recertified.
-
-Treat custom nodes as executable code. Inspect their source and dependency
-metadata before asking the operator to restart and load them.
+## Project extensions
 
 Project `.kimi-code/agents`, `.agents/agents`, `.kimi-code/skills`,
 `.agents/skills`, and `.kimi-code/mcp.json` are host-approved snapshots while a

@@ -135,18 +135,10 @@ def service_probe(name, full):
                 raise ValueError("required local executable is missing")
         subprocess.run(["playwright-cli", "--version"], check=True, capture_output=True, timeout=10)
         return "shell, Git, ripgrep, Python and Kimi present; Playwright CLI starts"
-    if name == "comfyui":
-        # Exercise the same TLS, bearer auth and API helper used by the agent.
-        import comfyctl
-
-        stats = comfyctl.request_json("GET", "/system_stats")
-        if not isinstance(stats, dict) or "system" not in stats:
-            raise ValueError("invalid ComfyUI stats")
-        if full:
-            schema = comfyctl.request_json("GET", "/object_info/EmptyImage")
-            if "EmptyImage" not in schema:
-                raise ValueError("missing EmptyImage node")
-        return "authenticated stats" + (" and node schema" if full else "")
+    probe = Path(__file__).parent / f"service_{name}.py"
+    if probe.is_file():
+        import runpy
+        return runpy.run_path(str(probe))["probe"](full)
     urls = {
         "kimi-web": "http://127.0.0.1:5494/",
         "model-proxy": "http://model-proxy:8080/healthz",
@@ -218,8 +210,10 @@ def main():
 
     config = json.loads(args.config.read_text())["mcpServers"]
     jobs = [("service", name) for name in (
-        "kimi-web", "model-proxy", "search", "comfyui", "local-tools"
+        "kimi-web", "model-proxy", "search", "local-tools"
     )]
+    jobs.extend(("service", path.stem.removeprefix("service_"))
+                for path in Path(__file__).parent.glob("service_*.py"))
     print("Service check (full)" if args.full else "Service check (quick)", flush=True)
     manual = False
     for name, server in config.items():

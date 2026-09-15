@@ -1,12 +1,9 @@
 """Exercise host entrypoints without operator credentials or a running stack."""
 
-import hashlib
-import json
 import os
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,12 +19,14 @@ class LauncherTests(unittest.TestCase):
         self.root = self.base / "harness with spaces"
         self.workspace = self.base / "workspace with spaces"
         for relative in (
-            "start.sh", "init-workspace.sh", "shell.sh", "extensions.sh",
+            "start.sh",
+            "shell.sh",
+            "extensions.sh",
             "doctor.sh",
-            "tools/runtime.sh", "tools/safe_workspace_init.py", "tools/verify_bind_paths.py",
-            "scripts/read_env.py", "scripts/install_comfy_macos.sh", "comfy/backend.env",
-            "scripts/select_macos_python.sh",
-            "dependencies.lock.json",
+            "tools/runtime.sh",
+            "tools/modules.py",
+            "tools/safe_workspace_init.py",
+            "scripts/read_env.py",
         ):
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -40,7 +39,9 @@ class LauncherTests(unittest.TestCase):
         self.bin.mkdir()
         (self.bin / "python3").symlink_to(sys.executable)
         self.command("uname", 'case "$1" in -s) echo Darwin;; -m) echo arm64;; esac\n')
-        self.command("docker", '''
+        self.command(
+            "docker",
+            """
 if [[ "$*" == "compose version" || "$*" == "info" ]]; then exit 0; fi
 if [[ "$*" == *"config --environment" ]]; then
   cat "$TEST_BOOTSTRAP"
@@ -48,7 +49,8 @@ if [[ "$*" == *"config --environment" ]]; then
 fi
 echo "Unexpected Docker call" >&2
 exit 99
-''')
+""",
+        )
         self.bootstrap = self.base / "bootstrap-fixture"
         self.bootstrap.write_text(f"WORKSPACE_PATH={self.workspace}\n")
         # Keep operator configuration out of test subprocesses.
@@ -74,30 +76,6 @@ exit 99
             check=False,
         )
 
-    def test_init_without_optional_paths_creates_workspace_and_releases_lock(self):
-        for _ in range(2):
-            result = self.run_script("init-workspace.sh")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("Initialized agent state", result.stdout)
-        self.assertTrue((self.workspace / "comfyui/user/default/workflows").is_dir())
-        manifests = list((self.root / ".local/runtime").glob("*/binds.json"))
-        self.assertEqual(len(manifests), 1)
-        self.assertEqual(
-            json.loads(manifests[0].read_text())["user"]["path"],
-            str(self.workspace / "comfyui/user"),
-        )
-        self.assertFalse(list((self.root / ".local/runtime").glob("*/bootstrap.*")))
-
-    def test_init_preserves_optional_external_paths(self):
-        models = self.base / "external models"
-        models.mkdir()
-        with self.bootstrap.open("a") as output:
-            output.write(f"COMFYUI_MODELS_PATH={models}\nCOMFYUI_USER_PATH=\n")
-        result = self.run_script("init-workspace.sh")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        manifest = next((self.root / ".local/runtime").glob("*/binds.json"))
-        self.assertEqual(json.loads(manifest.read_text())["models"]["path"], str(models))
-
     def test_start_reaches_selector_and_reports_failure(self):
         result = self.run_script("start.sh", "--non-interactive")
         self.assertEqual(result.returncode, 42, result.stderr)
@@ -105,14 +83,17 @@ exit 99
         self.assertIn("Harness failed at", result.stderr)
         self.assertFalse(list((self.root / ".local/runtime").glob("*/bootstrap.*")))
         # A failed start must leave the same instance available to init.
-        self.assertEqual(self.run_script("init-workspace.sh").returncode, 0)
+        self.assertEqual(self.run_script("start.sh", "--non-interactive").returncode, 42)
 
     def test_start_reports_unavailable_docker_before_version_selection(self):
-        self.command("docker", '''
+        self.command(
+            "docker",
+            """
 if [[ "$*" == "compose version" ]]; then exit 0; fi
 if [[ "$*" == *"config --environment" ]]; then cat "$TEST_BOOTSTRAP"; exit 0; fi
 exit 1
-''')
+""",
+        )
         result = self.run_script("start.sh")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Docker is not ready", result.stderr)
@@ -122,97 +103,6 @@ exit 1
         result = self.run_script("start.sh", "--non-interactive", "unexpected")
         self.assertEqual(result.returncode, 2)
         self.assertIn("usage:", result.stderr)
-
-    def test_macos_python_prefers_versioned_interpreter(self):
-        self.command("python3.12", "exit 0\n")
-        result = self.run_script("scripts/select_macos_python.sh")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), str(self.bin / "python3.12"))
-
-    def managed_python_fixture(self, valid=True):
-        (self.bin / "python3").unlink()
-        self.env["TEST_HOST_PYTHON"] = sys.executable
-        self.command("python3", '''
-if [[ "$1" == -c ]]; then exit 1; fi
-exec "$TEST_HOST_PYTHON" "$@"
-''')
-        # Make tests independent of any system Python 3.12 or package manager.
-        self.command("python3.12", "exit 1\n")
-        self.command("brew", "exit 99\n")
-        payload = self.base / "payload"
-        (payload / "python/bin").mkdir(parents=True)
-        python = payload / "python/bin/python3.12"
-        python.write_text(f"#!/bin/bash\nexit {0 if valid else 1}\n")
-        python.chmod(0o700)
-        archive = self.base / "python.tar.gz"
-        with tarfile.open(archive, "w:gz") as output:
-            output.add(payload / "python", arcname="python")
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        lock_path = self.root / "dependencies.lock.json"
-        lock = json.loads(lock_path.read_text())
-        lock["downloads"]["macos-python"]["digest"] = f"sha256:{digest}"
-        lock_path.write_text(json.dumps(lock))
-        self.env["TEST_ARCHIVE"] = str(archive)
-        self.env["HARNESS_RUNTIME_DIR"] = str(self.root / ".local/runtime/test")
-        self.command("curl", '''
-while [[ "$1" != --output ]]; do shift; done
-cp "$TEST_ARCHIVE" "$2"
-''')
-        return Path(self.env["HARNESS_RUNTIME_DIR"]) / "python" / digest
-
-    def test_macos_python_installs_verified_archive_and_reuses_it(self):
-        destination = self.managed_python_fixture()
-        result = self.run_script("scripts/select_macos_python.sh")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), str(destination / "python/bin/python3.12"))
-        self.assertTrue((destination / "python/bin/python3.12").is_file())
-        self.assertFalse(list(destination.parent.glob("install.*")))
-        self.command("curl", "exit 99\n")
-        reused = self.run_script("scripts/select_macos_python.sh")
-        self.assertEqual(reused.returncode, 0, reused.stderr)
-        self.assertEqual(reused.stdout, result.stdout)
-
-    def test_macos_python_rejects_bad_checksum_and_cleans_staging(self):
-        destination = self.managed_python_fixture()
-        Path(self.env["TEST_ARCHIVE"]).write_bytes(b"corrupted archive")
-        result = self.run_script("scripts/select_macos_python.sh")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("checksum mismatch", result.stderr)
-        self.assertFalse(destination.exists())
-        self.assertFalse(list(destination.parent.glob("install.*")))
-
-    def test_macos_python_rejects_incompatible_download(self):
-        destination = self.managed_python_fixture(valid=False)
-        result = self.run_script("scripts/select_macos_python.sh")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("does not run as arm64 Python 3.12", result.stderr)
-        self.assertFalse(destination.exists())
-        self.assertFalse(list(destination.parent.glob("install.*")))
-
-    def test_macos_python_download_failure_cleans_staging(self):
-        destination = self.managed_python_fixture()
-        self.command("curl", "exit 22\n")
-        result = self.run_script("scripts/select_macos_python.sh")
-        self.assertEqual(result.returncode, 22)
-        self.assertFalse(destination.exists())
-        self.assertFalse(list(destination.parent.glob("install.*")))
-
-    def test_macos_python_rejects_invalid_override_without_fallback(self):
-        self.command("python3.12", "exit 0\n")
-        self.env["COMFYUI_MACOS_PYTHON"] = str(self.base / "missing python")
-        result = self.run_script("scripts/select_macos_python.sh")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("COMFYUI_MACOS_PYTHON must point", result.stderr)
-        self.assertEqual(result.stdout, "")
-
-    def test_macos_python_valid_override_preserves_path_with_spaces(self):
-        python = self.base / "custom python"
-        python.write_text("#!/bin/bash\nexit 0\n")
-        python.chmod(0o700)
-        self.env["COMFYUI_MACOS_PYTHON"] = str(python)
-        result = self.run_script("scripts/select_macos_python.sh")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), str(python))
 
     def test_shell_reports_missing_runtime_instead_of_silent_exit(self):
         result = self.run_script("shell.sh")
@@ -231,29 +121,88 @@ cp "$TEST_ARCHIVE" "$2"
 
     def test_failed_command_diagnostic_does_not_echo_its_arguments(self):
         self.command("docker", "exit 17\n")
-        result = self.run_script("init-workspace.sh")
+        result = self.run_script("start.sh", "--non-interactive")
         self.assertEqual(result.returncode, 17)
         self.assertIn("Harness failed at", result.stderr)
         self.assertNotIn("config --environment", result.stderr)
 
-    def test_installer_preserves_existing_release_when_mps_check_fails(self):
-        self.command("shasum", 'cat >/dev/null\nprintf "fixture\\n"\n')
-        base = self.root / ".local/comfy-macos/0123456789abcdef"
-        release = base / "releases/fixture"
-        (release / "venv/bin").mkdir(parents=True)
-        python = release / "venv/bin/python"
-        python.write_text("#!/bin/bash\nexit 1\n")
-        python.chmod(0o700)
-        (release / "FINGERPRINT").write_text("fixture\n")
-        (base / "current").symlink_to("releases/fixture")
-        result = self.run_script(
-            "scripts/install_comfy_macos.sh", str(self.root), str(self.workspace),
-            "test-version", "test-commit", "python3", "0123456789abcdef",
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(python.is_file())
-        self.assertTrue((base / "current").is_dir())
-
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionFlowTests(unittest.TestCase):
+    """Use fake Docker/services to verify startup ordering without operator state."""
+
+    setUp = LauncherTests.setUp
+    command = LauncherTests.command
+    run_script = LauncherTests.run_script
+
+    def test_module_session_then_core_session_preserves_workspace(self):
+        for directory in ("tools", "runtime"):
+            shutil.copytree(ROOT / directory, self.root / directory, dirs_exist_ok=True)
+        (self.root / "scripts/select_versions.py").write_text("""
+import os
+from pathlib import Path
+path = Path(os.environ['HARNESS_SESSION_FILE'])
+path.write_text('KIMI_CODE_VERSION=0.42.0\\n'
+                'KIMI_CODE_ASSET_URL=https://example.invalid/asset\\n'
+                'KIMI_CODE_ASSET_SHA256=' + 'a'*64 + '\\n')
+with open(os.environ['TEST_EVENTS'], 'a') as output: output.write('kimi-version\\n')
+""")
+        module = self.root / "modules/demo"
+        module.mkdir(parents=True)
+        (module / "module.json").write_text(
+            '{"schema_version":1,"label":"Demo","workspace_directories":["demo/user"]}'
+        )
+        (module / "AGENTS.md").write_text("Demo instructions")
+        (module / "module.sh").write_text("""
+if [[ "${1:-}" == compatible ]]; then exit 0; fi
+module_configure() { echo configure >>"${TEST_EVENTS}"; }
+module_select_version() { echo module-version >>"${TEST_EVENTS}"; }
+module_prepare() { echo prepare >>"${TEST_EVENTS}"; }
+module_install() { echo install >>"${TEST_EVENTS}"; }
+module_start() { echo start >>"${TEST_EVENTS}"; }
+""")
+        self.bootstrap.write_text(f"WORKSPACE_PATH={self.workspace}\nLITELLM_API_KEY=fixture-key\n")
+        self.env["TEST_EVENTS"] = str(self.base / "events")
+        self.env["HARNESS_MODULES"] = "demo"
+        (self.bin / "python3").unlink()
+        self.env["TEST_REAL_PYTHON"] = sys.executable
+        self.command(
+            "python3",
+            """
+if [[ -n "${URL_TO_CHECK:-}" ]]; then cat >/dev/null; exit 0; fi
+exec "$TEST_REAL_PYTHON" "$@"
+""",
+        )
+        self.command(
+            "docker",
+            """
+if [[ "$*" == *"config --environment" ]]; then cat "$TEST_BOOTSTRAP"; exit 0; fi
+if [[ "$*" == *"config --format json" ]]; then echo '{}'; exit 0; fi
+if [[ "$*" == *"kimi --version" ]]; then echo 0.42.0; exit 0; fi
+if [[ "$*" == *"up --remove-orphans"* ]]; then sleep 1; exit 0; fi
+exit 0
+""",
+        )
+        result = self.run_script("start.sh", "--non-interactive")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.base / "events").read_text().splitlines(),
+            ["configure", "kimi-version", "module-version", "prepare", "install", "start"],
+        )
+        data = self.workspace / "demo/user/data"
+        data.write_text("keep")
+        self.assertIn("Demo instructions", (self.workspace / "AGENTS.md").read_text())
+        self.env["HARNESS_MODULES"] = ""
+        (self.base / "events").write_text("")
+        result = self.run_script("start.sh", "--non-interactive")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.base / "events").read_text(), "kimi-version\n")
+        self.assertEqual(data.read_text(), "keep")
+        self.assertNotIn("Demo instructions", (self.workspace / "AGENTS.md").read_text())
+        runtime = next((self.root / ".local/runtime").iterdir())
+        self.assertEqual((runtime / "last-modules.json").read_text().strip(), "[]")
+        self.assertFalse((runtime / "module.env").exists())
+        self.assertFalse((runtime / "nrp-api-key").exists())

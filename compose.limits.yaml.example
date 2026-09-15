@@ -22,7 +22,3 @@ services:
     cpus: 4
     pids_limit: 512
     logging: *bounded-logs
-  comfyui:
-    mem_limit: 32g
-    cpus: 12
-    logging: *bounded-logs

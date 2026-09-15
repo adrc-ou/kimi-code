@@ -17,25 +17,15 @@ harness_traps() {
 
 harness_platform() {
   case "$(uname -s):$(uname -m)" in
-    Darwin:arm64)
-      HARNESS_PLATFORM=darwin-arm64
-      HARNESS_PLATFORM_LABEL="macOS / Apple Silicon / MPS"
-      HARNESS_BACKEND=mps
-      HARNESS_KIMI_ASSET=kimi-code-linux-arm64.tar.gz
-      ;;
-    Linux:x86_64)
-      if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
-        HARNESS_PLATFORM=wsl2-x86_64
-        HARNESS_PLATFORM_LABEL="Windows / WSL2 / NVIDIA CUDA"
-        HARNESS_BACKEND=cuda
-        HARNESS_KIMI_ASSET=kimi-code-linux-x64.tar.gz
-      else
-        harness_die "Unsupported host. This project supports Apple Silicon macOS and Windows/WSL2 x86-64." || return
-      fi
-      ;;
-    *) harness_die "Unsupported host. On Windows, run inside WSL2, not Git Bash." || return ;;
+    Darwin:arm64) HARNESS_PLATFORM=darwin-arm64; HARNESS_KIMI_ASSET=kimi-code-linux-arm64.tar.gz ;;
+    Darwin:x86_64) HARNESS_PLATFORM=darwin-x86_64; HARNESS_KIMI_ASSET=kimi-code-linux-x64.tar.gz ;;
+    Linux:x86_64) HARNESS_PLATFORM=linux-x86_64; HARNESS_KIMI_ASSET=kimi-code-linux-x64.tar.gz
+      if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then HARNESS_PLATFORM=wsl2-x86_64; fi ;;
+    Linux:aarch64|Linux:arm64) HARNESS_PLATFORM=linux-arm64; HARNESS_KIMI_ASSET=kimi-code-linux-arm64.tar.gz ;;
+    *) harness_die "Unsupported host architecture; use macOS or Linux/WSL2 on arm64 or x86-64." || return ;;
   esac
-  export HARNESS_PLATFORM HARNESS_PLATFORM_LABEL HARNESS_BACKEND HARNESS_KIMI_ASSET
+  HARNESS_PLATFORM_LABEL=${HARNESS_PLATFORM}
+  export HARNESS_PLATFORM HARNESS_PLATFORM_LABEL HARNESS_KIMI_ASSET
 }
 
 harness_resolve_bootstrap_env() {
@@ -58,8 +48,9 @@ harness_resolve_bootstrap_env() {
   esac
   [[ "${HARNESS_WORKSPACE}" != *$'\n'* ]] || harness_die "WORKSPACE_PATH contains a newline" || return
   export WORKSPACE_PATH=${HARNESS_WORKSPACE}
+  export HARNESS_WORKSPACE
   local variable value
-  for variable in COMFYUI_MODELS_PATH COMFYUI_CUSTOM_NODES_PATH COMFYUI_INPUT_PATH COMFYUI_OUTPUT_PATH COMFYUI_TEMP_PATH COMFYUI_USER_PATH COMFYUI_MACOS_PYTHON COMPOSE_PROJECT_NAME LOCAL_UID LOCAL_GID; do
+  for variable in COMPOSE_PROJECT_NAME LOCAL_UID LOCAL_GID; do
     value=$(printf '%s\n' "${HARNESS_BOOTSTRAP_ENV}" | \
       python3 "${HARNESS_ROOT}/scripts/read_env.py" /dev/stdin "${variable}" 2>/dev/null || true)
     if [[ -n "${value}" ]]; then
@@ -124,10 +115,9 @@ harness_unlock() {
 
 harness_compose_files() {
   HARNESS_COMPOSE_FILES=(-f "${HARNESS_ROOT}/compose.yaml" -f "${HARNESS_ROOT}/compose.search.yaml")
-  if [[ "${HARNESS_BACKEND}" == cuda ]]; then
-    HARNESS_COMPOSE_FILES+=(-f "${HARNESS_ROOT}/compose.comfy.cuda.yaml")
-  else
-    HARNESS_COMPOSE_FILES+=(-f "${HARNESS_ROOT}/compose.comfy.mps.yaml")
+  harness_modules compose
+  if [[ -f "${HARNESS_COMPOSE_DIR}/module-environment.json" ]]; then
+    HARNESS_COMPOSE_FILES+=(-f "${HARNESS_COMPOSE_DIR}/module-environment.json")
   fi
   if [[ -f "${HARNESS_ROOT}/compose.limits.yaml" ]]; then
     HARNESS_COMPOSE_FILES+=(-f "${HARNESS_ROOT}/compose.limits.yaml")
@@ -160,6 +150,7 @@ harness_init() {
   HARNESS_RESOLVED_BOOTSTRAP=$(mktemp "${HARNESS_RUNTIME_DIR}/bootstrap.XXXXXX")
   printf '%s\n' "${HARNESS_BOOTSTRAP_ENV}" >"${HARNESS_RESOLVED_BOOTSTRAP}"
   unset HARNESS_BOOTSTRAP_ENV
+  export HARNESS_RESOLVED_BOOTSTRAP
 }
 
 harness_init_readonly() {
@@ -170,4 +161,21 @@ harness_init_readonly() {
   harness_resolve_bootstrap_env
   harness_instance
   unset HARNESS_BOOTSTRAP_ENV
+}
+
+# Hooks execute only operator-owned code installed in this harness, never workspace extensions.
+harness_modules() {
+  local phase=$1 module hook
+  [[ -f "${HARNESS_RUNTIME_DIR}/modules.list" ]] || return 0
+  while IFS= read -r module; do
+    [[ "${module}" =~ ^[a-z][a-z0-9_]*$ ]] || harness_die "Invalid module identifier" || return
+    MODULE_DIR="${HARNESS_ROOT}/modules/${module}"
+    [[ -f "${MODULE_DIR}/module.sh" ]] || harness_die "Session module removed; stop and restart the stack" || return
+    for hook in configure select_version prepare compose verify install check_build start; do
+      unset -f "module_${hook}" 2>/dev/null || true
+    done
+    # shellcheck disable=SC1091
+    source "${MODULE_DIR}/module.sh"
+    if declare -F "module_${phase}" >/dev/null; then "module_${phase}"; fi
+  done <"${HARNESS_RUNTIME_DIR}/modules.list"
 }

@@ -35,7 +35,7 @@ PY
 )
 url=${metadata%%$'\n'*}
 digest=${metadata#*$'\n'}
-base="${HARNESS_RUNTIME_DIR}/python"
+base="${HARNESS_RUNTIME_DIR}/module-data/comfyui/python"
 destination="${base}/${digest}"
 interpreter="${destination}/python/bin/python3.12"
 if [[ -e "${destination}" ]]; then

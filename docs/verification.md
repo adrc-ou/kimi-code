@@ -29,13 +29,13 @@ Python `kimi-cli` command set. No Homebrew installation is needed.
    ```
 
 Quick mode checks Kimi web, proxy health, search-adapter health, authenticated
-ComfyUI statistics, and every enabled harness MCP server's initialization and
+enabled module service probes, and every enabled harness MCP server's initialization and
 tool catalog (including configured tool allowlists). It also calls Chrome's
 `list_pages` to actually launch Chromium and Serena's `get_current_config` to
 detect missing project setup. Probes run concurrently, each bounded to 25 seconds.
 
 Full mode allows 60 seconds per probe and adds a real public web search through
-the authenticated search adapter and SearXNG, a ComfyUI node-schema request,
+the authenticated search adapter and SearXNG, enabled module functional probes,
 and representative read-only MCP calls: Hugging Face file metadata, DeepWiki
 repository structure, GitHub identity and Context7 library lookup when enabled.
 It does not enable disabled servers. No GPU jobs, model inference, private
@@ -65,14 +65,14 @@ merge project overrides or reuse Kimi's OAuth token store.
 | Chrome DevTools MCP | Agent container; launches sandboxed Chromium | No account; browsed sites may require login | On |
 | Playwright CLI and skill | Agent container; browser automation | No account; website access is external | Installed; not a separate MCP server |
 | Serena MCP | Agent container; code navigation/refactoring and language servers | No hosted account; needs a coding project and its language tooling | On |
-| Hugging Face MCP | Hugging Face's servers | Public Hub access; optional HF account/token for authenticated access | On, only `hf_fs` exposed |
+| Hugging Face MCP | Hugging Face's servers | Public Hub access; optional HF account/token for authenticated access | When ComfyUI selected; only `hf_fs` exposed |
 | DeepWiki MCP | Hosted by Cognition | Public indexed repositories; no account required | On |
 | GitHub MCP | Executable in agent container, calling GitHub's API | GitHub account and PAT | Off; read-only toolsets configured |
 | Context7 MCP | Hosted by Upstash | Public access with limits; optional account/API key | Off |
-| NVIDIA CUDA docs MCP | NVIDIA's servers | NVIDIA Developer sign-in / OAuth | Off; usable for docs even on a Mac |
+| NVIDIA CUDA docs MCP | NVIDIA's servers | NVIDIA Developer sign-in / OAuth | ComfyUI module; off until configured |
 | SearXNG | Separate local container | Queries outside search engines; no SearXNG account | On |
 | Search adapter | Separate local container | Uses only your SearXNG instance | On |
-| ComfyUI and `comfyctl.py` | Native MPS service on Mac; container on CUDA; helper in agent | No account for local execution; individual model downloads may require one | On; REST/WebSocket, not MCP |
+| ComfyUI and `comfyctl.py` | Native MPS service on Mac; container on CUDA; helper in agent | No account for local execution; individual model downloads may require one | When module selected; REST/WebSocket |
 | Harness skills | Read-only instruction files inside the agent | No account of their own; may direct use of the tools above | Installed |
 
 Remote MCP requests send tool arguments to their provider. Local execution does
@@ -100,7 +100,7 @@ return CAPTCHAs; a healthy container cannot rule that out.
 
 ## 3. Configure credentials
 
-Stop the stack before changing `.env` or `runtime/mcp.json`, then restart it.
+Stop the stack before changing `.env` or core or module `runtime/mcp.json`, then restart it.
 Do not paste credentials into chat, tracked JSON, shell command arguments, or a
 project MCP file. The two optional bearer variables below are now forwarded to
 the agent by Compose; declaring a variable in `.env` alone does not otherwise
@@ -118,7 +118,7 @@ make it available inside a container.
    grant write or administration permissions for this read-only configuration.
 5. If the organization requires approval, wait until the token is approved.
 6. Copy the token once into `GITHUB_PERSONAL_ACCESS_TOKEN` in your local `.env`.
-7. In `runtime/mcp.json`, change only `github.enabled` to `true`. Keep `--read-only`
+7. In core or module `runtime/mcp.json`, change only `github.enabled` to `true`. Keep `--read-only`
    and the limited toolsets.
 8. Restart. Run `./doctor.sh --full`; `get_me` verifies authentication. Then ask
    Kimi to read a known file, list issues, and list PRs in each selected repository.
@@ -128,7 +128,7 @@ See [GitHub's PAT instructions](https://docs.github.com/en/authentication/keepin
 Organizations may restrict token access; a 403 or an unexpected 404 can mean
 missing scope, pending approval, or an inaccessible repository.
 
-### GitHub releases: downloading Kimi/ComfyUI metadata
+### GitHub releases: downloading Kimi metadata
 
 `GITHUB_RELEASES_TOKEN` is a **different, host-side credential** used by the
 version selector for public release metadata/checksum downloads. It does not
@@ -173,7 +173,7 @@ Private Devin access is a different service and is not configured here.
 1. Sign in at the [Context7 dashboard](https://context7.com/dashboard) and create
    an API key if you need authenticated access/higher limits.
 2. Set `CONTEXT7_API_KEY` in `.env`; the MCP entry uses that variable as a bearer token.
-3. Set `context7.enabled` to `true` in `runtime/mcp.json`.
+3. Set `context7.enabled` to `true` in core or module `runtime/mcp.json`.
 4. Restart, run `./doctor.sh --full`, then ask Kimi to resolve a library and query
    its documentation. The automatic test covers resolution; test `query-docs`
    separately with the returned library ID.
@@ -183,7 +183,7 @@ No local `npx` installation is needed. See [Context7's official setup](https://g
 ### NVIDIA CUDA documentation
 
 1. Create/sign into an [NVIDIA Developer account](https://developer.nvidia.com/).
-2. Set `nvidia-cuda-docs.enabled` to `true` in `runtime/mcp.json`, then restart.
+2. Set `nvidia-cuda-docs.enabled` to `true` in `modules/comfyui/runtime/mcp.json`, then restart.
 3. In Kimi's MCP controls, authenticate this server. In the interactive Kimi TUI,
    use `/mcp-config login nvidia-cuda-docs` and follow the browser authorization
    flow. Use `./shell.sh`, then `kimi`, to open the TUI if needed.
@@ -210,7 +210,7 @@ Do not test by bypassing the proxy or launching extra concurrent model sessions.
 ## 4. Verify tools through Kimi, not just the transport
 
 Open a **fresh Kimi session** after configuration changes. Run `/mcp` and compare
-its enabled servers/tools with `runtime/mcp.json`. Project MCP entries override
+its enabled servers/tools with core or module `runtime/mcp.json`. Project MCP entries override
 same-named user entries, so the standalone doctor's result may differ from that
 session. `/mcp-config` configuration edits are constrained by this harness's
 read-only mounts; make harness configuration changes on the host while stopped.
@@ -232,7 +232,7 @@ An assistant's unsupported statement that a tool works is not evidence.
 | “Use web search to find Python's official documentation, then fetch the result.” | Search produces links and the fetch tool retrieves page content. |
 
 Serena's current `--project-from-cwd` setting discovers `.git` or
-`.serena/project.yml`. A fresh workspace with only ComfyUI data folders is not
+`.serena/project.yml`. A fresh workspace with only state/data folders is not
 automatically a code project. Activate the actual repository you intend to edit
 (for example a custom-node repository), rather than initializing Git over model
 storage merely to silence the check. Activation/onboarding may create project
@@ -246,13 +246,13 @@ tools, create/read/delete a test-only memory. Do not mass-invoke every advertise
 tool: tools that delete files, open external sessions, or execute code need
 individual test inputs and expected results.
 
-## 5. Verify ComfyUI execution and isolation
+## 5. Optional module verification
 
-While the stack is running, run the hardware-appropriate acceptance script:
+For an enabled ComfyUI module, run the hardware-appropriate acceptance script:
 
 ```bash
-bash tests/acceptance.sh mps    # Apple Silicon
-# or: bash tests/acceptance.sh cuda
+bash modules/comfyui/tests/acceptance.sh mps    # Apple Silicon
+# or: bash modules/comfyui/tests/acceptance.sh cuda
 ```
 
 This uploads a tiny fixture, executes an `EmptyImage → SaveImage` workflow,
@@ -278,8 +278,8 @@ MCP servers need their own equivalent connection, read and disposable-write test
 - Each relevant tool family has an observed successful call with checked output.
 - GitHub/private repository access and OAuth are tested separately from discovery.
 - A real model response, search/fetch, browser task, Serena symbol query, and
-  ComfyUI image workflow succeed.
-- Record Kimi/ComfyUI versions and which optional integrations were enabled.
+  enabled module acceptance tests succeed.
+- Record Kimi and selected module versions and which optional integrations were enabled.
 
 This is a reproducible acceptance record, not a promise that external services,
 token scopes, every future project language, or every model will remain healthy.

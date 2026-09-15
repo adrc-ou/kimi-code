@@ -13,7 +13,7 @@ commit=$4
 python_command=$5
 instance_id=$6
 [[ "${instance_id}" =~ ^[0-9a-f]{16}$ ]] || { echo "invalid instance id" >&2; exit 2; }
-base="${root}/.local/comfy-macos/${instance_id}"
+base="${root}/.local/runtime/${instance_id}/module-data/comfyui/app"
 releases="${base}/releases"
 current="${base}/current"
 old_link="${base}/old.$$"
@@ -29,10 +29,10 @@ fingerprint=$(
   {
     printf '%s\n' "${version}" "${commit}" "${python_command}"
     shasum -a 256 \
-      "${root}/comfy/backend.env" \
-      "${root}/comfy/requirements-macos.lock" \
-      "${root}/comfy/requirements-custom.lock" \
-      "${root}/scripts/install_comfy_macos.sh"
+      "${root}/modules/comfyui/backend/backend.env" \
+      "${root}/modules/comfyui/backend/requirements-macos.lock" \
+      "${root}/modules/comfyui/backend/requirements-custom.lock" \
+      "${root}/modules/comfyui/scripts/install_comfy_macos.sh"
   } | shasum -a 256 | awk '{print $1}'
 )
 release="${releases}/${fingerprint}"
@@ -81,9 +81,9 @@ test "$(git -C "${release}/app" rev-parse HEAD)" = "${commit}"
 
 "${python_command}" -m venv "${release}/venv"
 "${release}/venv/bin/python" -m pip install --require-hashes \
-  --requirement "${root}/comfy/requirements-macos.lock"
+  --requirement "${root}/modules/comfyui/backend/requirements-macos.lock"
 "${release}/venv/bin/python" -m pip install --require-hashes \
-  --requirement "${root}/comfy/requirements-custom.lock"
+  --requirement "${root}/modules/comfyui/backend/requirements-custom.lock"
 
 find "${release}/app/models" -depth -delete
 find "${release}/app/custom_nodes" -depth -delete

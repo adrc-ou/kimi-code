@@ -37,7 +37,6 @@ class ConfigurationTests(unittest.TestCase):
     def test_all_base_images_are_digest_pinned(self):
         for relative in (
             "container/Dockerfile",
-            "comfy/Dockerfile.cuda",
             "proxy/Dockerfile",
             "search-adapter/Dockerfile",
         ):

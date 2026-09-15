@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "nvidia-cuda-docs": {
+      "url": "https://api.copilot.nsight.ngc.nvidia.com/mcp/cuda-docs",
+      "enabled": false,
+      "startupTimeoutMs": 30000,
+      "toolTimeoutMs": 120000
+    },
+    "huggingface": {
+      "url": "https://huggingface.co/mcp",
+      "bearerTokenEnvVar": "HF_TOKEN",
+      "enabled": true,
+      "enabledTools": [
+        "hf_fs"
+      ],
+      "startupTimeoutMs": 30000,
+      "toolTimeoutMs": 120000
+    }
+  }
+}

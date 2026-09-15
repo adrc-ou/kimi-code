@@ -63,7 +63,6 @@ def main() -> None:
     ephemeral = {
         "proxy-token": secrets.token_urlsafe(32),
         "search-token": secrets.token_urlsafe(32),
-        "bridge-token": secrets.token_urlsafe(32),
         "nrp-api-key": api_key,
     }
     for name, value in ephemeral.items():
@@ -88,7 +87,6 @@ def main() -> None:
         os.chmod(path, 0o555)  # noqa: S103 - intentionally immutable in the container
     runtime_env = {
         "SEARCH_ADAPTER_TOKEN": ephemeral["search-token"],
-        "COMFYUI_TOKEN": ephemeral["bridge-token"],
         "NRP_API_KEY_FILE": str(args.runtime_dir / "nrp-api-key"),
         "NRP_INTERNAL_TOKEN_FILE": str(args.runtime_dir / "proxy-token"),
         "NRP_CACHE_SALT_FILE": str(args.runtime_dir / "cache-salt"),
@@ -97,9 +95,6 @@ def main() -> None:
         "KIMI_EMPTY_USER_AGENTS": str(args.runtime_dir / "user-agents"),
         "KIMI_EMPTY_USER_SKILLS": str(args.runtime_dir / "user-skills"),
         "KIMI_EMPTY_USER_PLUGINS": str(args.runtime_dir / "user-plugins"),
-        "COMFYUI_BRIDGE_MAX_BODY": values.get("COMFYUI_BRIDGE_MAX_BODY", "536870912"),
-        "COMFYUI_BRIDGE_MAX_WS_MESSAGE": values.get("COMFYUI_BRIDGE_MAX_WS_MESSAGE", "67108864"),
-        "COMFYUI_BRIDGE_MAX_CONNECTIONS": values.get("COMFYUI_BRIDGE_MAX_CONNECTIONS", "16"),
     }
     content = "".join(f"{key}={shlex.quote(value)}\n" for key, value in runtime_env.items())
     path = args.runtime_dir / "runtime.env"
