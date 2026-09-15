@@ -77,9 +77,11 @@ if [[ "${1:-}" == --runtime ]]; then
   compose=(docker compose -p "${test_project}" -f "${root}/compose.yaml" -f "${root}/compose.search.yaml")
   # Both a fresh cache and one already owned by SearXNG must initialize.
   "${compose[@]}" run --rm --no-deps searxng-init
+  # shellcheck disable=SC2016
   "${compose[@]}" run --rm --no-deps --entrypoint /bin/sh searxng -ec \
     'stat -c "%u:%g:%a" /var/cache/searxng; test "$(stat -c "%u:%g:%a" /var/cache/searxng)" = 977:977:700; echo preserved > /var/cache/searxng/test-marker'
   "${compose[@]}" run --rm --no-deps searxng-init
+  # shellcheck disable=SC2016
   "${compose[@]}" run --rm --no-deps --entrypoint /bin/sh searxng -ec \
     'test "$(stat -c "%u:%g:%a" /var/cache/searxng)" = 977:977:700; test "$(cat /var/cache/searxng/test-marker)" = preserved'
 
@@ -87,6 +89,7 @@ if [[ "${1:-}" == --runtime ]]; then
   # or mounting operator configuration. Cover default and custom host identities.
   for identity in 1000:1000 1234:2345; do
     export LOCAL_UID=${identity%:*} LOCAL_GID=${identity#*:}
+    # shellcheck disable=SC2016
     "${compose[@]}" config --format json | python3 -c '
 import json, os, sys
 services = json.load(sys.stdin)["services"]
