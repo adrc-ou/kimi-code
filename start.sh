@@ -156,8 +156,6 @@ PY
 }
 
 harness_modules start
-echo
-echo "Kimi Code: http://127.0.0.1:5494"
 echo "Instance:  ${HARNESS_INSTANCE_ID}"
 echo "Press Ctrl-C to stop everything."
 echo
@@ -167,12 +165,16 @@ harness_modules verify
 harness_compose up --remove-orphans --abort-on-container-failure &
 COMPOSE_PID=$!
 stack_started=true
-if wait_for_url http://127.0.0.1:5494/ "" "" 90; then
+if wait_for_url http://127.0.0.1:5494/api/v1/healthz "" "" 90; then
+  harness_compose exec -T kimi-agent python3 /opt/kimi-runtime/tools/register_workspace.py
+  echo "Kimi Code: http://127.0.0.1:5494 (workspace ready)"
+  python3 tools/open_kimi_browser.py docker compose --env-file "${root}/.env" "${HARNESS_COMPOSE_FILES[@]}" || true
   if ! harness_compose exec -T kimi-agent /opt/serena/bin/python /opt/kimi-runtime/tools/check_services.py; then
     echo "Service checks need attention. The stack remains running; see docs/verification.md and rerun ./doctor.sh." >&2
   fi
 else
-  echo "Kimi web did not become ready for service checks; inspect the startup logs." >&2
+  echo "Kimi web did not become ready for workspace registration; inspect the startup logs." >&2
+  exit 1
 fi
 while kill -0 "${COMPOSE_PID}" 2>/dev/null; do
   for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"}; do

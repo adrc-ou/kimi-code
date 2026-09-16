@@ -182,6 +182,8 @@ exec "$TEST_REAL_PYTHON" "$@"
 if [[ "$*" == *"config --environment" ]]; then cat "$TEST_BOOTSTRAP"; exit 0; fi
 if [[ "$*" == *"config --format json" ]]; then echo '{}'; exit 0; fi
 if [[ "$*" == *"kimi --version" ]]; then echo 0.42.0; exit 0; fi
+if [[ "$*" == *"/register_workspace.py" ]]; then echo register-workspace >>"$TEST_EVENTS"; exit 0; fi
+if [[ "$*" == *"/check_services.py" ]]; then echo check-services >>"$TEST_EVENTS"; exit 0; fi
 if [[ "$*" == *"up --remove-orphans"* ]]; then sleep 1; exit 0; fi
 exit 0
 """,
@@ -190,7 +192,7 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             (self.base / "events").read_text().splitlines(),
-            ["configure", "kimi-version", "module-version", "prepare", "install", "start"],
+            ["configure", "kimi-version", "module-version", "prepare", "install", "start", "register-workspace", "check-services"],
         )
         data = self.workspace / "demo/user/data"
         data.write_text("keep")
@@ -199,7 +201,7 @@ exit 0
         (self.base / "events").write_text("")
         result = self.run_script("start.sh", "--non-interactive")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.base / "events").read_text(), "kimi-version\n")
+        self.assertEqual((self.base / "events").read_text(), "kimi-version\nregister-workspace\ncheck-services\n")
         self.assertEqual(data.read_text(), "keep")
         self.assertNotIn("Demo instructions", (self.workspace / "AGENTS.md").read_text())
         runtime = next((self.root / ".local/runtime").iterdir())

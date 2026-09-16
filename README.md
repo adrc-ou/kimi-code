@@ -66,6 +66,17 @@ approved project extensions, and starts the segmented stack. Ctrl-C stops the
 containers and registered native module processes. Persistent workspace data
 is never removed when a module is unchecked or deleted.
 
+Before announcing readiness, the launcher registers `/workspace` with Kimi's
+authenticated local API. This persists in Kimi's state volume and makes it the
+default choice in a fresh UI. Existing sessions and remembered workspace choices
+are preserved; select `/workspace` once if your browser remembers another folder.
+Folder browsing and sandbox permissions are unchanged.
+The launcher then tests the banner's localhost URL followed by its network URLs
+in their displayed order and opens the first reachable one in the default system
+browser, including its authentication fragment. macOS uses `open`; Linux uses
+`xdg-open` (or `wslview` when installed on WSL). If no address is reachable or no
+browser opener is available, startup continues with a message for manual access.
+
 For repeatable automation, set explicit versions and disable prompts:
 
 ```bash
@@ -222,6 +233,15 @@ operator's credentials.
 Use `./shell.sh` from a second terminal to open a shell in the running Kimi
 container. It resolves the same instance, Compose files, generated secrets, and
 verified external paths as the launcher.
+
+## Persistent agent-state ownership
+
+Before Kimi starts, a network-isolated initializer repairs ownership of the
+Kimi and Serena named volumes to the configured agent UID/GID. This preserves
+sessions and settings across changes of host identity or rebuilt images. It
+mounts only those state volumes and its read-only script, with no workspace,
+Docker socket, network, or credentials. Kimi itself remains non-root with all
+capabilities dropped. Do not delete state volumes to fix an ownership mismatch.
 
 ## Optional host limits and cleanup
 

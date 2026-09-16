@@ -98,5 +98,38 @@ print(json.dumps({"services": {"cache-test": {
 }}}))
 ' >"${fixture}/cache-test.json"
     docker compose -p "${test_project}" -f "${fixture}/cache-test.json" run --rm cache-test
+    # Exercise the real initializer on fresh volumes, then migrate 1000:1000
+    # state to 1234:2345. Use the cached Python image without building Kimi.
+    # shellcheck disable=SC2016
+    "${compose[@]}" config --format json | python3 -c '
+import json, os, sys
+services = json.load(sys.stdin)["services"]
+initializer = services["agent-state-init"]
+initializer["image"] = services["searxng"]["image"]
+probe = {
+    "image": initializer["image"],
+    "user": os.environ["LOCAL_UID"] + ":" + os.environ["LOCAL_GID"],
+    "read_only": True, "network_mode": "none", "cap_drop": ["ALL"],
+    "security_opt": ["no-new-privileges:true"],
+    "volumes": [v for v in initializer["volumes"] if v["type"] == "volume"],
+    "entrypoint": ["python", "-c"],
+    "command": ["import os; from pathlib import Path; "
+                "roots=[Path(\"/state/kimi\"),Path(\"/state/serena\")]; "
+                "assert all(p.stat().st_uid == os.getuid() and p.stat().st_mode & 511 == 448 for p in roots); "
+                "p=roots[0]/\"server/instances\"; p.mkdir(parents=True,exist_ok=True); "
+                "marker=p/\"preserved\"; "
+                "assert not marker.exists() or marker.read_text() == \"keep\"; "
+                "marker.write_text(\"keep\"); marker.chmod(384); "
+                "link=roots[0]/\"outside-link\"; "
+                "link.is_symlink() or link.symlink_to(\"/etc/passwd\"); "
+                "(roots[1]/\"writable\").write_text(\"ok\")"],
+}
+print(json.dumps({"services": {"state-init-test": initializer, "state-write-test": probe},
+                  "volumes": {"kimi-state": {}, "serena-state": {}}}))
+' >"${fixture}/state-test.json"
+    for _ in 1 2; do
+      docker compose -p "${test_project}" -f "${fixture}/state-test.json" run --rm state-init-test
+      docker compose -p "${test_project}" -f "${fixture}/state-test.json" run --rm state-write-test
+    done
   done
 fi
