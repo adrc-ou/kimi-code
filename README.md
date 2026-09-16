@@ -40,6 +40,8 @@ Hosts need:
    host path, so avoid a location whose name you need to keep private.
 6. Keep the supplied NRP model and policy values unless the replacement model's
    identifier, context size, concurrency, and fair-use limits have been verified.
+   "NRP fair-use policy enforcement" below explains how the proxy derives every
+   lane reservation from those same values.
 
 The model identifier is the human-readable value exposed by the OU LiteLLM
 dashboard (not the upstream NRP model name/endpoint).
@@ -103,6 +105,42 @@ Generated secrets and native logs are kept under the instance-specific
 rendered provider configuration, and bridge certificates are deleted at normal
 shutdown. The private NRP cache salt persists so cached responses remain
 isolated across restarts.
+
+## NRP fair-use policy enforcement
+
+The managed qwen3 endpoint states three limits, and `model-proxy` enforces all
+three on the single credential it holds:
+
+- 200,000 output tokens per minute per API token and model. A rolling one-minute
+  ledger books each attempt's full output allowance before it starts and settles
+  it against measured usage; the gateway's own `x-ratelimit-remaining` header
+  wins whenever it reports less headroom. This is the only rule NRP meters for
+  you, and it returns HTTP 429.
+- Exactly one concurrent request once a request uses 35% or more of the served
+  context. The gate marks such a lane exclusive and admits it only when nothing
+  else is in flight.
+- Otherwise at most 16 concurrent qwen3 requests, with their combined context
+  inside 35% of the window. Live lane reservations are summed against a
+  320,000-token budget, deliberately below the 350,000-token ceiling.
+
+A reservation is `max_input_size` plus that lane's output clamp, read from the
+rendered Kimi configuration and revalidated on every request, so the proxy
+cannot silently disagree with what Kimi is configured to use: a configuration it
+cannot honour answers HTTP 503 instead of passing unmeasured traffic.
+
+At the shipped numbers `qwen3-primary` reserves its whole native 262,144-token
+window (196,608 input plus a 65,536 output clamp), `qwen3-long` reserves 965,536
+and is therefore strictly alone, and every `qwen3-subagent` reserves 64,000 with
+five permitted at once — `5 * 64,000 = 320,000`, the largest fan-out the budget
+allows. `qwen3-long` stays opt-in because its extra context comes from YaRN
+extension of the model's native window rather than native attention.
+
+Subagent and swarm wall-clock limits are unlimited: `timeout_ms = 0` in
+`runtime/config.toml`, re-pinned at every launch, never via the environment. A
+long run is bounded instead by `NRP_UPSTREAM_SOCK_READ_TIMEOUT` per stalled
+upstream read and `NRP_MAX_REQUEST_SECONDS` per client request, so a wedged
+stream cannot hold a scarce fair-use permit. Neither is a task-length limit.
+`docs/verification.md` shows how to read the policy currently in force.
 
 ## Persistent workspace contract
 
@@ -270,7 +308,8 @@ UI controls. Every other key is policy: a UI or `/config` edit that changes one
 is silently re-pinned from the baseline at the next launch, because the proxy's
 fair-use lane cannot be negotiated from inside the sandbox. That includes the
 permission mode, plan mode, skill and agent directories, provider definitions,
-model context sizes, and the forced subagent model. Widen
+model context sizes, the forced subagent model, and the `[subagent]`/`[swarm]`
+`timeout_ms = 0` that keeps subagent runs uncapped by wall clock. Widen
 `runtime/config-policy.json` deliberately if you want the UI to own another key.
 A stored `config.toml` that cannot be parsed is renamed to a timestamped
 `.unreadable-*` file and replaced with the baseline rather than starting Kimi

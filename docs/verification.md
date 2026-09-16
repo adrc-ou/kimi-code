@@ -204,6 +204,57 @@ documents OAuth login and configuration.
 `LITELLM_API_KEY` is supplied by your OU/NRP service administrator. It stays in
 the model-proxy container. Confirm the approved origin/model with that
 administrator; this harness cannot create an institutional account for you.
+
+The proxy enforces the three fair-use rules the policy actually states: 200,000
+output tokens per minute per API token and model (the only rule the gateway
+meters itself, with HTTP 429 — input tokens do not count); exactly one
+concurrent request once a request uses 35% or more of the served context; and
+otherwise at most 16 concurrent qwen3 requests whose combined context stays
+inside that 35%. Nothing about those numbers is baked into the proxy: each
+lane's reservation is `max_input_size` plus that lane's output clamp, read from
+the rendered Kimi configuration and revalidated on every request.
+
+Read the policy that is in force right now:
+
+```bash
+./shell.sh
+curl -s http://model-proxy:8080/healthz | python3 -m json.tool
+```
+
+Expect `policy_enforced: true` plus, per lane, its alias, context window, input
+allowance, output clamp, computed reservation, and whether that reservation is
+exclusive; then the rolling output-token window, the subagent permit count, the
+stall bound, and the per-request hold ceiling. `./doctor.sh` reports the same
+thing as `policy enforced (3 lanes; 5 subagent permits; budget 320000)`; a bare
+`HTTP ready` or a FAIL means the proxy has stopped verifying policy, not merely
+that it is slow.
+
+The served window is 1,000,000 tokens, of which 262,144 are native and the rest
+requires YaRN extension. `qwen3-primary` therefore reserves 262,144 and
+`qwen3-long` reserves 965,536, which is at or above 35% and so runs strictly
+alone. That is the intended shape, not a fault: a primary request and even one
+subagent reservation cannot both fit the deliberately stricter 320,000-token
+parallel budget.
+
+Drift fails closed. If the mounted configuration stops describing lanes the
+proxy can admit — `secondary_model.force` flipped off, an input allowance that
+cannot fit its own window plus the output clamp, or a reservation that could
+never be admitted — `/healthz` returns 503 and chat requests get 503 with
+`Retry-After` instead of unmeasured traffic. Confirm it once from the host, with
+the stack still running:
+
+```bash
+rendered=$(sed -n "s/^KIMI_RENDERED_CONFIG=//p" .local/runtime/*/runtime.env | tr -d "'")
+sed -i 's/^force = true/force = false/' "$rendered"
+docker compose exec -T kimi-agent curl -s -o /dev/null -w '%{http_code}\n' \
+  http://model-proxy:8080/healthz    # must print 503
+```
+
+Then stop the stack, run `./start.sh` to re-render, and confirm the code is 200
+again. Never edit the rendered file as a way to change policy: it is
+regenerated from `runtime/config.toml`, and the initializer re-stamps the
+agent's copy at every launch.
+
 A proxy health check validates its local policy/configuration, not upstream
 credential validity. Send one short prompt in Kimi and confirm a response.
 Do not test by bypassing the proxy or launching extra concurrent model sessions.
@@ -268,6 +319,9 @@ prepares before the agent starts. Check both halves after any change to
    keys were re-pinned from `runtime/config.toml`. Provider base URLs, API keys,
    internal proxy tokens, context ceilings, and the subagent concurrency lane
    must still match the rendered baseline even if you edited them in-session.
+   `[subagent]` and `[swarm]` are policy keys too: both must come back with
+   `timeout_ms = 0`, which is what keeps subagent wall-clock unlimited even
+   though the UI can rewrite the file.
 3. Confirm the staged operator files are protected and the settings file is
    not. Still in `./shell.sh`:
 

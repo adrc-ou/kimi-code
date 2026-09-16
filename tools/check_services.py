@@ -158,7 +158,20 @@ def service_probe(name, full):
         if not json.loads(payload).get("search_results"):
             raise ValueError("search returned no results")
         return "authenticated search returned results through SearXNG"
-    return "HTTP ready" + ("; upstream inference not tested" if name == "model-proxy" else "")
+    if name == "model-proxy":
+        # A 200 alone would hide a proxy that has stopped enforcing policy.
+        report = json.loads(payload)
+        if not report.get("policy_enforced"):
+            raise ValueError(f"policy not enforced: {report.get('policy_error', 'unknown')}")
+        summary = (
+            f"{len(report.get('lanes', {}))} lanes; "
+            f"{report.get('subagent_limit')} subagent permits; "
+            f"budget {report.get('parallel_context_budget')}"
+        )
+        return "policy enforced (" + summary + ")" + (
+            "; upstream inference not tested" if full else ""
+        )
+    return "HTTP ready"
 
 
 def run_probe(kind, name, full, config_path, timeout):

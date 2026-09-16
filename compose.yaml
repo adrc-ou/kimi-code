@@ -76,6 +76,19 @@ services:
       NRP_LONG_MAX_OUTPUT_TOKENS: "${NRP_LONG_MAX_OUTPUT_TOKENS:-65536}"
       NRP_SUBAGENT_MAX_OUTPUT_TOKENS: "${NRP_SUBAGENT_MAX_OUTPUT_TOKENS:-8192}"
 
+      # NRP's only gateway-enforced limit: output tokens per minute per API token.
+      NRP_OUTPUT_TOKENS_PER_MINUTE: "${NRP_OUTPUT_TOKENS_PER_MINUTE:-200000}"
+      NRP_OUTPUT_RATE_HEADROOM_PERCENT: "${NRP_OUTPUT_RATE_HEADROOM_PERCENT:-90}"
+      NRP_REQUEST_USAGE: "${NRP_REQUEST_USAGE:-1}"
+
+      # A wedged upstream stream must not hold a scarce fair-use permit.
+      NRP_UPSTREAM_SOCK_READ_TIMEOUT: "${NRP_UPSTREAM_SOCK_READ_TIMEOUT:-300}"
+      NRP_MAX_REQUEST_SECONDS: "${NRP_MAX_REQUEST_SECONDS:-3600}"
+
+      # Coarse anti-drift input ceiling; percent of the lane input cap.
+      NRP_INPUT_GUARD_PERCENT: "${NRP_INPUT_GUARD_PERCENT:-150}"
+      NRP_MEDIA_TOKEN_ESTIMATE: "${NRP_MEDIA_TOKEN_ESTIMATE:-1600}"
+
     secrets:
       - nrp_api_key
       - nrp_internal_token
@@ -141,10 +154,22 @@ services:
       KIMI_DISABLE_TELEMETRY: "1"
       KIMI_CODE_NO_AUTO_UPDATE: "1"
       KIMI_TOKEN_COUNTING_STRATEGY: "measured+estimated"
+
+      # Fair-use concurrency: the proxy grants at most KIMI_SUBAGENT_CONCURRENCY
+      # simultaneous subagent requests. Task slots sit above that so backgrounded
+      # Bash commands cannot consume a subagent lane; the extras queue at the proxy.
       KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY: "${KIMI_SUBAGENT_CONCURRENCY:-5}"
-      KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS: "${KIMI_SUBAGENT_CONCURRENCY:-5}"
-      KIMI_SUBAGENT_TIMEOUT_MS: "3600000"
-      KIMI_CODE_SWARM_TIMEOUT_MS: "3600000"
+      KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS: "${KIMI_BACKGROUND_TASK_SLOTS:-8}"
+      KIMI_CODE_BACKGROUND_BASH_TASK_TIMEOUT_S: "${KIMI_BACKGROUND_BASH_TASK_TIMEOUT_S:-0}"
+
+      # NRP models go down for maintenance and come back; retry rather than failing a
+      # multi-hour subagent run. Aborting a session still cancels immediately.
+      KIMI_CODE_INFINITE_RETRY: "1"
+
+      # Subagent and swarm wall-clock caps are intentionally NOT set here. Environment
+      # variables outrank config.toml and accept only a positive integer, so the
+      # unlimited setting lives in runtime/config.toml as [subagent]/[swarm]
+      # timeout_ms = 0, where the launcher re-pins it as policy.
 
       GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN:-}"
       CONTEXT7_API_KEY: "${CONTEXT7_API_KEY:-}"

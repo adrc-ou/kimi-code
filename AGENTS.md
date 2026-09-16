@@ -7,12 +7,23 @@ It is not the writable development workspace used by the contained agent.
 
 When changing NRP model, concurrency, context, or proxy behavior:
 - preserve NRP Fair Use compliance;
-- keep primary and subagent lanes mutually exclusive;
+- keep primary and subagent lanes mutually exclusive, which the reservation gate
+  derives from the configured windows rather than from a special case;
 - keep `secondary_model.force = true`;
 - verify proxy policy against the actual runtime Kimi configuration;
 - never place real model credentials in the kimi-agent container.
 - preserve strict `/primary`, `/long`, and `/subagent` route separation;
 - keep retries outside scarce fair-use permits during backoff;
+- keep output-rate admission outside fair-use permits too, so waiting on the
+  tokens-per-minute budget holds neither kind of capacity;
+- derive each lane's fair-use reservation from its `max_input_size` plus its own
+  output clamp in the rendered Kimi configuration, and revalidate it per request;
+  a configuration the proxy cannot fit must fail closed rather than pass traffic;
+- never reintroduce a hard-coded subagent or swarm wall-clock timeout in
+  `compose.yaml`. Unlimited is expressed only as `timeout_ms = 0` in
+  `runtime/config.toml`, where the launcher re-pins it, because those tables are
+  not user-owned; the equivalent environment variables outrank the file and
+  reject zero.
 - keep the persistent private cache salt out of logs and tracked files.
 
 Generated runtime files belong only under `.local/runtime/<instance>/`. Do not

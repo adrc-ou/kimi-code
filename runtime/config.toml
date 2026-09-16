@@ -46,8 +46,11 @@ api_key = "__MODEL_PROXY_TOKEN__"
 provider = "nrp-primary"
 model = "qwen3"
 
+# 262,144 is qwen3's native window; the advertised 1,000,000 needs YaRN scaling
+# and is opt-in through qwen3-long. Input plus the proxy's primary output clamp
+# (65,536) must fit inside max_context_size, so the input ceiling is 196,608.
 max_context_size = 262144
-max_input_size = 240000
+max_input_size = 196608
 
 capabilities = [
   "thinking",
@@ -165,10 +168,35 @@ strategy = "measured+estimated"
 
 
 [background]
-max_running_tasks = 5
+# Shared across background Agents and background Bash tasks, so this sits above the
+# proxy's subagent permit count: extra slots queue at the proxy instead of stealing a
+# lane from a subagent. Fair use is bounded by the proxy, not by this number.
+max_running_tasks = 8
 
 # Don't leave orphan processes after the session exits.
 keep_alive_on_exit = false
 
 # Long-running commands move to background rather than getting killed.
 bash_auto_background_on_timeout = true
+
+# Background Bash tasks get no wall-clock cap; the 0 here is what the compose
+# environment also forces, since the UI-owned [background] table can drift.
+bash_task_timeout_s = 0
+
+
+# ============================================================
+# Subagent wall-clock limits
+#
+# 0 means unlimited. These keys are NOT user-owned, so the launcher re-pins them
+# every start. Do not try to express "unlimited" through
+# KIMI_SUBAGENT_TIMEOUT_MS / KIMI_CODE_SWARM_TIMEOUT_MS: those variables take
+# higher priority than this file and accept only a positive integer, so 0 there
+# is an invalid value rather than a disabled cap.
+# ============================================================
+
+[subagent]
+timeout_ms = 0
+
+
+[swarm]
+timeout_ms = 0

@@ -80,5 +80,133 @@ class ConfigurationTests(unittest.TestCase):
         )
 
 
+COMPOSE_SOURCE = (ROOT / "compose.yaml").read_text()
+PROXY_SOURCE = (ROOT / "proxy" / "nrp_proxy.py").read_text()
+LANES = ("primary", "long", "subagent")
+
+
+def compose_value(key: str) -> int:
+    """The numeric fallback a compose environment entry is defaulted to."""
+    match = re.search(rf'^\s*{key}: "\$\{{[A-Z_]+:-(-?\d+)\}}"', COMPOSE_SOURCE, re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"{key} is not defaulted to a number in compose.yaml")
+    return int(match.group(1))
+
+
+def proxy_clamp(lane: str) -> int:
+    """The proxy's built-in output-token clamp for one lane."""
+    match = re.search(rf'"NRP_{lane.upper()}_MAX_OUTPUT_TOKENS", "(\d+)"', PROXY_SOURCE)
+    if match is None:
+        raise AssertionError(f"proxy has no default output clamp for lane {lane!r}")
+    return int(match.group(1))
+
+
+class FairUseInvariantsTests(unittest.TestCase):
+    """The checked-in numbers must still add up to the NRP fair-use policy."""
+
+    @classmethod
+    def setUpClass(cls):
+        with (ROOT / "runtime" / "config.toml").open("rb") as source:
+            cls.config = tomllib.load(source)
+        cls.clamps = {lane: proxy_clamp(lane) for lane in LANES}
+        cls.models = {}
+        for alias, model in cls.config["models"].items():
+            provider = str(model.get("provider", ""))
+            if provider.startswith("nrp-"):
+                cls.models[provider.removeprefix("nrp-")] = (alias, model)
+        cls.reserve = cls.config["loop_control"]["reserved_context_size"]
+
+    def lane_reservation(self, lane: str) -> int:
+        model = self.models[lane][1]
+        return model["max_input_size"] + self.clamps[lane]
+
+    def test_fair_use_numbers_come_from_compose_defaults(self):
+        self.assertEqual(compose_value("NRP_MODEL_CONTEXT"), 1000000)
+        self.assertEqual(compose_value("NRP_FAIR_USE_PERCENT"), 35)
+        self.assertEqual(compose_value("NRP_PARALLEL_CONTEXT_BUDGET"), 320000)
+        self.assertEqual(compose_value("NRP_OUTPUT_TOKENS_PER_MINUTE"), 200000)
+
+    def test_every_lane_is_bound_to_its_own_provider_and_route(self):
+        self.assertEqual(set(self.models), set(LANES))
+        for lane, (_alias, model) in self.models.items():
+            with self.subTest(lane=lane):
+                provider = self.config["providers"][f"nrp-{lane}"]
+                # A lane may not reach the model through another lane's route.
+                self.assertEqual(model["provider"], f"nrp-{lane}")
+                self.assertTrue(provider["base_url"].endswith(f"/{lane}/v1"))
+
+    def test_output_clamp_and_reserve_fit_every_lane(self):
+        for lane, (_alias, model) in self.models.items():
+            with self.subTest(lane=lane):
+                self.assertLessEqual(
+                    model["max_input_size"] + self.clamps[lane], model["max_context_size"]
+                )
+                self.assertLessEqual(
+                    model["max_input_size"] + self.reserve, model["max_context_size"]
+                )
+                self.assertLessEqual(model["max_context_size"], compose_value("NRP_MODEL_CONTEXT"))
+
+    def test_subagents_are_forced_onto_the_subagent_lane(self):
+        secondary = self.config["secondary_model"]
+        self.assertTrue(secondary["force"])
+        self.assertEqual(secondary["default_model"], self.models["subagent"][0])
+
+    def test_subagent_wall_clock_is_unlimited_and_policy_pinned(self):
+        # Unlimited has to live here: the equivalent environment variables outrank
+        # this file and reject 0, so expressing it in compose.yaml would fail startup.
+        self.assertEqual(self.config["subagent"]["timeout_ms"], 0)
+        self.assertEqual(self.config["swarm"]["timeout_ms"], 0)
+        policy = json.loads((ROOT / "runtime" / "config-policy.json").read_text())
+        for table in ("subagent", "swarm"):
+            self.assertNotIn(table, policy["user_owned"])
+
+    def test_compose_reintroduces_no_wall_clock_cap(self):
+        for key in ("KIMI_SUBAGENT_TIMEOUT_MS", "KIMI_CODE_SWARM_TIMEOUT_MS"):
+            self.assertIsNone(re.search(rf'^\s*{key}\s*:', COMPOSE_SOURCE, re.MULTILINE))
+
+    def test_subagent_fanout_is_the_largest_the_budget_allows(self):
+        concurrency = compose_value("KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY")
+        self.assertEqual(concurrency, compose_value("NRP_SUBAGENT_MAX_CONCURRENCY"))
+        budget = compose_value("NRP_PARALLEL_CONTEXT_BUDGET")
+        reservation = self.lane_reservation("subagent")
+        self.assertLessEqual(concurrency * reservation, budget)
+        self.assertEqual(concurrency, budget // reservation)
+        self.assertLessEqual(concurrency + 1, compose_value("NRP_MODEL_MAX_CONCURRENCY"))
+
+    def test_parallel_budget_stays_under_the_fair_use_ceiling(self):
+        ceiling = (
+            compose_value("NRP_MODEL_CONTEXT") * compose_value("NRP_FAIR_USE_PERCENT") // 100
+        )
+        self.assertLessEqual(compose_value("NRP_PARALLEL_CONTEXT_BUDGET"), ceiling)
+
+    def test_primary_lane_is_shared_but_long_context_is_exclusive(self):
+        ceiling = (
+            compose_value("NRP_MODEL_CONTEXT") * compose_value("NRP_FAIR_USE_PERCENT") // 100
+        )
+        self.assertLess(self.lane_reservation("primary"), ceiling)
+        self.assertGreaterEqual(self.lane_reservation("long"), ceiling)
+
+    def test_a_primary_request_cannot_share_the_budget_with_a_subagent(self):
+        budget = compose_value("NRP_PARALLEL_CONTEXT_BUDGET")
+        overlap = self.lane_reservation("primary") + self.lane_reservation("subagent")
+        self.assertGreater(overlap, budget)
+
+    def test_background_slots_do_not_steal_the_subagent_lane(self):
+        # [background] is user-owned, so compose also states the same numbers: the
+        # environment wins if the volume copy drifts.
+        self.assertEqual(
+            self.config["background"]["max_running_tasks"],
+            compose_value("KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS"),
+        )
+        self.assertEqual(
+            self.config["background"]["bash_task_timeout_s"],
+            compose_value("KIMI_CODE_BACKGROUND_BASH_TASK_TIMEOUT_S"),
+        )
+        self.assertGreaterEqual(
+            compose_value("KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS"),
+            compose_value("KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
