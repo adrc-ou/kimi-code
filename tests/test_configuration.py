@@ -46,8 +46,13 @@ class ConfigurationTests(unittest.TestCase):
                     self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
 
     def test_platform_key_is_not_persisted(self):
+        # Match any form (dict literal, CLI flag, variable): the selector writes
+        # a session file that is persisted and sourced by the launcher.
         selector = (ROOT / "scripts" / "select_versions.py").read_text()
-        self.assertNotIn('"PLATFORM_KEY":', selector)
+        self.assertIsNone(
+            re.search(r"platform[\s_-]*key", selector, re.IGNORECASE),
+            "select_versions.py must not accept or emit a platform key",
+        )
 
     def test_read_env_uses_last_resolved_value(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as output:

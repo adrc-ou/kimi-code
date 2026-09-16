@@ -56,7 +56,7 @@ conventions, and tests based on externally observable behavior.
 ## JavaScript / TypeScript
 
 Follow the repository's package manager, package.json scripts, formatter,
-linter, tsconfig, module conventions conventions.
+linter, tsconfig, module conventions.
 
 Do not add packages when the existing platform API is sufficient.
 

@@ -444,9 +444,7 @@ async def forward_chat(
                     allow_redirects=False,
                 )
 
-                #
                 # Retryable upstream errors
-                #
                 if response.status in RETRYABLE:
                     delay = retry_delay(response, attempt)
 
@@ -464,9 +462,6 @@ async def forward_chat(
                     response.close()
 
                 else:
-                    #
-                    # This includes your current HTTP 403 case.
-                    #
                     if (
                         response.content_length is not None
                         and response.content_length > MAX_RESPONSE_BYTES

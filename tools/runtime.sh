@@ -76,31 +76,6 @@ harness_instance() {
   export HARNESS_STATE_FILE HARNESS_SESSION_FILE HARNESS_IMAGE_SUFFIX COMPOSE_PROJECT_NAME
 }
 
-harness_path_notices() {
-  # Advisory only, never fatal. Bind sources appear verbatim in the agent's
-  # world-readable /proc/self/mountinfo and cannot be hidden from the container
-  # that owns the mount. The workspace is always bind-mounted, and approved
-  # project extensions are bind-mounted from this checkout, so any of these
-  # paths below $HOME publishes the host account name inside the sandbox.
-  # Named volumes are mounted from /docker/volumes/<project>_<name>/_data, so
-  # COMPOSE_PROJECT_NAME is published as well.
-  [[ -n "${HOME:-}" && "${HOME}" != "/" ]] || return 0
-  local inside=""
-  if [[ "${HARNESS_WORKSPACE}/" == "${HOME}/"* ]]; then
-    inside="workspace ${HARNESS_WORKSPACE}"
-  fi
-  if [[ -f "${HARNESS_COMPOSE_DIR}/approved-extensions.yaml" && "${HARNESS_ROOT}/" == "${HOME}/"* ]]; then
-    if [[ -n "${inside}" ]]; then
-      inside="${inside}, and the harness checkout ${HARNESS_ROOT}"
-    else
-      inside="harness checkout ${HARNESS_ROOT}"
-    fi
-  fi
-  [[ -n "${inside}" ]] || return 0
-  printf 'Notice: %s is below the host home directory (%s). The agent container can read that absolute path from its own mount table, and so can anything it sends outside the sandbox. Move it, or keep the workspace in a dedicated account directory, if the host account name must stay private.\n' \
-    "${inside}" "${HOME}" >&2
-}
-
 harness_lock() {
   HARNESS_LOCK_PATH="${HARNESS_RUNTIME_DIR}/launcher.lock"
   # FD 9 is reserved for the launcher. Python's flock works on both macOS and
@@ -172,7 +147,6 @@ harness_init() {
   harness_resolve_bootstrap_env
   harness_instance
   harness_lock
-  harness_path_notices
   HARNESS_RESOLVED_BOOTSTRAP=$(mktemp "${HARNESS_RUNTIME_DIR}/bootstrap.XXXXXX")
   printf '%s\n' "${HARNESS_BOOTSTRAP_ENV}" >"${HARNESS_RESOLVED_BOOTSTRAP}"
   unset HARNESS_BOOTSTRAP_ENV

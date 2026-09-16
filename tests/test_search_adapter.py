@@ -38,6 +38,48 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class SearchAdapterAccessLogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.lines = []
+        cls.original_log_message = ADAPTER.Handler.log_message
+        ADAPTER.Handler.log_message = lambda self, fmt, *args: cls.lines.append(fmt % args)
+        cls.adapter = ADAPTER.BoundedHTTPServer(
+            ("127.0.0.1", 0), ADAPTER.Handler, workers=2, queued=2
+        )
+        cls.adapter_thread = threading.Thread(target=cls.adapter.serve_forever, daemon=True)
+        cls.adapter_thread.start()
+        cls.base = f"http://127.0.0.1:{cls.adapter.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.adapter.shutdown()
+        cls.adapter.server_close()
+        cls.adapter_thread.join()
+        ADAPTER.Handler.log_message = cls.original_log_message
+
+    def get(self, path):
+        try:
+            with urllib.request.urlopen(f"{self.base}{path}") as response:
+                return response.status
+        except urllib.error.HTTPError as raised:
+            try:
+                return raised.code
+            finally:
+                raised.close()
+
+    def test_healthy_probe_is_not_logged(self):
+        self.lines.clear()
+        self.assertEqual(self.get("/healthz"), 200)
+        self.assertEqual(self.lines, [])
+
+    def test_other_requests_are_logged(self):
+        self.lines.clear()
+        self.assertEqual(self.get("/missing"), 404)
+        self.assertEqual(len(self.lines), 1)
+        self.assertIn("/missing", self.lines[0])
+
+
 class SearchAdapterTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

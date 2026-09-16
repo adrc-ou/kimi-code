@@ -189,10 +189,11 @@ No local `npx` installation is needed. See [Context7's official setup](https://g
    flow. Use `./shell.sh`, then `kimi`, to open the TUI if needed.
 4. Check `/mcp` in a fresh session and ask for CUDA documentation with a source link.
 
-The doctor reports this as `MANUAL`: its independent MCP client does not read or
-copy Kimi's OAuth token store. If browser callback handling fails across Docker,
-use the web UI's MCP authentication controls and inspect the reported flow error;
-do not put OAuth tokens in tracked JSON or open arbitrary ports as a workaround.
+Once the server is enabled, the doctor reports it as `MANUAL`: its independent MCP
+client does not read or copy Kimi's OAuth token store. If browser callback handling
+fails across Docker, use the web UI's MCP authentication controls and inspect the
+reported flow error; do not put OAuth tokens in tracked JSON or open arbitrary ports
+as a workaround.
 There is no `NVIDIA_API_KEY` variable wired into this project.
 [NVIDIA's connection instructions](https://developer.nvidia.com/nsight-ai) require
 Developer sign-in; [Kimi's MCP guide](https://moonshotai.github.io/kimi-code/en/customization/mcp)

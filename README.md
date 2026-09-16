@@ -214,7 +214,7 @@ Static and unit tests:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
-python3 -m compileall -q proxy scripts search-adapter tools tests
+python3 -m compileall -q proxy scripts search-adapter tests tools modules
 git ls-files '*.sh' -z | xargs -0 -n1 bash -n
 git ls-files '*.sh' -z | xargs -0 shellcheck
 ruff check .
@@ -286,8 +286,9 @@ and cannot be hidden from the container that owns the mount, and named-volume
 sources appear as `/docker/volumes/<project>_<name>/_data`. The agent therefore
 always learns the exact `WORKSPACE_PATH`, the Compose project name, and, when the
 workspace has approved project extensions, the extension snapshot paths under
-this checkout. The launcher prints a notice when the workspace is below `$HOME`,
-since that is normally your account name.
+this checkout. Those paths normally sit below your home directory, so your
+account name is included; keep it out of `WORKSPACE_PATH` and the harness
+checkout location if it must stay private.
 
 Everything else is now behind named volumes: the harness checkout layout, the
 instance directory name, the rendered configuration, and the generated secret

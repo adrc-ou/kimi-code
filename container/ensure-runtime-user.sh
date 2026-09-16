@@ -22,4 +22,3 @@ if [ -z "$user_name" ]; then
 fi
 
 install -d -o "$uid" -g "$gid" -m 700 "$home"
-printf '%s:%s\n' "$uid" "$gid" > /run/runtime-identity

@@ -9,3 +9,5 @@ container/node_modules/
 
 .agent-state/
 .kimi-code/
+.playwright-cli/
+.serena/

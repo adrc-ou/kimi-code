@@ -37,7 +37,11 @@ def register_workspace():
     if not isinstance(result, dict) or result.get("code") != 0:
         raise ValueError("Registration rejected")
     workspace = result.get("data")
-    if not isinstance(workspace, dict) or workspace.get("root") != "/workspace" or not workspace.get("id"):
+    if (
+        not isinstance(workspace, dict)
+        or workspace.get("root") != "/workspace"
+        or not workspace.get("id")
+    ):
         raise ValueError("Unexpected registration response")
 
 
@@ -47,7 +51,11 @@ def main():
     except (OSError, ValueError, urllib.error.URLError):
         # Do not print response bodies or exception details: they may contain
         # credentials or private server state.
-        print("Could not register /workspace with Kimi. Check server readiness and API compatibility.", file=sys.stderr)
+        print(
+            "Could not register /workspace with Kimi. "
+            "Check server readiness and API compatibility.",
+            file=sys.stderr,
+        )
         return 1
     print("Registered /workspace with Kimi.")
     return 0

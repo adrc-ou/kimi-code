@@ -86,13 +86,22 @@ def main():
         ).stdout
         url = first_reachable(advertised_urls(logs))
         if url is None:
-            print("No advertised Kimi URL is reachable; open the UI manually when ready.", file=sys.stderr)
+            print(
+                "No advertised Kimi URL is reachable; open the UI manually when ready.",
+                file=sys.stderr,
+            )
             return 1
         if not open_browser(url):
-            print("Could not open the default browser; use the Kimi URL in the ready banner.", file=sys.stderr)
+            print(
+                "Could not open the default browser; use the Kimi URL in the ready banner.",
+                file=sys.stderr,
+            )
             return 1
     except (OSError, ValueError, subprocess.SubprocessError):
-        print("Could not read Kimi's ready URLs; use the ready banner to open the UI manually.", file=sys.stderr)
+        print(
+            "Could not read Kimi's ready URLs; use the ready banner to open the UI manually.",
+            file=sys.stderr,
+        )
         return 1
     print("Opened Kimi Code in the default browser.")
     return 0

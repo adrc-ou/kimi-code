@@ -73,8 +73,8 @@ therefore always learn the exact host path of its workspace and the Compose
 project name, and it can learn the harness checkout path whenever the workspace
 has approved project-extension snapshots.
 
-The launcher prints a notice when the workspace sits below `$HOME`, because
-that is normally the operator's account name. Keep account names and other
+The workspace path normally sits below the operator's home directory, so the
+account name is part of what the agent can see. Keep account names and other
 sensitive path components out of the workspace location, out of the harness
 checkout location, and out of `COMPOSE_PROJECT_NAME`. Everything else in the
 harness root, including the instance directory, rendered configuration, and

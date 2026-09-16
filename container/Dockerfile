@@ -10,7 +10,8 @@ FROM ${UV_IMAGE} AS uv-bin
 
 FROM golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS github-mcp-builder
 
-ARG GITHUB_MCP_VERSION=v1.12.1
+# github/github-mcp-server v1.12.1, pinned by commit and mirrored in
+# dependencies.lock.json "sources".
 ARG GITHUB_MCP_COMMIT=7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d
 
 RUN apt-get update \

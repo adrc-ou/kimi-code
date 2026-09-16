@@ -11,7 +11,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("register_workspace", ROOT / "tools/register_workspace.py")
+spec = importlib.util.spec_from_file_location(
+    "register_workspace", ROOT / "tools/register_workspace.py"
+)
 registration = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(registration)
 
@@ -29,7 +31,10 @@ class RegistrationTests(unittest.TestCase):
     def run_registration(self, payload):
         with patch.object(registration.urllib.request, "build_opener") as build:
             build.return_value.open.return_value = io.BytesIO(json.dumps(payload).encode())
-            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            with (
+                contextlib.redirect_stdout(io.StringIO()) as out,
+                contextlib.redirect_stderr(io.StringIO()) as err,
+            ):
                 status = registration.main()
             request = build.return_value.open.call_args.args[0]
             return status, out.getvalue() + err.getvalue(), request, build.call_args.args
@@ -44,7 +49,9 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(json.loads(request.data), {"root": "/workspace"})
         self.assertEqual(request.get_header("Authorization"), "Bearer fixture-private-token")
         self.assertEqual(handlers[0].proxies, {})
-        self.assertIsNone(handlers[1].redirect_request(request, None, 302, "", {}, "https://example.invalid"))
+        self.assertIsNone(
+            handlers[1].redirect_request(request, None, 302, "", {}, "https://example.invalid")
+        )
         self.assertNotIn("fixture-private-token", output)
 
     def test_error_envelopes_and_wrong_workspace_fail_without_response_disclosure(self):

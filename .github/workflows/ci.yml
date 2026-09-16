@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main, restructure/current-kimi-code]
+    branches: [main, restructure/current-kimi-code, restructure/modularity]
   workflow_dispatch:
 
 permissions:

@@ -22,6 +22,7 @@ MAX_FIELD = int(os.environ.get("SEARCH_MAX_FIELD_CHARS", "16384"))
 MAX_OUTPUT_BYTES = int(os.environ.get("SEARCH_MAX_OUTPUT_BYTES", str(1024 * 1024)))
 CONNECT_TIMEOUT = float(os.environ.get("SEARCH_CONNECT_TIMEOUT", "10"))
 READ_TIMEOUT = float(os.environ.get("SEARCH_READ_TIMEOUT", "20"))
+HEALTH_PATH = "/healthz"
 
 
 def bounded_text(value, maximum: int = MAX_FIELD) -> str:
@@ -47,6 +48,19 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format_string, *args):
         print(format_string % args, flush=True)
 
+    def log_request(self, code="-", size="-"):
+        # The container health probe repeats every few seconds, so a healthy
+        # result is not worth a log line; failures still are.
+        path = urllib.parse.urlsplit(getattr(self, "path", "")).path
+        if (
+            isinstance(code, int)
+            and code < 400
+            and getattr(self, "command", "") == "GET"
+            and path == HEALTH_PATH
+        ):
+            return
+        super().log_request(code, size)
+
     def send_json(self, status, payload):
         body = json.dumps(payload, separators=(",", ":")).encode()
         if len(body) > MAX_OUTPUT_BYTES:
@@ -59,7 +73,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/healthz":
+        if self.path == HEALTH_PATH:
             self.send_json(200, {"status": "ok"})
         else:
             self.send_json(404, {"error": "not found"})
@@ -140,6 +154,7 @@ class BoundedHTTPServer(HTTPServer):
 
     def process_request(self, request, client_address):
         if not self.capacity.acquire(blocking=False):
+            print(f"overloaded: 503 to {client_address[0]}", flush=True)
             with request:
                 request.sendall(
                     b"HTTP/1.1 503 Service Unavailable\r\n"
