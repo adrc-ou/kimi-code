@@ -26,6 +26,24 @@ project `AGENTS.md` guidance remains part of the writable workspace.
 Do not reintroduce legacy `.agent/`, `.agent-container/`, `SAFE_CONTEXT`,
 or `KIMI_MODEL_*` configuration.
 
+## Agent state and settings
+
+Kimi's home is a writable named volume because the UI saves `config.toml` with a
+temporary-file rename. Never bind-mount a host file into `/home/agent/.kimi-code`
+again, and never make that whole path read-only.
+
+The root-only `agent-state-init` one-shot owns that volume's protected content:
+it stages runtime files, merges the user-owned keys from
+`runtime/config-policy.json` over the rendered baseline, and sets ext4 immutable
+flags. Keep every file that carries NRP policy re-pinned at launch rather than
+trusting in-session edits, keep the policy merge default-deny, and keep the
+initializer failing closed if the flags are not honoured.
+
+`kimi-agent` must receive no host binds other than the workspace, plus approved
+project-extension snapshots. Bind sources are visible in the agent's mount table,
+so never mount a path that names credentials, instance identities, or operator
+directories.
+
 ## Persistent workspace contract
 
 Module application code belongs in replaceable images or private native runtimes.

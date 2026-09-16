@@ -36,7 +36,8 @@ Hosts need:
 3. Set `LITELLM_API_KEY`.
 4. Set `SEARXNG_SECRET` to the output of `openssl rand -hex 32`.
 5. Set `WORKSPACE_PATH` to a dedicated directory containing only material the
-   agent is allowed to inspect and change.
+   agent is allowed to inspect and change. The agent can always see this exact
+   host path, so avoid a location whose name you need to keep private.
 6. Keep the supplied NRP model and policy values unless the replacement model's
    identifier, context size, concurrency, and fair-use limits have been verified.
 
@@ -179,11 +180,17 @@ and make one harmless read-only call before enabling the next.
 For GitHub, use a dedicated fine-grained read-only token restricted to required
 repositories. The Kimi process can access any token placed in its environment.
 
-Core and selected module MCP declarations are merged into a private runtime snapshot
-and mounted read-only, alongside selected skills, agents, and helper tools.
-Duplicate asset or MCP names fail startup instead of overriding core definitions.
-Edit this repository and restart to change declarations. OAuth and session state
-remain in Docker volumes.
+Core and selected module MCP declarations are merged into a private runtime
+snapshot and staged into the agent's read-only runtime mirror, alongside
+selected skills, agents, and helper tools. Duplicate asset or MCP names fail
+startup instead of overriding core definitions. Edit this repository and restart
+to change declarations. OAuth and session state remain in Docker volumes.
+
+The Kimi home copy of the MCP declaration is an immutable staged copy, so
+`/mcp-config` and UI edits to it fail closed rather than half-applying. Add or
+change a server on the host in `runtime/mcp.json` (or the project
+`.kimi-code/mcp.json` approval path below), then restart and open a fresh
+session.
 
 Chromium runs as the non-root agent with its process sandbox enabled and a
 reviewed seccomp profile. Do not add `--no-sandbox`, `SYS_ADMIN`, or an
@@ -234,14 +241,60 @@ Use `./shell.sh` from a second terminal to open a shell in the running Kimi
 container. It resolves the same instance, Compose files, generated secrets, and
 verified external paths as the launcher.
 
-## Persistent agent-state ownership
+## Persistent agent state and Kimi settings
 
-Before Kimi starts, a network-isolated initializer repairs ownership of the
-Kimi and Serena named volumes to the configured agent UID/GID. This preserves
-sessions and settings across changes of host identity or rebuilt images. It
-mounts only those state volumes and its read-only script, with no workspace,
-Docker socket, network, or credentials. Kimi itself remains non-root with all
-capabilities dropped. Do not delete state volumes to fix an ownership mismatch.
+The agent's own state lives in Docker named volumes, not on host binds: Kimi
+home, Serena cache, the read-only runtime asset mirror, and the placeholder
+volumes that shadow user-level agents, skills, and plugins. Settings saved in
+the Kimi UI therefore persist across restarts, rebuilt images, and changes of
+host identity. Do not delete state volumes to fix an ownership mismatch.
+
+Before Kimi starts, a network-isolated root initializer repairs volume
+ownership to the configured agent UID/GID and stages operator-controlled content
+into those volumes: the rendered runtime `AGENTS.md` and `SYSTEM.md`, the merged
+MCP declaration, and the selected skills/agents/tools tree. It then writes
+`config.toml` by overlaying the user-owned keys from whatever the volume already
+holds onto the freshly rendered baseline. Everything it stages is root-owned and
+readable but never writable by the agent; the three files that sit inside the
+agent-owned Kimi home additionally carry ext4 per-file immutable flags, because
+owning a directory lets you unlink anything in it regardless of the file's
+owner. That is what allows the Kimi home volume to be writable at all. The
+initializer mounts only its own script, the staging inputs, and those volumes: no
+workspace, Docker socket, network, or credentials. Kimi itself remains non-root
+with all capabilities dropped.
+
+`runtime/config.toml` is the commented source of truth for generated settings.
+The user-owned keys are declared in `runtime/config-policy.json` and currently
+cover the default model, thinking, telemetry, background-task, and experimental
+UI controls. Every other key is policy: a UI or `/config` edit that changes one
+is silently re-pinned from the baseline at the next launch, because the proxy's
+fair-use lane cannot be negotiated from inside the sandbox. That includes the
+permission mode, plan mode, skill and agent directories, provider definitions,
+model context sizes, and the forced subagent model. Widen
+`runtime/config-policy.json` deliberately if you want the UI to own another key.
+A stored `config.toml` that cannot be parsed is renamed to a timestamped
+`.unreadable-*` file and replaced with the baseline rather than starting Kimi
+with broken configuration.
+
+Model provider credentials, the per-instance base URL, and the internal proxy
+token are regenerated each launch and are never read back from the volume.
+
+## What the agent can see of the host
+
+Bind sources appear verbatim in `/proc/self/mountinfo`, which is world-readable
+and cannot be hidden from the container that owns the mount, and named-volume
+sources appear as `/docker/volumes/<project>_<name>/_data`. The agent therefore
+always learns the exact `WORKSPACE_PATH`, the Compose project name, and, when the
+workspace has approved project extensions, the extension snapshot paths under
+this checkout. The launcher prints a notice when the workspace is below `$HOME`,
+since that is normally your account name.
+
+Everything else is now behind named volumes: the harness checkout layout, the
+instance directory name, the rendered configuration, and the generated secret
+filenames under `.local/runtime/` no longer appear in the agent's mount table.
+Set `COMPOSE_PROJECT_NAME` to something neutral if the default
+`kimi_code_<instance-id>` name is not one you want published inside the
+sandbox.
 
 ## Optional host limits and cleanup
 

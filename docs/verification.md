@@ -212,8 +212,9 @@ Do not test by bypassing the proxy or launching extra concurrent model sessions.
 Open a **fresh Kimi session** after configuration changes. Run `/mcp` and compare
 its enabled servers/tools with core or module `runtime/mcp.json`. Project MCP entries override
 same-named user entries, so the standalone doctor's result may differ from that
-session. `/mcp-config` configuration edits are constrained by this harness's
-read-only mounts; make harness configuration changes on the host while stopped.
+session. `/mcp-config` edits to the harness MCP declaration do not persist: the
+agent's copy is an immutable staged file, so configure servers on the host and
+restart. Section 5 shows how to confirm settings persistence.
 
 Use these tasks one at a time and inspect the actual tool-call cards and results.
 An assistant's unsupported statement that a tool works is not evidence.
@@ -246,7 +247,75 @@ tools, create/read/delete a test-only memory. Do not mass-invoke every advertise
 tool: tools that delete files, open external sessions, or execute code need
 individual test inputs and expected results.
 
-## 5. Optional module verification
+## 5. Verify settings persistence and mount hygiene
+
+Kimi's settings live in a writable named volume that a root-only initializer
+prepares before the agent starts. Check both halves after any change to
+`compose.yaml`, `container/initialize-agent-state.py`,
+`tools/kimi_config_merge.py`, or `runtime/config*.toml`.
+
+1. In the Kimi web UI, change a user-owned setting (default model, thinking,
+   telemetry, background tasks, or experimental). The save must succeed. Open a
+   second terminal and confirm it landed in the volume:
+
+   ```bash
+   ./shell.sh
+   cat /home/agent/.kimi-code/config.toml
+   ```
+
+2. Stop and restart the stack, then confirm the value survived and that policy
+   keys were re-pinned from `runtime/config.toml`. Provider base URLs, API keys,
+   internal proxy tokens, context ceilings, and the subagent concurrency lane
+   must still match the rendered baseline even if you edited them in-session.
+3. Confirm the staged operator files are protected and the settings file is
+   not. Still in `./shell.sh`:
+
+   ```bash
+   lsattr /home/agent/.kimi-code/AGENTS.md /home/agent/.kimi-code/SYSTEM.md \
+     /home/agent/.kimi-code/mcp.json
+   stat -c '%a %U:%G %n' /opt/kimi-runtime /opt/kimi-runtime/skills \
+     /home/agent/.kimi-code/agents
+   ```
+
+   The three files must show the `i` flag and be mode `440`; the staged volume
+   directories must be mode `550`. Both must be owned by `root` with the agent's
+   primary group as the reader, which is what keeps them readable while the agent
+   cannot write them. Then check both directions of the boundary:
+
+   ```bash
+   echo probe >> /home/agent/.kimi-code/AGENTS.md && echo UNPROTECTED
+   rm -f /home/agent/.kimi-code/mcp.json && echo UNPROTECTED
+   touch /opt/kimi-runtime/skills/probe && echo UNPROTECTED
+   chattr -i /home/agent/.kimi-code/AGENTS.md && echo UNPROTECTED
+   python3 -c 'import os,pathlib;p=pathlib.Path("/home/agent/.kimi-code/config.toml");t=p.with_suffix(".toml.probe");t.write_bytes(p.read_bytes());os.replace(t,p)'
+   ```
+
+   Every `UNPROTECTED` line must be absent, the rename above (the exact mechanism
+   the settings UI uses) must succeed, and ordinary file tools in `/workspace`
+   must keep working. `chattr` exists in the image but cannot work without
+   `LINUX_IMMUTABLE`.
+4. Check what the agent can see of the host. Still inside `./shell.sh`:
+
+   ```bash
+   awk '$4 != "/" && $4 !~ /^\/(bus|fs|irq|null|zero|sys|proc|sysrq-trigger|dev)/ {
+     print $4 " -> " $5 }' /proc/self/mountinfo | sort -u
+   ```
+
+   Expected entries are the `/workspace` bind, the `/docker/volumes/...` named
+   volumes, Docker's own `/etc/host*`, `/etc/resolv.conf` and `docker-init`
+   files, and, only for a workspace with approved project extensions, its
+   `.local/runtime/<instance>/extension-snapshot/...` snapshots. No individual
+   harness file, generated configuration, or `.local/runtime` secret filename
+   may appear. The workspace path itself cannot be hidden; use one whose name is
+   not sensitive.
+5. A settings save that fails with `storage write failed: unrecognized I/O
+   error` means the Kimi home is not a writable volume, or the initializer
+   declined to start because the volume filesystem does not honour ext4
+   immutable flags. Read the `agent-state-init` service log; it fails closed
+   with the path and ioctl that were rejected rather than starting an
+   unprotected agent.
+
+## 6. Optional module verification
 
 For an enabled ComfyUI module, run the hardware-appropriate acceptance script:
 
@@ -273,6 +342,8 @@ MCP servers need their own equivalent connection, read and disposable-write test
 ## Completion checklist
 
 - Every expected enabled server appears in a fresh Kimi `/mcp` view.
+- A UI settings change saved without an error and survived a restart, and the
+  agent's mount table contains no harness file paths beyond the workspace.
 - Quick and full doctor checks have no unexplained failures; every `SETUP` or
   `MANUAL` result has been resolved or explicitly recorded as unused.
 - Each relevant tool family has an observed successful call with checked output.

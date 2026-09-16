@@ -33,6 +33,31 @@ class RenderRuntimeTests(unittest.TestCase):
             self.assertNotIn("__MODEL_PROXY_TOKEN__", (state / "kimi-config.toml").read_text())
             self.assertEqual(os.stat(state / "nrp-api-key").st_mode & 0o777, 0o600)
 
+    def test_runtime_environment_exposes_only_the_staging_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            env = Path(directory) / "resolved.env"
+            env.write_text("LITELLM_API_KEY=provider-secret\n")
+            subprocess.run(
+                [
+                    "python3",
+                    str(ROOT / "tools" / "render_runtime.py"),
+                    "--root",
+                    str(ROOT),
+                    "--runtime-dir",
+                    str(state),
+                    "--resolved-env",
+                    str(env),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            published = (state / "runtime.env").read_text()
+            self.assertIn("KIMI_RENDERED_CONFIG=", published)
+            self.assertIn("KIMI_SYSTEM_MD=", published)
+            self.assertNotIn("KIMI_EMPTY", published)
+            self.assertFalse((state / "user-agents").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

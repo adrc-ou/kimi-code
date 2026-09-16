@@ -6,3 +6,6 @@ container/node_modules/
 *.zip
 
 .DS_Store
+
+.agent-state/
+.kimi-code/

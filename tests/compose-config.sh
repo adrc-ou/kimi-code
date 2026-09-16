@@ -23,18 +23,17 @@ cleanup() {
   find "${fixture}" -depth -delete
 }
 trap cleanup EXIT
-mkdir -p "${fixture}/workspace" "${fixture}/empty"
-touch "${fixture}/config.toml" "${fixture}/SYSTEM.md" "${fixture}/secret" "${fixture}/cert.crt"
+mkdir -p "${fixture}/workspace" "${fixture}/empty" "${fixture}/assets/skills" \
+  "${fixture}/assets/agents" "${fixture}/assets/tools"
+touch "${fixture}/config.toml" "${fixture}/SYSTEM.md" "${fixture}/secret" "${fixture}/cert.crt" \
+  "${fixture}/assets/mcp.json"
 chmod 600 "${fixture}/"{config.toml,SYSTEM.md,secret,cert.crt}
 export HARNESS_RUNTIME_DIR="${fixture}"
 export HARNESS_TEST_FIXTURE="${fixture}"
 export WORKSPACE_PATH="${fixture}/workspace"
 export HARNESS_IMAGE_SUFFIX=test
 export KIMI_RENDERED_CONFIG="${fixture}/config.toml"
-export KIMI_EMPTY_SYSTEM="${fixture}/SYSTEM.md"
-export KIMI_EMPTY_USER_AGENTS="${fixture}/empty"
-export KIMI_EMPTY_USER_SKILLS="${fixture}/empty"
-export KIMI_EMPTY_USER_PLUGINS="${fixture}/empty"
+export KIMI_SYSTEM_MD="${fixture}/SYSTEM.md"
 export NRP_API_KEY_FILE="${fixture}/secret"
 export NRP_INTERNAL_TOKEN_FILE="${fixture}/secret"
 export NRP_CACHE_SALT_FILE="${fixture}/secret"
@@ -44,6 +43,30 @@ export KIMI_CODE_ASSET_URL=https://example.invalid/kimi.tar.gz
 export KIMI_CODE_ASSET_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 export LOCAL_UID=1000 LOCAL_GID=1000
 docker compose -f "${root}/compose.yaml" -f "${root}/compose.search.yaml" config --quiet
+
+# Mount hygiene: the agent container must not be able to read harness or host layout out of its
+# own mount table. Only the workspace bind may name a host path, and launcher-owned content must
+# arrive through volumes that the root-only initializer stages. Modules are checked by their own
+# compose-config.sh; a module that binds host files into kimi-agent must justify it there.
+docker compose -f "${root}/compose.yaml" -f "${root}/compose.search.yaml" config --format json \
+  | WORKSPACE_PATH="${fixture}/workspace" ROOT="${root}" python3 -c '
+import json, os, sys
+services = json.load(sys.stdin)["services"]
+agent = services["kimi-agent"]
+workspace = os.path.realpath(os.environ["WORKSPACE_PATH"])
+root = os.path.realpath(os.environ["ROOT"])
+for mount in agent["volumes"]:
+    if mount["type"] != "bind":
+        continue
+    source = os.path.realpath(mount["source"])
+    assert source == workspace, f"kimi-agent exposes host bind {source}"
+assert not any(mount["source"].startswith(f"{root}/") for mount in agent["volumes"] if "source" in mount)
+volumes = {mount["source"] for mount in agent["volumes"] if mount["type"] == "volume"}
+assert {"kimi-state", "serena-state", "kimi-assets"} <= volumes, volumes
+for name, service in services.items():
+    assert service.get("read_only") is True, f"{name} lost its read-only root filesystem"
+print("kimi-agent mounts expose only the workspace bind")
+'
 for check in "${root}"/modules/*/tests/compose-config.sh; do
   [[ ! -f "${check}" ]] || bash "${check}"
 done
@@ -125,7 +148,9 @@ probe = {
                 "(roots[1]/\"writable\").write_text(\"ok\")"],
 }
 print(json.dumps({"services": {"state-init-test": initializer, "state-write-test": probe},
-                  "volumes": {"kimi-state": {}, "serena-state": {}}}))
+                  "volumes": {"kimi-state": {}, "serena-state": {}, "kimi-assets": {},
+                              "kimi_user_agents": {}, "kimi_user_skills": {},
+                              "kimi_user_plugins": {}}}))
 ' >"${fixture}/state-test.json"
     for _ in 1 2; do
       docker compose -p "${test_project}" -f "${fixture}/state-test.json" run --rm state-init-test

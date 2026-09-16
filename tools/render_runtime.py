@@ -78,23 +78,18 @@ def main() -> None:
     if "__MODEL_PROXY_TOKEN__" in rendered or rendered == template:
         raise SystemExit("runtime/config.toml is missing the proxy token placeholder")
     write_secret(args.runtime_dir / "kimi-config.toml", rendered)
-    empty_system = args.runtime_dir / "SYSTEM.md"
-    empty_system.unlink(missing_ok=True)
-    write_secret(empty_system, "")
-    for name in ("user-agents", "user-skills", "user-plugins"):
-        path = args.runtime_dir / name
-        path.mkdir(exist_ok=True)
-        os.chmod(path, 0o555)  # noqa: S103 - intentionally immutable in the container
+    # Deliberately empty: the initializer stages this as an immutable root-owned SYSTEM.md, which
+    # denies the agent a writable system-prompt file without Kimi needing one from the harness.
+    system_markdown = args.runtime_dir / "SYSTEM.md"
+    system_markdown.unlink(missing_ok=True)
+    write_secret(system_markdown, "")
     runtime_env = {
         "SEARCH_ADAPTER_TOKEN": ephemeral["search-token"],
         "NRP_API_KEY_FILE": str(args.runtime_dir / "nrp-api-key"),
         "NRP_INTERNAL_TOKEN_FILE": str(args.runtime_dir / "proxy-token"),
         "NRP_CACHE_SALT_FILE": str(args.runtime_dir / "cache-salt"),
         "KIMI_RENDERED_CONFIG": str(args.runtime_dir / "kimi-config.toml"),
-        "KIMI_EMPTY_SYSTEM": str(empty_system),
-        "KIMI_EMPTY_USER_AGENTS": str(args.runtime_dir / "user-agents"),
-        "KIMI_EMPTY_USER_SKILLS": str(args.runtime_dir / "user-skills"),
-        "KIMI_EMPTY_USER_PLUGINS": str(args.runtime_dir / "user-plugins"),
+        "KIMI_SYSTEM_MD": str(system_markdown),
     }
     content = "".join(f"{key}={shlex.quote(value)}\n" for key, value in runtime_env.items())
     path = args.runtime_dir / "runtime.env"

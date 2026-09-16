@@ -138,11 +138,24 @@ with `create_host_path: false`.
 ## Runtime assembly and security
 
 Core and selected module skills, agents, tools and MCP entries are copied into
-`<runtime>/assets/` and mounted read-only at the existing runtime locations.
-Duplicate names fail closed. They cannot override core runtime assets. The core
-Kimi config and NRP provider policy remain authoritative. Module guidance is
-replaced in the marked section of workspace `AGENTS.md`; text outside the
-markers remains intact. Symlinks, hardlinks and malformed markers are refused.
+`<runtime>/assets/` and are otherwise unreachable to the agent. The initializer
+copies that tree into the agent's runtime mirror volume as root-owned,
+group-readable content, so `<runtime>/assets/` is the only path through which
+module runtime content reaches `/opt/kimi-runtime`. Duplicate names fail closed.
+Module content cannot override core runtime assets or the core Kimi config and
+NRP provider policy, which remain authoritative; only the initializer writes
+policy files. Module guidance is replaced in the marked section of workspace
+`AGENTS.md`; text outside the markers remains intact. Symlinks, hardlinks and
+malformed markers are refused.
+
+For the same reason, a module Compose overlay must not add host binds to
+`kimi-agent`. Every source path it names is disclosed in the agent's mount table,
+and each extra mount is one more thing a reviewer has to trace, so assets belong
+in `<runtime>/assets/` and per-instance state belongs in declared workspace
+directories or named volumes. `modules/comfyui/compose.mps.yaml` is the one
+current exception: the MPS bridge CA certificate is still bound at
+`/run/comfy-bridge/ca.crt`. It is a public certificate rather than a secret, but
+it does disclose an instance runtime path and should move to staged assets.
 
 Optional `runtime/tools/service_<id>.py` files define `probe(full)` and return a
 short success description. The doctor discovers only selected probes and runs
