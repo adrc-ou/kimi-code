@@ -7,8 +7,8 @@ COPY requirements.lock /app/requirements.lock
 
 RUN pip install --no-cache-dir --require-hashes --requirement /app/requirements.lock
 
-COPY nrp_proxy.py /app/nrp_proxy.py
+COPY model_proxy.py /app/model_proxy.py
 
 USER 65532:65532
 
-CMD ["python", "/app/nrp_proxy.py"]
+CMD ["python", "/app/model_proxy.py"]

@@ -80,8 +80,10 @@ services:
       agent-search: {}
       search-backend: {}
     read_only: true
+    # Bounded and non-executable: the adapter is pure Python that pre-installs its
+    # dependencies at build time and never writes a temporary file.
     tmpfs:
-      - /tmp:rw,nosuid,nodev
+      - /tmp:rw,nosuid,nodev,noexec,size=256m
     security_opt:
       - no-new-privileges:true
     cap_drop:

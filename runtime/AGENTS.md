@@ -88,13 +88,15 @@ Use read-only sub-agents aggressively for:
 - tensor-contract verification;
 - independent review.
 
-Fair use caps how many sub-agents NRP will *serve* at once, not how much work
-you may line up. AgentSwarm dispatches at most `KIMI_SUBAGENT_CONCURRENCY`
-(five by default) concurrently and the policy proxy enforces the same number
-upstream; extra background tasks queue at the proxy instead of oversubscribing
-the credential. Prefer to fan independent, bounded research out across all five
-lanes rather than serialising it, and treat waiting at the proxy as normal
-pacing, not as a failure.
+Fair use caps how many sub-agents the provider will *serve* at once, not how much
+work you may line up. The exact ceiling for the current model pair is published in
+the generated "Model runtime envelope" section of the workspace `AGENTS.md`, and
+the launcher configures `AgentSwarm` to dispatch no more than that number
+concurrently. The policy proxy enforces the same ceiling upstream, so extra
+background tasks queue at the proxy instead of oversubscribing the credential.
+Prefer to fan independent, bounded research out across every available lane rather
+than serialising it, and treat waiting at the proxy as normal pacing, not as a
+failure.
 
 Do not let several agents edit overlapping files concurrently.
 
@@ -150,86 +152,68 @@ Do not commit unless requested.
 
 Use `git status` and `git diff` frequently.
 
-## NRP managed-LLM fair-use policy
+## Managed model provider policy
 
-The configured qwen3 service (Qwen3.8-Flash-Next) is subject to the National
-Research Platform Fair Use Policy, which has exactly three rules:
+The model serving this workspace and the provider terms it is served under are
+chosen by the operator at launch, not here. Every concrete number - context
+window per lane, aggregate in-flight budget, concurrency ceiling, per-minute
+allowance - is published in the generated "Model runtime envelope" section of the
+workspace `AGENTS.md`, is recomputed on every start, and is enforced independently
+by the model proxy. Read that section for the numbers; treat this section as the
+rules that hold whatever the numbers turn out to be.
 
-1. 200,000 **output** tokens per minute per API token and model. This is the
-   only rule the gateway enforces by itself, with HTTP 429. Input tokens do not
-   count against it, and `x-ratelimit-remaining` / `x-ratelimit-reset` report
-   the headroom that remains.
-2. A request that uses at least 35% of the served context window may only have
-   one concurrent request for that token and model.
-3. Any other request may run concurrently up to 16 simultaneous qwen3 requests,
-   provided their combined context stays inside 35% of the window.
+The proxy enforces three families of provider rule:
 
-The served context window is 1,000,000 tokens: 262,144 of it native, the rest
-available only through YaRN extension. At 35%, the concurrent-context ceiling is
-350,000 tokens.
-
-This installation intentionally uses a stricter 320,000-token aggregate
-parallel budget, so ordinary traffic never lands exactly on the ceiling.
-
-The model proxy enforces all three rules. It reserves the worst-case in-flight
-context of each lane as `max_input_size + that lane's output clamp`, read from
-the rendered Kimi configuration for every request rather than hard-coded, so a
-configuration the proxy cannot honour fails closed with HTTP 503 instead of
-sending unverifiable traffic.
+- **Context.** Concurrent requests share an aggregate in-flight token budget
+  derived from the provider's own fraction of the model window, applied with the
+  provider's declared safety margin. A lane's cost is its input ceiling plus its
+  output clamp, read from Kimi's live rendered configuration rather than
+  hard-coded, so a configuration the proxy cannot honour fails closed with HTTP
+  503 instead of sending unverifiable traffic.
+- **Exclusivity.** A single request at or above the provider's threshold runs
+  alone. The proxy admits it only when nothing else is in flight, and holds the
+  others queued until it finishes.
+- **Rate.** Rolling per-minute ledgers, booked at the lane's full output
+  allowance before the request starts and settled against usage measured out of
+  the response stream. Where the gateway reports less remaining quota than the
+  proxy does, the gateway's number wins.
 
 ### Primary requests
 
-Primary-agent requests use the `nrp-primary` provider lane.
+Primary-agent traffic uses the primary provider lane, and the long-context lane
+when the operator selected a model that declares one. Both are primary requests: a
+long request is a bigger primary step, never a way to obtain subagent-style
+concurrency, and it is served alone precisely because it is large.
 
-The normal primary model reserves 262,144 tokens — 196,608 input plus the
-proxy's 65,536 output clamp — which sits below the 350,000 exclusivity
-threshold, while leaving no room in the 320,000 budget for even one subagent
-reservation beside it. Primary traffic is therefore alone in practice without
-being declared exclusive. A primary request must never be deliberately routed
-through the subagent lane.
+Keep the default model as launched. Each lane's input ceiling sits below its own
+window on purpose, because the proxy clamps the response's output budget and a
+truncated thinking step is worse than compacting slightly earlier.
 
-Keep `qwen3-primary` as the default. Its input ceiling is below its own
-262,144-token window on purpose: the proxy clamps every response at 65,536
-output tokens, and a truncated thinking step is worse than compacting slightly
-earlier.
-
-The `qwen3-long` model reserves 965,536 tokens, which reaches the 35% ceiling,
-so rule 2 makes it strictly alone. It buys the YaRN-extended 1,000,000-token
-window and remains a primary request; use it when a single step genuinely needs
-more than 196,608 input tokens, not as a routine default.
+A primary request must never be deliberately routed through the subagent lane.
 
 ### Subagents
 
-Every subagent is forced onto `qwen3-subagent`.
+Every subagent is forced onto the subagent lane, and its context is bound to the
+lane the harness published. Do not attempt to override the secondary model with
+`primary`, and do not bypass the configured model proxy.
 
-Its maximum context is 64,000 tokens: 55,808 input plus the subagent lane's
-8,192 output clamp, which is the reservation the proxy charges it.
-
-At most five subagent requests may execute concurrently, which exactly fills the
-parallel budget:
-
-    5 * 64,000 = 320,000
-
-Do not attempt to override the secondary model with `primary`.
-
-Do not bypass the configured model proxy.
-
-Do not directly invoke the NRP/LiteLLM endpoint with curl, Python HTTP clients,
-or other tools.
-
-Do not start another independent Kimi stack using the same NRP API credential
-unless it shares the same NRP policy scheduler.
+Do not directly invoke a provider endpoint with curl, Python HTTP clients, or
+other tools, and do not start another independent Kimi stack that would use the
+same provider credential unless it shares the same policy scheduler. Both actions
+spend capacity the proxy cannot see.
 
 ### Parallel work
 
-Use parallel agents primarily for independent, bounded research tasks.
+Use parallel agents primarily for independent, bounded research tasks, and run as
+many as the published envelope allows. Under-using the allowance buys nothing.
 
 Prefer concise evidence handoffs rather than allowing every subagent to consume
-its entire context window.
+its entire context window: context is the scarce resource, and every token in
+flight is charged against the shared budget.
 
-If a task needs substantially more than 64K of isolated context, perform it
-sequentially in the primary agent or change the operator-selected concurrency
-profile rather than exceeding the aggregate parallel budget.
+If a task needs substantially more context than the subagent lane offers,
+perform it sequentially in the primary agent, or use the long-context lane if the
+primary model declares one, rather than exceeding the aggregate budget.
 
 ### Long-running work
 
@@ -240,26 +224,22 @@ that: those tables are policy-pinned and re-stamped at every start, while
 accept only a positive integer, so they cannot say "no limit".
 
 A long subagent run is bounded by the proxy instead. No upstream read may stall
-for longer than `NRP_UPSTREAM_SOCK_READ_TIMEOUT`, and one client request may not
-be retried for longer than `NRP_MAX_REQUEST_SECONDS`. Both exist so a wedged
-stream cannot keep a scarce fair-use permit; neither is a task-length limit, and
+for longer than `MODEL_PROXY_SOCK_READ_TIMEOUT`, and one client request may not
+be retried for longer than `MODEL_PROXY_MAX_REQUEST_SECONDS`. Both exist so a
+wedged stream cannot keep a scarce permit; neither is a task-length limit, and
 hitting one is a reason to resume the work, not to redesign it.
 
-### Rate limiting
+### Backpressure
 
-Rule 1 is metered before a request is sent: each attempt books its lane's full
-output allowance against a rolling minute, then settles to the usage measured
-out of the response stream. Bookings are released while the proxy is backing
-off, so waiting for NRP never spends capacity. If the gateway reports less
-remaining quota than the proxy does, the gateway's number wins.
-
-NRP may temporarily return HTTP 429 or server errors.
+The provider may temporarily return HTTP 429 or server errors.
 
 Treat these as backpressure, not as a reason to increase concurrency.
 
-Allow the configured proxy to retry with backoff.
+Allow the configured proxy to retry with backoff. Bookings are released while the
+proxy is backing off, so waiting for the provider never spends capacity, and a
+request queued behind a permit is not a failed request.
 
-Never work around NRP rate limits by opening additional connections, containers,
+Never work around a provider limit by opening additional connections, containers,
 credentials, or sessions.
 
 ## Project extensions

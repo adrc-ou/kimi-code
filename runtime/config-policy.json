@@ -1,7 +1,6 @@
 {
   "schema_version": 1,
   "user_owned": [
-    "default_model",
     "thinking",
     "telemetry",
     "background",

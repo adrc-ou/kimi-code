@@ -1,0 +1,88 @@
+# Provider definition: endpoint, credentials, and policy rules for one upstream service.
+#
+# Schema and rationale: docs/models-providers.md. Policy lives here, keyed by rule kind and
+# scope, so the launcher can resolve it against whichever models the operator selects.
+# The directory name is the stable identifier that models reference with `provider = "nrp"`.
+
+schema_version = 1
+label = "NRP"
+
+# Published fair-use terms these rules were transcribed from. Kept here so an operator
+# re-reading the policy after a change starts from the same source of truth.
+policy_url = "https://nrp.ai/documentation/userdocs/ai/llm-managed/fair-use"
+
+[endpoint]
+# Origin only, no /v1 suffix. This is the documented default for this deployment; an
+# operator may override it by setting the variable named in base_url_env in .env.
+base_url = "https://litellm.lib.ou.edu"
+base_url_env = "NRP_BASE_URL"
+
+# Kimi provider type used for the generated provider tables.
+protocol = "openai"
+
+# Named credentials. A credential id maps to one API key, and any number of models may
+# name the same id to share it. Values never enter .env for the session path: they are
+# read from `env` when present, otherwise prompted for once and stored in a mode-0600
+# session file that is mounted into the proxy container as a Docker secret.
+[[credential]]
+id = "default"
+label = "NRP managed-LLM API token"
+prompt = "NRP API token"
+env = "NRP_API_KEY"
+key_url = "https://litellm.lib.ou.edu/ui/?page=api-keys"
+
+# ------------------------------------------------------------
+# Fair-use rules
+#
+# NRP states three rules. Only the first is enforced by the gateway itself; the other two
+# are terms of use that this harness enforces on the operator's behalf.
+#
+#   1. 200,000 output tokens per minute per API token and model.
+#   2. A single request using at least 35% of the model's context length is limited to
+#      one concurrent request.
+#   3. Otherwise at most 16 concurrent requests for qwen3, and all concurrent requests
+#      combined must stay within 35% of the model's context length.
+#
+# `scope` decides which traffic shares a counter, which is what makes selecting the same
+# model for both lanes behave differently from two models: "model" keys are the wire model
+# identifier, so both lanes hit one counter; "credential_model" keys pair the API token
+# with the model.
+# ------------------------------------------------------------
+
+[[rule]]
+kind = "output_tokens_per_minute"
+scope = "credential_model"
+limit = 200000
+
+[[rule]]
+kind = "exclusive_above_context_fraction"
+scope = "model"
+percent = 35
+
+[[rule]]
+kind = "max_concurrent_requests"
+scope = "model"
+limit = 16
+
+[[rule]]
+kind = "aggregate_context_fraction"
+scope = "model"
+percent = 35
+
+# ------------------------------------------------------------
+# Deliberate under-use of the rules above.
+#
+# These are the only tunables here, and they exist because request cost is estimated
+# before it is known. The resolved budget is always the provider's own threshold
+# multiplied by the margin, never a number that can exceed the published rule.
+#
+#   context_margin_percent      aggregate in-flight context budget, as a share of the
+#                               35% threshold. At 95% of 350,000 the derived budget is
+#                               332,500, which admits five 64,000-token subagents and
+#                               still overlaps one subagent with the primary lane.
+#   output_rate_margin_percent  booked share of the per-minute output allowance, leaving
+#                               room for estimates that land slightly low.
+# ------------------------------------------------------------
+[safety]
+context_margin_percent = 95
+output_rate_margin_percent = 90

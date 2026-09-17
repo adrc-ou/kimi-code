@@ -39,10 +39,13 @@ harness_compose exec kimi-agent python3 /opt/kimi-runtime/tools/comfyctl.py down
 
 # Expansion must occur inside the container.
 # shellcheck disable=SC2016
-harness_compose exec kimi-agent sh -c 'test -z "${LITELLM_API_KEY:-}${NRP_API_KEY:-}"'
-harness_compose exec search-adapter sh -c 'test ! -r /run/secrets/nrp_api_key && ! getent hosts model-proxy'
+harness_compose exec kimi-agent sh -c 'test -z "${NRP_API_KEY:-}"'
+# Credentials are mounted only into model-proxy, under the secret name the selected
+# definitions generate, so no other service may read any file below /run/secrets.
+harness_compose exec kimi-agent sh -c '! ls -A /run/secrets/* >/dev/null 2>&1'
+harness_compose exec search-adapter sh -c '! ls -A /run/secrets/* >/dev/null 2>&1 && ! getent hosts model-proxy'
 if [[ "${expected_backend}" == cuda ]]; then
-  harness_compose exec comfyui sh -c 'test ! -r /run/secrets/nrp_api_key && ! getent hosts model-proxy'
+  harness_compose exec comfyui sh -c '! ls -A /run/secrets/* >/dev/null 2>&1 && ! getent hosts model-proxy'
   harness_compose exec comfyui python -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name())'
 else
   "${HARNESS_RUNTIME_DIR}/module-data/comfyui/app/current"/venv/bin/python -c 'import torch; assert torch.backends.mps.is_available()'

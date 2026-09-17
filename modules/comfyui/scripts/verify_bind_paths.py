@@ -12,21 +12,35 @@ from pathlib import Path
 KINDS = ("models", "custom_nodes", "input", "output", "temp", "user")
 
 
-def ensure_real_directory(path: Path) -> Path:
+def ensure_real_directory(path: Path) -> tuple[Path, os.stat_result]:
+    """Verify a bind source and return the directory that was actually opened.
+
+    The identity comes from the descriptor, not a second lookup, so what the caller records
+    is what the walk checked rather than what a later rename may have put at that name.
+    """
     if not path.is_absolute():
         raise ValueError(f"bind source must be absolute: {path}")
     if any(character in str(path) for character in ("\n", "\r", "\x00")):
         raise ValueError("bind source contains a forbidden control character")
+    if ".." in path.parts:
+        # Every parent reference is itself a real directory, so the walk below cannot see
+        # that the name it lands on sits outside the tree the operator configured.
+        raise ValueError(f"bind source must not contain a parent reference: {path}")
     current = Path(path.anchor)
     for component in path.parts[1:]:
         current = current / component
         info = current.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise ValueError(f"bind source component is not a real directory: {current}")
-    resolved = path.resolve(strict=True)
-    if resolved.stat().st_uid != os.getuid():
-        raise ValueError(f"bind source is not owned by uid {os.getuid()}: {resolved}")
-    return resolved
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if info.st_uid != os.getuid():
+        raise ValueError(f"bind source is not owned by uid {os.getuid()}: {path}")
+    return path, info
 
 
 def sources(workspace: Path) -> dict[str, Path]:
@@ -39,11 +53,10 @@ def sources(workspace: Path) -> dict[str, Path]:
 
 
 def snapshot(workspace: Path) -> dict[str, dict[str, int | str]]:
-    workspace = ensure_real_directory(workspace)
+    workspace, _ = ensure_real_directory(workspace)
     result = {}
     for name, path in sources(workspace).items():
-        path = ensure_real_directory(path)
-        info = path.stat()
+        path, info = ensure_real_directory(path)
         result[name] = {
             "path": str(path),
             "device": info.st_dev,

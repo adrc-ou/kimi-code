@@ -31,6 +31,26 @@ class LauncherTests(unittest.TestCase):
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / relative, destination)
+        # Model selection runs before the version menu, so a launcher fixture needs the
+        # definition trees and every module the resolver imports.
+        for relative in (
+            "tools/models.py",
+            "tools/model_config.py",
+            "tools/policy.py",
+            "tools/definitions.py",
+            "tools/compose_hygiene.py",
+            "tools/env_values.py",
+            "tools/git_query.py",
+            "tools/managed_section.py",
+            "runtime/config.toml",
+            "compose.bootstrap.yaml",
+        ):
+            destination = self.root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, destination)
+        for tree in ("models", "providers"):
+            shutil.copytree(ROOT / tree, self.root / tree)
+        self.workspace.mkdir(parents=True, exist_ok=True)
         (self.root / ".env").touch()
         (self.root / "scripts/select_versions.py").write_text(
             'print("VERSION_SELECTION_REACHED", flush=True)\nraise SystemExit(42)\n'
@@ -59,6 +79,28 @@ exit 99
             "HOME": str(self.base),
             "TEST_BOOTSTRAP": str(self.bootstrap),
         }
+        self.require_executable_fixtures()
+
+    def require_executable_fixtures(self):
+        # These tests drive the entrypoints through stub commands in self.bin, which the
+        # launcher runs by name through bash. On a noexec filesystem (a tmpfs /tmp is the
+        # common case) every such call exits 126, indistinguishable from a real regression.
+        probe = self.bin / "harness-exec-probe"
+        probe.write_text("#!/bin/bash\nexit 0\n")
+        probe.chmod(0o700)
+        try:
+            unreachable = subprocess.run(
+                ["/bin/bash", "-c", "harness-exec-probe"],
+                capture_output=True,
+                env={**self.env, "PATH": str(self.bin)},
+            ).returncode == 126
+        except OSError:
+            unreachable = True
+        if unreachable:
+            self.skipTest(
+                f"{self.base} is on a noexec filesystem, so the launcher stubs cannot run; "
+                "set TMPDIR to a writable executable directory"
+            )
 
     def command(self, name, body):
         path = self.bin / name
@@ -133,6 +175,7 @@ class SessionFlowTests(unittest.TestCase):
     setUp = LauncherTests.setUp
     command = LauncherTests.command
     run_script = LauncherTests.run_script
+    require_executable_fixtures = LauncherTests.require_executable_fixtures
 
     def test_module_session_then_core_session_preserves_workspace(self):
         for directory in ("tools", "runtime"):
@@ -160,7 +203,7 @@ module_prepare() { echo prepare >>"${TEST_EVENTS}"; }
 module_install() { echo install >>"${TEST_EVENTS}"; }
 module_start() { echo start >>"${TEST_EVENTS}"; }
 """)
-        self.bootstrap.write_text(f"WORKSPACE_PATH={self.workspace}\nLITELLM_API_KEY=fixture-key\n")
+        self.bootstrap.write_text(f"WORKSPACE_PATH={self.workspace}\nNRP_API_KEY=fixture-key\n")
         self.env["TEST_EVENTS"] = str(self.base / "events")
         self.env["HARNESS_MODULES"] = "demo"
         (self.bin / "python3").unlink()
@@ -172,11 +215,65 @@ if [[ -n "${URL_TO_CHECK:-}" ]]; then cat >/dev/null; exit 0; fi
 exec "$TEST_REAL_PYTHON" "$@"
 """,
         )
+        # The launcher asserts confinement against the resolved configuration before it starts
+        # anything, so the stub has to describe a real one: the workspace bind, the staged
+        # volumes, and the five snapshot binds approve_extensions.py always emits.
+        self.command(
+            "resolved-config-clean",
+            """
+exec "$TEST_REAL_PYTHON" - <<'PY'
+import json, os
+
+
+def bind(source, target, read_only=True):
+    return {
+        "type": "bind",
+        "source": source,
+        "target": target,
+        "read_only": read_only,
+        "bind": {"create_host_path": False},
+    }
+
+
+snapshot = os.path.join(os.environ["HARNESS_RUNTIME_DIR"], "extension-snapshot")
+volumes = [
+    bind(os.environ["WORKSPACE_PATH"], "/workspace", False),
+    {"type": "volume", "source": "kimi-state", "target": "/home/agent/.kimi-code"},
+    {"type": "volume", "source": "serena-state", "target": "/home/agent/.serena"},
+    {"type": "volume", "source": "kimi-assets", "target": "/opt/kimi-runtime"},
+]
+volumes += [
+    bind(f"{snapshot}/{relative}", f"/workspace/{relative}")
+    for relative in (
+        ".kimi-code/agents",
+        ".agents/agents",
+        ".kimi-code/skills",
+        ".agents/skills",
+        ".kimi-code/mcp.json",
+    )
+]
+print(
+    json.dumps(
+        {
+            "services": {
+                "model-proxy": {"read_only": True, "secrets": [{"source": "proxy_internal_token"}]},
+                "kimi-agent": {
+                    "read_only": True,
+                    "volumes": volumes,
+                    "ports": [{"host_ip": "127.0.0.1", "published": "5494", "target": 5494}],
+                },
+            }
+        }
+    )
+)
+PY
+""",
+        )
         self.command(
             "docker",
             """
 if [[ "$*" == *"config --environment" ]]; then cat "$TEST_BOOTSTRAP"; exit 0; fi
-if [[ "$*" == *"config --format json" ]]; then echo '{}'; exit 0; fi
+if [[ "$*" == *"config --format json" ]]; then "${RESOLVED_STUB:-resolved-config-clean}"; exit 0; fi
 if [[ "$*" == *"kimi --version" ]]; then echo 0.42.0; exit 0; fi
 if [[ "$*" == *"/register_workspace.py" ]]; then
   echo register-workspace >>"$TEST_EVENTS"; exit 0
@@ -211,7 +308,38 @@ exit 0
         runtime = next((self.root / ".local/runtime").iterdir())
         self.assertEqual((runtime / "last-modules.json").read_text().strip(), "[]")
         self.assertFalse((runtime / "module.env").exists())
-        self.assertFalse((runtime / "nrp-api-key").exists())
+        # Session material is deleted on exit, but the selection survives in the "last used"
+        # copy so the next launch can label and pre-select it.
+        self.assertFalse(list((runtime / "credentials").glob("*")))
+        self.assertFalse((runtime / "model-policy.json").exists())
+        self.assertFalse((runtime / "model.env").exists())
+        self.assertFalse((runtime / "model-selection.json").exists())
+        self.assertIn("primary", (runtime / "last-model-selection.json").read_text())
+        guidance = (self.workspace / "AGENTS.md").read_text()
+        self.assertIn("kimi-harness model policy begin", guidance)
+        self.assertIn("Model runtime envelope", guidance)
+        # A resolved configuration that hands the agent an arbitrary host path has to stop
+        # the launch before anything is started.
+        self.command(
+            "resolved-config-rogue",
+            """
+resolved-config-clean | "$TEST_REAL_PYTHON" -c '
+import json, sys
+configuration = json.load(sys.stdin)
+configuration["services"]["kimi-agent"]["volumes"].append(
+    {"type": "bind", "source": "/etc", "target": "/mnt/etc", "read_only": True,
+     "bind": {"create_host_path": False}}
+)
+print(json.dumps(configuration))
+'
+""",
+        )
+        (self.base / "events").write_text("")
+        self.env["RESOLVED_STUB"] = "resolved-config-rogue"
+        result = self.run_script("start.sh", "--non-interactive")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("exposes host bind", result.stderr)
+        self.assertNotIn("register-workspace", (self.base / "events").read_text())
 
 
 if __name__ == "__main__":

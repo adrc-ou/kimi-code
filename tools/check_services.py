@@ -163,10 +163,25 @@ def service_probe(name, full):
         report = json.loads(payload)
         if not report.get("policy_enforced"):
             raise ValueError(f"policy not enforced: {report.get('policy_error', 'unknown')}")
+        budgets = sorted(
+            {
+                counter["context_budget"]
+                for counter in (report.get("counters") or {}).values()
+                if isinstance(counter.get("context_budget"), int)
+            }
+        )
+        rates = sorted(
+            {
+                rate["capacity"]
+                for rate in (report.get("rates") or {}).values()
+                if isinstance(rate.get("capacity"), int)
+            }
+        )
         summary = (
             f"{len(report.get('lanes', {}))} lanes; "
             f"{report.get('subagent_limit')} subagent permits; "
-            f"budget {report.get('parallel_context_budget')}"
+            f"context budget {'/'.join(map(str, budgets)) or 'none'}; "
+            f"rate {len(rates)} counter(s)"
         )
         return "policy enforced (" + summary + ")" + (
             "; upstream inference not tested" if full else ""

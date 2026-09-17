@@ -2,7 +2,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.approve_extensions import PRIVILEGED, approve, prepare, require_approval
+from tools.approve_extensions import (
+    PRIVILEGED,
+    approve,
+    copy_snapshot,
+    inspect_path,
+    prepare,
+    require_approval,
+)
 
 
 class ApproveExtensionTests(unittest.TestCase):
@@ -86,6 +93,51 @@ class ApproveExtensionTests(unittest.TestCase):
             source.write_text("two\n")
             with self.assertRaises(SystemExit):
                 require_approval(workspace, manifest)
+
+
+    def test_symlinked_extension_ancestor_is_refused(self):
+        # POSIX resolves every intermediate component, so a link at .kimi-code or .agents
+        # used to make host content look like project content to both the scan and the copy.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "host"
+            skill = outside / "skills" / "demo"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("host content\n")
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".kimi-code").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "ancestor is not a real directory"):
+                inspect_path(workspace, ".kimi-code/skills")
+            with self.assertRaisesRegex(ValueError, "ancestor is not a real directory"):
+                require_approval(workspace, root / "approval.json")
+            with self.assertRaisesRegex(ValueError, "ancestor is not a real directory"):
+                approve(workspace, root / "approval.json")
+
+    def test_snapshot_copy_refuses_a_link_planted_after_the_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "host" / "agents"
+            outside.mkdir(parents=True)
+            (outside / "AGENT.md").write_text("host content\n")
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".kimi-code").symlink_to(root / "host", target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "ancestor is not a real directory"):
+                copy_snapshot(workspace, root / "state", ".kimi-code/agents")
+            self.assertFalse((root / "state" / ".kimi-code" / "agents" / "AGENT.md").exists())
+
+    def test_real_ancestors_still_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            skill = workspace / ".agents" / "skills" / "demo"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("safe\n")
+            self.assertEqual(
+                set(inspect_path(workspace, ".agents/skills")),
+                {".agents/skills/", ".agents/skills/demo/", ".agents/skills/demo/SKILL.md"},
+            )
 
 
 if __name__ == "__main__":

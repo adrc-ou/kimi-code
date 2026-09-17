@@ -6,7 +6,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("comfy_bridge", ROOT / "scripts" / "comfy_bridge.py")
 assert SPEC and SPEC.loader
 BRIDGE = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(BRIDGE)
+try:
+    SPEC.loader.exec_module(BRIDGE)
+except ImportError as exc:
+    # Reported as a skip naming the prerequisite, not as one loader error that silently
+    # stands in for this module's whole suite.
+    raise unittest.SkipTest(
+        f"the bridge cannot be imported without its dependencies ({exc}); "
+        "install aiohttp==3.14.3 to run these tests"
+    ) from None
 
 
 class Request:

@@ -1,7 +1,7 @@
-# Modular NRP LiteLLM + Kimi Code development harness
+# Modular managed-LLM + Kimi Code development harness
 
-This project runs Kimi Code against OU Libraries' NRP-backed LiteLLM gateway,
-enforces the configured NRP concurrency policy, provides selected MCP servers
+This project runs Kimi Code against an operator-configured managed model
+provider, enforces that provider's usage policy, provides selected MCP servers
 and local SearXNG search. Optional modules add application services and tools.
 
 The core runs on macOS (Intel or Apple Silicon) and Linux/WSL2 (x86-64 or
@@ -9,7 +9,20 @@ arm64), with Docker and Compose. Modules determine their own host compatibility.
 The included [ComfyUI module](modules/comfyui/README.md) supports Apple Silicon
 MPS and Linux/WSL2 NVIDIA CUDA. Intel Macs can run the core without that module.
 
-See [the module authoring contract](docs/modules.md) to add another module.
+Three directories hold declarative, drop-in configuration, each with its own
+authoring contract:
+
+- [`./models`](docs/models-providers.md) — what a model *is*: window size and
+  which role lanes it serves. One directory per model.
+- [`./providers`](docs/models-providers.md) — what a provider *permits*:
+  endpoint, credentials, and policy rules such as NRP's fair-use limits. One
+  directory per provider.
+- [`./modules`](docs/modules.md) — optional services and tools that run beside
+  the agent.
+
+Nothing in `.env` describes a model or a policy limit. `.env` supplies
+credentials and process bounds; the numbers that decide how much of a model you
+may use at once are derived from the definitions you picked at launch.
 
 ## Prerequisites
 
@@ -27,24 +40,40 @@ Hosts need:
 - network access to GitHub, Python package indexes, Docker Hub, and configured
   model/MCP endpoints.
 
+Run `./start.sh` as your own account, never with `sudo`: your UID becomes the
+container user, so a root launch would run the agent as root and leave host
+artifacts owned by root.
+
 ## Initial configuration
 
-1. Create a virtual key in the
-   [OU LiteLLM dashboard](https://litellm.lib.ou.edu/ui/?page=api-keys) and grant
-   it access only to the intended model.
-2. Copy `.env.example` to `.env`.
-3. Set `LITELLM_API_KEY`.
-4. Set `SEARXNG_SECRET` to the output of `openssl rand -hex 32`.
-5. Set `WORKSPACE_PATH` to a dedicated directory containing only material the
+1. Copy `.env.example` to `.env`.
+2. Set the credential for each provider you intend to use. The variable names
+   come from the definitions, not from a list in this README: every
+   `[[credential]]` table in `providers/*/provider.toml` names the `.env`
+   variable it reads and, in `key_url`, where to obtain the key. The shipped
+   NRP provider reads `NRP_API_KEY`.
+3. Set `SEARXNG_SECRET` to the output of `openssl rand -hex 32`.
+4. Set `WORKSPACE_PATH` to a dedicated directory containing only material the
    agent is allowed to inspect and change. The agent can always see this exact
    host path, so avoid a location whose name you need to keep private.
-6. Keep the supplied NRP model and policy values unless the replacement model's
-   identifier, context size, concurrency, and fair-use limits have been verified.
-   "NRP fair-use policy enforcement" below explains how the proxy derives every
-   lane reservation from those same values.
+5. Leave everything else blank or defaulted. `NRP_BASE_URL` redirects the NRP
+   endpoint for this deployment only; `KIMI_BACKGROUND_TASK_SLOTS` blanks to a
+   value derived from the resolved plan; the `MODEL_PROXY_*` names are process
+   bounds, not policy.
 
-The model identifier is the human-readable value exposed by the OU LiteLLM
-dashboard (not the upstream NRP model name/endpoint).
+Anything that says which model is served, how large its window is, or how much
+of it you may use at once lives in `./models` and `./providers`, never here. If
+you are migrating an older `.env`, the launcher prints what it ignored:
+
+| Old variable | Now |
+| --- | --- |
+| `LITELLM_API_KEY` | `NRP_API_KEY` (named by `providers/nrp/provider.toml`) |
+| `LITELLM_UPSTREAM_ORIGIN` | `providers/nrp` `[endpoint].base_url`, optionally overridden by `NRP_BASE_URL` |
+| `LITELLM_MODEL_ID` | `models/<id>` `model = "…"` |
+| `NRP_MODEL_CONTEXT`, `NRP_FAIR_USE_PERCENT`, `NRP_PARALLEL_CONTEXT_BUDGET`, `NRP_MODEL_MAX_CONCURRENCY`, `NRP_OUTPUT_TOKENS_PER_MINUTE`, `NRP_OUTPUT_RATE_HEADROOM_PERCENT` | `[[rule]]` / `[safety]` in the provider, and `[context]` / `[lane.*]` in the model |
+| `NRP_{PRIMARY,LONG,SUBAGENT}_MAX_OUTPUT_TOKENS` | `[lane.*].output_clamp_tokens` |
+| `KIMI_SUBAGENT_CONCURRENCY` | derived from the plan; see "Resolved policy enforcement" |
+| `NRP_UPSTREAM_SOCK_READ_TIMEOUT`, `NRP_MAX_REQUEST_SECONDS`, `NRP_INPUT_GUARD_PERCENT`, `NRP_MEDIA_TOKEN_ESTIMATE`, `NRP_REQUEST_USAGE`, `NRP_MAX_*_BYTES`, `NRP_MAX_QUEUED` | same value under a `MODEL_PROXY_*` name |
 
 ## Starting and stopping
 
@@ -54,10 +83,21 @@ Run:
 ./start.sh
 ```
 
-The launcher first shows compatible modules in a checkbox menu. Use ↑/↓ to
-move, Space to toggle, and Enter to continue. Last session's enabled modules
-appear first and are checked; each group is alphabetical by label. On the first
-run all modules are unchecked. If none are compatible, this step is skipped.
+The launcher first asks which model serves the primary agent and which serves
+subagents. Each picker lists the models defined in `./models` alphabetically by
+label, marks the last-used choice, and pre-selects it; only models whose provider
+exists in `./providers` are offered. Press ↑/↓ to move and Enter to continue.
+Answering non-interactively (`--non-interactive`, or a single available model)
+reuses the previous choice, and `HARNESS_PRIMARY_MODEL` /
+`HARNESS_SUBAGENT_MODEL` override one picker.
+
+Both models then resolve against their providers' rules into one enforcement plan,
+and every number downstream — lane sizes, Kimi's model tables, the subagent
+fan-out, the proxy's gates — is derived from that plan. Next the launcher shows
+compatible modules in a checkbox menu. Use ↑/↓ to move, Space to toggle, and Enter
+to continue. Last session's enabled modules appear first and are checked; each
+group is alphabetical by label. On the first run all modules are unchecked. If
+none are compatible, this step is skipped.
 
 Next comes the existing Kimi version menu, followed by each selected module's
 version menu. Missing required module variables are prompted for this session
@@ -80,15 +120,18 @@ browser, including its authentication fragment. macOS uses `open`; Linux uses
 `xdg-open` (or `wslview` when installed on WSL). If no address is reachable or no
 browser opener is available, startup continues with a message for manual access.
 
-For repeatable automation, set explicit versions and disable prompts:
+For repeatable automation, set explicit choices and disable prompts:
 
 ```bash
-HARNESS_MODULES= KIMI_CODE_VERSION=0.42.0 ./start.sh --non-interactive
+HARNESS_PRIMARY_MODEL=qwen3_8_flash_next HARNESS_SUBAGENT_MODEL=qwen3_8_flash_next \
+  HARNESS_MODULES= KIMI_CODE_VERSION=0.42.0 ./start.sh --non-interactive
 ```
 
-`HARNESS_MODULES` is a comma-separated list of module directory identifiers;
-an explicit empty value selects the core only. If omitted in non-interactive
-mode, the previous compatible selection is reused. Missing required module
+`HARNESS_PRIMARY_MODEL` and `HARNESS_SUBAGENT_MODEL` take model directory
+identifiers and skip the corresponding picker; an identifier that is not available
+for that role stops startup. `HARNESS_MODULES` is a comma-separated list of module
+directory identifiers; an explicit empty value selects the core only. If omitted in
+non-interactive mode, the previous compatible selection is reused. Missing required module
 variables cause non-interactive startup to fail without printing their values.
 
 The requested versions must still exist in the compatible official release
@@ -106,39 +149,63 @@ rendered provider configuration, and bridge certificates are deleted at normal
 shutdown. The private NRP cache salt persists so cached responses remain
 isolated across restarts.
 
-## NRP fair-use policy enforcement
+## Resolved policy enforcement
 
-The managed qwen3 endpoint states three limits, and `model-proxy` enforces all
-three on the single credential it holds:
+`model-proxy` never holds a policy number of its own. At launch
+`tools/models.py resolve` reads the two selected models and the `[[rule]]` tables of
+their providers and writes one plan; the proxy mounts that plan as its enforcement
+input and refuses to serve if it cannot honour it. Adding a provider whose terms
+look nothing like NRP's — a token-per-minute ceiling, a hard context cap, no
+concurrency rule at all — is a definition change, not a proxy change.
 
-- 200,000 output tokens per minute per API token and model. A rolling one-minute
-  ledger books each attempt's full output allowance before it starts and settles
-  it against measured usage; the gateway's own `x-ratelimit-remaining` header
-  wins whenever it reports less headroom. This is the only rule NRP meters for
-  you, and it returns HTTP 429.
-- Exactly one concurrent request once a request uses 35% or more of the served
-  context. The gate marks such a lane exclusive and admits it only when nothing
-  else is in flight.
-- Otherwise at most 16 concurrent qwen3 requests, with their combined context
-  inside 35% of the window. Live lane reservations are summed against a
-  320,000-token budget, deliberately below the 350,000-token ceiling.
+The rules NRP publishes, transcribed into `providers/nrp/provider.toml`:
 
-A reservation is `max_input_size` plus that lane's output clamp, read from the
-rendered Kimi configuration and revalidated on every request, so the proxy
-cannot silently disagree with what Kimi is configured to use: a configuration it
-cannot honour answers HTTP 503 instead of passing unmeasured traffic.
+- 200,000 output tokens per minute per API token *and* model, as a
+  `output_tokens_per_minute` rule at `credential_model` scope. This is the only
+  rule the gateway meters for you, and it returns HTTP 429. A rolling one-minute
+  ledger books each attempt's full output clamp before it starts and settles it
+  against measured usage; the gateway's own `x-ratelimit-*` header wins whenever
+  it reports less headroom.
+- Exactly one concurrent request once a request uses 35% or more of the model's
+  context, as `exclusive_above_context_fraction` at `model` scope. The resolver
+  marks such a lane exclusive and the proxy admits it only when the counter is
+  empty.
+- Otherwise at most 16 concurrent requests for the model, with their combined
+  context inside 35% of the window, as `max_concurrent_requests` and
+  `aggregate_context_fraction`, both at `model` scope.
 
-At the shipped numbers `qwen3-primary` reserves its whole native 262,144-token
-window (196,608 input plus a 65,536 output clamp), `qwen3-long` reserves 965,536
-and is therefore strictly alone, and every `qwen3-subagent` reserves 64,000 with
-five permitted at once — `5 * 64,000 = 320,000`, the largest fan-out the budget
-allows. `qwen3-long` stays opt-in because its extra context comes from YaRN
-extension of the model's native window rather than native attention.
+Because both scope on the model identifier, selecting one model for both lanes
+makes them contend for the same permits, while selecting two models shares only
+the per-key rate ledger. The counter-keying table in
+[docs/models-providers.md](docs/models-providers.md) states exactly how a
+selection resolves.
+
+Two numbers in the provider file are deliberate under-use, and they are the only
+tunables: `[safety].context_margin_percent` (95) and
+`output_rate_margin_percent` (90) multiply the provider's own thresholds, so a
+margin can never push a budget above the published rule. At the shipped
+definition the model advertises 1,000,000 tokens, so the aggregate ceiling is
+350,000 and the in-flight budget is 332,500; the rate ledger books 180,000 output
+tokens per minute.
+
+A lane's reservation is its input cap plus its output clamp, both from
+`[lane.*]` in the model definition and both revalidated against Kimi's live
+rendered configuration on every policy refresh — a configuration the proxy cannot
+honour answers HTTP 503 instead of passing unmeasured traffic. At the shipped
+numbers `qwen3-primary` reserves its whole native 262,144-token window,
+`qwen3-long` reserves 965,536 and is therefore strictly alone, and each
+`qwen3-subagent` reserves 64,000, which is 5 at once against the 332,500
+budget: the largest fan-out the rules allow. `qwen3-long` stays opt-in because its
+extra context comes from YaRN extension of the model's native window rather than
+native attention. `./start.sh` derives Kimi's subagent concurrency from the same
+plan, so Kimi is told to run exactly as many children as the proxy will admit, and
+the generated section in the workspace `AGENTS.md` instructs it to use the whole
+envelope instead of self-limiting.
 
 Subagent and swarm wall-clock limits are unlimited: `timeout_ms = 0` in
 `runtime/config.toml`, re-pinned at every launch, never via the environment. A
-long run is bounded instead by `NRP_UPSTREAM_SOCK_READ_TIMEOUT` per stalled
-upstream read and `NRP_MAX_REQUEST_SECONDS` per client request, so a wedged
+long run is bounded instead by `MODEL_PROXY_SOCK_READ_TIMEOUT` per stalled
+upstream read and `MODEL_PROXY_MAX_REQUEST_SECONDS` per client request, so a wedged
 stream cannot hold a scarce fair-use permit. Neither is a task-length limit.
 `docs/verification.md` shows how to read the policy currently in force.
 
@@ -192,7 +259,7 @@ node, or Python package is vendored in this repository.
 
 `.dockerignore` excludes `.env`, `.local`, Git metadata, bytecode, and generated
 archives from the root build context. Do not remove the `.env` exclusion: the
-LiteLLM credential must never be sent as Docker build-context data.
+provider API keys must never be sent as Docker build-context data.
 
 ## MCP servers
 
@@ -243,10 +310,22 @@ published to the host.
 
 Compose networks isolate the model proxy, search backend, and module services. Only
 Kimi joins the intended client-side networks; separate egress networks prevent
-the private networks from becoming a second flat service mesh. The real NRP key
-is mounted only into `model-proxy` as a file secret.
+the private networks from becoming a second flat service mesh. Each credential
+the selection actually uses is mounted only into `model-proxy`, as a file secret
+generated for that session.
 
 ## Validation
+
+Install the test prerequisites first. `aiohttp` is what the proxy module imports, so
+without it the policy-enforcement suite reports a skip instead of running — a green
+`OK` that has not checked a single rate, reservation, retry, or route assertion:
+
+```bash
+python3 -m pip install aiohttp==3.14.3
+```
+
+If your `TMPDIR` sits on a `noexec` filesystem (a tmpfs `/tmp` usually is), the launcher
+tests skip for the same reason; point `TMPDIR` at an executable directory to run them.
 
 Static and unit tests:
 
@@ -301,19 +380,24 @@ initializer mounts only its own script, the staging inputs, and those volumes: n
 workspace, Docker socket, network, or credentials. Kimi itself remains non-root
 with all capabilities dropped.
 
-`runtime/config.toml` is the commented source of truth for generated settings.
-The user-owned keys are declared in `runtime/config-policy.json` and currently
-cover the default model, thinking, telemetry, background-task, and experimental
-UI controls. Every other key is policy: a UI or `/config` edit that changes one
-is silently re-pinned from the baseline at the next launch, because the proxy's
-fair-use lane cannot be negotiated from inside the sandbox. That includes the
-permission mode, plan mode, skill and agent directories, provider definitions,
-model context sizes, the forced subagent model, and the `[subagent]`/`[swarm]`
-`timeout_ms = 0` that keeps subagent runs uncapped by wall clock. Widen
-`runtime/config-policy.json` deliberately if you want the UI to own another key.
-A stored `config.toml` that cannot be parsed is renamed to a timestamped
-`.unreadable-*` file and replaced with the baseline rather than starting Kimi
-with broken configuration.
+`runtime/config.toml` is the commented source of truth for the static half of
+generated settings; the model and provider tables are appended to it from the
+resolved plan, so `default_model`, every `[models.*]` window, every
+`[providers.*]` base URL, and `[secondary_model]` arrive from `./models` and
+`./providers` rather than from that file. The user-owned keys are declared in
+`runtime/config-policy.json` and currently cover only thinking, telemetry,
+background-task, and experimental UI controls. Every other key is policy: a UI or
+`/config` edit that changes one is silently re-pinned at the next launch, because
+the proxy's provider lane cannot be negotiated from inside the sandbox. That
+includes the default model, the forced subagent model, permission mode, plan mode,
+skill and agent directories, provider definitions, model context sizes, and the
+`[subagent]`/`[swarm]` `timeout_ms = 0` that keeps subagent runs uncapped by wall
+clock. Widen `runtime/config-policy.json` deliberately if you want the UI to own
+another key — but note that making `default_model` user-owned again would let an
+in-session `/model` choice survive a restart and drift away from the plan the
+proxy enforces. A stored `config.toml` that cannot be parsed is renamed to a
+timestamped `.unreadable-*` file and replaced with the baseline rather than
+starting Kimi with broken configuration.
 
 Model provider credentials, the per-instance base URL, and the internal proxy
 token are regenerated each launch and are never read back from the volume.

@@ -9,85 +9,94 @@ fi
 # Ignore operator configuration, even when this check runs in a configured clone.
 export COMPOSE_ENV_FILES=/dev/null
 export COMPOSE_DISABLE_ENV_FILE=1
-export LITELLM_UPSTREAM_ORIGIN=https://example.invalid
-export LITELLM_MODEL_ID=test-model
 export SEARXNG_SECRET=compose-fixture-only
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/kimi compose.XXXXXX")
 test_project="kimi-cache-test-$(basename "${fixture}" | tr '[:upper:] .' '[:lower:]--')"
+# Stand-in for the fragment tools/models.py resolve writes from the selected definitions: the
+# launcher appends it, so credential secret names are never spelled in compose.yaml and these
+# checks exercise a real mount rather than an imagined one.
+compose_files=(-f "${root}/compose.yaml" -f "${root}/compose.search.yaml" -f "${fixture}/models.json")
 runtime_test=false
 cleanup() {
   if [[ "${runtime_test}" == true ]]; then
-    docker compose -p "${test_project}" -f "${root}/compose.yaml" \
-      -f "${root}/compose.search.yaml" down --volumes --remove-orphans
+    docker compose -p "${test_project}" "${compose_files[@]}" down --volumes --remove-orphans
   fi
   find "${fixture}" -depth -delete
 }
 trap cleanup EXIT
 mkdir -p "${fixture}/workspace" "${fixture}/empty" "${fixture}/assets/skills" \
-  "${fixture}/assets/agents" "${fixture}/assets/tools"
+  "${fixture}/assets/agents" "${fixture}/assets/tools" "${fixture}/credentials"
 touch "${fixture}/config.toml" "${fixture}/SYSTEM.md" "${fixture}/secret" "${fixture}/cert.crt" \
-  "${fixture}/assets/mcp.json"
-chmod 600 "${fixture}/"{config.toml,SYSTEM.md,secret,cert.crt}
+  "${fixture}/assets/mcp.json" "${fixture}/model-policy.json" \
+  "${fixture}/credentials/nrp__default"
+chmod 600 "${fixture}/"{config.toml,SYSTEM.md,secret,cert.crt,model-policy.json}
+chmod 600 "${fixture}/credentials/nrp__default"
 export HARNESS_RUNTIME_DIR="${fixture}"
 export HARNESS_TEST_FIXTURE="${fixture}"
 export WORKSPACE_PATH="${fixture}/workspace"
 export HARNESS_IMAGE_SUFFIX=test
 export KIMI_RENDERED_CONFIG="${fixture}/config.toml"
 export KIMI_SYSTEM_MD="${fixture}/SYSTEM.md"
-export NRP_API_KEY_FILE="${fixture}/secret"
-export NRP_INTERNAL_TOKEN_FILE="${fixture}/secret"
-export NRP_CACHE_SALT_FILE="${fixture}/secret"
+export MODEL_PROXY_POLICY_FILE="${fixture}/model-policy.json"
+export MODEL_PROXY_INTERNAL_TOKEN_FILE="${fixture}/secret"
+export MODEL_PROXY_CACHE_SALT_FILE="${fixture}/secret"
+export KIMI_SUBAGENT_CONCURRENCY=5
+export KIMI_BACKGROUND_TASK_SLOTS=8
+export KIMI_BACKGROUND_BASH_TASK_TIMEOUT_S=0
 export SEARCH_ADAPTER_TOKEN=test-search-token-with-at-least-32-characters
 export KIMI_CODE_VERSION=0.42.0
 export KIMI_CODE_ASSET_URL=https://example.invalid/kimi.tar.gz
 export KIMI_CODE_ASSET_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 export LOCAL_UID=1000 LOCAL_GID=1000
-docker compose -f "${root}/compose.yaml" -f "${root}/compose.search.yaml" config --quiet
+printf '%s\n' \
+  'services:' \
+  '  model-proxy:' \
+  '    secrets:' \
+  '      - proxy_internal_token' \
+  '      - proxy_cache_salt' \
+  '      - nrp__default' \
+  'secrets:' \
+  "  nrp__default:" \
+  "    file: ${fixture}/credentials/nrp__default" >"${fixture}/models.json"
+docker compose "${compose_files[@]}" config --quiet
 
-# Mount hygiene: the agent container must not be able to read harness or host layout out of its
-# own mount table. Only the workspace bind may name a host path, and launcher-owned content must
-# arrive through volumes that the root-only initializer stages. Modules are checked by their own
-# compose-config.sh; a module that binds host files into kimi-agent must justify it there.
-docker compose -f "${root}/compose.yaml" -f "${root}/compose.search.yaml" config --format json \
-  | WORKSPACE_PATH="${fixture}/workspace" ROOT="${root}" python3 -c '
-import json, os, sys
-services = json.load(sys.stdin)["services"]
-agent = services["kimi-agent"]
-workspace = os.path.realpath(os.environ["WORKSPACE_PATH"])
-root = os.path.realpath(os.environ["ROOT"])
-for mount in agent["volumes"]:
-    if mount["type"] != "bind":
-        continue
-    source = os.path.realpath(mount["source"])
-    assert source == workspace, f"kimi-agent exposes host bind {source}"
-assert not any(mount["source"].startswith(f"{root}/") for mount in agent["volumes"] if "source" in mount)
-volumes = {mount["source"] for mount in agent["volumes"] if mount["type"] == "volume"}
-assert {"kimi-state", "serena-state", "kimi-assets"} <= volumes, volumes
-for name, service in services.items():
-    assert service.get("read_only") is True, f"{name} lost its read-only root filesystem"
-print("kimi-agent mounts expose only the workspace bind")
-'
-for check in "${root}"/modules/*/tests/compose-config.sh; do
-  [[ ! -f "${check}" ]] || bash "${check}"
-done
-cp "${root}/compose.limits.yaml.example" "${fixture}/limits.yaml"
-docker compose -f "${root}/compose.yaml" -f "${root}/compose.search.yaml" -f "${fixture}/limits.yaml" config --quiet
-mkdir -p "${fixture}/approved-skills"
+# Approved project extensions legitimately bind the snapshot the launcher staged for them, so
+# the hygiene assertions below have to cover that generated fragment as well as the checked-in
+# files. The path mirrors what tools/approve_extensions.py actually emits.
+mkdir -p "${fixture}/extension-snapshot/.kimi-code/skills"
 printf '%s\n' \
   'services:' \
   '  kimi-agent:' \
   '    volumes:' \
   '      - type: bind' \
-  "        source: ${fixture}/approved-skills" \
+  "        source: ${fixture}/extension-snapshot/.kimi-code/skills" \
   '        target: /workspace/.kimi-code/skills' \
   '        read_only: true' \
   '        bind:' \
   '          create_host_path: false' >"${fixture}/approved.yaml"
-docker compose -f "${root}/compose.yaml" -f "${root}/compose.search.yaml" -f "${fixture}/approved.yaml" config --quiet
+
+# Mount, credential and port hygiene of the resolved configuration: the agent container must not
+# be able to read harness or host layout out of its own mount table, a provider credential must
+# reach model-proxy alone, and every published port must stay on loopback. Modules run the same
+# assertions over their own overlays from their own compose-config.sh.
+for fragment in "" "${fixture}/approved.yaml"; do
+  files=("${compose_files[@]}")
+  label="core configuration"
+  [[ -z "${fragment}" ]] || { files+=(-f "${fragment}"); label="with approved extensions"; }
+  docker compose "${files[@]}" config --format json |
+    python3 "${root}/tools/compose_hygiene.py" \
+      --workspace "${WORKSPACE_PATH}" --runtime-dir "${HARNESS_RUNTIME_DIR}" \
+      --expect-secret nrp__default --label "${label}"
+done
+for check in "${root}"/modules/*/tests/compose-config.sh; do
+  [[ ! -f "${check}" ]] || bash "${check}"
+done
+cp "${root}/compose.limits.yaml.example" "${fixture}/limits.yaml"
+docker compose "${compose_files[@]}" -f "${fixture}/limits.yaml" config --quiet
 
 if [[ "${1:-}" == --runtime ]]; then
   runtime_test=true
-  compose=(docker compose -p "${test_project}" -f "${root}/compose.yaml" -f "${root}/compose.search.yaml")
+  compose=(docker compose -p "${test_project}" "${compose_files[@]}")
   # Both a fresh cache and one already owned by SearXNG must initialize.
   "${compose[@]}" run --rm --no-deps searxng-init
   # shellcheck disable=SC2016

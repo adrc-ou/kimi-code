@@ -3,7 +3,12 @@ services:
     image: scratch
     environment:
       WORKSPACE_PATH: "${WORKSPACE_PATH:?Set WORKSPACE_PATH in .env}"
-      LITELLM_API_KEY: "${LITELLM_API_KEY:-}"
+      # Provider credentials and endpoint overrides, named by ./providers. Compose only
+      # resolves what a file declares, so a new provider adds its names here; tools/models.py
+      # resolve refuses to continue when a definition's variable is missing from this file.
+      NRP_API_KEY: "${NRP_API_KEY:-}"
+      NRP_BASE_URL: "${NRP_BASE_URL:-}"
+      KIMI_BACKGROUND_TASK_SLOTS: "${KIMI_BACKGROUND_TASK_SLOTS:-}"
       GITHUB_RELEASES_TOKEN: "${GITHUB_RELEASES_TOKEN:-}"
       COMFYUI_MODELS_PATH: "${COMFYUI_MODELS_PATH:-}"
       COMFYUI_CUSTOM_NODES_PATH: "${COMFYUI_CUSTOM_NODES_PATH:-}"

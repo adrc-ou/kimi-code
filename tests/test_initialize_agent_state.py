@@ -160,7 +160,7 @@ class ConfigMergeIntegrationTests(unittest.TestCase):
         self.assertEqual((info.st_uid, info.st_gid), (self.uid, self.gid))
         self.assertEqual(self.merged()["default_model"], "qwen3-primary")
 
-    def test_settings_written_by_the_ui_survive_the_next_launch(self):
+    def test_settings_written_by_the_ui_survive_but_model_choice_does_not(self):
         init.merge_config(self.fixture.stage, self.fixture.home, self.MODULE, self.uid, self.gid)
         stored = merge.parse_config((self.fixture.home / "config.toml").read_text())
         stored["default_model"] = "qwen3-long"
@@ -171,8 +171,10 @@ class ConfigMergeIntegrationTests(unittest.TestCase):
             self.fixture.stage, self.fixture.home, self.MODULE, self.uid, self.gid
         )
         self.assertEqual(outcome, "merged")
-        self.assertEqual(self.merged()["default_model"], "qwen3-long")
         self.assertFalse(self.merged()["thinking"]["enabled"])
+        # The model is selected by ./start.sh from ./models, and the proxy enforces the plan
+        # that selection resolved, so an in-session change is re-pinned at the next launch.
+        self.assertEqual(self.merged()["default_model"], "qwen3-primary")
         self.assertEqual(self.merged()["default_permission_mode"], "manual")
 
     def test_unreadable_stored_config_is_quarantined_and_rebuilt(self):

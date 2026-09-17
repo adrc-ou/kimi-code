@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
-"""Strict OpenAI-compatible NRP policy proxy.
+"""Strict OpenAI-compatible provider-policy proxy.
 
-NRP's Fair Use Policy has three rules, and this module enforces all three:
+The enforcement envelope is not configured here. It is resolved at launch from the model
+definitions in ``./models`` and the provider rules in ``./providers``, written to
+``model-policy.json``, and mounted into this container. This module reads that plan and
+refuses traffic it cannot fit inside it, which is why no model window, context percentage,
+or provider name appears below.
 
-1. 200,000 output tokens per minute per API token and model. This is the only
-   limit the gateway enforces itself. ``OutputRateLedger`` books each request's
-   full lane output at admission and settles it to measured usage, so the proxy
-   paces itself instead of waiting to be rejected with HTTP 429.
-2. Any single request utilizing at least 35% of the model's context length is
-   limited to one concurrent request. ``FairUseGate`` treats such lanes as
-   exclusive.
-3. Otherwise all concurrent requests combined must stay inside 35% of the model's
-   context length, within the per-model request-count ceiling. ``FairUseGate``
-   admits on summed per-lane reservations, so lane behaviour is derived from the
-   rendered Kimi configuration rather than hard-coded per lane.
+A plan carries three counter families, and each counter becomes one live object:
 
-A request's lane reservation is ``max_input_size`` plus the lane output clamp,
-which is the worst-case context that request can occupy while in flight.
+* ``context`` - worst-case in-flight tokens for one subject. Admission compares the sum of
+  live reservations with the provider's aggregate budget, and a single request at or above
+  the provider's exclusivity threshold runs alone. A fair-use rule such as "all concurrent
+  requests combined stay inside 35% of the context window" lives here.
+* ``count`` - a plain concurrency ceiling on a model, credential, or provider subject.
+* ``rate`` - a rolling-window budget in one metered unit. ``RateLedger`` books each request's
+  full expected charge in that unit before it starts and settles it against measured usage, so
+  the proxy paces itself instead of waiting to be rejected with HTTP 429.
 
-Fair-use permits and rate bookings are always released before a backoff sleep, so
-waiting on NRP never consumes a permit. The enforced Kimi configuration is
-re-read on the request path: drift fails a lane closed instead of being served
-under stale assumptions.
+A request holds a slot in every counter its lane names. Counters are always taken in
+sorted counter-id order, so no two requests can pick them up in opposite orders and
+deadlock. Fair-use permits and rate bookings are always released before a backoff sleep,
+so waiting on a provider never consumes capacity.
+
+Both the plan and the rendered Kimi configuration that plan was compiled into are re-read
+on the request path: drift stops the affected traffic instead of being served under stale
+assumptions.
 """
 
 from __future__ import annotations
@@ -51,9 +55,10 @@ from aiohttp import (
 
 DEBUG_HTTP = False
 
-LANES = ("primary", "long", "subagent")
-PROVIDER_BY_LANE = {lane: f"nrp-{lane}" for lane in LANES}
 RATE_WINDOW_SECONDS = 60.0
+
+#: Units a rate ledger may meter, mirroring the plan's ``unit`` field.
+LEDGER_UNITS = frozenset({"output_tokens", "input_tokens", "total_tokens", "requests"})
 
 
 def secret(file_variable: str, value_variable: str, *, min_length: int = 32) -> str:
@@ -66,45 +71,34 @@ def secret(file_variable: str, value_variable: str, *, min_length: int = 32) -> 
     return value
 
 
-UPSTREAM = os.environ["NRP_UPSTREAM_ORIGIN"].rstrip("/")
-UPSTREAM_MODEL = os.environ["NRP_UPSTREAM_MODEL"]
-# Provider-issued keys have no harness-defined length; only our generated
-# internal credentials and private cache salt require at least 32 characters.
-API_KEY = secret("NRP_API_KEY_FILE", "NRP_API_KEY", min_length=1)
-INTERNAL_BEARER_TOKEN = secret("NRP_INTERNAL_TOKEN_FILE", "NRP_INTERNAL_TOKEN")
-CACHE_SALT = secret("NRP_CACHE_SALT_FILE", "NRP_CACHE_SALT")
-KIMI_CONFIG_PATH = os.environ.get("KIMI_CONFIG_PATH", "/policy/kimi-config.toml")
-SUBAGENT_LIMIT = int(os.environ.get("NRP_SUBAGENT_MAX_CONCURRENCY", "5"))
-MODEL_CONTEXT = int(os.environ.get("NRP_MODEL_CONTEXT", "1000000"))
-FAIR_USE_PERCENT = int(os.environ.get("NRP_FAIR_USE_PERCENT", "35"))
-PARALLEL_CONTEXT_BUDGET = int(os.environ.get("NRP_PARALLEL_CONTEXT_BUDGET", "320000"))
-MODEL_MAX_CONCURRENCY = int(os.environ.get("NRP_MODEL_MAX_CONCURRENCY", "16"))
-MAX_REQUEST_BYTES = int(os.environ.get("NRP_MAX_REQUEST_BYTES", str(256 * 1024**2)))
-MAX_RESPONSE_BYTES = int(os.environ.get("NRP_MAX_RESPONSE_BYTES", str(512 * 1024**2)))
-MAX_ERROR_BYTES = int(os.environ.get("NRP_MAX_ERROR_BYTES", str(64 * 1024)))
-MAX_QUEUED = int(os.environ.get("NRP_MAX_QUEUED", "32"))
-MAX_OUTPUT_TOKENS = {
-    "primary": int(os.environ.get("NRP_PRIMARY_MAX_OUTPUT_TOKENS", "65536")),
-    "long": int(os.environ.get("NRP_LONG_MAX_OUTPUT_TOKENS", "65536")),
-    "subagent": int(os.environ.get("NRP_SUBAGENT_MAX_OUTPUT_TOKENS", "8192")),
-}
+#: The plan schema this proxy understands; ``tools/policy.py`` publishes the matching constant.
+PLAN_SCHEMA_VERSION = 1
 
-# Rule 1: the gateway's only automatic limit, kept below capacity so that output
-# estimates landing high do not turn into 429s.
-OUTPUT_TOKENS_PER_MINUTE = int(os.environ.get("NRP_OUTPUT_TOKENS_PER_MINUTE", "200000"))
-OUTPUT_RATE_HEADROOM = int(os.environ.get("NRP_OUTPUT_RATE_HEADROOM_PERCENT", "90"))
+#: The resolved plan this proxy enforces, and the Kimi configuration that same plan was
+#: rendered into. Both are read on the request path, so a mismatch fails closed.
+POLICY_PATH = os.environ.get("MODEL_PROXY_POLICY", "/policy/model-policy.json")
+KIMI_CONFIG_PATH = os.environ.get("KIMI_CONFIG_PATH", "/policy/kimi-config.toml")
+#: Provider credentials are mounted one file per credential, named by the plan.
+SECRETS_DIR = os.environ.get("MODEL_PROXY_SECRETS_DIR", "/run/secrets")
+INTERNAL_BEARER_TOKEN = secret("MODEL_PROXY_INTERNAL_TOKEN_FILE", "MODEL_PROXY_INTERNAL_TOKEN")
+CACHE_SALT = secret("MODEL_PROXY_CACHE_SALT_FILE", "MODEL_PROXY_CACHE_SALT")
+
+MAX_REQUEST_BYTES = int(os.environ.get("MODEL_PROXY_MAX_REQUEST_BYTES", str(256 * 1024**2)))
+MAX_RESPONSE_BYTES = int(os.environ.get("MODEL_PROXY_MAX_RESPONSE_BYTES", str(512 * 1024**2)))
+MAX_ERROR_BYTES = int(os.environ.get("MODEL_PROXY_MAX_ERROR_BYTES", str(64 * 1024)))
+MAX_QUEUED = int(os.environ.get("MODEL_PROXY_MAX_QUEUED", "32"))
 
 # A stalled upstream read must release its permit rather than wedge the lane.
-SOCK_READ_TIMEOUT = float(os.environ.get("NRP_UPSTREAM_SOCK_READ_TIMEOUT", "300"))
-MAX_REQUEST_SECONDS = float(os.environ.get("NRP_MAX_REQUEST_SECONDS", "3600"))
+SOCK_READ_TIMEOUT = float(os.environ.get("MODEL_PROXY_SOCK_READ_TIMEOUT", "300"))
+MAX_REQUEST_SECONDS = float(os.environ.get("MODEL_PROXY_MAX_REQUEST_SECONDS", "3600"))
 
 # Coarse per-lane input ceiling, as a percentage of the lane input cap. It exists
 # to catch configuration drift and abuse, not to meter legitimate traffic.
-INPUT_GUARD_PERCENT = int(os.environ.get("NRP_INPUT_GUARD_PERCENT", "150"))
-MEDIA_TOKEN_ESTIMATE = int(os.environ.get("NRP_MEDIA_TOKEN_ESTIMATE", "1600"))
+INPUT_GUARD_PERCENT = int(os.environ.get("MODEL_PROXY_INPUT_GUARD_PERCENT", "150"))
+MEDIA_TOKEN_ESTIMATE = int(os.environ.get("MODEL_PROXY_MEDIA_TOKEN_ESTIMATE", "1600"))
 
 # Whether the gateway still accepts usage reporting in streamed responses.
-REQUEST_USAGE = os.environ.get("NRP_REQUEST_USAGE", "1").strip().lower() in {
+REQUEST_USAGE = os.environ.get("MODEL_PROXY_REQUEST_USAGE", "1").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -188,21 +182,29 @@ def debug_http(
 
 
 # ============================================================
-# Enforced Kimi configuration
+# The resolved plan, and the Kimi configuration rendered from it
 # ============================================================
 
 
 class PolicyDrift(RuntimeError):
-    """The rendered Kimi configuration no longer satisfies fair-use policy."""
+    """The mounted plan, or the Kimi configuration rendered from it, is not enforceable."""
 
 
 @dataclass(frozen=True)
 class LanePolicy:
+    """One serving lane: what it costs, where its traffic goes, who admits it."""
+
+    name: str
     alias: str
+    provider_name: str
+    model: str
+    base_url: str
+    secret_name: str
     context: int
     max_input: int
     output_clamp: int
     reserved: int
+    counters: tuple[str, ...]
 
     @property
     def reservation(self) -> int:
@@ -213,164 +215,302 @@ class LanePolicy:
 @dataclass(frozen=True)
 class RuntimePolicy:
     lanes: dict[str, LanePolicy]
-    forced_alias: str
-
-    def reservation(self, lane: str) -> int:
-        return self.lanes[lane].reservation
-
-    def output_clamp(self, lane: str) -> int:
-        return self.lanes[lane].output_clamp
+    counters: dict[str, dict]
+    limits: dict
+    reserved: int
+    providers: tuple[str, ...]
 
 
-def fair_use_ceiling() -> int:
-    return MODEL_CONTEXT * FAIR_USE_PERCENT // 100
+def _positive(entry: dict, key: str, where: str) -> int:
+    value = entry.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise PolicyDrift(f"{where}.{key} must be a positive integer")
+    return value
 
 
-def _lane_model(config: dict, lane: str) -> tuple[str, dict]:
-    provider = PROVIDER_BY_LANE[lane]
-    matches = [
-        (alias, model)
-        for alias, model in config.get("models", {}).items()
-        if isinstance(model, dict) and model.get("provider") == provider
-    ]
-    if len(matches) != 1:
-        raise PolicyDrift(f"expected exactly one model bound to provider {provider!r}")
-    alias, model = matches[0]
-    for key in ("max_context_size", "max_input_size"):
-        if not isinstance(model.get(key), int) or model[key] <= 0:
-            raise PolicyDrift(f"{alias}.{key} must be a positive integer")
-    return alias, model
+def load_plan(path: str | None = None) -> dict:
+    """Read the plan the launcher resolved from ``./models`` and ``./providers``."""
+    location = path or POLICY_PATH
+    try:
+        with open(location, encoding="utf-8") as source:
+            plan = json.load(source)
+    except (OSError, ValueError) as exc:
+        raise PolicyDrift(f"cannot read model policy {location}: {exc}") from exc
+    if not isinstance(plan, dict) or plan.get("schema_version") != PLAN_SCHEMA_VERSION:
+        raise PolicyDrift(f"model policy must be schema {PLAN_SCHEMA_VERSION}")
+    if not isinstance(plan.get("lanes"), dict) or not plan["lanes"]:
+        raise PolicyDrift("model policy declares no lanes")
+    if not isinstance(plan.get("providers"), dict) or not plan["providers"]:
+        raise PolicyDrift("model policy declares no providers")
+    return plan
+
+
+def upstream_credential(secret_name: str) -> str:
+    """Provider key for one credential, read from the file the launcher mounted for it.
+
+    Names come from the plan, which was generated from operator-owned definitions, and are
+    constrained here so a definition can never reach outside the secrets directory.
+    """
+    if not re.fullmatch(r"[a-z0-9_]{1,64}", secret_name):
+        raise PolicyDrift(f"invalid credential name {secret_name!r}")
+    try:
+        value = (Path(SECRETS_DIR) / secret_name).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise PolicyDrift(f"credential {secret_name} is not mounted: {exc}") from exc
+    if not value:
+        raise PolicyDrift(f"credential {secret_name} is empty")
+    return value
+
+
+def _lane_from_plan(name: str, entry: dict, providers: dict, reserved: int) -> LanePolicy:
+    provider = providers.get(entry.get("provider"))
+    if not isinstance(provider, dict):
+        raise PolicyDrift(
+            f"lane {name} names provider {entry.get('provider')!r}, which the plan omits"
+        )
+    credential = (provider.get("credentials") or {}).get(entry.get("credential"))
+    if not isinstance(credential, dict):
+        raise PolicyDrift(
+            f"lane {name} names credential {entry.get('credential')!r}, which the plan omits"
+        )
+    base_url = str(provider.get("base_url", "")).rstrip("/")
+    if not base_url.startswith(("http://", "https://")):
+        raise PolicyDrift(f"provider {entry['provider']} publishes no usable endpoint")
+    return LanePolicy(
+        name=name,
+        alias=str(entry["alias"]),
+        provider_name=str(entry["provider_name"]),
+        model=str(entry["model"]),
+        base_url=base_url,
+        secret_name=str(credential["secret_name"]),
+        context=_positive(entry, "context_tokens", f"lane {name}"),
+        max_input=_positive(entry, "input_tokens", f"lane {name}"),
+        output_clamp=_positive(entry, "output_clamp_tokens", f"lane {name}"),
+        reserved=reserved,
+        counters=tuple(sorted(entry.get("counters") or ())),
+    )
+
+
+def enforce_kimi_configuration(policy: RuntimePolicy, config_path: str | None = None) -> None:
+    """Prove the live Kimi configuration is still the one this plan produced.
+
+    The plan is authoritative because it is what the operator's definitions resolved to. The
+    rendered configuration is cross-checked rather than trusted: an alias Kimi does not offer,
+    a lane sized differently than the plan priced it, or a lost subagent binding is drift, and
+    drift stops traffic instead of sending requests the plan cannot account for.
+    """
+    try:
+        with open(config_path or KIMI_CONFIG_PATH, "rb") as source:
+            config = tomllib.load(source)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise PolicyDrift(f"cannot read the rendered Kimi configuration: {exc}") from exc
+
+    reserve = int((config.get("loop_control") or {}).get("reserved_context_size", 0))
+    if reserve != policy.reserved:
+        raise PolicyDrift(
+            f"Kimi reserves {reserve} output tokens per step but the plan budgeted "
+            f"{policy.reserved}"
+        )
+
+    models = config.get("models") or {}
+    for name, lane in policy.lanes.items():
+        model = models.get(lane.alias)
+        if not isinstance(model, dict):
+            raise PolicyDrift(f"Kimi does not offer {lane.alias!r}, the model for lane {name}")
+        if model.get("provider") != lane.provider_name:
+            raise PolicyDrift(
+                f"Kimi binds {lane.alias!r} to provider {model.get('provider')!r}, "
+                f"not the plan's {lane.provider_name!r}"
+            )
+        for key, want in (
+            ("max_context_size", lane.context),
+            ("max_input_size", lane.max_input),
+        ):
+            if model.get(key) != want:
+                raise PolicyDrift(
+                    f"Kimi sizes {lane.alias}.{key} at {model.get(key)!r}, "
+                    f"the plan enforces {want}"
+                )
+
+    secondary = config.get("secondary_model") or {}
+    if secondary.get("force") is not True:
+        raise PolicyDrift("Kimi secondary_model.force must be true")
+    subagent = policy.lanes.get("subagent")
+    if subagent is not None and secondary.get("default_model") != subagent.alias:
+        raise PolicyDrift(
+            f"forced secondary model {secondary.get('default_model')!r} is not {subagent.alias!r}"
+        )
+    primary = policy.lanes.get("primary")
+    if primary is not None and config.get("default_model") != primary.alias:
+        raise PolicyDrift(
+            f"Kimi default model {config.get('default_model')!r} is not {primary.alias!r}"
+        )
 
 
 def load_runtime_policy(config_path: str | None = None) -> RuntimePolicy:
-    """Read and validate the rendered Kimi configuration that defines each lane."""
-    with open(config_path or KIMI_CONFIG_PATH, "rb") as source:
-        config = tomllib.load(source)
+    """Build enforcement state from the plan, then cross-check the live Kimi configuration."""
+    plan = load_plan()
+    reserved = _positive(plan, "reserved_context_size", "model policy")
+    lanes = {
+        name: _lane_from_plan(name, entry, plan["providers"], reserved)
+        for name, entry in plan["lanes"].items()
+    }
+    for name in lanes:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", name):
+            raise PolicyDrift(f"lane name {name!r} cannot be used in a route")
+    policy = RuntimePolicy(
+        lanes=lanes,
+        counters={
+            key: dict(value)
+            for key, value in (plan.get("counters") or {}).items()
+            if isinstance(value, dict)
+        },
+        limits=dict(plan.get("limits") or {}),
+        reserved=reserved,
+        providers=tuple(sorted({lane.provider_name for lane in lanes.values()})),
+    )
+    enforce_kimi_configuration(policy, config_path)
+    return policy
 
-    secondary = config["secondary_model"]
-    if secondary.get("force") is not True:
-        raise PolicyDrift("Kimi secondary_model.force must be true")
-    forced_alias = secondary["default_model"]
 
-    reserve = int(config.get("loop_control", {}).get("reserved_context_size", 0))
-    if reserve <= 0:
-        raise PolicyDrift("Kimi loop_control.reserved_context_size must be positive")
-
-    lanes: dict[str, LanePolicy] = {}
-    for lane in LANES:
-        alias, model = _lane_model(config, lane)
-        context = int(model["max_context_size"])
-        max_input = int(model["max_input_size"])
-        clamp = MAX_OUTPUT_TOKENS[lane]
-        if max_input + reserve > context:
-            raise PolicyDrift(f"{alias}: max_input_size + reserved_context_size exceeds window")
-        if max_input + clamp > context:
-            raise PolicyDrift(f"{alias}: max_input_size + {clamp} output clamp exceeds window")
-        lanes[lane] = LanePolicy(alias, context, max_input, clamp, reserve)
-
-    if lanes["subagent"].alias != forced_alias:
-        provider = PROVIDER_BY_LANE["subagent"]
-        raise PolicyDrift(f"forced secondary model {forced_alias!r} is not the {provider} lane")
-
-    return RuntimePolicy(lanes=lanes, forced_alias=forced_alias)
+def counter_limits(counter: dict) -> tuple[int | None, int | None, int | None]:
+    """Return (context budget, exclusivity threshold, request limit) a counter imposes."""
+    family = counter.get("family")
+    if family == "context":
+        return counter.get("budget"), counter.get("exclusive_at"), counter.get("max")
+    if family == "count":
+        return None, None, counter.get("max")
+    return None, None, None
 
 
 def validate_policy(policy: RuntimePolicy | None = None) -> None:
-    """Fail startup unless every configured lane can coexist inside fair use."""
+    """Fail startup unless every planned lane and every configured knob is usable.
+
+    Nothing here decides a limit; the plan already carries the numbers the provider rules
+    produced. This proves the plan is internally servable, so a definition that could only
+    ever starve a lane stops the proxy at startup instead of at the first request.
+    """
     policy = policy or BASELINE_POLICY
     numeric_values = {
-        "NRP_MODEL_CONTEXT": MODEL_CONTEXT,
-        "NRP_FAIR_USE_PERCENT": FAIR_USE_PERCENT,
-        "NRP_PARALLEL_CONTEXT_BUDGET": PARALLEL_CONTEXT_BUDGET,
-        "NRP_MODEL_MAX_CONCURRENCY": MODEL_MAX_CONCURRENCY,
-        "NRP_SUBAGENT_MAX_CONCURRENCY": SUBAGENT_LIMIT,
-        "NRP_OUTPUT_TOKENS_PER_MINUTE": OUTPUT_TOKENS_PER_MINUTE,
-        "NRP_OUTPUT_RATE_HEADROOM_PERCENT": OUTPUT_RATE_HEADROOM,
-        "NRP_UPSTREAM_SOCK_READ_TIMEOUT": SOCK_READ_TIMEOUT,
-        "NRP_MAX_REQUEST_SECONDS": MAX_REQUEST_SECONDS,
-        "NRP_INPUT_GUARD_PERCENT": INPUT_GUARD_PERCENT,
-        "NRP_MEDIA_TOKEN_ESTIMATE": MEDIA_TOKEN_ESTIMATE,
-        "NRP_MAX_REQUEST_BYTES": MAX_REQUEST_BYTES,
-        "NRP_MAX_RESPONSE_BYTES": MAX_RESPONSE_BYTES,
-        "NRP_MAX_QUEUED": MAX_QUEUED,
+        "MODEL_PROXY_MAX_REQUEST_BYTES": MAX_REQUEST_BYTES,
+        "MODEL_PROXY_MAX_RESPONSE_BYTES": MAX_RESPONSE_BYTES,
+        "MODEL_PROXY_MAX_ERROR_BYTES": MAX_ERROR_BYTES,
+        "MODEL_PROXY_MAX_QUEUED": MAX_QUEUED,
+        "MODEL_PROXY_SOCK_READ_TIMEOUT": SOCK_READ_TIMEOUT,
+        "MODEL_PROXY_MAX_REQUEST_SECONDS": MAX_REQUEST_SECONDS,
+        "MODEL_PROXY_INPUT_GUARD_PERCENT": INPUT_GUARD_PERCENT,
+        "MODEL_PROXY_MEDIA_TOKEN_ESTIMATE": MEDIA_TOKEN_ESTIMATE,
     }
     for name, value in numeric_values.items():
         if value <= 0:
             raise RuntimeError(f"{name} must be positive; got {value}")
-    if FAIR_USE_PERCENT > 100:
-        raise RuntimeError(f"NRP_FAIR_USE_PERCENT must not exceed 100; got {FAIR_USE_PERCENT}")
-    if not 1 <= OUTPUT_RATE_HEADROOM <= 100:
-        raise RuntimeError("NRP_OUTPUT_RATE_HEADROOM_PERCENT must be between 1 and 100")
     if INPUT_GUARD_PERCENT < 100:
-        raise RuntimeError("NRP_INPUT_GUARD_PERCENT must be at least 100")
+        raise RuntimeError("MODEL_PROXY_INPUT_GUARD_PERCENT must be at least 100")
 
-    ceiling = fair_use_ceiling()
-    if PARALLEL_CONTEXT_BUDGET > ceiling:
-        raise RuntimeError("NRP_PARALLEL_CONTEXT_BUDGET exceeds the configured fair-use limit")
-    if SUBAGENT_LIMIT > MODEL_MAX_CONCURRENCY:
-        raise RuntimeError("Configured subagent concurrency exceeds NRP model concurrency")
-
-    for lane, lane_policy in policy.lanes.items():
-        if lane_policy.reservation > MODEL_CONTEXT:
-            raise RuntimeError(f"{lane} lane cannot fit inside the served context window")
-        if lane_policy.reservation < ceiling and lane_policy.reservation > PARALLEL_CONTEXT_BUDGET:
+    for lane_name, lane in policy.lanes.items():
+        if lane.max_input + lane.reserved > lane.context:
             raise RuntimeError(
-                f"{lane} lane reservation {lane_policy.reservation} can never be admitted "
-                f"under parallel budget {PARALLEL_CONTEXT_BUDGET}"
+                f"{lane.alias} ({lane_name}): {lane.max_input} input + {lane.reserved} reserved "
+                f"does not fit its {lane.context}-token window"
             )
+        if lane.max_input + lane.output_clamp > lane.context:
+            raise RuntimeError(
+                f"{lane.alias} ({lane_name}): {lane.max_input} input + {lane.output_clamp} "
+                f"output clamp does not fit its {lane.context}-token window"
+            )
+        for counter_id in lane.counters:
+            counter = policy.counters.get(counter_id)
+            if counter is None:
+                raise RuntimeError(f"{lane.alias} names unknown counter {counter_id}")
+            budget, exclusive_at, _limit = counter_limits(counter)
+            if budget is None:
+                continue
+            aggregate = counter.get("ceiling")
+            if isinstance(aggregate, int) and budget > aggregate:
+                raise RuntimeError(
+                    f"counter {counter_id} budgets {budget} tokens above the "
+                    f"{aggregate}-token aggregate ceiling its provider publishes"
+                )
+            # A reservation that reaches the exclusivity threshold may exceed the budget: the
+            # provider's own terms allow a request that large to run, provided nothing else
+            # runs beside it. Below that threshold, a lane that cannot fit inside the budget
+            # could never be admitted at all.
+            if lane.reservation > budget and not (
+                exclusive_at is not None and lane.reservation >= exclusive_at
+            ):
+                raise RuntimeError(
+                    f"{lane.alias} reserves {lane.reservation} tokens but counter {counter_id} "
+                    f"only budgets {budget}; no request on this lane could ever be admitted"
+                )
 
-    subagent_reservation = policy.reservation("subagent")
-    if SUBAGENT_LIMIT * subagent_reservation > PARALLEL_CONTEXT_BUDGET:
-        raise RuntimeError("Subagent configuration exceeds parallel context budget")
+    subagent = policy.lanes.get("subagent")
+    fan_out = policy.limits.get("subagent_concurrency")
+    if subagent is not None and isinstance(fan_out, int) and fan_out > 0:
+        for counter_id in subagent.counters:
+            budget = policy.counters[counter_id].get("budget")
+            if budget is not None and fan_out * subagent.reservation > budget:
+                raise RuntimeError(
+                    f"{fan_out} subagent reservations of {subagent.reservation} exceed the "
+                    f"{budget}-token budget on counter {counter_id}"
+                )
 
 
-_policy_cache: tuple[int, int, RuntimePolicy] | None = None
+_policy_cache: tuple[object, object, RuntimePolicy] | None = None
 _policy_error: str | None = None
 _policy_error_logged = False
 
 
-def current_policy() -> RuntimePolicy:
-    """Return the enforced policy, re-reading it whenever the file has changed.
+def _file_stamp(path: str) -> tuple[int, int]:
+    stat = os.stat(path)
+    return (int(stat.st_mtime_ns), stat.st_size)
 
-    Fails closed: a configuration that no longer satisfies fair use stops the
-    affected traffic rather than being served under the last known-good policy.
+
+def _refuse(detail: str, cause: BaseException) -> PolicyDrift:
+    """Log one line per distinct policy failure and return the error the caller raises."""
+    global _policy_error, _policy_error_logged
+    if detail != _policy_error or not _policy_error_logged:
+        print(f"policy_drift error={detail}", flush=True)
+        _policy_error_logged = True
+    _policy_error = detail
+    error = PolicyDrift(detail)
+    error.__cause__ = cause
+    return error
+
+
+def current_policy() -> RuntimePolicy:
+    """Return the enforced policy, re-reading either input whenever it has changed.
+
+    Fails closed: a plan or a configuration the proxy cannot honour stops the affected
+    traffic rather than being served under the last known-good policy.
     """
     global _policy_cache, _policy_error, _policy_error_logged
 
-    stat = os.stat(KIMI_CONFIG_PATH)
-    stamp = (int(stat.st_mtime_ns), stat.st_size)
+    try:
+        stamp = (_file_stamp(POLICY_PATH), _file_stamp(KIMI_CONFIG_PATH))
+    except OSError as exc:
+        raise _refuse(f"policy inputs are unreadable: {exc}", exc) from exc
+
     if _policy_cache is not None and _policy_cache[0:2] == stamp:
         return _policy_cache[2]
 
     try:
         policy = load_runtime_policy()
-    except (OSError, KeyError, ValueError, PolicyDrift, TypeError) as exc:
-        detail = str(exc)
-        if detail != _policy_error or not _policy_error_logged:
-            print(f"policy_drift error={detail}", flush=True)
-            _policy_error_logged = True
-        _policy_error = detail
-        raise PolicyDrift(detail) from exc
-
-    try:
         validate_policy(policy)
-    except RuntimeError as exc:
-        detail = str(exc)
-        if detail != _policy_error or not _policy_error_logged:
-            print(f"policy_drift error={detail}", flush=True)
-            _policy_error_logged = True
-        _policy_error = detail
-        raise PolicyDrift(detail) from exc
+    except (KeyError, TypeError, ValueError, PolicyDrift, RuntimeError) as exc:
+        raise _refuse(str(exc), exc) from exc
 
     if _policy_error is not None:
         print("policy_drift_clear", flush=True)
     _policy_error = None
     _policy_error_logged = False
     _policy_cache = (stamp[0], stamp[1], policy)
+    # Counter numbers move with the plan; the objects holding live reservations do not.
+    enforcement.sync(policy)
     return policy
 
 
 BASELINE_POLICY = load_runtime_policy()
+validate_policy(BASELINE_POLICY)
 
 
 def estimate_input_tokens(body: bytes) -> tuple[int, int]:
@@ -405,7 +545,13 @@ def _object_no_duplicates(pairs):
     return result
 
 
-def rewrite_model(body: bytes, request: web.Request, lane: str = "primary") -> bytes:
+def rewrite_model(body: bytes, request: web.Request, lane: LanePolicy) -> bytes:
+    """Validate a chat request and rebind it to the model and clamp this lane was sold.
+
+    The client's alias is deliberately discarded: the route a request arrived on is the
+    only thing that decides which model it reaches, so a body cannot ask for a lane with a
+    bigger window or a longer output than the reservation that was charged for it.
+    """
     if request.method != "POST" or request.content_type != "application/json":
         raise web.HTTPUnsupportedMediaType(text="chat requests require application/json")
     try:
@@ -427,13 +573,13 @@ def rewrite_model(body: bytes, request: web.Request, lane: str = "primary") -> b
         value = payload[name]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise web.HTTPBadRequest(text=f"{name} must be a positive integer")
-        payload[name] = min(value, MAX_OUTPUT_TOKENS[lane])
+        payload[name] = min(value, lane.output_clamp)
     if not limits:
-        payload["max_completion_tokens"] = MAX_OUTPUT_TOKENS[lane]
-    # Rule 1 is metered in output tokens, so measured usage beats estimation.
+        payload["max_completion_tokens"] = lane.output_clamp
+    # Output tokens are what the provider meters itself, so measured usage beats estimation.
     if REQUEST_USAGE and USAGE_SUPPORTED and payload.get("stream") is True:
         payload.setdefault("stream_options", {"include_usage": True})
-    payload["model"] = UPSTREAM_MODEL
+    payload["model"] = lane.model
     payload["cache_salt"] = CACHE_SALT
     return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
 
@@ -443,13 +589,53 @@ def body_rejects_stream_usage(status: int, body: bytes) -> bool:
 
 
 # ============================================================
-# Rule 1: output tokens per minute
+# Rate counters: booked usage in a rolling window
 # ============================================================
+
+
+@dataclass(frozen=True)
+class Cost:
+    """What one request may cost, in every unit a provider might meter it in.
+
+    The plan says which unit each ledger reads; this object is the one place that knows how
+    much a request charges in each of them, so adding a metered unit is a change here and in
+    the definition taxonomy rather than a search through the admission path.
+    """
+
+    input: int
+    output: int
+
+    def charge(self, unit: str) -> int:
+        if unit == "requests":
+            return 1
+        if unit == "input_tokens":
+            return self.input
+        if unit == "total_tokens":
+            return self.input + self.output
+        return self.output
+
+    def credit(self, unit: str, outcome: Attempt) -> int | None:
+        """Measured cost once the response finished.
+
+        ``None`` means nothing was measured in that unit, and the pessimistic charge stands
+        for the rest of the window - the safe direction to be wrong in.
+        """
+        if unit == "requests":
+            return 1
+        if unit == "input_tokens":
+            return outcome.prompt_tokens
+        if unit == "total_tokens":
+            if outcome.prompt_tokens is None or outcome.output_tokens is None:
+                return None
+            return outcome.prompt_tokens + outcome.output_tokens
+        if outcome.output_tokens is not None:
+            return outcome.output_tokens
+        return outcome.estimated_output
 
 
 @dataclass(eq=False)
 class Booking:
-    """One entry in the rolling output-token window.
+    """One entry in a rolling rate window, charged in that ledger's unit.
 
     Identity comparison is deliberate: two bookings for the same amount and expiry
     must not be interchangeable when one of them is settled.
@@ -461,29 +647,41 @@ class Booking:
     pruned: bool = False
 
 
-class OutputRateLedger:
-    """Rolling-window cap on output tokens, which is all NRP enforces itself.
+class RateLedger:
+    """Rolling-window cap on one metered unit - output tokens, input tokens, total, or requests.
 
-    A request books its lane's full output allowance before it starts, because
-    its eventual size is genuinely unknown, and is then settled to measured
-    usage. The gateway's own remaining-quota header wins whenever it reports
-    less headroom than we do.
+    A request books the largest charge its lane could plausibly incur before it starts,
+    because its eventual size is genuinely unknown, and is then settled to measured usage.
+    The gateway's own remaining-quota header wins whenever it reports less headroom than we
+    do, for the units the header actually describes.
     """
 
     def __init__(
         self,
         capacity: int,
+        unit: str = "output_tokens",
         *,
         window: float = RATE_WINDOW_SECONDS,
         clock=time.monotonic,
     ) -> None:
+        if unit not in LEDGER_UNITS:
+            raise RuntimeError(f"unknown rate unit {unit!r}")
         self.capacity = capacity
+        self.unit = unit
         self.window = window
         self.clock = clock
         self.bookings: deque[Booking] = deque()
         self.committed = 0
         self.server_remaining: int | None = None
         self.server_expires_at: float = 0.0
+
+    def charge(self, cost: Cost) -> int:
+        """What one request books against this ledger, before any usage is known."""
+        return cost.charge(self.unit)
+
+    def credit(self, cost: Cost, outcome: Attempt) -> int | None:
+        """Measured cost once a response is done; ``None`` keeps the pessimistic charge."""
+        return cost.credit(self.unit, outcome)
 
     def _insert(self, booking: Booking) -> None:
         self.bookings.append(booking)
@@ -511,14 +709,30 @@ class OutputRateLedger:
         return max(0, room)
 
     def note_server(self, headers) -> None:
-        remaining = headers.get("x-ratelimit-remaining")
+        """Let the endpoint's own headroom win, for the unit it actually reports.
+
+        A gateway quota header describes one meter: request-count headers for a request
+        ledger, token-count headers for an output-token ledger. A ledger whose unit no
+        header describes - an input-token cap on a gateway that meters output - keeps its
+        own pessimistic bookings rather than borrowing a number that means something else.
+        """
+        if self.unit == "requests":
+            remaining_key, reset_key = (
+                "x-ratelimit-requests-remaining",
+                "x-ratelimit-requests-reset",
+            )
+        elif self.unit == "output_tokens":
+            remaining_key, reset_key = "x-ratelimit-remaining", "x-ratelimit-reset"
+        else:
+            return
+        remaining = headers.get(remaining_key)
         if remaining is None:
             return
         try:
             value = int(float(remaining))
         except ValueError:
             return
-        reset = headers.get("x-ratelimit-reset")
+        reset = headers.get(reset_key)
         try:
             seconds = float(reset) if reset is not None else RATE_WINDOW_SECONDS
         except ValueError:
@@ -569,44 +783,50 @@ class OutputRateLedger:
     def snapshot(self) -> dict:
         return {
             "capacity": self.capacity,
+            "unit": self.unit,
             "committed": self.projected(),
             "available": self.available(),
             "server_remaining": self.server_remaining,
         }
 
 
-def output_rate_capacity() -> int:
-    return OUTPUT_TOKENS_PER_MINUTE * OUTPUT_RATE_HEADROOM // 100
-
-
 # ============================================================
-# Rules 2 and 3: concurrent context and request count
+# Concurrent context and request count
 # ============================================================
 
 
 class FairUseGate:
-    """Admission for fair-use context and request-count limits.
+    """Admission for one provider counter.
 
-    Lanes are not special-cased. A lane whose worst-case reservation reaches the
-    fair-use ceiling may run alone (rule 2); every other lane is admitted while
-    the sum of live reservations stays inside the parallel budget (rule 3). At
-    the shipped numbers that reproduces strict primary/subagent separation,
-    because a primary reservation plus one subagent reservation exceeds it.
+    A counter carries whichever of three constraints the provider publishes for its scope:
+    an aggregate in-flight token budget, a threshold at or above which a single request must
+    run alone, and a hard request-count ceiling. ``None`` means the provider stated nothing
+    of that kind, so the constraint is simply absent - a provider with only a concurrency
+    limit gets a counting semaphore, and one with only a token budget gets a bin.
+
+    Lanes are not special-cased. A reservation that reaches the exclusivity threshold runs
+    alone because the provider says a request that large may not overlap anything; every
+    other lane is admitted while the sum of live reservations stays inside the budget. Which
+    lane yields to which is a fairness choice, not a policy rule: subagents give way to a
+    primary that is already queued, so an idle operator cannot be starved by a fan-out of
+    children.
     """
 
     def __init__(
         self,
-        subagent_limit: int,
+        counter_id: str,
         *,
-        model_limit: int = MODEL_MAX_CONCURRENCY,
-        budget: int = PARALLEL_CONTEXT_BUDGET,
-        ceiling: int | None = None,
+        budget: int | None = None,
+        exclusive_at: int | None = None,
+        limit: int | None = None,
+        subagent_limit: int | None = None,
     ) -> None:
+        self.counter_id = counter_id
         self.condition = asyncio.Condition()
-        self.subagent_limit = subagent_limit
-        self.model_limit = model_limit
         self.budget = budget
-        self.ceiling = fair_use_ceiling() if ceiling is None else ceiling
+        self.exclusive_at = exclusive_at
+        self.limit = limit
+        self.subagent_limit = subagent_limit
         self.reserved = 0
         self.active = 0
         self.active_primary = 0
@@ -614,24 +834,22 @@ class FairUseGate:
         self.waiting_primary = 0
 
     def is_exclusive(self, reservation: int) -> bool:
-        return reservation >= self.ceiling
+        return self.exclusive_at is not None and reservation >= self.exclusive_at
 
     def _admits(self, lane: str, reservation: int) -> bool:
-        if self.active >= self.model_limit:
+        if self.limit is not None and self.active >= self.limit:
             return False
-        if lane == "subagent" and self.active_subagents >= self.subagent_limit:
+        if self.subagent_limit is not None and self.active_subagents >= self.subagent_limit:
             return False
         if self.is_exclusive(reservation):
             return self.active == 0
-        # Subagents yield to a primary that is already queued, so an idle
-        # operator cannot be starved by a continuous fan-out of children.
         if lane != "primary" and self.waiting_primary:
             return False
-        return self.reserved + reservation <= self.budget
+        return self.budget is None or self.reserved + reservation <= self.budget
 
     @contextlib.asynccontextmanager
     async def slot(self, lane: str, reservation: int) -> AsyncIterator[None]:
-        primary_like = lane in {"primary", "long"}
+        primary_like = lane != "subagent"
         async with self.condition:
             if primary_like:
                 self.waiting_primary += 1
@@ -666,10 +884,10 @@ class FairUseGate:
             "active_subagents": self.active_subagents,
             "waiting_primary": self.waiting_primary,
             "reserved_context": self.reserved,
-            "parallel_context_budget": self.budget,
-            "fair_use_context_ceiling": self.ceiling,
+            "context_budget": self.budget,
+            "exclusive_at": self.exclusive_at,
+            "request_limit": self.limit,
             "subagent_limit": self.subagent_limit,
-            "model_limit": self.model_limit,
         }
 
 
@@ -705,9 +923,146 @@ class Stats:
     policy_errors: int = 0
 
 
-gate = FairUseGate(SUBAGENT_LIMIT)
-rate_ledger = OutputRateLedger(output_rate_capacity())
-ingress = IngressGate(1 + SUBAGENT_LIMIT, MAX_QUEUED)
+class Enforcement:
+    """The live counter objects for one plan, keyed by the counter ids the plan publishes.
+
+    Objects are reused across a reload and only their numbers move, because a reload happens
+    while requests are in flight: a gate that was rebuilt would forget reservations it still
+    has to release. Refreshing in place means the next admission is judged by the new policy
+    while the old one is still paid back correctly.
+    """
+
+    def __init__(self) -> None:
+        self.gates: dict[str, FairUseGate] = {}
+        self.ledgers: dict[str, RateLedger] = {}
+
+    def sync(self, policy: RuntimePolicy) -> None:
+        fan_out = policy.limits.get("subagent_concurrency")
+        wanted: set[str] = set()
+        for counter_id, counter in sorted(policy.counters.items()):
+            family = counter.get("family")
+            lanes = counter.get("lanes") or []
+            if family in {"context", "count"}:
+                budget, exclusive_at, limit = counter_limits(counter)
+                subagent_limit = fan_out if "subagent" in lanes else None
+                gate = self.gates.get(counter_id)
+                if gate is None:
+                    self.gates[counter_id] = FairUseGate(
+                        counter_id,
+                        budget=budget,
+                        exclusive_at=exclusive_at,
+                        limit=limit,
+                        subagent_limit=subagent_limit,
+                    )
+                else:
+                    gate.budget = budget
+                    gate.exclusive_at = exclusive_at
+                    gate.limit = limit
+                    gate.subagent_limit = subagent_limit
+                wanted.add(counter_id)
+            elif family == "rate":
+                capacity = counter.get("capacity")
+                if not isinstance(capacity, int) or capacity <= 0:
+                    continue
+                unit = str(counter.get("unit") or "output_tokens")
+                ledger = self.ledgers.get(counter_id)
+                if ledger is None:
+                    self.ledgers[counter_id] = RateLedger(capacity, unit)
+                else:
+                    ledger.capacity = capacity
+                    ledger.unit = unit
+                wanted.add(counter_id)
+        for counter_id in set(self.gates) - wanted:
+            del self.gates[counter_id]
+        for counter_id in set(self.ledgers) - wanted:
+            del self.ledgers[counter_id]
+
+    def gates_for(self, lane: LanePolicy) -> tuple[FairUseGate, ...]:
+        """Counters this lane must hold, in the one order every request takes them.
+
+        Sorted counter-id order is what keeps two lanes that share counters from deadlocking:
+        no request can be waiting on a counter another request has not yet tried to take.
+        """
+        return tuple(self.gates[key] for key in lane.counters if key in self.gates)
+
+    def ledgers_for(self, lane: LanePolicy) -> tuple[tuple[str, RateLedger], ...]:
+        return tuple(
+            (key, self.ledgers[key]) for key in lane.counters if key in self.ledgers
+        )
+
+    def book(self, lane: LanePolicy, cost: Cost) -> dict[str, Booking] | None:
+        """Reserve usage on every rate counter this lane shares, or on none of them.
+
+        Each ledger charges itself in its own unit from the same request, so a provider that
+        meters both output tokens and requests sees one request booked once in each.
+        """
+        bookings: dict[str, Booking] = {}
+        for counter_id, ledger in self.ledgers_for(lane):
+            booking = ledger.reserve(ledger.charge(cost))
+            if booking is None:
+                for key, item in bookings.items():
+                    self.ledgers[key].settle(item, 0)
+                return None
+            bookings[counter_id] = booking
+        return bookings
+
+    def settle(
+        self,
+        lane: LanePolicy,
+        bookings: dict[str, Booking] | None,
+        cost: Cost,
+        outcome: Attempt | None,
+    ) -> None:
+        """Settle every booking in the unit its own ledger meters.
+
+        ``outcome`` is None when the attempt never reached the client, which refunds the
+        charge entirely. Where a response reported nothing measurable in a ledger's unit, the
+        pessimistic charge stands for the rest of the window - the safe direction to be wrong.
+        """
+        for counter_id, booking in (bookings or {}).items():
+            ledger = self.ledgers[counter_id]
+            if outcome is None:
+                ledger.settle(booking, 0)
+                continue
+            actual = ledger.credit(cost, outcome)
+            if actual is None:
+                stats.usage_unknown += 1
+            ledger.settle(booking, actual)
+
+    def wait_seconds(self, lane: LanePolicy) -> float:
+        waits = [ledger.wait_seconds() for _key, ledger in self.ledgers_for(lane)]
+        return max(waits) if waits else 1.0
+
+    def is_exclusive(self, lane: LanePolicy) -> bool:
+        """True when any counter this lane holds would serve it alone."""
+        return any(gate.is_exclusive(lane.reservation) for gate in self.gates_for(lane))
+
+    def snapshot(self) -> dict:
+        gates = {
+            counter_id: gate.snapshot() for counter_id, gate in sorted(self.gates.items())
+        }
+        ledgers = {
+            counter_id: ledger.snapshot()
+            for counter_id, ledger in sorted(self.ledgers.items())
+        }
+        return {"counters": gates, "rates": ledgers}
+
+
+@contextlib.asynccontextmanager
+async def admission(lane: LanePolicy, enforcement: Enforcement) -> AsyncIterator[None]:
+    """Hold every counter the plan says this lane's traffic is charged to."""
+    reservation = lane.reservation
+    async with contextlib.AsyncExitStack() as stack:
+        for gate in enforcement.gates_for(lane):
+            await stack.enter_async_context(gate.slot(lane.name, reservation))
+        yield
+
+
+enforcement = Enforcement()
+enforcement.sync(BASELINE_POLICY)
+ingress = IngressGate(
+    1 + int(BASELINE_POLICY.limits.get("subagent_concurrency") or 1), MAX_QUEUED
+)
 stats = Stats()
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -727,14 +1082,16 @@ def connection_headers(headers) -> set[str]:
     }
 
 
-def filtered_request_headers(request: web.Request) -> dict[str, str]:
+def filtered_request_headers(request: web.Request, api_key: str) -> dict[str, str]:
     blocked = (
         HOP_BY_HOP_HEADERS
         | connection_headers(request.headers)
         | {"host", "authorization", "content-length", "content-encoding", "accept-encoding"}
     )
     result = {name: value for name, value in request.headers.items() if name.lower() not in blocked}
-    result["Authorization"] = f"Bearer {API_KEY}"
+    # The client's bearer is the harness's internal token; the provider key belongs to the
+    # lane's credential and never leaves this process.
+    result["Authorization"] = f"Bearer {api_key}"
     result["Content-Type"] = "application/json"
     # Usage is read out of the response stream, so it must not arrive compressed.
     result["Accept-Encoding"] = "identity"
@@ -870,7 +1227,7 @@ async def health(_request: web.Request) -> web.Response:
         policy = current_policy()
     except PolicyDrift as exc:
         return web.json_response(
-            {"status": "policy-drift", "policy_error": str(exc), **gate.snapshot()},
+            {"status": "policy-drift", "policy_error": str(exc), **enforcement.snapshot()},
             status=503,
         )
 
@@ -878,23 +1235,28 @@ async def health(_request: web.Request) -> web.Response:
         {
             "status": "ok",
             "policy_enforced": True,
-            **gate.snapshot(),
-            **{"rate_" + key: value for key, value in rate_ledger.snapshot().items()},
-            "fair_use_percent": FAIR_USE_PERCENT,
-            "model_context": MODEL_CONTEXT,
-            "output_tokens_per_minute": OUTPUT_TOKENS_PER_MINUTE,
+            **enforcement.snapshot(),
+            "subagent_limit": policy.limits.get("subagent_concurrency"),
+            "providers": sorted(policy.providers),
+            "credentials": sorted(
+                {lane.secret_name for lane in policy.lanes.values()},
+            ),
             "lanes": {
                 lane: {
                     "alias": item.alias,
+                    "provider": item.provider_name,
+                    "model": item.model,
+                    "endpoint": item.base_url,
+                    "credential": item.secret_name,
                     "context": item.context,
                     "max_input": item.max_input,
                     "output_clamp": item.output_clamp,
                     "reservation": item.reservation,
-                    "exclusive": gate.is_exclusive(item.reservation),
+                    "exclusive": enforcement.is_exclusive(item),
+                    "counters": list(item.counters),
                 }
                 for lane, item in policy.lanes.items()
             },
-            "forced_secondary_model": policy.forced_alias,
             "input_guard_percent": INPUT_GUARD_PERCENT,
             "sock_read_timeout_seconds": SOCK_READ_TIMEOUT,
             "max_request_seconds": MAX_REQUEST_SECONDS,
@@ -914,9 +1276,8 @@ async def health(_request: web.Request) -> web.Response:
 
 async def models(request: web.Request) -> web.Response:
     authorize_client(request)
-    return web.json_response(
-        {"object": "list", "data": [{"id": UPSTREAM_MODEL, "object": "model"}]}
-    )
+    lane = current_policy().lanes[request.match_info["lane"]]
+    return web.json_response({"object": "list", "data": [{"id": lane.model, "object": "model"}]})
 
 
 async def chat(request: web.Request) -> web.StreamResponse:
@@ -931,7 +1292,7 @@ async def chat(request: web.Request) -> web.StreamResponse:
             text="compressed request bodies are not supported"
         )
 
-    lane = request.match_info["lane"]
+    lane_name = request.match_info["lane"]
 
     try:
         policy = current_policy()
@@ -941,6 +1302,8 @@ async def chat(request: web.Request) -> web.StreamResponse:
             text=f"model policy is not currently enforced: {exc}",
             headers={"Retry-After": "5"},
         ) from exc
+
+    lane = policy.lanes[lane_name]
 
     async with ingress.slot():
         inbound_body = await request.read()
@@ -953,12 +1316,12 @@ async def chat(request: web.Request) -> web.StreamResponse:
             body=inbound_body,
         )
 
-        guard = policy.lanes[lane].max_input * INPUT_GUARD_PERCENT // 100
+        guard = lane.max_input * INPUT_GUARD_PERCENT // 100
         estimate, media = estimate_input_tokens(inbound_body)
         if estimate > guard:
             stats.guard_rejections += 1
             print(
-                f"input_guard lane={lane} estimate={estimate} guard={guard} "
+                f"input_guard lane={lane_name} estimate={estimate} guard={guard} "
                 f"media_items={media} input_bytes={len(inbound_body)}",
                 flush=True,
             )
@@ -977,8 +1340,11 @@ async def chat(request: web.Request) -> web.StreamResponse:
             lane,
             outbound_body,
             started,
-            policy,
             inbound_body,
+            # The guard's estimate is the best input figure available before the request
+            # runs; a ledger that meters input charges itself from it and settles to the
+            # prompt tokens the response reports.
+            Cost(input=estimate, output=lane.output_clamp),
         )
 
 
@@ -1014,33 +1380,36 @@ class Attempt:
 async def stream_attempt(
     request: web.Request,
     session: ClientSession,
-    lane: str,
+    lane: LanePolicy,
     body: bytes,
-    policy: RuntimePolicy,
     attempt: int,
 ) -> Attempt:
-    """Make one attempt, holding the lane's fair-use permit for its whole life."""
-    async with gate.slot(lane, policy.reservation(lane)):
-        outbound_headers = filtered_request_headers(request)
+    """Make one attempt, holding every fair-use permit this lane is charged to."""
+    url = f"{lane.base_url}/v1/chat/completions"
+    async with admission(lane, enforcement):
+        outbound_headers = filtered_request_headers(
+            request, upstream_credential(lane.secret_name)
+        )
 
         debug_http(
             f"OUTBOUND REQUEST TO UPSTREAM - ATTEMPT {attempt}",
             method="POST",
-            url=f"{UPSTREAM}/v1/chat/completions",
+            url=url,
             headers=outbound_headers,
             body=body,
             redact_cache_salt=True,
         )
 
         response = await session.post(
-            f"{UPSTREAM}/v1/chat/completions",
+            url,
             data=body,
             headers=outbound_headers,
             allow_redirects=False,
         )
 
         try:
-            rate_ledger.note_server(response.headers)
+            for _counter_id, ledger in enforcement.ledgers_for(lane):
+                ledger.note_server(response.headers)
 
             if response.status in RETRYABLE or response.status == 400:
                 error_body = await response.content.read(MAX_ERROR_BYTES + 1)
@@ -1088,7 +1457,7 @@ async def stream_attempt(
                         response.close()
                         scanner.finish()
                         print(
-                            f"response_limit lane={lane} input_bytes={len(body)} "
+                            f"response_limit lane={lane.name} input_bytes={len(body)} "
                             f"output_bytes={output_bytes}",
                             flush=True,
                         )
@@ -1106,7 +1475,7 @@ async def stream_attempt(
                 scanner.finish()
                 response.close()
                 print(
-                    f"stream_stall lane={lane} attempt={attempt} bytes={output_bytes}",
+                    f"stream_stall lane={lane.name} attempt={attempt} bytes={output_bytes}",
                     flush=True,
                 )
                 if request.transport is not None:
@@ -1147,34 +1516,25 @@ def _attempt_result(
     )
 
 
-def book_output(booking: Booking | None, outcome: Attempt) -> None:
-    """Settle a rate booking against measured output.
-
-    With neither measured usage nor an estimate the pessimistic booking stands for
-    the rest of the window, which is the safe direction to be wrong in.
-    """
-    actual = outcome.output_tokens
-    if actual is None:
-        actual = outcome.estimated_output
-    if actual is None:
-        stats.usage_unknown += 1
-        rate_ledger.settle(booking, None)
-        return
-    rate_ledger.settle(booking, actual)
+def book_output(
+    lane: LanePolicy, bookings: dict[str, Booking] | None, cost: Cost, outcome: Attempt
+) -> None:
+    """Settle this attempt's rate bookings against what it actually produced."""
+    enforcement.settle(lane, bookings, cost, outcome)
 
 
 async def forward_chat(
     request: web.Request,
-    lane: str,
+    lane: LanePolicy,
     body: bytes,
     started: float,
-    policy: RuntimePolicy,
     inbound_body: bytes,
+    cost: Cost,
 ) -> web.StreamResponse:
     """Retry an upstream request until it finishes or the client goes away.
 
     Every sleep happens with no fair-use permit held and no rate booking outstanding,
-    so backpressure from NRP never occupies capacity that other requests could use.
+    so provider backpressure never occupies capacity that other requests could use.
     """
     global USAGE_SUPPORTED
 
@@ -1191,7 +1551,7 @@ async def forward_chat(
         if elapsed > MAX_REQUEST_SECONDS:
             stats.deadline_stops += 1
             print(
-                f"request_deadline lane={lane} attempts={attempt_number} "
+                f"request_deadline lane={lane.name} attempts={attempt_number} "
                 f"elapsed_seconds={elapsed:.1f}",
                 flush=True,
             )
@@ -1199,13 +1559,12 @@ async def forward_chat(
                 text="upstream did not complete within the policy request limit"
             )
 
-        booking = rate_ledger.reserve(policy.output_clamp(lane))
-        if booking is None:
+        bookings = enforcement.book(lane, cost)
+        if bookings is None:
             stats.rate_waits += 1
-            delay = rate_ledger.wait_seconds()
+            delay = enforcement.wait_seconds(lane)
             print(
-                f"rate_wait lane={lane} attempt={attempt_number} delay={delay:.1f}s "
-                f"committed={rate_ledger.committed}",
+                f"rate_wait lane={lane.name} attempt={attempt_number} delay={delay:.1f}s",
                 flush=True,
             )
             await asyncio.sleep(delay)
@@ -1213,21 +1572,21 @@ async def forward_chat(
 
         try:
             outcome = await stream_attempt(
-                request, session, lane, body, policy, attempt_number
+                request, session, lane, body, attempt_number
             )
         except (TimeoutError, ClientConnectionError, ServerDisconnectedError) as exc:
-            rate_ledger.settle(booking, 0)
+            enforcement.settle(lane, bookings, cost, None)
             delay = retry_delay(_HeaderBag({}), attempt_number)
             print(
-                f"upstream_retry lane={lane} attempt={attempt_number} "
+                f"upstream_retry lane={lane.name} attempt={attempt_number} "
                 f"error={type(exc).__name__} delay={delay:.1f}s",
                 flush=True,
             )
         else:
             if outcome.streamed:
-                book_output(booking, outcome)
+                book_output(lane, bookings, cost, outcome)
                 print(
-                    f"request_complete lane={lane} input_bytes={len(body)} "
+                    f"request_complete lane={lane.name} input_bytes={len(body)} "
                     f"attempts={attempt_number} prompt_tokens={outcome.prompt_tokens} "
                     f"output_tokens={outcome.output_tokens} "
                     f"estimated_output={outcome.estimated_output} "
@@ -1246,10 +1605,10 @@ async def forward_chat(
                     flush=True,
                 )
 
-            rate_ledger.settle(booking, 0)
+            enforcement.settle(lane, bookings, cost, None)
             delay = outcome.retry_after if outcome.retry_after is not None else 1.0
             print(
-                f"upstream_retry lane={lane} attempt={attempt_number} "
+                f"upstream_retry lane={lane.name} attempt={attempt_number} "
                 f"delay={delay:.1f}s",
                 flush=True,
             )
@@ -1278,20 +1637,24 @@ def create_app() -> web.Application:
     app.on_startup.append(create_client)
     app.on_cleanup.append(close_client)
 
+    # Only lanes the operator's definitions produced are routable; a lane the plan does
+    # not publish answers 404 rather than being admitted and failing policy validation.
+    lanes = "{lane:" + "|".join(sorted(BASELINE_POLICY.lanes)) + "}"
     app.router.add_get("/healthz", health)
-    app.router.add_post(
-        "/{lane:primary|long|subagent}/v1/chat/completions",
-        chat,
-    )
-    app.router.add_get(
-        "/{lane:primary|long|subagent}/v1/models",
-        models,
-    )
+    app.router.add_post(f"/{lanes}/v1/chat/completions", chat)
+    app.router.add_get(f"/{lanes}/v1/models", models)
     return app
 
 
 def main() -> None:
     validate_policy()
+    for name, lane in sorted(BASELINE_POLICY.lanes.items()):
+        print(
+            f"lane={name} alias={lane.alias} provider={lane.provider_name} "
+            f"context={lane.context} input={lane.max_input} output={lane.output_clamp} "
+            f"reservation={lane.reservation} counters={','.join(lane.counters)}",
+            flush=True,
+        )
     web.run_app(create_app(), host="0.0.0.0", port=8080, access_log=None)  # noqa: S104
 
 

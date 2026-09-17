@@ -16,11 +16,20 @@ for command in docker git python3 shasum; do
   command -v "${command}" >/dev/null 2>&1 || { echo "Required command not found: ${command}" >&2; exit 1; }
 done
 
+# LOCAL_UID becomes the container user, so a root launch would build the agent image with
+# USER 0:0 and leave every host artifact owned by root. The in-container initializer refuses
+# root too, but it runs inside Compose and cannot cover the build or the version probe.
+if [[ "$(id -u)" == 0 ]]; then
+  echo "./start.sh must not run as root; run it as the account that owns the workspace." >&2
+  exit 1
+fi
+
 # shellcheck disable=SC1091
 source "${root}/tools/runtime.sh"
 harness_traps
 echo "Preparing Kimi workspace..."
 harness_init
+harness_warn_env_migration
 docker info >/dev/null || { echo "Docker is not ready. Start Docker Desktop and retry." >&2; exit 1; }
 
 MODULE_PIDS=()
@@ -45,9 +54,12 @@ cleanup() {
   if [[ "${stack_started}" == true ]]; then
     harness_compose down --remove-orphans >/dev/null 2>&1 || true
   fi
-  for file in proxy-token search-token nrp-api-key kimi-config.toml runtime.env session.env module.env compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
+  for file in proxy-token search-token kimi-config.toml runtime.env session.env module.env model-selection.json model-policy.json model.env compose/models.json compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
     [[ -f "${HARNESS_RUNTIME_DIR}/${file}" ]] && find "${HARNESS_RUNTIME_DIR}/${file}" -delete
   done
+  # Provider keys are session material: empty the directory, including any file a
+  # renamed credential left behind.
+  [[ -d "${HARNESS_RUNTIME_DIR}/credentials" ]] && find "${HARNESS_RUNTIME_DIR}/credentials" -mindepth 1 -delete
   harness_unlock
   exit "${status}"
 }
@@ -68,6 +80,17 @@ fi
 export MODULE_NON_INTERACTIVE=${non_interactive}
 module_args=()
 [[ "${non_interactive}" == true ]] && module_args+=(--non-interactive)
+
+# Model selection precedes the Kimi Code version choice: every downstream number -
+# lane sizes, the subagent fan-out, the proxy's enforcement plan - is derived from
+# the two models selected here rather than from .env.
+python3 tools/models.py select ${module_args[@]+"${module_args[@]}"}
+python3 tools/models.py resolve
+set -a
+# shellcheck disable=SC1091
+source "${HARNESS_RUNTIME_DIR}/model.env"
+set +a
+
 python3 tools/modules.py select ${module_args[@]+"${module_args[@]}"}
 harness_modules configure
 
@@ -133,6 +156,7 @@ harness_modules check_build
 cp -- "${session_file}" "${state_file}"
 chmod 600 "${state_file}"
 cp "${HARNESS_RUNTIME_DIR}/modules.json" "${HARNESS_RUNTIME_DIR}/last-modules.json"
+cp "${HARNESS_RUNTIME_DIR}/model-selection.json" "${HARNESS_RUNTIME_DIR}/last-model-selection.json"
 find "${session_file}" -delete
 
 wait_for_url() {

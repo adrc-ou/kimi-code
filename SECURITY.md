@@ -89,7 +89,10 @@ Review executable project extensions with `./extensions.sh list`, then approve
 their exact content with `./extensions.sh approve`. Approved snapshots are
 mounted read-only. A content change requires review, approval, and restart.
 Ordinary `AGENTS.md` guidance remains writable and does not enter this approval
-boundary.
+boundary. Links are refused at every level of a privileged path, not only at its
+leaf: an ancestor link would otherwise let workspace-authored content redirect the
+scan, the approval digest, and the snapshot copy into a host directory the agent
+cannot otherwise read.
 
 Modules under `modules/` are operator-trusted host code, like the launcher itself.
 Never load modules from the writable workspace. Stop the stack before installing,

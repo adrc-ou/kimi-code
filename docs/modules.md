@@ -149,13 +149,19 @@ policy files. Module guidance is replaced in the marked section of workspace
 malformed markers are refused.
 
 For the same reason, a module Compose overlay must not add host binds to
-`kimi-agent`. Every source path it names is disclosed in the agent's mount table,
-and each extra mount is one more thing a reviewer has to trace, so assets belong
-in `<runtime>/assets/` and per-instance state belongs in declared workspace
-directories or named volumes. `modules/comfyui/compose.mps.yaml` is the one
-current exception: the MPS bridge CA certificate is still bound at
-`/run/comfy-bridge/ca.crt`. It is a public certificate rather than a secret, but
-it does disclose an instance runtime path and should move to staged assets.
+`kimi-agent`. `tools/compose_hygiene.py` runs against the fully resolved launch
+configuration, and `tests/compose-config.sh` runs it again over the core files,
+the generated approved-extension fragment, and each module overlay; only the
+workspace bind and staged extension-snapshot binds are accepted. Every source
+path a bind names is disclosed in the agent's mount table, and each extra mount
+is one more thing a reviewer has to trace, so assets belong in
+`<runtime>/assets/` and per-instance state belongs in declared workspace
+directories or named volumes. A module that must hand the agent a file the
+launcher generated stages it into a named volume with a network-less root-only
+one-shot, which is what `modules/comfyui/compose.mps.yaml` does for the MPS
+bridge CA certificate at `/run/comfy-bridge/ca.crt`. The same script requires
+every published port to sit on `127.0.0.1` and every container to keep a
+read-only root filesystem.
 
 Optional `runtime/tools/service_<id>.py` files define `probe(full)` and return a
 short success description. The doctor discovers only selected probes and runs

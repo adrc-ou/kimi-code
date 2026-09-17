@@ -15,7 +15,12 @@ MODULE_DIR="${root}/modules/comfyui"
 # shellcheck disable=SC1091
 source "${MODULE_DIR}/module.sh"
 comfy_backend
+# The shared assertions, over this module's overlay: a module must not add a host bind to
+# kimi-agent, loosen a root filesystem, or publish a port beyond loopback.
 for backend in cuda mps; do
   docker compose -f "${root}/compose.yaml" -f "${root}/compose.search.yaml" \
-    -f "${root}/modules/comfyui/compose.${backend}.yaml" config --quiet
+    -f "${root}/modules/comfyui/compose.${backend}.yaml" config --format json |
+    python3 "${root}/tools/compose_hygiene.py" \
+      --workspace "${WORKSPACE_PATH}" --runtime-dir "${HARNESS_RUNTIME_DIR}" \
+      --label "comfyui ${backend}"
 done

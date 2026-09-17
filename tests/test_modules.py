@@ -80,7 +80,7 @@ class ModuleTests(unittest.TestCase):
         target.write_text("keep")
         guidance = self.workspace / "AGENTS.md"
         guidance.symlink_to(target)
-        with self.assertRaises(OSError):
+        with self.assertRaises(UnsafeWorkspace):
             merge_guidance(self.workspace, "bad")
         guidance.unlink()
         os.link(target, guidance)
@@ -202,7 +202,7 @@ class ModuleTests(unittest.TestCase):
         (self.root / ".env").write_text("")
         bootstrap = self.runtime / "bootstrap"
         bootstrap.write_text("")
-        token = "quote'${LITELLM_API_KEY}`literal`"
+        token = "quote'${NRP_API_KEY}`literal`"
         with (
             patch.dict(
                 os.environ,

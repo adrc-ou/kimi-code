@@ -1,4 +1,16 @@
-default_model = "qwen3-primary"
+# Kimi Code baseline for this harness.
+#
+# This file describes how Kimi behaves. It deliberately contains no model facts and no
+# provider policy: the model tables, provider tables, default model and subagent binding are
+# generated at launch from ./models and ./providers (see docs/models-providers.md) and
+# substituted into the placeholder at the foot of this file. A number that appears here would
+# be a second copy of a truth that already has one.
+#
+# Keys that are not listed as user-owned in runtime/config-policy.json are re-pinned on every
+# launch, so an in-session change to harness policy does not survive a restart.
+
+# Replaced with the alias of the model selected for the primary agent by ./start.sh.
+default_model = "__KIMI_PRIMARY_ALIAS__"
 
 default_permission_mode = "manual"
 default_plan_mode = false
@@ -13,139 +25,8 @@ builtin_product_skills = true
 
 telemetry = false
 
-# ============================================================
-# NRP providers
-#
-# The two providers hit the same physical NRP qwen3 endpoint,
-# but through different policy-enforcement lanes.
-# ============================================================
-
-[providers.nrp-primary]
-type = "openai"
-base_url = "http://model-proxy:8080/primary/v1"
-api_key = "__MODEL_PROXY_TOKEN__"
-
-
-[providers.nrp-long]
-type = "openai"
-base_url = "http://model-proxy:8080/long/v1"
-api_key = "__MODEL_PROXY_TOKEN__"
-
-
-[providers.nrp-subagent]
-type = "openai"
-base_url = "http://model-proxy:8080/subagent/v1"
-api_key = "__MODEL_PROXY_TOKEN__"
-
-
-# ============================================================
-# Primary model: native-context-oriented default
-# ============================================================
-
-[models.qwen3-primary]
-provider = "nrp-primary"
-model = "qwen3"
-
-# 262,144 is qwen3's native window; the advertised 1,000,000 needs YaRN scaling
-# and is opt-in through qwen3-long. Input plus the proxy's primary output clamp
-# (65,536) must fit inside max_context_size, so the input ceiling is 196,608.
-max_context_size = 262144
-max_input_size = 196608
-
-capabilities = [
-  "thinking",
-  "image_in",
-  "video_in",
-  "tool_use",
-]
-
-support_efforts = [
-  "low",
-  "medium",
-  "xhigh",
-]
-
-default_effort = "xhigh"
-
-display_name = "NRP Qwen3.8 Flash Next — Primary"
-
-
-# ============================================================
-# Explicit long-context primary
-#
-# Still travels through the exclusive primary lane.
-# ============================================================
-
-[models.qwen3-long]
-provider = "nrp-long"
-model = "qwen3"
-
-max_context_size = 1000000
-max_input_size = 900000
-
-capabilities = [
-  "thinking",
-  "image_in",
-  "video_in",
-  "tool_use",
-]
-
-support_efforts = [
-  "low",
-  "medium",
-  "xhigh",
-]
-
-default_effort = "xhigh"
-
-display_name = "NRP Qwen3.8 Flash Next — Long Context"
-
-
-# ============================================================
-# NRP-safe subagent model
-#
-# 5 concurrent instances × 64K = 320K.
-# ============================================================
-
-[models.qwen3-subagent]
-provider = "nrp-subagent"
-model = "qwen3"
-
-max_context_size = 64000
-max_input_size = 55808
-
-capabilities = [
-  "thinking",
-  "image_in",
-  "video_in",
-  "tool_use",
-]
-
-support_efforts = [
-  "low",
-  "medium",
-  "xhigh",
-]
-
-default_effort = "xhigh"
-
-display_name = "NRP Qwen3.8 Flash Next — 64K Subagent"
-
-
-# ============================================================
-# HARD subagent binding
-#
-# This is important.
-#
-# Every Agent / AgentSwarm child is forced onto qwen3-subagent.
-# Kimi may not substitute "primary".
-# ============================================================
-
-[secondary_model]
-default_model = "qwen3-subagent"
-force = true
-default_effort = "xhigh"
-
+# The proxy token is the launcher's internal bearer, substituted per instance. Provider API
+# keys never appear here: they are mounted into the proxy container, not the agent's.
 
 [thinking]
 enabled = true
@@ -159,7 +40,9 @@ max_steps_per_turn = 0
 # Current default is 10; make it explicit.
 max_attempts_per_step = 10
 
-# Must be small enough to work inside the 64K subagent model.
+# Output Kimi leaves unclaimed before it compacts. Every generated lane must fit
+# input_tokens + this value inside its window, so it is a harness knob, not a model fact,
+# and it has to be small enough to work inside the smallest selected lane.
 reserved_context_size = 8192
 
 
@@ -169,7 +52,7 @@ strategy = "measured+estimated"
 
 [background]
 # Shared across background Agents and background Bash tasks, so this sits above the
-# proxy's subagent permit count: extra slots queue at the proxy instead of stealing a
+# derived subagent permit count: extra slots queue at the proxy instead of stealing a
 # lane from a subagent. Fair use is bounded by the proxy, not by this number.
 max_running_tasks = 8
 
@@ -200,3 +83,13 @@ timeout_ms = 0
 
 [swarm]
 timeout_ms = 0
+
+
+# ============================================================
+# Generated model and provider configuration
+#
+# tools/render_runtime.py replaces the marker line below with the [providers.*], [models.*]
+# and [secondary_model] tables for the models chosen at launch, plus the hard subagent
+# binding. The marker is a comment so this file stays parseable TOML on its own.
+# ============================================================
+#__KIMI_MODEL_CONFIG__

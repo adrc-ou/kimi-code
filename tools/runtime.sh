@@ -119,6 +119,9 @@ harness_compose_files() {
   if [[ -f "${HARNESS_COMPOSE_DIR}/module-environment.json" ]]; then
     HARNESS_COMPOSE_FILES+=(-f "${HARNESS_COMPOSE_DIR}/module-environment.json")
   fi
+  if [[ -f "${HARNESS_COMPOSE_DIR}/models.json" ]]; then
+    HARNESS_COMPOSE_FILES+=(-f "${HARNESS_COMPOSE_DIR}/models.json")
+  fi
   if [[ -f "${HARNESS_ROOT}/compose.limits.yaml" ]]; then
     HARNESS_COMPOSE_FILES+=(-f "${HARNESS_ROOT}/compose.limits.yaml")
   fi
@@ -134,6 +137,11 @@ harness_compose() {
 harness_validate_compose() {
   harness_compose config --format json >"${HARNESS_COMPOSE_DIR}/resolved.json"
   chmod 600 "${HARNESS_COMPOSE_DIR}/resolved.json"
+  # Check the launch as resolved rather than the files in the checkout: this is the only
+  # moment when every module overlay and approved-extension bind is known.
+  python3 "${HARNESS_ROOT}/tools/compose_hygiene.py" \
+    --workspace "${WORKSPACE_PATH}" --runtime-dir "${HARNESS_RUNTIME_DIR}" \
+    --label launch <"${HARNESS_COMPOSE_DIR}/resolved.json"
 }
 
 harness_init() {
@@ -161,6 +169,71 @@ harness_init_readonly() {
   harness_resolve_bootstrap_env
   harness_instance
   unset HARNESS_BOOTSTRAP_ENV
+}
+
+# Migration notices for .env keys that stopped meaning something when model facts moved into
+# ./models and provider rules into ./providers. Setting a key from the first group has no
+# effect: the equivalent numbers are derived from the selected definitions. A key from the
+# second group still works but answers to a MODEL_PROXY_* name. Printed, never fatal: an
+# untidy .env must not stop a workspace from starting.
+harness_retired_env=(
+  LITELLM_API_KEY
+  LITELLM_UPSTREAM_ORIGIN
+  LITELLM_MODEL_ID
+  NRP_MODEL_CONTEXT
+  NRP_FAIR_USE_PERCENT
+  NRP_PARALLEL_CONTEXT_BUDGET
+  NRP_OUTPUT_TOKENS_PER_MINUTE
+  NRP_OUTPUT_RATE_HEADROOM_PERCENT
+  NRP_MODEL_MAX_CONCURRENCY
+  NRP_PRIMARY_MAX_OUTPUT_TOKENS
+  NRP_LONG_MAX_OUTPUT_TOKENS
+  NRP_SUBAGENT_MAX_OUTPUT_TOKENS
+  KIMI_SUBAGENT_CONCURRENCY
+)
+harness_renamed_env=(
+  NRP_UPSTREAM_SOCK_READ_TIMEOUT=MODEL_PROXY_SOCK_READ_TIMEOUT
+  NRP_MAX_REQUEST_SECONDS=MODEL_PROXY_MAX_REQUEST_SECONDS
+  NRP_INPUT_GUARD_PERCENT=MODEL_PROXY_INPUT_GUARD_PERCENT
+  NRP_MEDIA_TOKEN_ESTIMATE=MODEL_PROXY_MEDIA_TOKEN_ESTIMATE
+  NRP_REQUEST_USAGE=MODEL_PROXY_REQUEST_USAGE
+  NRP_MAX_REQUEST_BYTES=MODEL_PROXY_MAX_REQUEST_BYTES
+  NRP_MAX_RESPONSE_BYTES=MODEL_PROXY_MAX_RESPONSE_BYTES
+  NRP_MAX_ERROR_BYTES=MODEL_PROXY_MAX_ERROR_BYTES
+  NRP_MAX_QUEUED=MODEL_PROXY_MAX_QUEUED
+)
+
+harness_env_declares() {
+  local file=$1 key=$2
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=" "${file}"
+}
+
+harness_warn_env_migration() {
+  local file=${HARNESS_ROOT}/.env entry key retired=() renamed=()
+  [[ -f "${file}" ]] || return 0
+  for key in "${harness_retired_env[@]}"; do
+    if harness_env_declares "${file}" "${key}"; then
+      retired+=("${key}")
+    fi
+  done
+  for entry in "${harness_renamed_env[@]}"; do
+    key=${entry%%=*}
+    if harness_env_declares "${file}" "${key}"; then
+      renamed+=("${entry}")
+    fi
+  done
+  if [[ ${#retired[@]} -gt 0 ]]; then
+    echo ".env keys now derived from ./models and ./providers - delete them:" >&2
+    for key in ${retired[@]+"${retired[@]}"}; do
+      echo "  ${key}" >&2
+    done
+  fi
+  if [[ ${#renamed[@]} -gt 0 ]]; then
+    echo ".env keys renamed with the provider-neutral proxy - use the new name:" >&2
+    for entry in ${renamed[@]+"${renamed[@]}"}; do
+      echo "  ${entry%%=*} -> ${entry#*=}" >&2
+    done
+  fi
 }
 
 # Hooks execute only operator-owned code installed in this harness, never workspace extensions.

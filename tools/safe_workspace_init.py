@@ -7,9 +7,13 @@ import argparse
 import errno
 import os
 import stat
-import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
+
+if __package__:
+    from .git_query import git_text
+else:
+    from git_query import git_text
 
 DIRECTORIES = (".agent-state/logs",)
 FILES = (
@@ -118,22 +122,10 @@ def ensure_file(root_fd: int, relative: str, expected_uid: int) -> None:
 
 
 def update_git_exclude(root: Path, expected_uid: int) -> None:
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            "info/exclude",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode:
+    output = git_text(root, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude")
+    if not output:
         return
-    exclude = Path(result.stdout.strip())
+    exclude = Path(output)
     try:
         relative = exclude.resolve(strict=False).relative_to(root)
     except ValueError:

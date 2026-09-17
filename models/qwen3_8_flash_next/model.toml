@@ -1,0 +1,56 @@
+# Model definition: immutable facts about one model the harness can serve.
+#
+# Schema and rationale: docs/models-providers.md. This file describes the model only.
+# Provider policy (concurrency, context fractions, token rates) belongs to the provider
+# named below, never here, and neither belongs in .env.
+#
+# The directory name is the stable identifier; `label` is the user-facing name shown by
+# ./start.sh. Copy this directory to add a model, delete it to remove one.
+
+schema_version = 1
+
+label = "Qwen3.8-Flash-Next"
+provider = "nrp"
+
+# Identifier sent upstream. Kimi's own alias is derived from `slug` below.
+model = "Qwen3.8 Flash Next"
+
+# Short stable stem for Kimi model aliases: qwen3-primary, qwen3-long, qwen3-subagent.
+slug = "qwen3"
+
+# Exactly one credential of the named provider. Models that share a credential id share
+# one API key; a model needs its own key by declaring its own credential entry.
+credential = "default"
+
+# Metadata copied into every generated Kimi model table, unless a lane overrides the effort.
+# Capabilities describe the model, not the slice of it a lane uses, so they are not per lane.
+capabilities = ["thinking", "image_in", "video_in", "tool_use"]
+support_efforts = ["low", "medium", "xhigh"]
+default_effort = "xhigh"
+
+# What the provider advertises as this model's context length. Fraction-based provider
+# rules are measured against this number, not against any single lane's window.
+# Defaults to the largest declared lane window when omitted.
+[context]
+advertised_tokens = 1000000
+
+# Native window is 262,144 tokens. The remaining advertised headroom requires YaRN
+# extrapolation upstream, so it is opt-in through the long lane instead of default.
+[lane.primary]
+context_tokens = 262144
+input_tokens = 196608
+output_clamp_tokens = 65536
+
+# Optional lane. Declaring it creates the /long route and the qwen3-long alias, which
+# stays an exclusive primary request; omitting it removes both.
+[lane.long]
+context_tokens = 1000000
+input_tokens = 900000
+output_clamp_tokens = 65536
+
+# Subagent lane. Five concurrent children at this size is what the provider's aggregate
+# context rule permits, and ./start.sh derives Kimi's swarm concurrency from it.
+[lane.subagent]
+context_tokens = 64000
+input_tokens = 55808
+output_clamp_tokens = 8192

@@ -16,21 +16,9 @@ import tty
 from pathlib import Path
 
 if __package__:
-    from .safe_workspace_init import (
-        OPEN_DIR,
-        UnsafeWorkspace,
-        components,
-        initialize,
-        require_directory,
-    )
+    from .safe_workspace_init import UnsafeWorkspace, components, initialize
 else:
-    from safe_workspace_init import (
-        OPEN_DIR,
-        UnsafeWorkspace,
-        components,
-        initialize,
-        require_directory,
-    )
+    from safe_workspace_init import UnsafeWorkspace, components, initialize
 
 ID = re.compile(r"[a-z][a-z0-9_]*\Z")
 ENV = re.compile(r"[A-Z][A-Z0-9_]*\Z")
@@ -147,52 +135,12 @@ def write_json(path, value):
 
 def merge_guidance(workspace, text):
     """Replace only our delimited section; preserve user guidance and reject links."""
-    import stat
+    if __package__:
+        from .managed_section import replace_section
+    else:
+        from managed_section import replace_section
 
-    fd = os.open(workspace, OPEN_DIR)
-    try:
-        require_directory(fd, str(workspace), os.getuid())
-        file = os.open(
-            "AGENTS.md", os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600, dir_fd=fd
-        )
-        try:
-            info = os.fstat(file)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
-                raise UnsafeWorkspace("unsafe workspace AGENTS.md")
-            if info.st_size > 4 * 1024 * 1024:
-                raise UnsafeWorkspace("workspace AGENTS.md exceeds 4 MiB")
-            existing = os.read(file, info.st_size).decode()
-            if BEGIN in existing or END in existing:
-                if (
-                    existing.count(BEGIN) != 1
-                    or existing.count(END) != 1
-                    or existing.index(END) < existing.index(BEGIN)
-                ):
-                    raise UnsafeWorkspace(
-                        "invalid module guidance markers; preserve and repair AGENTS.md"
-                    )
-                a, tail = existing.split(BEGIN)
-                _, b = tail.split(END)
-                existing = a + b
-            content = existing
-            if text:
-                content += (
-                    ("" if not existing or existing.endswith("\n") else "\n")
-                    + BEGIN
-                    + "\n"
-                    + text
-                    + "\n"
-                    + END
-                )
-            if content != os.pread(file, info.st_size, 0).decode():
-                os.lseek(file, 0, 0)
-                os.write(file, content.encode())
-                os.ftruncate(file, len(content.encode()))
-                os.fsync(file)
-        finally:
-            os.close(file)
-    finally:
-        os.close(fd)
+    replace_section(workspace, BEGIN, END, text)
 
 
 def assemble(root, runtime, modules, workspace):
@@ -301,14 +249,17 @@ def main():
         assemble(root, runtime, modules, Path(os.environ["HARNESS_WORKSPACE"]))
         return
     if __package__:
-        from .render_runtime import read_values, write_secret
+        from .env_values import read_env_values
+        from .render_runtime import write_secret
     else:
-        from render_runtime import read_values, write_secret
+        from env_values import read_env_values
+        from render_runtime import write_secret
     import shlex
 
-    values = read_values(Path(os.environ["HARNESS_RESOLVED_BOOTSTRAP"]))
+    values = read_env_values(Path(os.environ["HARNESS_RESOLVED_BOOTSTRAP"]))
     declared = {
-        key.removeprefix("export "): value for key, value in read_values(root / ".env").items()
+        key.removeprefix("export "): value
+        for key, value in read_env_values(root / ".env").items()
     }
     session = {}
     agent = {}

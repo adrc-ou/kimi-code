@@ -9,9 +9,15 @@ import json
 import os
 import shutil
 import stat
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+
+if __package__:
+    from .git_query import git_text
+    from .safe_workspace_init import UnsafeWorkspace, components
+else:
+    from git_query import git_text
+    from safe_workspace_init import UnsafeWorkspace, components
 
 PRIVILEGED = (
     ".kimi-code/agents",
@@ -30,10 +36,33 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def require_real_ancestors(workspace: Path, relative: str) -> None:
+    """Refuse a privileged path whose parent chain leaves the workspace.
+
+    Stating the leaf is not enough: POSIX resolves every intermediate component, so a
+    workspace-authored link at .kimi-code or .agents would be read and snapshotted as if
+    it were project content.
+    """
+    try:
+        parents = components(relative)[:-1]
+    except UnsafeWorkspace as exc:
+        raise ValueError(f"unsafe extension path: {relative}") from exc
+    current = workspace
+    for part in parents:
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise ValueError(f"unreadable extension ancestor: {relative}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"extension ancestor is not a real directory: {relative}")
+
+
 def inspect_path(workspace: Path, relative: str) -> dict[str, str]:
     path = workspace / relative
     if not path.exists() and not path.is_symlink():
         return {}
+    require_real_ancestors(workspace, relative)
     entries: dict[str, str] = {}
     paths = [path] if path.is_file() or path.is_symlink() else [path, *sorted(path.rglob("*"))]
     seen_case: set[str] = set()
@@ -61,18 +90,10 @@ def inspect_path(workspace: Path, relative: str) -> dict[str, str]:
 
 def workspace_identity(workspace: Path) -> dict[str, str]:
     result = {"path": str(workspace)}
-    command = subprocess.run(
-        ["git", "-C", str(workspace), "rev-parse", "HEAD"], capture_output=True, text=True
-    )
-    if command.returncode == 0:
-        result["git_head"] = command.stdout.strip()
-    remote = subprocess.run(
-        ["git", "-C", str(workspace), "config", "--get", "remote.origin.url"],
-        capture_output=True,
-        text=True,
-    )
-    if remote.returncode == 0:
-        result["git_remote"] = remote.stdout.strip()
+    if head := git_text(workspace, "rev-parse", "HEAD"):
+        result["git_head"] = head
+    if remote := git_text(workspace, "config", "--get", "remote.origin.url"):
+        result["git_remote"] = remote
     return result
 
 
@@ -125,6 +146,8 @@ def require_approval(workspace: Path, manifest: Path) -> dict[str, object]:
 
 def copy_snapshot(source: Path, target: Path, relative: str) -> tuple[Path, str]:
     origin = source / relative
+    if origin.exists() or origin.is_symlink():
+        require_real_ancestors(source, relative)
     destination = target / relative
     if origin.is_file() and not (relative == ".kimi-code/mcp.json" and origin.stat().st_size == 0):
         destination.parent.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,21 @@
+# The agent image builds from this whole checkout, so anything excluded here never reaches a
+# build context or a layer cache. Nothing the Dockerfiles COPY is listed: the agent image takes
+# only container/package.json, container/package-lock.json, container/serena.lock and
+# container/ensure-runtime-user.sh, and the ComfyUI backend build keeps modules/ in context.
 .git
 .env
 .local
+.serena/
+.agent-state/
+.playwright-cli/
+.github/
 **/__pycache__
 **/*.pyc
+**/.DS_Store
 *.zip
+# Key material must never be one accidental `docker build` away from a published layer digest.
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/id_rsa*

@@ -5,6 +5,11 @@ unless a step explicitly says to run them inside Kimi or its container.
 This guide matches the configured Kimi Code 0.43-era harness, not the older
 Python `kimi-cli` command set. No Homebrew installation is needed.
 
+This page covers a running stack. Static and unit validation is the
+[Validation section of the README](../README.md#validation), which also states its
+`aiohttp` prerequisite — without it the policy-enforcement suite skips rather than
+runs, and a green result means nothing about fair-use enforcement.
+
 ## 1. Start with the automatic checks
 
 1. Start the stack with `./start.sh`.
@@ -60,8 +65,8 @@ merge project overrides or reuse Kimi's OAuth token store.
 
 | Component | Where it runs | External service / account | Default |
 | --- | --- | --- | --- |
-| Kimi web, file/shell tools | Agent container | Inference uses OU/NRP via the proxy | On |
-| Model policy proxy | Separate local container | OU/NRP LiteLLM credential | On |
+| Kimi web, file/shell tools | Agent container | Inference uses the selected provider via the proxy | On |
+| Model policy proxy | Separate local container | The selected provider's credential | On |
 | Chrome DevTools MCP | Agent container; launches sandboxed Chromium | No account; browsed sites may require login | On |
 | Playwright CLI and skill | Agent container; browser automation | No account; website access is external | Installed; not a separate MCP server |
 | Serena MCP | Agent container; code navigation/refactoring and language servers | No hosted account; needs a coding project and its language tooling | On |
@@ -199,20 +204,24 @@ There is no `NVIDIA_API_KEY` variable wired into this project.
 Developer sign-in; [Kimi's MCP guide](https://moonshotai.github.io/kimi-code/en/customization/mcp)
 documents OAuth login and configuration.
 
-### OU/NRP model access
+### Model provider access
 
-`LITELLM_API_KEY` is supplied by your OU/NRP service administrator. It stays in
-the model-proxy container. Confirm the approved origin/model with that
-administrator; this harness cannot create an institutional account for you.
+Each provider definition names the `.env` variable its credential is read from
+(`NRP_API_KEY` for the shipped NRP provider) and a `key_url` where the
+administrator issues it. The value stays in the model-proxy container; confirm
+the approved endpoint and model entitlement with that administrator, because this
+harness cannot create an institutional account for you.
 
-The proxy enforces the three fair-use rules the policy actually states: 200,000
-output tokens per minute per API token and model (the only rule the gateway
-meters itself, with HTTP 429 — input tokens do not count); exactly one
-concurrent request once a request uses 35% or more of the served context; and
-otherwise at most 16 concurrent qwen3 requests whose combined context stays
-inside that 35%. Nothing about those numbers is baked into the proxy: each
-lane's reservation is `max_input_size` plus that lane's output clamp, read from
-the rendered Kimi configuration and revalidated on every request.
+The proxy enforces whatever rules the selected providers publish, resolved at
+launch into one plan — see
+[the definition contract](models-providers.md). For NRP that is three rules: a
+per-minute output-token allowance per API token *and* model (the only rule the
+gateway meters itself, with HTTP 429 — input tokens do not count); one concurrent
+request once a request uses at least the policy's fraction of the model context;
+and otherwise a bounded number of concurrent requests whose combined context
+stays inside that fraction. Nothing about those numbers is baked into the proxy:
+each lane's reservation is its input cap plus its output clamp from the resolved
+plan, revalidated against Kimi's live rendered configuration on every refresh.
 
 Read the policy that is in force right now:
 
@@ -221,20 +230,29 @@ Read the policy that is in force right now:
 curl -s http://model-proxy:8080/healthz | python3 -m json.tool
 ```
 
-Expect `policy_enforced: true` plus, per lane, its alias, context window, input
-allowance, output clamp, computed reservation, and whether that reservation is
-exclusive; then the rolling output-token window, the subagent permit count, the
-stall bound, and the per-request hold ceiling. `./doctor.sh` reports the same
-thing as `policy enforced (3 lanes; 5 subagent permits; budget 320000)`; a bare
-`HTTP ready` or a FAIL means the proxy has stopped verifying policy, not merely
-that it is slow.
+Expect `policy_enforced: true`; `subagent_limit`; `providers` and `credentials`
+for the selection; then per lane its alias, model, endpoint, credential, context
+window, input cap, output clamp, computed reservation, whether that reservation
+runs alone, and the counter ids it holds. `counters` reports each context gate's
+`context_budget` against its provider threshold, and `rates` each rolling
+ledger's `capacity` and `unit`. `./doctor.sh` condenses the same data to
+`policy enforced (3 lanes; 5 subagent permits; context budget 332500; rate 1
+counter(s))`; a bare `HTTP ready` or a FAIL means the proxy has stopped
+verifying policy, not merely that it is slow.
 
-The served window is 1,000,000 tokens, of which 262,144 are native and the rest
-requires YaRN extension. `qwen3-primary` therefore reserves 262,144 and
-`qwen3-long` reserves 965,536, which is at or above 35% and so runs strictly
-alone. That is the intended shape, not a fault: a primary request and even one
-subagent reservation cannot both fit the deliberately stricter 320,000-token
-parallel budget.
+The same envelope is written into the workspace `AGENTS.md` between
+`<!-- kimi-harness model policy begin -->` and `... end -->`, so you can read
+what Kimi was told without a container shell. Check that the numbers there match
+`/healthz`; both come from the one plan, so a mismatch means a stale launch.
+
+With the shipped definitions the model advertises 1,000,000 tokens, of which
+262,144 are native and the rest requires YaRN extension upstream. The primary lane
+reserves its whole native window and the long lane reserves 965,536, which is at
+or above the exclusivity threshold and so runs strictly alone. Only that long lane
+runs alone. A primary request plus one subagent reservation does fit the aggregate
+budget, which is what the safety margin buys; a primary request plus the full
+five-subagent fan-out does not, so the proxy queues the overflow rather than
+refusing it. That is the intended shape, not a fault.
 
 Drift fails closed. If the mounted configuration stops describing lanes the
 proxy can admit — `secondary_model.force` flipped off, an input allowance that
@@ -252,7 +270,7 @@ docker compose exec -T kimi-agent curl -s -o /dev/null -w '%{http_code}\n' \
 
 Then stop the stack, run `./start.sh` to re-render, and confirm the code is 200
 again. Never edit the rendered file as a way to change policy: it is
-regenerated from `runtime/config.toml`, and the initializer re-stamps the
+regenerated from `./models` and `./providers`, and the initializer re-stamps the
 agent's copy at every launch.
 
 A proxy health check validates its local policy/configuration, not upstream
@@ -306,8 +324,8 @@ prepares before the agent starts. Check both halves after any change to
 `compose.yaml`, `container/initialize-agent-state.py`,
 `tools/kimi_config_merge.py`, or `runtime/config*.toml`.
 
-1. In the Kimi web UI, change a user-owned setting (default model, thinking,
-   telemetry, background tasks, or experimental). The save must succeed. Open a
+1. In the Kimi web UI, change a user-owned setting (thinking, telemetry,
+   background tasks, or experimental). The save must succeed. Open a
    second terminal and confirm it landed in the volume:
 
    ```bash
@@ -316,9 +334,12 @@ prepares before the agent starts. Check both halves after any change to
    ```
 
 2. Stop and restart the stack, then confirm the value survived and that policy
-   keys were re-pinned from `runtime/config.toml`. Provider base URLs, API keys,
-   internal proxy tokens, context ceilings, and the subagent concurrency lane
-   must still match the rendered baseline even if you edited them in-session.
+   keys were re-pinned from the rendered baseline. Provider base URLs, API keys,
+   internal proxy tokens, model context ceilings, the default model, and the
+   forced subagent model must still match the plan even if you edited them
+   in-session — Kimi's own `/model` and `/secondary-model` commands can change
+   the live file, and there is no documented way to remove that surface, which is
+   why the launch-time choice is re-stamped rather than merely written once.
    `[subagent]` and `[swarm]` are policy keys too: both must come back with
    `timeout_ms = 0`, which is what keeps subagent wall-clock unlimited even
    though the UI can rewrite the file.
@@ -398,7 +419,8 @@ MCP servers need their own equivalent connection, read and disposable-write test
 
 - Every expected enabled server appears in a fresh Kimi `/mcp` view.
 - A UI settings change saved without an error and survived a restart, and the
-  agent's mount table contains no harness file paths beyond the workspace.
+  agent's mount table contains no harness file paths beyond its workspace and any
+  approved project-extension snapshots.
 - Quick and full doctor checks have no unexplained failures; every `SETUP` or
   `MANUAL` result has been resolved or explicitly recorded as unused.
 - Each relevant tool family has an observed successful call with checked output.

@@ -5,20 +5,34 @@ It is not the writable development workspace used by the contained agent.
 
 `runtime/AGENTS.md` is the authoritative runtime operating contract.
 
-When changing NRP model, concurrency, context, or proxy behavior:
-- preserve NRP Fair Use compliance;
-- keep primary and subagent lanes mutually exclusive, which the reservation gate
-  derives from the configured windows rather than from a special case;
+`./models` and `./providers` are the only place model facts and provider policy
+are stated; `docs/models-providers.md` is their schema contract, in the same
+relationship `docs/modules.md` has to `./modules`. Do not add a model name,
+context window, concurrency ceiling, or policy percentage anywhere else, and in
+particular not to `.env`. When NRP republishes its terms, one edit to
+`providers/nrp/provider.toml` must be enough.
+
+When changing model, provider, concurrency, context, or proxy behavior:
+- preserve compliance with every rule the selected providers publish, and keep
+  the resolver's derived limits the largest those rules allow rather than
+  hand-picking smaller ones;
+- keep the three lanes on separate routes, providers and model aliases, and let the
+  reservation gate decide which of them may overlap: only a lane whose reservation
+  reaches its provider's exclusive threshold runs alone, and that is derived from the
+  resolved windows rather than from a special case;
 - keep `secondary_model.force = true`;
 - verify proxy policy against the actual runtime Kimi configuration;
-- never place real model credentials in the kimi-agent container.
-- preserve strict `/primary`, `/long`, and `/subagent` route separation;
-- keep retries outside scarce fair-use permits during backoff;
-- keep output-rate admission outside fair-use permits too, so waiting on the
-  tokens-per-minute budget holds neither kind of capacity;
-- derive each lane's fair-use reservation from its `max_input_size` plus its own
-  output clamp in the rendered Kimi configuration, and revalidate it per request;
-  a configuration the proxy cannot fit must fail closed rather than pass traffic;
+- never place real model credentials in the kimi-agent container, and mount a
+  credential only into `model-proxy`, through the generated secrets fragment for
+  the credentials this selection actually uses;
+- preserve strict `/primary`, `/long`, and `/subagent` route separation, with
+  only the lanes in the resolved plan routed at all;
+- keep retries outside scarce permits during backoff;
+- keep rate admission outside permit holds too, so waiting on a rolling ledger
+  books neither kind of capacity;
+- derive each lane's reservation from its `max_input_size` plus its own output
+  clamp in the rendered Kimi configuration, and revalidate it per request; a
+  configuration the proxy cannot fit must fail closed rather than pass traffic;
 - never reintroduce a hard-coded subagent or swarm wall-clock timeout in
   `compose.yaml`. Unlimited is expressed only as `timeout_ms = 0` in
   `runtime/config.toml`, where the launcher re-pins it, because those tables are
@@ -27,8 +41,8 @@ When changing NRP model, concurrency, context, or proxy behavior:
 - keep the persistent private cache salt out of logs and tracked files.
 
 Generated runtime files belong only under `.local/runtime/<instance>/`. Do not
-write credentials, rendered provider configuration, approval manifests, bridge
-private keys, or launcher locks into the workspace.
+write credentials, rendered provider configuration, the resolved policy plan,
+approval manifests, bridge private keys, or launcher locks into the workspace.
 
 Project agents, skills, and MCP configuration must pass `extensions.sh`
 approval and remain mounted read-only during a running session. Ordinary
@@ -46,14 +60,19 @@ again, and never make that whole path read-only.
 The root-only `agent-state-init` one-shot owns that volume's protected content:
 it stages runtime files, merges the user-owned keys from
 `runtime/config-policy.json` over the rendered baseline, and sets ext4 immutable
-flags. Keep every file that carries NRP policy re-pinned at launch rather than
-trusting in-session edits, keep the policy merge default-deny, and keep the
+flags. Keep every file that carries provider policy re-pinned at launch rather
+than trusting in-session edits, keep the policy merge default-deny, and keep the
 initializer failing closed if the flags are not honoured.
 
 `kimi-agent` must receive no host binds other than the workspace, plus approved
 project-extension snapshots. Bind sources are visible in the agent's mount table,
 so never mount a path that names credentials, instance identities, or operator
-directories.
+directories. `tools/compose_hygiene.py` enforces this against the fully resolved
+launch configuration, and `tests/compose-config.sh` runs it again over the core
+files, the generated approved-extension fragment, and every module overlay. It
+also requires every published port to be bound to `127.0.0.1` and every container
+to keep a read-only root filesystem. Stage module-owned files into a named volume
+with a root-only one-shot instead of adding a bind.
 
 ## Persistent workspace contract
 

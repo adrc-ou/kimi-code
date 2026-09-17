@@ -55,9 +55,19 @@ POLICY = {"schema_version": 1, "user_owned": ["default_model", "thinking", "tele
 class PolicyTests(unittest.TestCase):
     def test_reads_the_repository_policy(self):
         user_owned = merge.load_policy(ROOT / "runtime" / "config-policy.json")
-        self.assertIn("default_model", user_owned)
-        # Policy-bearing keys must never be agent-owned.
-        for forbidden in ("providers", "models", "secondary_model", "extra_skill_dirs"):
+        self.assertEqual(
+            user_owned, frozenset({"thinking", "telemetry", "background", "experimental"})
+        )
+        # Which model answers is decided by ./models and ./providers at launch, so an
+        # in-session /model choice must not survive into the next session: the proxy
+        # enforces the plan the default model was rendered from.
+        for forbidden in (
+            "default_model",
+            "providers",
+            "models",
+            "secondary_model",
+            "extra_skill_dirs",
+        ):
             self.assertNotIn(forbidden, user_owned)
 
     def test_rejects_unknown_schema_version(self):
