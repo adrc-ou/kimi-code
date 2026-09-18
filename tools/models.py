@@ -8,8 +8,9 @@ Run from ``start.sh`` before the Kimi Code version selection:
 
 Everything the rest of the launcher needs about models then comes from ``model-policy.json``,
 which is derived rather than configured: the proxy mounts it as its enforcement input, Kimi's
-model tables are rendered from it, and the workspace ``AGENTS.md`` policy section is generated
-from it. No number in ``.env`` describes a model.
+model tables are rendered from it, and the runtime envelope appended to the system prompt is
+generated from it. No number in ``.env`` describes a model, and nothing here writes into the
+workspace: that file belongs to the project Kimi is working on.
 
 Model and provider directories are operator-supplied configuration that this launcher reads in
 order to send a credential to an endpoint, so they are treated as trusted input: symlinks and
@@ -34,18 +35,12 @@ if __package__:
     from . import model_config, policy
     from .definitions import DefinitionError, load_definitions
     from .env_values import read_env_values
-    from .managed_section import replace_section
-    from .safe_workspace_init import UnsafeWorkspace
 else:
     import model_config
     import policy
     from definitions import DefinitionError, load_definitions
     from env_values import read_env_values
-    from managed_section import replace_section
-    from safe_workspace_init import UnsafeWorkspace
 
-BEGIN = "<!-- kimi-harness model policy begin -->"
-END = "<!-- kimi-harness model policy end -->"
 LANES = ("primary", "long", "subagent")
 SELECTABLE = ("primary", "subagent")
 SELECTION = "model-selection.json"
@@ -57,7 +52,7 @@ CREDENTIALS_DIR = "credentials"
 PROMPTS = {"primary": "Primary agent model", "subagent": "Subagent model"}
 #: Both failure families mean "this selection cannot be served", and both must print one
 #: clean line rather than a traceback, because start.sh surfaces the launcher's stderr.
-Refusal = (DefinitionError, policy.ResolutionError, UnsafeWorkspace, OSError, ValueError)
+Refusal = (DefinitionError, policy.ResolutionError, OSError, ValueError)
 
 
 def write_text(path: Path, text: str) -> None:
@@ -223,18 +218,29 @@ def apply_endpoint_overrides(
 
 
 #: Names the launcher itself needs out of ``.env``, beyond any one provider's definitions.
-HARNESS_BOOTSTRAP_NAMES = ("KIMI_BACKGROUND_TASK_SLOTS",)
+HARNESS_BOOTSTRAP_NAMES = ("KIMI_BACKGROUND_TASK_SLOTS", "KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE")
 BOOTSTRAP_COMPOSE = "compose.bootstrap.yaml"
 
 
 def bootstrap_names(plan: dict[str, Any]) -> set[str]:
-    """Every ``.env`` variable name the selected definitions ask the launcher to read."""
-    names = set(HARNESS_BOOTSTRAP_NAMES)
+    """Every ``.env`` variable name the selected definitions ask the launcher to read.
+
+    A name left empty is not a name: that credential is prompt-only, and asking Compose to
+    interpolate an empty variable would make the declaration file look like the thing refusing
+    to launch.
+    """
+    names = {name for name in HARNESS_BOOTSTRAP_NAMES if name}
     for provider in plan["providers"].values():
         if provider.get("base_url_env"):
             names.add(str(provider["base_url_env"]))
         for credential in (provider.get("credentials") or {}).values():
-            names.add(str(credential["env"]))
+            if credential.get("env"):
+                names.add(str(credential["env"]))
+    for lane in plan["lanes"].values():
+        # The model-scoped name is required whether or not it won this session: Compose drops a
+        # name it never declared, and the model would silently fall back to the provider key.
+        if lane.get("key_env"):
+            names.add(str(lane["key_env"]))
     return names
 
 
@@ -298,8 +304,11 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
 def used_credentials(plan: dict[str, Any]) -> list[dict[str, str]]:
     """Every credential the selected lanes actually use, de-duplicated by secret name.
 
-    Two models naming one credential id collapse into one entry, which is how key sharing is
-    expressed; a model can never reference two keys, so one lane always has one identity.
+    Which entries that is depends on how the operator scoped their keys. Two models naming one
+    credential collapse into one entry, which is key sharing; a model that declared a
+    ``key_env`` with a value in the environment got a credential of its own at resolution, so
+    it appears separately and its key never reaches the other model. A lane can name only one
+    credential, so one lane always has exactly one upstream identity either way.
     """
     seen: dict[str, dict[str, str]] = {}
     for lane in plan["lanes"].values():
@@ -317,18 +326,36 @@ def used_credentials(plan: dict[str, Any]) -> list[dict[str, str]]:
             "key_url": declaration.get("key_url", ""),
             "provider": provider_id,
             "provider_label": plan["providers"][provider_id]["label"],
+            # Set only for a model-scoped credential: the variable that key fell back from,
+            # which the operator may equally well have filled in.
+            "fallback_env": declaration.get("fallback_env", ""),
         }
     return [seen[key] for key in sorted(seen)]
+
+
+def key_scopes(item: dict[str, str]) -> str:
+    """Name the variables that would satisfy one key, saying what each one covers.
+
+    A model-scoped key has two answers and the operator should not have to know which one the
+    definition preferred, so both names are spelled out with their scope attached.
+    """
+    if not item["fallback_env"]:
+        return item["env"]
+    return (
+        f"{item['env']} for this model alone, or {item['fallback_env']} for every model "
+        f"of {item['provider_label']}"
+    )
 
 
 def materialise_credentials(plan: dict[str, Any], runtime: Path, values: dict[str, str]) -> None:
     """Write one mode-0600 file per used credential, ready to mount as a Docker secret.
 
     A value comes from the resolved bootstrap environment when the operator persisted it there,
-    and is otherwise asked for once, for this session only. A prompted value is never written
-    back to ``.env`` or to any launcher environment file, and no credential value ever reaches
-    the agent container: only the proxy mounts these paths, and the launcher deletes them when
-    it exits.
+    and is otherwise asked for once, for this session only - asked for *that model*, since a
+    model that declared its own variable gets its own file whatever the answer is. A prompted
+    value is never written back to ``.env`` or to any launcher environment file, and no
+    credential value ever reaches the agent container: only the proxy mounts these paths, and
+    the launcher deletes them when it exits.
     """
     directory = runtime / CREDENTIALS_DIR
     directory.mkdir(parents=True, exist_ok=True)
@@ -341,11 +368,11 @@ def materialise_credentials(plan: dict[str, Any], runtime: Path, values: dict[st
             if not sys.stdin.isatty():
                 raise DefinitionError(
                     f"{item['provider_label']} needs a key for {item['label']}{where}: set "
-                    f"{item['env']} in .env for non-interactive startup"
+                    f"{key_scopes(item)} in .env for non-interactive startup"
                 )
             print(
-                f"{item['provider_label']}: {item['label']}{where}. "
-                f"Add {item['env']} to .env to persist it; this value is for this session only."
+                f"{item['provider_label']}: {item['label']}{where}. Set {key_scopes(item)} in "
+                ".env to persist it; this value is for this session only."
             )
             while not secret:
                 secret = getpass.getpass(f"{item['prompt']} ({item['env']}): ").strip()
@@ -399,7 +426,7 @@ def model_environment(plan: dict[str, Any], values: dict[str, str]) -> dict[str,
     }
 
 
-def cmd_resolve(root: Path, runtime: Path, workspace: Path) -> int:
+def cmd_resolve(root: Path, runtime: Path) -> int:
     providers, model_list = load_definitions(root)
     values = bootstrap_values(root)
     providers = apply_endpoint_overrides(providers, values)
@@ -412,6 +439,7 @@ def cmd_resolve(root: Path, runtime: Path, workspace: Path) -> int:
         models,
         {lane: str(selection.get(lane, "")) for lane in SELECTABLE},
         reserved_context_size=reserved_context_size(root),
+        key_values=values,
     )
     require_bootstrap_declarations(root, plan)
     write_json(runtime / POLICY_FILE, plan)
@@ -421,7 +449,8 @@ def cmd_resolve(root: Path, runtime: Path, workspace: Path) -> int:
         runtime / MODEL_ENV,
         "".join(f"{key}={shlex.quote(value)}\n" for key, value in environment.items()),
     )
-    replace_section(workspace, BEGIN, END, policy.render_guidance(plan))
+    # The envelope is not published from here: tools/render_runtime.py appends the same rendered
+    # text to the staged system prompt, so no launcher step writes inside the workspace.
 
     print(
         "Model policy resolved: "
@@ -460,7 +489,7 @@ def main() -> int:
     runtime.mkdir(parents=True, exist_ok=True)
     if args.action == "select":
         return cmd_select(root, runtime, non_interactive=args.non_interactive)
-    return cmd_resolve(root, runtime, Path(os.environ["HARNESS_WORKSPACE"]))
+    return cmd_resolve(root, runtime)
 
 
 if __name__ == "__main__":

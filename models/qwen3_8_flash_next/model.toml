@@ -18,9 +18,15 @@ model = "Qwen3.8 Flash Next"
 # Short stable stem for Kimi model aliases: qwen3-primary, qwen3-long, qwen3-subagent.
 slug = "qwen3"
 
-# Exactly one credential of the named provider. Models that share a credential id share
-# one API key; a model needs its own key by declaring its own credential entry.
+# Required: the provider-scoped credential this model falls back to when its own key_env
+# is unset. Models that share a credential id share that one provider key.
 credential = "default"
+
+# Optional: the .env variable holding a key for this model alone. Set, and this model
+# authenticates with that key instead of the provider-scoped one named above; blank or
+# absent, it falls back to that key. Either name may be persisted in .env, and ./start.sh
+# asks for this model's key by name when neither is set.
+key_env = "QWEN3_API_KEY"
 
 # Metadata copied into every generated Kimi model table, unless a lane overrides the effort.
 # Capabilities describe the model, not the slice of it a lane uses, so they are not per lane.

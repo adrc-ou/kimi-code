@@ -64,6 +64,33 @@ flags. Keep every file that carries provider policy re-pinned at launch rather
 than trusting in-session edits, keep the policy merge default-deny, and keep the
 initializer failing closed if the flags are not honoured.
 
+The session system prompt resolves the project-root `SYSTEM.md` first, then the
+tracked `SYSTEM.md.example`, then nothing — the same override/default pair as
+`.env` and `.env.example`, with the operator's file kept out of git. An empty
+file is a decision rather than a missing file and must not fall back to the
+default — but Kimi Code discards a prompt that is blank once trimmed, so a
+deliberately empty prompt stages as a lone period and only an absent pair of
+files stages nothing at all. Whatever is chosen is staged through the same
+protection, so never make it writable from inside the session. Amendment and
+replacement are both supported: a file bearing the `${base_prompt}` placeholder
+wraps Kimi Code's own prompt, and one without it replaces that prompt completely.
+Do not copy the built-in prompt into either file — use the placeholder, or name
+the individual template variables that the built-in prompt would have carried.
+Keep comments out of the tracked default: Markdown comments are not stripped and
+ship inside every request.
+
+`tools/render_runtime.py` appends to that text, in order, the selected modules'
+guidance and the generated Model runtime envelope. Module guidance is not behind
+any flag: staging it is the only path a module's own `AGENTS.md` has to reach the
+agent. The envelope is appended unless
+`KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE` in `.env`, read through
+`compose.bootstrap.yaml`, holds a truthy value — the flag names the omission, so
+an unset, blank, or unrecognised value appends it, which is the default.
+Appending is what keeps the workspace sacrosanct. Nothing in the harness writes
+the workspace's `AGENTS.md`: that file belongs to whatever project the agent is
+working on, so never reintroduce a managed section, a marker pair, or any other
+generated block there.
+
 `kimi-agent` must receive no host binds other than the workspace, plus approved
 project-extension snapshots. Bind sources are visible in the agent's mount table,
 so never mount a path that names credentials, instance identities, or operator

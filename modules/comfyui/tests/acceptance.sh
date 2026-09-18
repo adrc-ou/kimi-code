@@ -40,6 +40,8 @@ harness_compose exec kimi-agent python3 /opt/kimi-runtime/tools/comfyctl.py down
 # Expansion must occur inside the container.
 # shellcheck disable=SC2016
 harness_compose exec kimi-agent sh -c 'test -z "${NRP_API_KEY:-}"'
+# shellcheck disable=SC2016
+harness_compose exec kimi-agent sh -c 'test -z "${QWEN3_API_KEY:-}"'
 # Credentials are mounted only into model-proxy, under the secret name the selected
 # definitions generate, so no other service may read any file below /run/secrets.
 harness_compose exec kimi-agent sh -c '! ls -A /run/secrets/* >/dev/null 2>&1'

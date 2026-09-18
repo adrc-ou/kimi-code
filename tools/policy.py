@@ -29,6 +29,7 @@ if __package__:
     from .definitions import (
         CONTEXT_RULE_KINDS,
         COUNT_RULE_KINDS,
+        NAME_SEPARATOR,
         PER_REQUEST_RULE_KINDS,
         RATE_RULE_KINDS,
         RATE_RULE_UNITS,
@@ -38,6 +39,7 @@ else:
     from definitions import (
         CONTEXT_RULE_KINDS,
         COUNT_RULE_KINDS,
+        NAME_SEPARATOR,
         PER_REQUEST_RULE_KINDS,
         RATE_RULE_KINDS,
         RATE_RULE_UNITS,
@@ -69,6 +71,94 @@ class ResolutionError(DefinitionError):
     """The selected models cannot be served together inside their providers' rules."""
 
 
+#: The proxy reads a credential from one file named by the plan, and constrains that name to
+#: ``[a-z0-9_]{1,64}``. Model-scoped names are synthesised here, so the same bound is checked
+#: at resolution: a name the proxy would refuse must stop the launch, not the first request.
+SECRET_NAME_MAX = 64
+
+
+def _has_value(values: dict[str, str], name: str) -> bool:
+    """Whether the resolved environment actually carries a value for one variable name.
+
+    Blank is absent. An operator who leaves a declared name empty in ``.env`` means "not set
+    here", which is the same state as omitting the line, and Compose hands over the empty
+    string for both.
+    """
+    return bool(name) and bool((values.get(name) or "").strip())
+
+
+def scope_keys(
+    providers: dict[str, dict[str, Any]],
+    models: dict[str, dict[str, Any]],
+    model_ids: tuple[str, ...],
+    values: dict[str, str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Give each model that asked for its own key a credential identity of its own.
+
+    A model authenticates with its own key when the variable its ``model.toml`` names has a
+    value, and with the provider-scoped key of its ``credential`` otherwise. When neither has
+    a value the model keeps its own scope, because that is what the launcher then asks for: a
+    key requested for one model must not be written into the file every model of the provider
+    reads.
+
+    The rewrite happens before any counter is built, because the credential id is part of what
+    a credential-scoped rule counts against. Two models on two keys share no ledger upstream,
+    so they must share none here either; two models on one provider key keep sharing one.
+    """
+    scoped_providers = {
+        provider_id: {**provider, "credentials": dict(provider["credentials"])}
+        for provider_id, provider in providers.items()
+    }
+    scoped_models = {model_id: dict(model) for model_id, model in models.items()}
+    for model_id in dict.fromkeys(model_ids):
+        model = scoped_models[model_id]
+        key_env = model.get("key_env") or ""
+        if not key_env:
+            continue
+        provider = scoped_providers[model["provider"]]
+        base = provider["credentials"].get(model["credential"])
+        if base is None:
+            raise ResolutionError(
+                f"model {model_id} names credential {model['credential']!r}, which "
+                f"providers/{provider['id']} does not declare"
+            )
+        if base.get("fallback_env"):
+            # Already this model's own scope: one model selected for several lanes must be
+            # scoped once, or its credential id would grow a suffix per lane.
+            continue
+        own_key = _has_value(values, key_env)
+        shared_key = _has_value(values, base["env"])
+        if not own_key and shared_key:
+            # Nothing to scope: this model reads the provider-scoped key like its siblings.
+            continue
+        credential_id = f"{model['credential']}{NAME_SEPARATOR}{model['slug']}"
+        secret_name = f"{provider['id']}{NAME_SEPARATOR}{credential_id}"
+        if credential_id in provider["credentials"]:
+            raise ResolutionError(
+                f"{model_id} would scope its key as credential {credential_id!r}, which "
+                f"providers/{provider['id']} already declares; rename that credential or the "
+                "model's slug"
+            )
+        if len(secret_name) > SECRET_NAME_MAX:
+            raise ResolutionError(
+                f"{model_id} credential name {secret_name!r} exceeds {SECRET_NAME_MAX} "
+                "characters, which the proxy refuses to open"
+            )
+        provider["credentials"][credential_id] = {
+            **base,
+            "id": credential_id,
+            # The launcher shows these when it has to ask, and the question is about one model:
+            # naming both variables is what tells the operator which scope they are choosing.
+            "label": f"{model['label']} API key",
+            "prompt": f"API key for {model['label']}",
+            "env": key_env,
+            "fallback_env": base["env"],
+            "secret_name": secret_name,
+        }
+        model["credential"] = credential_id
+    return scoped_providers, scoped_models
+
+
 def _key_for(scope: str, provider: str, model: dict[str, Any]) -> tuple[str, str]:
     """Return (scope family, subject) deciding which traffic shares one rule's counter."""
     credential = model["credential"]
@@ -84,6 +174,27 @@ def _key_for(scope: str, provider: str, model: dict[str, Any]) -> tuple[str, str
 
 def _applies(rule: dict[str, Any], model: dict[str, Any]) -> bool:
     return rule["models"] is None or model["model"] in rule["models"]
+
+
+def _identity_groups(
+    models: dict[str, dict[str, Any]], scope: str, lane_entries: list[dict[str, Any]]
+) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    """Split one model group by the upstream identity a scope actually counts against.
+
+    ``model`` and ``provider`` subjects are built from things every definition in the group
+    shares, so the group stays whole. ``credential`` and ``credential_model`` subjects name a
+    credential id, and two definitions of one wire model authenticated with two different keys
+    share no ledger upstream -- so they must share none here, and each key's counter carries
+    only the lanes using it.
+    """
+    if scope not in {"credential", "credential_model"}:
+        return [(models[lane_entries[0]["model_id"]], lane_entries)]
+    groups: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
+    for entry in lane_entries:
+        model = models[entry["model_id"]]
+        group = groups.setdefault(model["credential"], (model, []))
+        group[1].append(entry)
+    return list(groups.values())
 
 
 def _provider_rules(provider: dict[str, Any], family: frozenset[str]) -> list[dict[str, Any]]:
@@ -248,6 +359,9 @@ def _lane_entry(
         "route": f"/{lane}/v1",
         "model": model["model"],
         "credential": model["credential"],
+        # The declared name, kept even when the provider-scoped key won, because the launcher
+        # has to read it for the model-scoped choice to be possible at all.
+        "key_env": model.get("key_env", ""),
         "context_tokens": context,
         "input_tokens": input_tokens,
         "output_clamp_tokens": clamp,
@@ -266,8 +380,15 @@ def resolve(
     selection: dict[str, str],
     *,
     reserved_context_size: int,
+    key_values: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Build the enforcement plan for one primary model and one subagent model."""
+    """Build the enforcement plan for one primary model and one subagent model.
+
+    ``key_values`` is the resolved launcher environment, and it is an input because which key
+    a model authenticates with is a fact about the upstream identity being metered. Every
+    derived limit is unchanged by it: scoping a key per model splits ledgers, it does not
+    enlarge any allowance.
+    """
     if reserved_context_size <= 0:
         raise ResolutionError("reserved_context_size must be positive")
     for role in ("primary", "subagent"):
@@ -277,6 +398,13 @@ def resolve(
                 f"selected {role} model {selection.get(role)!r} is not available; "
                 f"defined models: {available}"
             )
+
+    providers, models = scope_keys(
+        providers,
+        models,
+        (selection["primary"], selection["subagent"]),
+        key_values or {},
+    )
 
     # Lane membership follows the selection: the long lane exists only when the primary
     # model declares it, so an operator who drops the lane drops the route and the alias.
@@ -319,16 +447,20 @@ def resolve(
         if context is not None:
             counters[context["id"]] = context
         for scope in COUNTER_SCOPES:
-            for counter in _shared_counters(provider, model, scope, lane_entries):
-                existing = counters.get(counter["id"])
-                if existing is None:
-                    counters[counter["id"]] = counter
-                else:
-                    existing["lanes"] = sorted(set(existing["lanes"]) | set(counter["lanes"]))
-                    if "capacity" in counter:
-                        existing["capacity"] = min(existing["capacity"], counter["capacity"])
-                    if "max" in counter:
-                        existing["max"] = min(existing["max"] or counter["max"], counter["max"])
+            groups = _identity_groups(models, scope, lane_entries)
+            for group_model, group_lanes in groups:
+                for counter in _shared_counters(provider, group_model, scope, group_lanes):
+                    existing = counters.get(counter["id"])
+                    if existing is None:
+                        counters[counter["id"]] = counter
+                    else:
+                        existing["lanes"] = sorted(
+                            set(existing["lanes"]) | set(counter["lanes"])
+                        )
+                        if "capacity" in counter:
+                            existing["capacity"] = min(existing["capacity"], counter["capacity"])
+                        if "max" in counter:
+                            existing["max"] = min(existing["max"] or counter["max"], counter["max"])
 
     for lane_name, lane in selected.items():
         lane["counters"] = sorted(
@@ -363,6 +495,10 @@ def resolve(
                         "env": credential["env"],
                         "key_url": credential["key_url"],
                         "secret_name": credential["secret_name"],
+                        # Present only on a model-scoped credential: the provider-scoped
+                        # variable this key would have fallen back to, which is the other half
+                        # of what the launcher tells the operator to set.
+                        "fallback_env": credential.get("fallback_env", ""),
                     }
                     for credential_id, credential in provider["credentials"].items()
                 },
@@ -480,16 +616,18 @@ def _derive_limits(
 def render_guidance(plan: dict[str, Any]) -> str:
     """Human- and model-readable statement of the resolved envelope.
 
-    This text is what lands in the workspace ``AGENTS.md`` managed section. It states the
-    numbers and then instructs the agent to use all of them: a limit that is respected but
-    not reached is a slower workspace, not a safer one.
+    This text is appended to the staged system prompt at every launch, unless the operator set
+    ``KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE`` to a truthy value. It states the numbers and then
+    instructs the agent to use all of them: a limit that is respected but not reached is a slower
+    workspace, not a safer one.
     """
     lines: list[str] = [
-        "## Model runtime envelope (generated at launch - do not hand-edit)",
+        "## Model runtime envelope (generated at launch)",
         "",
         "The harness derived these numbers from the selected model definitions and their",
-        "providers' policy rules. They are recomputed on every start, so an edit here is",
-        "discarded, and the model proxy enforces them independently of anything written below.",
+        "providers' policy rules and appends them here at every start, so nothing in this",
+        "section is maintained by hand, and the model proxy enforces them independently of",
+        "anything written below.",
         "",
     ]
     for provider_id, provider in sorted(plan["providers"].items()):
@@ -571,8 +709,9 @@ def render_guidance(plan: dict[str, Any]) -> str:
     lines += [
         "",
         "Provider terms may change and model windows differ. To alter any number here, edit the",
-        "definitions in `./models` and `./providers`, then restart the stack - never `.env`,",
-        "never this section.",
+        "definitions in `./models` and `./providers`, then restart the stack - never `.env`.",
+        "Setting `KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1` leaves this section out of the system",
+        "prompt altogether; it changes no number.",
         "",
     ]
     return "\n".join(lines)

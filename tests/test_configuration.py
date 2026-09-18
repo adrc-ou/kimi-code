@@ -177,17 +177,47 @@ class NoHardcodedModelFactsTests(unittest.TestCase):
             r"|KIMI_SUBAGENT_CONCURRENCY=)",
             re.MULTILINE,
         )
-        # MODEL_PROXY_* tunables and the credential/env names are allowed; a retired
-        # model or policy variable is not.
+        # MODEL_PROXY_* tunables and endpoint overrides are allowed; a retired model or policy
+        # variable is not.
         offenders = [
-            line.split("=", 1)[0]
-            for line in ENV_EXAMPLE.splitlines()
-            if forbidden.match(line) and not line.startswith("NRP_API_KEY")
+            line.split("=", 1)[0] for line in ENV_EXAMPLE.splitlines() if forbidden.match(line)
         ]
         self.assertEqual(offenders, [])
-        self.assertIn("NRP_API_KEY=", ENV_EXAMPLE)
         # Blank means "derive it from the selected definitions".
         self.assertRegex(ENV_EXAMPLE, r"(?m)^KIMI_BACKGROUND_TASK_SLOTS=$")
+
+    def test_env_example_explains_key_scopes_without_naming_a_key_variable(self):
+        # Which variables hold model keys depends on which models and providers are installed
+        # and on how the operator scopes their keys, so the template must name none: it sends
+        # the reader to the definitions instead. An operator who copies this file and greps for
+        # a name must still find out how to get one.
+        section = ENV_EXAMPLE.split("# Model provider credentials", 1)[1].split(
+            "# Kimi background capacity", 1
+        )[0]
+        assignments = [
+            line.split("=", 1)[0].strip()
+            for line in section.splitlines()
+            if "=" in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(
+            assignments,
+            ["NRP_BASE_URL"],
+            "the credentials section may declare an endpoint override but never a key variable",
+        )
+        self.assertNotIn("_API_KEY", section)
+        for needle in ("key_env", "[[credential]]", "models/<id>/model.toml", "providers/<id>"):
+            self.assertIn(needle, section, "the two key scopes are no longer described")
+        self.assertIn("grep", section, "the template no longer says how to find the names")
+
+    def test_env_example_documents_the_envelope_omission(self):
+        """The flag is read out of ``.env``, so the template names it and says what on means."""
+        self.assertIn("KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=0", ENV_EXAMPLE)
+        self.assertIn("Model runtime envelope", ENV_EXAMPLE)
+        section = ENV_EXAMPLE.split("# Kimi system prompt", 1)[1].split(
+            "# Optional GitHub MCP", 1
+        )[0]
+        for needle in ("SYSTEM.md", "1", "true", "default"):
+            self.assertIn(needle, section, "the omission is no longer explained where it is set")
 
     def test_no_tracked_file_mentions_litellm_except_the_nrp_endpoint(self):
         # LiteLLM is one gateway an operator might happen to have behind the endpoint, and the
@@ -233,8 +263,10 @@ class NoHardcodedModelFactsTests(unittest.TestCase):
         text = (ROOT / "runtime" / "AGENTS.md").read_text()
         for token in ("262,144", "1,000,000", "320,000", "350,000", "64,000", "200,000"):
             self.assertNotIn(token, text)
-        # The contract must send the reader to the generated section instead.
+        # The contract must send the reader to the envelope appended to its own system prompt,
+        # and never into the workspace's AGENTS.md, which the harness does not write.
         self.assertIn("Model runtime envelope", text)
+        self.assertNotIn("workspace `AGENTS.md`", text)
 
     def test_bootstrap_declares_every_name_the_definitions_read(self):
         plan = shipped_plan()
@@ -454,6 +486,11 @@ class ResolvedEnvelopeTests(unittest.TestCase):
         self.assertIn(f"up to {limit} subagents concurrently", text)
         self.assertIn("Use the whole envelope", text)
         self.assertIn("Model runtime envelope", text)
+        # This text is appended to a prompt that Kimi Code renders with a global template
+        # substitution, so a dollar-brace here would expand into whatever the session defines.
+        self.assertNotIn("${", text)
+        # The statement of the limits also names the switch that leaves it out of the prompt.
+        self.assertIn("KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1", text)
         # The provider's published terms are cited so a reader can check the transcription.
         self.assertIn(self.plan["providers"]["nrp"]["policy_url"], text)
         for lane in self.plan["lanes"].values():

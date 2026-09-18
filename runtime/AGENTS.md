@@ -89,14 +89,14 @@ Use read-only sub-agents aggressively for:
 - independent review.
 
 Fair use caps how many sub-agents the provider will *serve* at once, not how much
-work you may line up. The exact ceiling for the current model pair is published in
-the generated "Model runtime envelope" section of the workspace `AGENTS.md`, and
-the launcher configures `AgentSwarm` to dispatch no more than that number
-concurrently. The policy proxy enforces the same ceiling upstream, so extra
-background tasks queue at the proxy instead of oversubscribing the credential.
-Prefer to fan independent, bounded research out across every available lane rather
-than serialising it, and treat waiting at the proxy as normal pacing, not as a
-failure.
+work you may line up. The exact ceiling for the current model pair is stated in the
+generated "Model runtime envelope" section that the launcher appends to this
+agent's system prompt, and the launcher configures `AgentSwarm` to dispatch no more
+than that number concurrently. The policy proxy enforces the same ceiling upstream,
+so extra background tasks queue at the proxy instead of oversubscribing the
+credential. Prefer to fan independent, bounded research out across every available
+lane rather than serialising it, and treat waiting at the proxy as normal pacing,
+not as a failure.
 
 Do not let several agents edit overlapping files concurrently.
 
@@ -157,10 +157,10 @@ Use `git status` and `git diff` frequently.
 The model serving this workspace and the provider terms it is served under are
 chosen by the operator at launch, not here. Every concrete number - context
 window per lane, aggregate in-flight budget, concurrency ceiling, per-minute
-allowance - is published in the generated "Model runtime envelope" section of the
-workspace `AGENTS.md`, is recomputed on every start, and is enforced independently
-by the model proxy. Read that section for the numbers; treat this section as the
-rules that hold whatever the numbers turn out to be.
+allowance - is stated in the generated "Model runtime envelope" section the
+launcher appends to this agent's system prompt, is recomputed on every start, and
+is enforced independently by the model proxy. Read that section for the numbers;
+treat this section as the rules that hold whatever the numbers turn out to be.
 
 The proxy enforces three families of provider rule:
 

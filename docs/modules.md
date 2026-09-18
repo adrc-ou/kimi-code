@@ -9,7 +9,7 @@ and contents must be real files/directories, never symlinks or devices.
 modules/example/
 ├── module.json              # required: metadata and declarative setup
 ├── module.sh                # required: host compatibility and lifecycle hooks
-├── AGENTS.md                # optional: workspace guidance
+├── AGENTS.md                # optional: guidance appended to the session prompt
 ├── README.md                # recommended: requirements, security and operation
 ├── runtime/
 │   ├── mcp.json             # optional: {"mcpServers": {...}}
@@ -144,9 +144,10 @@ group-readable content, so `<runtime>/assets/` is the only path through which
 module runtime content reaches `/opt/kimi-runtime`. Duplicate names fail closed.
 Module content cannot override core runtime assets or the core Kimi config and
 NRP provider policy, which remain authoritative; only the initializer writes
-policy files. Module guidance is replaced in the marked section of workspace
-`AGENTS.md`; text outside the markers remains intact. Symlinks, hardlinks and
-malformed markers are refused.
+policy files. Module guidance is staged in the instance runtime directory and
+appended to the session's system prompt under a heading naming the module. The
+workspace's own `AGENTS.md` belongs to the project being worked on and is never
+written, so no marker pair and no managed region exists there.
 
 For the same reason, a module Compose overlay must not add host binds to
 `kimi-agent`. `tools/compose_hygiene.py` runs against the fully resolved launch

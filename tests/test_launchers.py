@@ -41,7 +41,6 @@ class LauncherTests(unittest.TestCase):
             "tools/compose_hygiene.py",
             "tools/env_values.py",
             "tools/git_query.py",
-            "tools/managed_section.py",
             "runtime/config.toml",
             "compose.bootstrap.yaml",
         ):
@@ -294,7 +293,13 @@ exit 0
         )
         data = self.workspace / "demo/user/data"
         data.write_text("keep")
-        self.assertIn("Demo instructions", (self.workspace / "AGENTS.md").read_text())
+        runtime = next((self.root / ".local/runtime").iterdir())
+        staged = (runtime / "SYSTEM.md").read_text()
+        self.assertIn("Demo instructions", staged)
+        self.assertIn("Model runtime envelope", staged)
+        # The workspace's own guidance file belongs to the project being worked on, so the
+        # harness must never write inside it - not for the envelope, and not for module text.
+        self.assertFalse((self.workspace / "AGENTS.md").exists())
         self.env["HARNESS_MODULES"] = ""
         (self.base / "events").write_text("")
         result = self.run_script("start.sh", "--non-interactive")
@@ -304,8 +309,10 @@ exit 0
             "kimi-version\nregister-workspace\ncheck-services\n",
         )
         self.assertEqual(data.read_text(), "keep")
-        self.assertNotIn("Demo instructions", (self.workspace / "AGENTS.md").read_text())
-        runtime = next((self.root / ".local/runtime").iterdir())
+        staged = (runtime / "SYSTEM.md").read_text()
+        self.assertNotIn("Demo instructions", staged)
+        self.assertIn("Model runtime envelope", staged)
+        self.assertFalse((self.workspace / "AGENTS.md").exists())
         self.assertEqual((runtime / "last-modules.json").read_text().strip(), "[]")
         self.assertFalse((runtime / "module.env").exists())
         # Session material is deleted on exit, but the selection survives in the "last used"
@@ -315,9 +322,19 @@ exit 0
         self.assertFalse((runtime / "model.env").exists())
         self.assertFalse((runtime / "model-selection.json").exists())
         self.assertIn("primary", (runtime / "last-model-selection.json").read_text())
-        guidance = (self.workspace / "AGENTS.md").read_text()
-        self.assertIn("kimi-harness model policy begin", guidance)
-        self.assertIn("Model runtime envelope", guidance)
+        # The omission has to survive the whole path: `.env`, the bootstrap declaration, the
+        # resolved environment, and the staged prompt. An empty prompt file is the operator asking
+        # for no prompt, and Kimi Code throws a blank one away, so what must reach the volume is the
+        # one-token sentinel rather than nothing.
+        (self.root / "SYSTEM.md").write_text("")
+        self.bootstrap.write_text(
+            f"WORKSPACE_PATH={self.workspace}\nNRP_API_KEY=fixture-key\n"
+            "KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1\n"
+        )
+        result = self.run_script("start.sh", "--non-interactive")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((runtime / "SYSTEM.md").read_text(), ".\n")
+        self.assertFalse((self.workspace / "AGENTS.md").exists())
         # A resolved configuration that hands the agent an arbitrary host path has to stop
         # the launch before anything is started.
         self.command(

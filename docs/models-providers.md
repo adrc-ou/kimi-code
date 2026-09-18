@@ -26,10 +26,20 @@ Identifiers:
 | --- | --- | --- |
 | `[a-z][a-z0-9_]*` | `providers/<id>`, `models/<id>`, `credential.id`, `model.provider`, `model.credential` | Directory names are stable keys; `_` is allowed, `-` is not, so `-` can separate fields in generated names |
 | `[a-z][a-z0-9]*` | `model.slug` | The slug forms Kimi aliases (`qwen3-primary`), so it must not contain the `_`/`-` separators used around it |
-| `[A-Z][A-Z0-9_]*` | `endpoint.base_url_env`, `credential.env` | Both name a variable in `.env` |
+| `[A-Z][A-Z0-9_]*` | `endpoint.base_url_env`, `credential.env`, `model.key_env` | All three name a variable in `.env` |
+
+Neither a provider directory id nor a credential id may contain `__`, even
+though `[a-z][a-z0-9_]*` alone would allow it: secrets are addressed by joining
+those identifiers with `__`, so a component carrying the separator would make one
+name spellable two ways. Discovery refuses such a directory or id.
+
+A model-scoped `key_env` also may not equal the `env` of any credential of its
+own provider — that would ask one variable to hold two different keys, and the
+model might as well name that credential instead.
 
 Slugs must be unique across all models: two models sharing a slug would
-generate identical Kimi aliases, which is refused at discovery.
+generate identical Kimi aliases, and identical model-scoped credential names,
+which is refused at discovery.
 
 ## `models/<id>/model.toml`
 
@@ -41,6 +51,7 @@ provider = "nrp"                # a directory that must exist in ./providers
 model = "Qwen3.8 Flash Next"    # identifier sent upstream (the wire name)
 slug = "qwen3"                  # alias stem: <slug>-primary, <slug>-long, <slug>-subagent
 credential = "default"          # exactly one credential id of the named provider
+key_env = "QWEN3_API_KEY"       # optional; .env variable holding a key for this model alone
 
 capabilities = ["thinking", "image_in", "video_in", "tool_use"]  # optional
 support_efforts = ["low", "medium", "xhigh"]         # optional
@@ -135,13 +146,39 @@ definition — the definition stays the documented default, and the override is
 applied by `tools/models.py resolve`. `protocol` becomes the Kimi provider
 `type`, so a future Anthropic-style endpoint needs no code change.
 
-**Credentials.** One `[[credential]]` table = one API key. A model names exactly
-one credential id, so a lane always has exactly one upstream identity, while any
-number of models may name the *same* id to share one key. Inside the container a
-credential is addressed as `<provider>__<credential>`, which is collision-free
-because both halves forbid `_` at the boundary. `env` is the `.env` name the
-launcher reads; `key_url` records where an operator obtains the key, because
-that is a provider fact and belongs with the provider.
+**Credentials and key scope.** A key can be handed out per model or per provider,
+and the operator picks which without touching code. `credential` in a model is
+always the *provider-scoped* identity: one `[[credential]]` table = one shared
+key, and any number of models may name the same id to use it. `key_env` in the
+same model is the optional *model-scoped* variable. Resolution then reads:
+
+| `key_env` has a value | `credential.env` has a value | This model authenticates with |
+| --- | --- | --- |
+| yes | either | `key_env`, as a credential of its own |
+| no | yes | `credential.env`, shared with every model naming that credential |
+| no | no | a prompt at launch, for this model alone |
+
+The third row is why a model that declares `key_env` keeps its own scope even
+when neither variable is set: a key asked for *on behalf of one model* must not be
+written into the file every model of that provider reads.
+
+A model-scoped key becomes an ordinary credential identity, so nothing
+downstream has to know the distinction exists. The id is synthesised as
+`<credential>__<slug>`, so the shipped model reads `QWEN3_API_KEY` into a
+credential called `default__qwen3` and the launcher writes the secret file
+`nrp__default__qwen3`. Synthesis is refused if that id already exists in the
+provider — rename the credential or the slug rather than silently reusing one.
+Because the credential id is part of what `credential` and `credential_model`
+rules count against, scoping happens **before** the resolver builds any counter:
+two models on two keys share no upstream ledger, so they must share none here,
+while two models on one provider key keep sharing one. A scoped credential still
+records the provider-scoped name as `fallback_env`, which is all the launcher
+needs to name both variables when it asks.
+
+Inside the container a credential is addressed as `<provider>__<credential>`,
+which is collision-free because no component may contain the `__` separator.
+`env` is the `.env` name the launcher reads; `key_url` records where an operator
+obtains the key, because that is a provider fact and belongs with the provider.
 
 Values never enter the agent container and are never written to `.env`, the
 workspace, or any tracked file. The launcher writes one mode-0600 file per
@@ -206,6 +243,12 @@ and produces one enforcement plan (`model-policy.json`). It runs on every
 launch, so nothing is configured twice, and it is the only input the proxy,
 Kimi's config renderer, and the workspace guidance consume.
 
+Key scope is settled first, before any lane or counter exists: `scope_keys()`
+reads the launcher environment and gives every selected model that declares a
+`key_env` a credential identity of its own, per the table under **Credentials and
+key scope** above. No derived limit changes because of it — scoping a key per
+model splits ledgers, it does not enlarge any allowance.
+
 1. **Lane membership.** `primary` comes from the primary selection, `subagent`
    from the subagent selection, and `long` exists only if the primary model
    declares it. Dropping a lane drops its route, its alias, and its counters.
@@ -216,7 +259,10 @@ Kimi's config renderer, and the workspace guidance consume.
    model is) must fit inside every lane or resolution fails.
 3. **Counters.** One context counter per (provider, model) pair, plus rate and
    count counters per admissible scope, each keyed by the scope table above and
-   carrying the list of lanes bound to it. A model-scoped concurrency limit is
+   carrying the list of lanes bound to it. A model serving itself with its own
+   key contributes its synthesised credential id to those subjects, so a
+   credential-scoped rule follows the key actually in use rather than the
+   provider that issued it. A model-scoped concurrency limit is
    folded into that model's context counter rather than duplicated, since both
    describe the same set of in-flight requests.
 4. **Exclusivity.** A lane is exclusive when its in-flight cost
@@ -254,7 +300,8 @@ margin. Under-using a paid allowance buys nothing and costs wall-clock time, so
 enforces — Kimi fills the envelope exactly instead of hoping two hand-written
 numbers agree. `tools/policy.py render_guidance()` turns the plan into a table of
 lanes, budgets and ceilings plus an explicit instruction to run the full allowed
-number of subagents, and that text is what lands in the workspace `AGENTS.md`.
+number of subagents, and that text is what the launcher appends to the session's
+system prompt.
 
 ## Artifacts and lifetimes
 
@@ -267,7 +314,7 @@ atomically) and are deleted when the launcher exits:
 | `last-model-selection.json` | `start.sh` after a successful launch | `models.py select` | Prior selection, shown as `(last used)` and pre-selected |
 | `model-policy.json` | `models.py resolve` | proxy, `render_runtime.py`, `check_services.py` | The plan: lanes, counters, limits, providers, selection |
 | `model.env` | `models.py resolve` | `start.sh`, then Compose interpolation | `KIMI_SUBAGENT_CONCURRENCY`, `KIMI_BACKGROUND_TASK_SLOTS` — only the values `compose.yaml` interpolates; lane aliases reach Kimi through the rendered config |
-| `credentials/<provider>__<credential>` | `render_runtime.py` | proxy (via Docker secret) | One key value each; stale files from deselected models are removed |
+| `credentials/<provider>__<credential>` | `render_runtime.py` | proxy (via Docker secret) | One key value each, where a model-scoped credential id is the synthesised `<credential>__<slug>`; stale files from deselected models are removed |
 | `compose/models.json` | `models.py resolve` | Compose (`-f`, appended by `tools/runtime.sh`) | Secrets declaration + the proxy service's secret list |
 
 The plan is a versioned document (`schema_version = 1`); the proxy refuses a plan
@@ -275,33 +322,52 @@ whose version it does not understand. Only lanes present in the plan get routes,
 so a model without a `long` lane 404s on `/long/v1/*` rather than serving it.
 
 `compose.bootstrap.yaml` must declare every `.env` name the selected definitions
-reference — each `credential.env`, each `endpoint.base_url_env`, and the
-harness's own `KIMI_BACKGROUND_TASK_SLOTS`. `models.py resolve` checks this
-because Compose interpolates only names a file declares, and a missing
-declaration looks exactly like an operator who left the key blank.
+reference — each `credential.env`, each `model.key_env`, each
+`endpoint.base_url_env`, and the harness's own `KIMI_BACKGROUND_TASK_SLOTS`.
+`key_env` is declared even when the provider-scoped key won, because the name is
+a property of the selected model and Compose silently drops undeclared names.
+`models.py resolve` checks this because Compose interpolates only names a file
+declares, and a missing declaration looks exactly like an operator who left the
+key blank.
 
-## Workspace guidance section
+## System prompt composition
 
-`models.py resolve` rewrites one marked region of the workspace `AGENTS.md`:
+The generated envelope never enters the workspace. `tools/models.py resolve`
+writes the plan, and `tools/render_runtime.py` renders `policy.render_guidance()`
+from that same plan and appends it to the staged session prompt. The order is
+fixed: the prompt file (`SYSTEM.md` or `SYSTEM.md.example`), then the selected
+modules' guidance, then the envelope.
 
-```markdown
-<!-- kimi-harness model policy begin -->
-...generated envelope...
-<!-- kimi-harness model policy end -->
-```
+Nothing writes into `<workspace>/AGENTS.md`. That file belongs to the project Kimi
+is working on, and an operator is entitled to find the harness left it untouched —
+which is also why module guidance is staged in the instance runtime directory as
+`module-guidance.md` rather than merged into it. Both are re-stamped at every
+launch and neither carries a credential, so neither is session material that the
+launcher has to delete on exit.
 
-Only that region is touched; operator text outside it survives verbatim, and so
-does the separate module-guidance section written by `tools/modules.py`, because
-each producer passes its own marker pair. A duplicated, out-of-order or corrupt
-marker pair is refused rather than repaired. The shared mechanics live in
-`tools/managed_section.py`.
+Appending the envelope is the default. Set `KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1`
+(or `true`, `yes`, `on`) in `.env` and the prompt is staged with nothing appended
+to it; the flag is named after the omission, so a value that is not truthy omits
+nothing. Module guidance is not behind that flag, since staging it is the only
+path a module's own `AGENTS.md` has to reach the agent. Appended text goes through
+Kimi's template substitution like the rest of the prompt, which is why the
+generated envelope is written without a single `${...}`.
+
+Kimi Code discards a system prompt that is blank once trimmed and substitutes its
+own built-in prompt, so a deliberately empty prompt file stages as a lone period
+rather than nothing. Only an absent `SYSTEM.md` with an absent `SYSTEM.md.example`
+stages a blank file, and that tier means "use whatever Kimi ships".
 
 ## Adding a model
 
 1. `cp -r models/qwen3_8_flash_next models/new_thing`
 2. Set `label`, `model` (wire name), a unique `slug`, the `provider` and
    `credential` ids, `[context].advertised_tokens`, and the lanes you want.
-3. `./start.sh` — the new label appears alphabetically in both pickers.
+3. Optionally set `key_env` to a variable name of your own — that is what lets
+   this model carry its own key in `.env` instead of sharing the one its
+   `credential` names. Whatever you choose, add that name to
+   `compose.bootstrap.yaml`, alongside the names your provider contributes.
+4. `./start.sh` — the new label appears alphabetically in both pickers.
 
 Delete the directory to remove it. Nothing else references model ids.
 

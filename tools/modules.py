@@ -22,8 +22,6 @@ else:
 
 ID = re.compile(r"[a-z][a-z0-9_]*\Z")
 ENV = re.compile(r"[A-Z][A-Z0-9_]*\Z")
-BEGIN = "<!-- kimi-harness modules begin -->"
-END = "<!-- kimi-harness modules end -->"
 
 
 def discover(root):
@@ -133,14 +131,18 @@ def write_json(path, value):
     path.chmod(0o600)
 
 
-def merge_guidance(workspace, text):
-    """Replace only our delimited section; preserve user guidance and reject links."""
-    if __package__:
-        from .managed_section import replace_section
-    else:
-        from managed_section import replace_section
+def module_guidance(modules):
+    """The module text that has to reach the agent, staged for the system prompt.
 
-    replace_section(workspace, BEGIN, END, text)
+    Each selected module's own ``AGENTS.md`` is the guidance, verbatim under a heading naming the
+    module. It is staged into the instance runtime directory rather than written into the
+    workspace, because ``<workspace>/AGENTS.md`` belongs to the project being worked on.
+    """
+    return "\n".join(
+        f"## Module: {module['label']}\n\n" + (module["path"] / "AGENTS.md").read_text()
+        for module in modules
+        if (module["path"] / "AGENTS.md").exists()
+    )
 
 
 def assemble(root, runtime, modules, workspace):
@@ -151,7 +153,6 @@ def assemble(root, runtime, modules, workspace):
     mcp = {"mcpServers": {}}
     for category in ("skills", "agents", "tools"):
         (target / category).mkdir()
-    guidance = []
     for source in [root / "runtime", *[m["path"] / "runtime" for m in modules]]:
         for category in ("skills", "agents", "tools"):
             directory = (
@@ -180,11 +181,12 @@ def assemble(root, runtime, modules, workspace):
     write_json(target / "mcp.json", mcp)
     for module in modules:
         initialize(workspace, module.get("workspace_directories", []))
-        if (module["path"] / "AGENTS.md").exists():
-            guidance.append(
-                f"## Module: {module['label']}\n\n" + (module["path"] / "AGENTS.md").read_text()
-            )
-    merge_guidance(workspace, "\n".join(guidance))
+    if __package__:
+        from .render_runtime import MODULE_GUIDANCE_FILE, write_secret
+    else:
+        from render_runtime import MODULE_GUIDANCE_FILE, write_secret
+
+    write_secret(runtime / MODULE_GUIDANCE_FILE, module_guidance(modules))
 
 
 def reconcile_installed(runtime, modules):

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.modules import assemble, choose, discover, merge_guidance, ordered
+from tools.modules import assemble, choose, discover, module_guidance, ordered
 from tools.safe_workspace_init import UnsafeWorkspace, initialize
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,7 +55,7 @@ class ModuleTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 choose([], [], True)
 
-    def test_disabled_module_preserves_data_and_removes_only_managed_guidance(self):
+    def test_disabled_module_preserves_data_and_clears_its_staged_guidance(self):
         path = self.module(workspace_directories=["demo/user"])
         (path / "AGENTS.md").write_text("Use demo tools.\n")
         guidance = self.workspace / "AGENTS.md"
@@ -63,30 +63,33 @@ class ModuleTests(unittest.TestCase):
         assemble(self.root, self.runtime, discover(self.root), self.workspace)
         data = self.workspace / "demo/user/data"
         data.write_text("keep")
-        first = guidance.read_text()
-        assemble(self.root, self.runtime, discover(self.root), self.workspace)
-        self.assertEqual(guidance.read_text(), first)
+        # Module text is staged for the system prompt instead: the workspace's own guidance
+        # file belongs to the project being worked on and the harness never writes it, whether
+        # a module is selected or not.
+        staged = self.runtime / "module-guidance.md"
+        self.assertIn("## Module: Demo\n\nUse demo tools.", staged.read_text())
+        self.assertEqual(guidance.read_text(), "# User guidance\nKeep this.\n")
         assemble(self.root, self.runtime, [], self.workspace)
+        self.assertEqual(staged.read_text(), "")
         self.assertEqual(guidance.read_text(), "# User guidance\nKeep this.\n")
         self.assertEqual(data.read_text(), "keep")
+
+    def test_each_module_owns_a_heading_naming_it(self):
+        for name, text in (("alpha", "Alpha way.\n"), ("beta", "Beta way.\n")):
+            (self.module(name) / "AGENTS.md").write_text(text)
+        guidance = module_guidance(discover(self.root))
+        self.assertIn("## Module: Alpha\n\nAlpha way.", guidance)
+        self.assertLess(guidance.index("## Module: Alpha"), guidance.index("## Module: Beta"))
+
+    def test_a_module_without_guidance_contributes_no_section(self):
+        self.module()
+        self.assertEqual(module_guidance(discover(self.root)), "")
+        self.assertEqual(module_guidance([]), "")
 
     def test_core_setup_does_not_create_comfyui(self):
         assemble(self.root, self.runtime, [], self.workspace)
         self.assertFalse((self.workspace / "comfyui").exists())
         self.assertFalse((self.runtime / "assets/tools/comfyctl.py").exists())
-
-    def test_guidance_rejects_symlink_and_hardlink(self):
-        target = self.root / "outside"
-        target.write_text("keep")
-        guidance = self.workspace / "AGENTS.md"
-        guidance.symlink_to(target)
-        with self.assertRaises(UnsafeWorkspace):
-            merge_guidance(self.workspace, "bad")
-        guidance.unlink()
-        os.link(target, guidance)
-        with self.assertRaises(UnsafeWorkspace):
-            merge_guidance(self.workspace, "bad")
-        self.assertEqual(target.read_text(), "keep")
 
     def test_module_directories_cannot_escape_or_follow_links(self):
         self.module(workspace_directories=["../escape"])

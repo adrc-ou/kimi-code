@@ -29,6 +29,20 @@ SLUG = re.compile(r"[a-z][a-z0-9]*\Z")
 ENV_VAR = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 BARE = re.compile(r"[A-Za-z0-9_-]+\Z")
 
+#: Secrets are addressed as ``<provider>__<credential>``, and a model that authenticates with
+#: its own key gets ``<provider>__<credential>__<slug>``. Those names are only injective if no
+#: component contains the separator, which ``ID`` alone would permit.
+NAME_SEPARATOR = "__"
+
+
+def _no_secret_separator(value: str, where: str) -> str:
+    if NAME_SEPARATOR in value:
+        raise DefinitionError(
+            f"{where} may not contain {NAME_SEPARATOR!r}: credential names are built by "
+            "joining these identifiers with it, and such a name could be spelled two ways"
+        )
+    return value
+
 SCHEMA_VERSION = 1
 LANES = ("primary", "long", "subagent")
 CREDENTIAL_LANES = ("primary", "subagent")
@@ -149,6 +163,7 @@ def discover_providers(root: Path) -> dict[str, dict[str, Any]]:
             raise DefinitionError(
                 f"Provider directories must be real directories with lowercase identifiers: {path}"
             )
+        _no_secret_separator(provider_id, f"providers/{provider_id}")
         _walk_safe(path, "provider")
         result[provider_id] = _parse_provider(provider_id, path)
     return result
@@ -236,6 +251,7 @@ def _parse_credentials(raw: Any, where: str, provider_id: str) -> dict[str, dict
         credential_id = _text(item, "id", here)
         if not ID.fullmatch(credential_id):
             raise DefinitionError(f"{here}.id must be a lowercase identifier")
+        _no_secret_separator(credential_id, f"{here}.id")
         if credential_id in result:
             raise DefinitionError(f"{where} declares credential {credential_id!r} twice")
         for key in item:
@@ -348,8 +364,17 @@ def discover_models(root: Path, providers: dict[str, dict[str, Any]]) -> list[di
             )
         _walk_safe(path, "model")
         parsed = _parse_model(model_id, path)
-        if parsed["provider"] not in providers:
+        provider = providers.get(parsed["provider"])
+        if provider is None:
             continue
+        if parsed["key_env"] and parsed["key_env"] in {
+            credential["env"] for credential in provider["credentials"].values()
+        }:
+            raise DefinitionError(
+                f"models/{model_id}.key_env names a variable that a [[credential]] of "
+                f"providers/{parsed['provider']} already names; a model-scoped key must be its "
+                "own variable, or the model should simply name that credential"
+            )
         result.append(parsed)
 
     seen_slugs: dict[str, str] = {}
@@ -373,6 +398,7 @@ def _parse_model(model_id: str, path: Path) -> dict[str, Any]:
         "model",
         "slug",
         "credential",
+        "key_env",
         "context",
         "lane",
         "capabilities",
@@ -394,6 +420,13 @@ def _parse_model(model_id: str, path: Path) -> dict[str, Any]:
     credential = _text(document, "credential", where)
     if not ID.fullmatch(credential):
         raise DefinitionError(f"{where}.credential must be a lowercase credential identifier")
+    # Optional: the .env variable holding a key for this model alone. Absent, or present but
+    # blank in .env, the model authenticates with the provider-scoped key its `credential`
+    # names. Naming a key this way gives the model its own upstream identity, which is what
+    # credential-scoped provider rules are then counted against.
+    key_env = document.get("key_env", "")
+    if key_env and not ENV_VAR.fullmatch(str(key_env)):
+        raise DefinitionError(f"{where}.key_env must be an UPPER_SNAKE variable name")
 
     context = document.get("context", {})
     if not isinstance(context, dict):
@@ -424,6 +457,7 @@ def _parse_model(model_id: str, path: Path) -> dict[str, Any]:
         "model": model_name,
         "slug": slug,
         "credential": credential,
+        "key_env": str(key_env or ""),
         "advertised_tokens": advertised,
         "lanes": lanes,
         "capabilities": _string_list(document, "capabilities", where, required=False),

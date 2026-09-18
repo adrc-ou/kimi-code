@@ -47,11 +47,14 @@ artifacts owned by root.
 ## Initial configuration
 
 1. Copy `.env.example` to `.env`.
-2. Set the credential for each provider you intend to use. The variable names
-   come from the definitions, not from a list in this README: every
-   `[[credential]]` table in `providers/*/provider.toml` names the `.env`
-   variable it reads and, in `key_url`, where to obtain the key. The shipped
-   NRP provider reads `NRP_API_KEY`.
+2. Set an API key for each model you intend to use. The variable names come
+   from the definitions, not from a list in this README: each
+   `models/<id>/model.toml` names the `.env` variable holding a key for that
+   model alone in `key_env`, and the provider-scoped key it falls back to in
+   `credential`, whose `[[credential]]` table in `providers/*/provider.toml`
+   names its own variable and, in `key_url`, where to obtain the key. A
+   model-scoped key wins; set only the provider-scoped one and every model of
+   that provider shares it.
 3. Set `SEARXNG_SECRET` to the output of `openssl rand -hex 32`.
 4. Set `WORKSPACE_PATH` to a dedicated directory containing only material the
    agent is allowed to inspect and change. The agent can always see this exact
@@ -67,7 +70,7 @@ you are migrating an older `.env`, the launcher prints what it ignored:
 
 | Old variable | Now |
 | --- | --- |
-| `LITELLM_API_KEY` | `NRP_API_KEY` (named by `providers/nrp/provider.toml`) |
+| `LITELLM_API_KEY` | a model `key_env` in `models/<id>/model.toml`, or `NRP_API_KEY` (named by `providers/nrp/provider.toml`) as the provider-wide fallback |
 | `LITELLM_UPSTREAM_ORIGIN` | `providers/nrp` `[endpoint].base_url`, optionally overridden by `NRP_BASE_URL` |
 | `LITELLM_MODEL_ID` | `models/<id>` `model = "…"` |
 | `NRP_MODEL_CONTEXT`, `NRP_FAIR_USE_PERCENT`, `NRP_PARALLEL_CONTEXT_BUDGET`, `NRP_MODEL_MAX_CONCURRENCY`, `NRP_OUTPUT_TOKENS_PER_MINUTE`, `NRP_OUTPUT_RATE_HEADROOM_PERCENT` | `[[rule]]` / `[safety]` in the provider, and `[context]` / `[lane.*]` in the model |
@@ -104,10 +107,16 @@ version menu. Missing required module variables are prompted for this session
 only; add them to `.env` yourself to persist them. Secret inputs are hidden.
 
 After all choices, the launcher initializes the workspace, installs selected
-versions, generates private runtime configuration, snapshots module assets and
-approved project extensions, and starts the segmented stack. Ctrl-C stops the
-containers and registered native module processes. Persistent workspace data
-is never removed when a module is unchecked or deleted.
+versions, and generates private runtime configuration. That is where each
+selected model's API key is read: a model with no value in its own `key_env`
+falls back to the provider-scoped variable its `credential` names, and when
+neither is set you are asked for that model's key, for this session only. The
+prompt names both variables, so adding either one to `.env` skips it next time —
+the model-scoped name keeps the key to that model, the provider-scoped name
+shares it across every model of that provider. The launcher then snapshots module
+assets and approved project extensions, and starts the segmented stack. Ctrl-C
+stops the containers and registered native module processes. Persistent
+workspace data is never removed when a module is unchecked or deleted.
 
 Before announcing readiness, the launcher registers `/workspace` with Kimi's
 authenticated local API. This persists in Kimi's state volume and makes it the
@@ -199,7 +208,7 @@ budget: the largest fan-out the rules allow. `qwen3-long` stays opt-in because i
 extra context comes from YaRN extension of the model's native window rather than
 native attention. `./start.sh` derives Kimi's subagent concurrency from the same
 plan, so Kimi is told to run exactly as many children as the proxy will admit, and
-the generated section in the workspace `AGENTS.md` instructs it to use the whole
+the generated envelope appended to its system prompt instructs it to use the whole
 envelope instead of self-limiting.
 
 Subagent and swarm wall-clock limits are unlimited: `timeout_ms = 0` in
@@ -216,8 +225,9 @@ Each selected module declares additional relative workspace directories.
 Existing files and directories are preserved. Initialization rejects symlinked
 children rather than following them outside the workspace.
 
-Module `AGENTS.md` instructions appear in a managed section of the workspace's
-`AGENTS.md`. Restarting replaces only that section, keeping user guidance intact.
+Module `AGENTS.md` instructions are staged for the session and appended to its
+system prompt, each under a heading naming the module that owns it. The workspace's
+own `AGENTS.md` is never written: it belongs to the project Kimi is working on.
 Deselection removes the module's active instructions and runtime assets, while
 leaving its persistent data alone. No separate initialization command is needed.
 
@@ -401,6 +411,65 @@ starting Kimi with broken configuration.
 
 Model provider credentials, the per-instance base URL, and the internal proxy
 token are regenerated each launch and are never read back from the volume.
+
+## Customising the system prompt
+
+The session's system prompt comes from the first of these that exists in the
+project root: `SYSTEM.md`, then `SYSTEM.md.example`, then nothing at all. The
+pair behaves exactly like `.env` and `.env.example` — the tracked
+`SYSTEM.md.example` is the harness's default prompt, and an untracked
+`SYSTEM.md` (already in `.gitignore`) is yours to override it with. An empty
+file is a decision rather than a missing one, so it does not fall back to the
+default. Kimi Code throws away a system prompt that is blank once trimmed and
+silently uses its own, so a deliberately empty prompt is staged as a lone period
+— one token, no instructions — and only an absent pair of files stages nothing.
+
+Appended on top of that text, in this order, are the selected modules' guidance
+and the generated Model runtime envelope. `tools/render_runtime.py` stages the
+result as `SYSTEM.md` in the instance runtime directory — the prompt file
+untouched when there is nothing to append — `start.sh` passes that path to
+Compose as `KIMI_SYSTEM_MD`, and the root-only initializer installs it as
+`/home/agent/.kimi-code/SYSTEM.md`, root-owned, mode `440`, and immutable — the
+same protection as the runtime `AGENTS.md`. Editing either file and restarting
+changes the agent's instructions; the agent cannot change them from inside a
+session, so a mid-session edit does nothing until the next launch.
+
+The file is the complete prompt for the session, and two modes are equally
+supported. Include the literal `${base_prompt}` where you want Kimi Code's own
+built-in prompt, and your text amends it — the shipped default does this, with
+`${base_prompt}` first and an added section after it. Omit the placeholder and
+your text *is* the prompt, which replaces Kimi's built-in one outright.
+
+Replacement is deliberate power: much of what makes the prompt useful arrives
+through it rather than being fixed text, including the working directory and its
+listing, the applicable `AGENTS.md` files, the skills listing, and the plugin
+sections. A replacement prompt that does not name them loses them, so if you
+write one, name the variables you want. The runtime envelope is the exception:
+the launcher appends it after your text, so replacing the prompt does not lose
+it. These are the ones Kimi itself substitutes,
+available in either mode and resolved whether or not `${base_prompt}` appears:
+`base_prompt`, `role_additional`, `product_name`, `reply_style_guide`,
+`notify_user_guidance`, `os`, `windows_notes`, `shell`, `cwd`, `cwd_listing`,
+`agents_md`, `additional_dirs_info`, `additional_dirs_section`, `skills`,
+`skills_section`, and `plugin_sections`. An unrecognised name is left in the
+prompt as literal text rather than expanded.
+
+Substitution replaces *every* occurrence, so mention `${base_prompt}` in prose or
+a comment and the whole built-in prompt appears a second time. The same is true
+of the other variables, and it is why the shipped default carries no comments:
+Markdown comments are invisible in a reader and fully visible to the model. It
+also applies to the appended sections, which is why the generated envelope is
+written without a single `${...}`.
+
+The appended envelope states what the proxy will enforce for this session — the
+per-lane windows, the shared in-flight context budget, the subagent ceiling — and
+tells the agent to use all of it. Appending it is the default; set
+`KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1` in `.env` (also `true`, `yes`, or `on`) to
+append nothing at all. The flag is named after the omission, so a blank, zero, or
+misspelled value still appends the envelope. Turning it off changes no limit: the
+proxy enforces the same plan either way, and the agent is simply no longer told
+what that plan is. Module guidance is not behind this flag, because staging it is
+the only path a module's own `AGENTS.md` has to reach the agent.
 
 ## What the agent can see of the host
 

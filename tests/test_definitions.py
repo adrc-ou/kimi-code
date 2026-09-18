@@ -145,6 +145,16 @@ class ProviderTests(DefinitionFixture):
             with self.subTest(case=name), self.assertRaises(definitions.DefinitionError):
                 self.load(provider=text)
 
+    def test_an_identifier_cannot_contain_the_secret_separator(self):
+        # Secret names are these identifiers joined with "__", so an identifier carrying the
+        # separator itself would make one mounted file reachable under two different names.
+        for name, kwargs in (
+            ("a credential id", {"provider": PROVIDER.replace('id = "default"', 'id = "a__b"')}),
+            ("a provider id", {"provider_id": "a__b"}),
+        ):
+            with self.subTest(case=name):
+                self.assertRefused(**kwargs)
+
     def test_a_policy_link_must_be_https(self):
         message = self.assertRefused(
             provider=PROVIDER.replace(
@@ -379,6 +389,137 @@ class ModelTests(DefinitionFixture):
         for name, text in cases.items():
             with self.subTest(case=name):
                 self.assertRefused(models={"fixture_model": text})
+
+    def test_a_model_may_name_the_variable_holding_its_own_key(self):
+        scoped = MODEL.replace(
+            'credential = "default"',
+            'credential = "default"\nkey_env = "FIXTURE_MODEL_API_KEY"',
+        )
+        _, models = self.load(models={"fixture_model": scoped})
+        self.assertEqual(models[0]["key_env"], "FIXTURE_MODEL_API_KEY")
+
+    def test_a_model_without_one_authenticates_with_its_providers_credential(self):
+        _, models = self.load()
+        self.assertEqual(models[0]["key_env"], "")
+
+    def test_a_model_key_variable_must_look_like_one(self):
+        for name, value in (("lowercase", "fixture_key"), ("a spaced value", "BAD NAME")):
+            with self.subTest(case=name):
+                self.assertRefused(
+                    models={
+                        "fixture_model": MODEL.replace(
+                            'credential = "default"',
+                            f'credential = "default"\nkey_env = "{value}"',
+                        )
+                    }
+                )
+
+    def test_a_model_cannot_reuse_a_variable_its_provider_already_names(self):
+        # Two spellings of one variable would make the fallback indistinguishable from the
+        # model-scoped choice, which is the distinction the whole mechanism rests on.
+        provider = PROVIDER.replace(
+            'label = "Fixture API token"', 'label = "Fixture API token"\nenv = "FIXTURE_API_KEY"'
+        )
+        message = self.assertRefused(
+            provider=provider,
+            models={
+                "fixture_model": MODEL.replace(
+                    'credential = "default"',
+                    'credential = "default"\nkey_env = "FIXTURE_API_KEY"',
+                )
+            },
+        )
+        self.assertIn("key_env", message)
+
+
+class KeyScopeCounterTests(DefinitionFixture):
+    """A counter must follow the key a lane actually authenticates with.
+
+    Two model definitions may share one wire model and still hold two different keys, and
+    upstream those are two ledgers. Collapsing them by wire name alone would meter one
+    tenant's traffic against another's quota.
+    """
+
+    def resolve(self, values: dict[str, str]) -> dict:
+        import policy
+
+        provider = PROVIDER.replace(
+            'label = "Fixture API token"',
+            'label = "Fixture API token"\nenv = "FIXTURE_API_KEY"',
+        )
+        # The shipped fixture budgets 35% of its window, which no lane of it could ever fit;
+        # this case needs a pair that resolves, so the rule is the whole window.
+        provider = provider.replace("percent = 35", "percent = 100")
+        models = {
+            "a_model": MODEL.replace(
+                'label = "Fixture Model"\n',
+                'label = "A Model"\n',
+            ).replace('slug = "fixturemodel"', 'slug = "am"\nkey_env = "AMA_API_KEY"'),
+            "b_model": MODEL.replace(
+                'label = "Fixture Model"\n',
+                'label = "B Model"\n',
+            ).replace('slug = "fixturemodel"', 'slug = "bm"\nkey_env = "AMB_API_KEY"'),
+        }
+        providers, parsed = definitions.load_definitions(
+            self.tree(provider=provider, models=models)
+        )
+        return policy.resolve(
+            providers,
+            {item["id"]: item for item in parsed},
+            {"primary": "a_model", "subagent": "b_model"},
+            reserved_context_size=1024,
+            key_values=values,
+        )
+
+    def ledgers(self, plan: dict) -> dict[str, list[str]]:
+        return {
+            counter["subject"]: counter["lanes"]
+            for counter in plan["counters"].values()
+            if counter["family"] == "rate"
+        }
+
+    def test_two_keys_on_one_wire_model_are_metered_as_two_ledgers(self):
+        plan = self.resolve({"AMA_API_KEY": "own-key", "FIXTURE_API_KEY": "shared-key"})
+        self.assertEqual(
+            self.ledgers(plan),
+            {
+                "fixture/default__am/fixture-model": ["primary"],
+                "fixture/default/fixture-model": ["subagent"],
+            },
+            "the model with its own key must not share a ledger with the one that fell back",
+        )
+        context = next(c for c in plan["counters"].values() if c["family"] == "context")
+        self.assertEqual(
+            context["lanes"],
+            ["primary", "subagent"],
+            "the provider publishes the context rule per model, so both lanes still contend "
+            "for it whatever key each one uses",
+        )
+
+    def test_one_shared_key_still_meters_both_models_together(self):
+        plan = self.resolve({"FIXTURE_API_KEY": "shared-key"})
+        self.assertEqual(
+            self.ledgers(plan), {"fixture/default/fixture-model": ["primary", "subagent"]}
+        )
+
+    def test_two_models_without_any_key_are_asked_for_separately(self):
+        # Nothing is set in either scope, so ./start.sh must prompt once per selected model,
+        # and a key typed for one of them may not land in the file the other reads.
+        import models as model_setup
+
+        items = model_setup.used_credentials(self.resolve({}))
+        self.assertEqual(
+            [(item["secret"], item["env"], item["label"]) for item in items],
+            [
+                ("fixture__default__am", "AMA_API_KEY", "A Model API key"),
+                ("fixture__default__bm", "AMB_API_KEY", "B Model API key"),
+            ],
+        )
+        self.assertEqual(
+            model_setup.key_scopes(items[0]),
+            "AMA_API_KEY for this model alone, or FIXTURE_API_KEY for every model "
+            "of Fixture Provider",
+        )
 
 
 class TreeHygieneTests(DefinitionFixture):

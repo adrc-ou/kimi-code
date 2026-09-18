@@ -206,11 +206,13 @@ documents OAuth login and configuration.
 
 ### Model provider access
 
-Each provider definition names the `.env` variable its credential is read from
-(`NRP_API_KEY` for the shipped NRP provider) and a `key_url` where the
-administrator issues it. The value stays in the model-proxy container; confirm
-the approved endpoint and model entitlement with that administrator, because this
-harness cannot create an institutional account for you.
+Each model definition may name a `key_env` variable holding a key for that model alone;
+the `[[credential]]` it points at in the provider definition supplies the provider-scoped
+fallback variable (`QWEN3_API_KEY` then `NRP_API_KEY` for the shipped model) and a
+`key_url` where the administrator issues it. To list the names a checkout defines, run
+`grep -rn '^key_env = ' models` and `grep -rn '^env = ' providers`. The value stays in the
+model-proxy container; confirm the approved endpoint and model entitlement with that
+administrator, because this harness cannot create an institutional account for you.
 
 The proxy enforces whatever rules the selected providers publish, resolved at
 launch into one plan — see
@@ -240,10 +242,13 @@ ledger's `capacity` and `unit`. `./doctor.sh` condenses the same data to
 counter(s))`; a bare `HTTP ready` or a FAIL means the proxy has stopped
 verifying policy, not merely that it is slow.
 
-The same envelope is written into the workspace `AGENTS.md` between
-`<!-- kimi-harness model policy begin -->` and `... end -->`, so you can read
-what Kimi was told without a container shell. Check that the numbers there match
-`/healthz`; both come from the one plan, so a mismatch means a stale launch.
+The same envelope is appended to the session's system prompt, so what Kimi was
+told is readable without a container shell: the staged copy is
+`.local/runtime/<instance>/SYSTEM.md` on the host, and
+`/home/agent/.kimi-code/SYSTEM.md` inside the sandbox. Check that the numbers
+there match `/healthz`; both come from the one plan, so a mismatch means a stale
+launch. `KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1` appends nothing at all, so a missing
+section is a setting rather than a fault — the proxy still enforces the plan.
 
 With the shipped definitions the model advertises 1,000,000 tokens, of which
 262,144 are native and the rest requires YaRN extension upstream. The primary lane
@@ -390,6 +395,64 @@ prepares before the agent starts. Check both halves after any change to
    immutable flags. Read the `agent-state-init` service log; it fails closed
    with the path and ioctl that were rejected rather than starting an
    unprotected agent.
+6. Confirm the selected prompt and the appended envelope reached the model rather
+   than only the volume. The staged file is the input; what Kimi actually sent is
+   recorded in the session's `profile.bind` record. Inside `./shell.sh`, after at
+   least one turn of a new session:
+
+   ```bash
+   python3 - <<'PY'
+   import json, pathlib
+   root = pathlib.Path("/workspace")
+   source = next((root / name for name in
+       ("SYSTEM.md", "SYSTEM.md.example") if (root / name).is_file()), None)
+   own = source.read_text() if source else ""
+   staged = pathlib.Path("/home/agent/.kimi-code/SYSTEM.md")
+   text = staged.read_text() if staged.is_file() else ""
+   logs = sorted(pathlib.Path("/home/agent/.kimi-code/sessions").glob(
+       "*/agents/main/wire.jsonl"), key=lambda p: p.stat().st_mtime)
+   for line in logs[-1].open():
+       record = json.loads(line)
+       if record.get("type") == "profile.bind":
+           prompt = record["systemPrompt"]
+           lines = own.strip().splitlines()
+           last = lines[-1].lstrip("# ").strip() if lines else ""
+           print("staged prompt starts with the prompt file:",
+                 not own.strip() or text.startswith(own.strip("\n")))
+           print("amending:", "${base_prompt}" in text)
+           print("built-in prompt kept:", prompt.startswith("You are "))
+           print("placeholder consumed:", "${base_prompt}" not in prompt)
+           print("prompt file kept:", not last or last in prompt)
+           print("envelope appended:", "Model runtime envelope" in prompt)
+           break
+   PY
+   ```
+
+   With `SYSTEM.md.example` in place and the flag at its default, expect
+   `staged prompt starts with the prompt file`, `amending`, `built-in prompt
+   kept`, `placeholder consumed`, `prompt file kept`, and `envelope appended` all
+   `True`. A `False` on `built-in prompt kept` while `amending` is `True` is a
+   bug: Kimi substitutes every occurrence of the placeholder, so a second one in
+   prose or a comment brings the built-in prompt in twice.
+
+   A prompt file with no `${base_prompt}` is a supported replacement, not a
+   misconfiguration, and `amending` reads `False` for it. Then `built-in prompt
+   kept` is expected to read `False` as well, and that is the point — nothing
+   supplies the working directory, the applicable `AGENTS.md` files, the skills
+   listing, or the plugin sections unless the prompt names those variables
+   itself. The envelope is the exception: it is appended after your text either
+   way, and only `KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1` removes it, which is when
+   `envelope appended` should read `False`. Check for the rest by reading the
+   recorded `prompt` before you accept a replacement prompt as working.
+
+   An empty `SYSTEM.md` is a decision, not a missing file: the prompt file
+   contributes nothing, and the staged prompt is then exactly the appended
+   envelope. With the envelope omitted there is nothing left to say, and since
+   Kimi Code discards a prompt that is blank once trimmed, the staged file is a
+   lone period and the recorded `prompt` is that period — `built-in prompt kept`
+   reads `False`, which is what an empty prompt looks like from here. Only an
+   absent `SYSTEM.md` with an absent `SYSTEM.md.example` stages nothing, and that
+   is the case where Kimi supplies its own prompt.
 
 ## 6. Optional module verification
 

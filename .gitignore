@@ -1,4 +1,7 @@
 .env
+# Operator's own system prompt, which overrides the tracked default the same way `.env` does.
+# Root-anchored so a module or subdirectory prompt file of the same name stays visible.
+/SYSTEM.md
 .local/
 **/__pycache__/
 **/*.pyc

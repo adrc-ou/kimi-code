@@ -21,9 +21,11 @@ base_url_env = "NRP_BASE_URL"
 protocol = "openai"
 
 # Named credentials. A credential id maps to one API key, and any number of models may
-# name the same id to share it. Values never enter .env for the session path: they are
-# read from `env` when present, otherwise prompted for once and stored in a mode-0600
-# session file that is mounted into the proxy container as a Docker secret.
+# name the same id to share it. A model may also declare a `key_env` of its own in its
+# model.toml; that key then wins for that model, and this credential is what it falls back
+# to. Values never enter .env for the session path: they are read from `env` when present,
+# otherwise prompted for once and stored in a mode-0600 session file that is mounted into
+# the proxy container as a Docker secret.
 [[credential]]
 id = "default"
 label = "NRP managed-LLM API token"
