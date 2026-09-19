@@ -9,7 +9,7 @@ and contents must be real files/directories, never symlinks or devices.
 modules/example/
 ├── module.json              # required: metadata and declarative setup
 ├── module.sh                # required: host compatibility and lifecycle hooks
-├── AGENTS.md                # optional: guidance appended to the session prompt
+├── AGENTS.md                # optional: guidance added to the session's operating contract
 ├── README.md                # recommended: requirements, security and operation
 ├── runtime/
 │   ├── mcp.json             # optional: {"mcpServers": {...}}
@@ -145,7 +145,10 @@ module runtime content reaches `/opt/kimi-runtime`. Duplicate names fail closed.
 Module content cannot override core runtime assets or the core Kimi config and
 NRP provider policy, which remain authoritative; only the initializer writes
 policy files. Module guidance is staged in the instance runtime directory and
-appended to the session's system prompt under a heading naming the module. The
+appended to the all-lane operating contract - the composed `CONTEXT.md`, installed as
+`AGENTS.md` in Kimi's home - under a heading naming the module, which is why every lane
+receives it and the system prompt does not. The startup panel can switch it off, and
+the retired `.env` flag that once did so is gone. The
 workspace's own `AGENTS.md` belongs to the project being worked on and is never
 written, so no marker pair and no managed region exists there.
 

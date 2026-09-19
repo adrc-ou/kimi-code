@@ -56,9 +56,8 @@ if [[ "$1" == -c ]]; then exit 1; fi
 exec "$TEST_HOST_PYTHON" "$@"
 """,
         )
-        # Make tests independent of any system Python 3.12 or package manager.
+        # Make tests independent of any system Python 3.12.
         self.command("python3.12", "exit 1\n")
-        self.command("brew", "exit 99\n")
         payload = self.base / "payload"
         (payload / "python/bin").mkdir(parents=True)
         python = payload / "python/bin/python3.12"

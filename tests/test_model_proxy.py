@@ -22,9 +22,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT / "tools") not in sys.path:
-    sys.path.insert(0, str(ROOT / "tools"))
+ROOT = Path(__file__).resolve().parent.parent
+# The repository root as well as tools/: unittest only puts the start directory on the path, not
+# its parent, so `tests.helpers` needs the root added explicitly to resolve under every way of
+# running the suite - `discover -s tests`, `python -m unittest tests.test_x`, and a bare
+# `python -m unittest test_x` from inside tests/.
+for _directory in (ROOT, ROOT / "tools"):
+    if str(_directory) not in sys.path:
+        sys.path.insert(0, str(_directory))
 
 
 def load_module(name: str, path: Path):
@@ -38,8 +43,7 @@ def load_module(name: str, path: Path):
     return module
 
 
-import definitions  # noqa: E402
-import policy as plan_policy  # noqa: E402
+from tests.helpers import shipped_plan  # noqa: E402
 
 CONFIG_MERGE = load_module("kimi_config_merge", ROOT / "tools" / "kimi_config_merge.py")
 RENDER = load_module("render_runtime", ROOT / "tools" / "render_runtime.py")
@@ -53,19 +57,6 @@ PROVIDER_KEY = "provider-fixture"
 # the fixture has to outlive every test in this module.
 FIXTURES = tempfile.TemporaryDirectory()
 FIXTURE_DIR = Path(FIXTURES.name)
-
-
-def shipped_plan() -> dict:
-    """Resolve the checked-in definitions exactly as ./start.sh does."""
-    with (ROOT / "runtime" / "config.toml").open("rb") as source:
-        reserved = tomllib.load(source)["loop_control"]["reserved_context_size"]
-    providers, models = definitions.load_definitions(ROOT)
-    return plan_policy.resolve(
-        providers,
-        {item["id"]: item for item in models},
-        {"primary": models[0]["id"], "subagent": models[0]["id"]},
-        reserved_context_size=reserved,
-    )
 
 
 PLAN = shipped_plan()
@@ -119,8 +110,8 @@ except ImportError as exc:
     # reported *error*, so a host missing aiohttp looks like a host with one broken test while
     # the whole suite has silently not run. A skip names the missing prerequisite instead.
     raise unittest.SkipTest(
-        f"the proxy cannot be imported without its dependencies ({exc}); "
-        "install aiohttp==3.14.3 to run these tests"
+        f"the proxy cannot be imported without its dependencies ({exc}); install what "
+        "proxy/requirements.in pins to run these tests"
     ) from None
 
 POLICY = PROXY.BASELINE_POLICY
@@ -361,9 +352,18 @@ class RequestValidationTests(unittest.TestCase):
             for route in variant.create_app().router.routes()
             if route.resource.canonical.startswith("/{lane}/")
         }
-        for pattern in patterns:
-            self.assertNotIn("long", pattern)
-        self.assertEqual(len(patterns), 2)
+        # Built from the variant's own lanes rather than counted, so this says both things at
+        # once: the deselected lane is out of the alternation, and the lanes that remain are
+        # still routable. A count would pass on an empty app, and "long" would slip through as a
+        # substring of some other lane's name.
+        remaining = "|".join(sorted(variant.BASELINE_POLICY.lanes))
+        self.assertEqual(
+            patterns,
+            {
+                rf"/(?P<lane>{remaining})/v1/chat/completions",
+                rf"/(?P<lane>{remaining})/v1/models",
+            },
+        )
 
     def test_model_is_rewritten_to_the_lane_model(self):
         body = PROXY.rewrite_model(
@@ -526,7 +526,7 @@ class PlanLoadingTests(unittest.TestCase):
     def test_a_lane_number_must_be_a_positive_integer(self):
         for key, value in (
             ("context_tokens", 0),
-            ("input_tokens", "64000"),
+            ("input_tokens", "not-an-integer"),
             ("output_clamp_tokens", -1),
         ):
             plan = mutated()
@@ -601,16 +601,18 @@ class ConfigurationDriftTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
-    """Startup proves the plan is servable; it never decides a limit itself."""
+    """Startup proves the plan is servable; it never decides a limit itself.
+
+    The servability of the shipped plan itself is not repeated here as a test: importing the
+    module above already runs ``validate_policy(BASELINE_POLICY)``, which is why a plan that
+    could not be served fails every test in this file rather than one of them.
+    """
 
     def test_every_lane_input_allowance_fits_its_own_window(self):
         for name, lane in POLICY.lanes.items():
             with self.subTest(lane=name):
                 self.assertLessEqual(lane.max_input + lane.output_clamp, lane.context)
                 self.assertLessEqual(lane.max_input + lane.reserved, lane.context)
-
-    def test_the_shipped_plan_is_servable(self):
-        PROXY.validate_policy(POLICY)
 
     def test_a_lane_that_could_never_be_admitted_stops_startup(self):
         plan = mutated()
@@ -631,7 +633,6 @@ class ValidationTests(unittest.TestCase):
         self.assertGreater(LONG.reservation, BUDGET)
         gate = PROXY.FairUseGate(CONTEXT_ID, budget=BUDGET, exclusive_at=EXCLUSIVE_AT)
         self.assertTrue(gate.is_exclusive(LONG.reservation))
-        PROXY.validate_policy(POLICY)
 
     def test_a_subagent_batch_over_the_budget_stops_startup(self):
         plan = mutated()

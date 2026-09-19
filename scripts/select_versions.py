@@ -179,21 +179,22 @@ def kimi_catalog(asset_name: str) -> tuple[list[dict[str, str]], str]:
 
 
 def add_installed_entry(
-    catalog: list[dict[str, str]],
-    installed: str,
-    state: dict[str, str],
-    product: str,
+    catalog: list[dict[str, str]], installed: str, state: dict[str, str]
 ) -> list[dict[str, str]]:
+    """Offer the version already on disk, but only while its provenance is still provable.
+
+    An entry without a url and a digest cannot be re-verified, and every later consumer indexes
+    ``item["url"]`` unconditionally, so an unverifiable install is left out of the menu rather
+    than offered as a choice that would crash on selection.
+    """
     if not installed or any(item["version"] == installed for item in catalog):
         return catalog
 
-    if product == "Kimi Code":
-        url = state.get("KIMI_CODE_ASSET_URL", "")
-        checksum = state.get("KIMI_CODE_ASSET_SHA256", "")
-        if not url or not re.fullmatch(r"[0-9a-f]{64}", checksum):
-            return catalog
-        return [*catalog, {"version": installed, "url": url, "sha256": checksum}]
-    return [*catalog, {"version": installed}]
+    url = state.get("KIMI_CODE_ASSET_URL", "")
+    checksum = state.get("KIMI_CODE_ASSET_SHA256", "")
+    if not url or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        return catalog
+    return [*catalog, {"version": installed, "url": url, "sha256": checksum}]
 
 
 def visible_choices(catalog: list[dict[str, str]], installed: str) -> list[dict[str, str]]:
@@ -298,7 +299,7 @@ def main() -> None:
 
     state = load_state(args.state)
     kimi, latest_kimi = kimi_catalog(args.kimi_asset)
-    kimi = add_installed_entry(kimi, args.installed_kimi, state, "Kimi Code")
+    kimi = add_installed_entry(kimi, args.installed_kimi, state)
 
     selected_kimi = choose(
         "Kimi Code",

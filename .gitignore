@@ -1,7 +1,9 @@
 .env
-# Operator's own system prompt, which overrides the tracked default the same way `.env` does.
+# The operator's own prompt documents, which supersede the harness defaults the same way `.env`
+# supersedes `.env.example`. The `.example` files are documentation and are never loaded.
 # Root-anchored so a module or subdirectory prompt file of the same name stays visible.
 /SYSTEM.md
+/CONTEXT.md
 .local/
 **/__pycache__/
 **/*.pyc

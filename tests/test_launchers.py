@@ -1,5 +1,7 @@
 """Exercise host entrypoints without operator credentials or a running stack."""
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -9,6 +11,10 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "tools") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tools"))
+
+import prompt_context  # noqa: E402
 
 
 class LauncherTests(unittest.TestCase):
@@ -23,8 +29,10 @@ class LauncherTests(unittest.TestCase):
             "shell.sh",
             "extensions.sh",
             "doctor.sh",
+            "prompts.sh",
             "tools/runtime.sh",
             "tools/modules.py",
+            "tools/private_file.py",
             "tools/safe_workspace_init.py",
             "scripts/read_env.py",
         ):
@@ -42,6 +50,7 @@ class LauncherTests(unittest.TestCase):
             "tools/env_values.py",
             "tools/git_query.py",
             "runtime/config.toml",
+            "runtime/config-policy.json",
             "compose.bootstrap.yaml",
         ):
             destination = self.root / relative
@@ -294,9 +303,14 @@ exit 0
         data = self.workspace / "demo/user/data"
         data.write_text("keep")
         runtime = next((self.root / ".local/runtime").iterdir())
+        # A module's own guidance has exactly one route to the agent, and it is the all-lane
+        # contract rather than the main agent's voice.
+        contract = (runtime / "AGENTS.md").read_text()
+        self.assertIn("Demo instructions", contract)
+        self.assertIn("Model usage limits", contract)
         staged = (runtime / "SYSTEM.md").read_text()
-        self.assertIn("Demo instructions", staged)
         self.assertIn("Model runtime envelope", staged)
+        self.assertNotIn("Demo instructions", staged)
         # The workspace's own guidance file belongs to the project being worked on, so the
         # harness must never write inside it - not for the envelope, and not for module text.
         self.assertFalse((self.workspace / "AGENTS.md").exists())
@@ -309,9 +323,9 @@ exit 0
             "kimi-version\nregister-workspace\ncheck-services\n",
         )
         self.assertEqual(data.read_text(), "keep")
-        staged = (runtime / "SYSTEM.md").read_text()
-        self.assertNotIn("Demo instructions", staged)
-        self.assertIn("Model runtime envelope", staged)
+        self.assertNotIn("Demo instructions", (runtime / "AGENTS.md").read_text())
+        self.assertIn("Model usage limits", (runtime / "AGENTS.md").read_text())
+        self.assertIn("Model runtime envelope", (runtime / "SYSTEM.md").read_text())
         self.assertFalse((self.workspace / "AGENTS.md").exists())
         self.assertEqual((runtime / "last-modules.json").read_text().strip(), "[]")
         self.assertFalse((runtime / "module.env").exists())
@@ -322,19 +336,22 @@ exit 0
         self.assertFalse((runtime / "model.env").exists())
         self.assertFalse((runtime / "model-selection.json").exists())
         self.assertIn("primary", (runtime / "last-model-selection.json").read_text())
-        # The omission has to survive the whole path: `.env`, the bootstrap declaration, the
-        # resolved environment, and the staged prompt. An empty prompt file is the operator asking
-        # for no prompt, and Kimi Code throws a blank one away, so what must reach the volume is the
-        # one-token sentinel rather than nothing.
+        # The panel's choices are memory: they survive the launch that made them and are honoured
+        # by the next, which is the only way a headless session can express a selection at all.
+        # An empty prompt file is the operator asking for no prompt, and Kimi Code throws a blank
+        # one away, so what must reach the volume is the one-token sentinel rather than nothing.
         (self.root / "SYSTEM.md").write_text("")
-        self.bootstrap.write_text(
-            f"WORKSPACE_PATH={self.workspace}\nNRP_API_KEY=fixture-key\n"
-            "KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1\n"
+        prompt_context.save_prefs(
+            runtime / prompt_context.PREFS_FILE,
+            dict.fromkeys(prompt_context.OPTION_IDS, False),
         )
+        self.bootstrap.write_text(f"WORKSPACE_PATH={self.workspace}\nNRP_API_KEY=fixture-key\n")
         result = self.run_script("start.sh", "--non-interactive")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((runtime / "SYSTEM.md").read_text(), ".\n")
         self.assertFalse((self.workspace / "AGENTS.md").exists())
+        # Remembered choices are not wiped by the launch that read them.
+        self.assertTrue((runtime / prompt_context.PREFS_FILE).is_file())
         # A resolved configuration that hands the agent an arbitrary host path has to stop
         # the launch before anything is started.
         self.command(
@@ -357,6 +374,113 @@ print(json.dumps(configuration))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("exposes host bind", result.stderr)
         self.assertNotIn("register-workspace", (self.base / "events").read_text())
+
+
+class PromptsScriptTests(unittest.TestCase):
+    """``./prompts.sh`` is a dispatcher, so these tests check the dispatch and the guards.
+
+    A full panel render needs the resolved policy plan, which only a real launch writes. Rather
+    than reproduce that here - ``test_prompt_panel.py`` already covers the drawing - these tests
+    drive every mode reachable without a plan and hold the plan-hungry mode to the panel's own
+    complaint, which is the behaviour an operator actually meets when they run it too early.
+    """
+
+    command = LauncherTests.command
+    run_script = LauncherTests.run_script
+    require_executable_fixtures = LauncherTests.require_executable_fixtures
+
+    def setUp(self) -> None:
+        LauncherTests.setUp(self)
+        # The panel is a real program in this repo, so the stubbed launcher runs the real one.
+        shutil.copytree(ROOT / "tools", self.root / "tools", dirs_exist_ok=True)
+        shutil.copytree(ROOT / "runtime", self.root / "runtime", dirs_exist_ok=True)
+
+    def instance_runtime_dir(self) -> Path:
+        """The instance directory the launcher would compute for this fixture.
+
+        Mirrors ``harness_instance()``: a digest of root, workspace and platform, truncated. The
+        platform is what the ``uname`` stub in ``setUp`` reports.
+        """
+        material = b"\0".join(
+            (str(self.root).encode(), str(self.workspace).encode(), b"darwin-arm64")
+        )
+        return self.root / ".local/runtime" / hashlib.sha256(material).hexdigest()[:16]
+
+    def with_plan(self, plan: object) -> Path:
+        runtime = self.instance_runtime_dir()
+        runtime.mkdir(parents=True, exist_ok=True)
+        (runtime / "model-policy.json").write_text(json.dumps(plan), encoding="utf-8")
+        return runtime
+
+    def test_unknown_mode_is_usage_not_a_crash(self):
+        result = self.run_script("prompts.sh", "--nonsense")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage: ./prompts.sh", result.stderr)
+
+    def test_extra_arguments_are_refused_before_the_runtime_is_read(self):
+        result = self.run_script("prompts.sh", "--vars", "spurious")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage:", result.stderr)
+
+    def test_missing_runtime_says_so_instead_of_printing_nothing(self):
+        result = self.run_script("prompts.sh")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("No prepared runtime", result.stderr)
+
+    def test_configure_lists_every_shipped_option_without_reading_the_plan(self):
+        self.with_plan({})
+        result = self.run_script("prompts.sh", "--configure", "--show")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for option_id in prompt_context.OPTION_IDS:
+            self.assertIn(option_id, result.stdout)
+
+    def test_configure_writes_the_file_the_launcher_composes_from(self):
+        runtime = self.with_plan({})
+        result = self.run_script("prompts.sh", "--configure", "--disable", "lane_table")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prefs = json.loads((runtime / prompt_context.PREFS_FILE).read_text(encoding="utf-8"))
+        self.assertFalse(prefs["lane_table"])
+        self.assertTrue(prefs["module_guidance"])
+
+    def test_configure_rejects_an_option_it_does_not_own(self):
+        self.with_plan({})
+        result = self.run_script("prompts.sh", "--configure", "--disable", "not_an_option")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("valid ids", result.stderr)
+
+    def test_show_refuses_to_price_a_plan_it_cannot_resolve(self):
+        self.with_plan({})
+        result = self.run_script("prompts.sh", "--show")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the panel needs the resolved policy plan", result.stderr)
+
+    def test_vars_names_both_placeholder_families_and_the_read_only_tables(self):
+        self.with_plan({})
+        result = self.run_script("prompts.sh", "--vars")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for expected in ("base_prompt", "harness.date", "kimi.coder_role"):
+            self.assertIn(expected, result.stdout)
+        # The operator's own config tables are evidence here, never a checkbox: they are not the
+        # harness's to rewrite, so the listing has to say so in the operator's words.
+        self.assertIn("[experimental]", result.stdout)
+
+    def test_the_container_backed_modes_name_the_stack_as_the_missing_piece(self):
+        self.command(
+            "docker",
+            """
+if [[ "$*" == "compose version" || "$*" == "info" ]]; then exit 0; fi
+if [[ "$*" == *"config --environment" ]]; then cat "$TEST_BOOTSTRAP"; exit 0; fi
+if [[ "$1" == ps ]]; then exit 0; fi
+echo "Unexpected Docker call" >&2
+exit 99
+""",
+        )
+        self.with_plan({})
+        for mode in ("--live", "--extract"):
+            with self.subTest(mode=mode):
+                result = self.run_script("prompts.sh", mode)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("is not running", result.stderr)
 
 
 if __name__ == "__main__":

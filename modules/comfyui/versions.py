@@ -11,8 +11,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from select_versions import SEMVER_RE, choose, load_state, semver_key, write_environment
 
 
-def comfy_catalog(platform_key: str) -> tuple[list[dict[str, str]], str]:
-    path = Path(__file__).resolve().parent / "backend" / "compatibility.json"
+def comfy_catalog(
+    platform_key: str, path: Path | None = None
+) -> tuple[list[dict[str, str]], str]:
+    """The certified backends for one platform, newest first, with the newest version.
+
+    ``path`` is the compatibility document; it defaults to the one shipped beside this module,
+    and a caller may point it at another so the ordering and the refusals can be exercised
+    without waiting for the shipped file to contain a second release.
+    """
+    if path is None:
+        path = Path(__file__).resolve().parent / "backend" / "compatibility.json"
     document = json.loads(path.read_text())
     entries = document.get("entries", [])
     if not isinstance(entries, list):

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.modules import assemble, choose, discover, module_guidance, ordered
+from tools.modules import assemble, choose, discover, module_agents_text, ordered
 from tools.safe_workspace_init import UnsafeWorkspace, initialize
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,19 +77,28 @@ class ModuleTests(unittest.TestCase):
     def test_each_module_owns_a_heading_naming_it(self):
         for name, text in (("alpha", "Alpha way.\n"), ("beta", "Beta way.\n")):
             (self.module(name) / "AGENTS.md").write_text(text)
-        guidance = module_guidance(discover(self.root))
+        guidance = module_agents_text(discover(self.root))
         self.assertIn("## Module: Alpha\n\nAlpha way.", guidance)
         self.assertLess(guidance.index("## Module: Alpha"), guidance.index("## Module: Beta"))
 
     def test_a_module_without_guidance_contributes_no_section(self):
         self.module()
-        self.assertEqual(module_guidance(discover(self.root)), "")
-        self.assertEqual(module_guidance([]), "")
+        self.assertEqual(module_agents_text(discover(self.root)), "")
+        self.assertEqual(module_agents_text([]), "")
 
-    def test_core_setup_does_not_create_comfyui(self):
+    def test_an_unselected_module_contributes_nothing(self):
+        path = self.module(workspace_directories=["demo/user"])
+        (path / "AGENTS.md").write_text("Demo way.\n")
+        (path / "runtime/tools").mkdir(parents=True)
+        (path / "runtime/tools/democtl.py").write_text("exit 0\n")
         assemble(self.root, self.runtime, [], self.workspace)
-        self.assertFalse((self.workspace / "comfyui").exists())
-        self.assertFalse((self.runtime / "assets/tools/comfyctl.py").exists())
+        self.assertFalse((self.workspace / "demo").exists())
+        self.assertFalse((self.runtime / "assets/tools/democtl.py").exists())
+        self.assertEqual((self.runtime / "module-guidance.md").read_text(), "")
+        assemble(self.root, self.runtime, discover(self.root), self.workspace)
+        self.assertTrue((self.workspace / "demo/user").exists())
+        self.assertTrue((self.runtime / "assets/tools/democtl.py").exists())
+        self.assertIn("## Module: Demo", (self.runtime / "module-guidance.md").read_text())
 
     def test_module_directories_cannot_escape_or_follow_links(self):
         self.module(workspace_directories=["../escape"])

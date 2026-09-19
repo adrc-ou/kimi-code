@@ -13,6 +13,7 @@ if str(ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(ROOT / "tools"))
 
 import policy  # noqa: E402
+import prompt_context  # noqa: E402
 import render_runtime  # noqa: E402
 
 
@@ -27,23 +28,13 @@ class LaunchSteps:
     PROVIDER_ONLY = "NRP_API_KEY=provider-secret\n"
     MODEL_SCOPED = "QWEN3_API_KEY=model-secret\nNRP_API_KEY=provider-secret\n"
 
-    def fixture(
-        self, directory: Path, values: str = PROVIDER_ONLY, omit: str | None = None
-    ) -> Path:
-        """A resolved plan, plus the resolved ``.env`` the renderer is asked to read.
-
-        ``omit`` is the literal text the operator put after the
-        ``KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=`` line; ``None`` leaves the name out of the file
-        entirely, which is how an operator who never set the flag looks to the launcher.
-        """
+    def fixture(self, directory: Path, values: str = PROVIDER_ONLY) -> Path:
+        """A resolved plan, plus the resolved ``.env`` the renderer is asked to read."""
         state = directory / "state"
         workspace = directory / "workspace"
         workspace.mkdir()
         resolved = directory / "resolved.env"
-        text = f"{values}NRP_BASE_URL=\nKIMI_BACKGROUND_TASK_SLOTS=\n"
-        if omit is not None:
-            text += f"{render_runtime.OMIT_ENVELOPE_FLAG}={omit}\n"
-        resolved.write_text(text)
+        resolved.write_text(f"{values}NRP_BASE_URL=\nKIMI_BACKGROUND_TASK_SLOTS=\n")
         environment = {
             **os.environ,
             "HARNESS_ROOT": str(ROOT),
@@ -94,7 +85,10 @@ class RenderRuntimeTests(LaunchSteps, unittest.TestCase):
             self.render(state, resolved)
             self.assertNotEqual(first_token, (state / "proxy-token").read_text())
             self.assertEqual(first_salt, (state / "cache-salt").read_text())
-            self.assertEqual(len(first_salt), 43)
+            # Long enough to be unguessable and made only of characters a path, a URL and a
+            # Compose secret file all carry unchanged: the length itself is the generator's affair.
+            self.assertGreaterEqual(len(first_salt), 32)
+            self.assertRegex(first_salt, r"^[A-Za-z0-9_-]+$")
             config = (state / "kimi-config.toml").read_text()
             self.assertNotIn("__MODEL_PROXY_TOKEN__", config)
             # The default model is whatever the primary selection's alias is, so this asserts
@@ -145,6 +139,29 @@ class RenderRuntimeTests(LaunchSteps, unittest.TestCase):
             self.assertIn("MODEL_PROXY_POLICY_FILE=", published)
             self.assertNotIn("KIMI_EMPTY", published)
             self.assertFalse((state / "user-agents").exists())
+
+    def test_the_staged_documents_are_recorded_beside_themselves(self):
+        """The sidecar is what lets doctor.sh explain an edit that had no effect.
+
+        Nothing the agent can read may carry a credential, but the mode and the rotation behaviour
+        are still the renderer's to get right: this file names operator documents, and it is
+        rewritten rather than appended so a deselected document cannot linger as a false record.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            state = self.fixture(base)
+            resolved = base / "resolved.env"
+            self.render(state, resolved)
+            sidecar = state / prompt_context.SOURCES_FILE
+            self.assertEqual(os.stat(sidecar).st_mode & 0o777, 0o600)
+            recorded = json.loads(sidecar.read_text())
+            self.assertEqual(set(recorded), {"agents", "system"})
+            self.assertEqual(recorded["agents"]["source"], "runtime/AGENTS.md")
+            self.assertIsNone(recorded["system"]["source"], "no SYSTEM.md exists in the checkout")
+            self.assertFalse(prompt_context.stale_sources(ROOT, state))
+            # A second launch restages the pair, so the record has to describe the new bytes.
+            self.render(state, resolved)
+            self.assertEqual(json.loads(sidecar.read_text()), recorded)
 
     def test_renderer_refuses_a_missing_plan(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -227,20 +244,28 @@ class ModelScopedKeyTests(LaunchSteps, unittest.TestCase):
 
 
 class SystemPromptStagingTests(LaunchSteps, unittest.TestCase):
-    """Which prompt reaches Kimi, and what each source means.
+    """Which two documents reach Kimi, and what each source and each choice means.
 
-    The project-root ``SYSTEM.md`` is the operator's own untracked file and ``SYSTEM.md.example``
-    is the harness default, so the pair behaves like ``.env`` and ``.env.example``. Either is a
-    complete prompt: it may wrap Kimi Code's built-in prompt through ``${base_prompt}`` or replace
-    it outright, and an empty file means an empty prompt rather than a fallback to the default.
-    Appended on top of that text are the selected modules' guidance and the generated runtime
-    envelope, the latter unless ``KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE`` is truthy.
+    The all-lane contract resolves in two tiers - the project-root ``CONTEXT.md``, else this
+    harness's own ``runtime/AGENTS.md`` - and is staged as ``AGENTS.md``, where Kimi injects it
+    through ``${agents_md}`` into every agent. The main agent's voice comes from ``SYSTEM.md``
+    alone, or from Kimi's built-in prompt when the operator has no file. Neither chain reads a
+    ``.example``. On top of whichever text resolves, the panel's remembered choices decide which
+    generated blocks are appended: the usage limits for every agent, and the lane table plus the
+    parallel-work guidance for the main agent only.
     """
 
+    CONTRACT = "CONTEXT.md"
     LOCAL = "SYSTEM.md"
-    DEFAULT = "SYSTEM.md.example"
-    #: The envelope is recognised by its heading rather than its numbers, which are derived.
-    HEADING = "Model runtime envelope"
+    #: Documentation only. Named so the tests can keep asserting neither is ever loaded.
+    EXAMPLE = "SYSTEM.md.example"
+    CONTRACT_EXAMPLE = "CONTEXT.md.example"
+    #: The generated blocks are recognised by their heading line, never by the numbers under it.
+    #: The leading newline matters: the contract prose mentions "Model runtime envelope" in
+    #: passing, and "### Parallel work" contains "## Parallel work" as a substring.
+    LIMITS = "## Model usage limits (generated at launch)"
+    ENVELOPE = "\n## Model runtime envelope (generated at launch)"
+    PARALLELISM = "\n## Parallel work"
 
     def root_with(self, **files: str) -> Path:
         """A project root holding only the named prompt files, given by their root-level name."""
@@ -250,160 +275,231 @@ class SystemPromptStagingTests(LaunchSteps, unittest.TestCase):
             (root / name).write_text(content)
         return root
 
-    def prompt_source(self) -> Path:
-        """The file this checkout actually resolves, which an operator's local file overrides."""
-        local = ROOT / self.LOCAL
-        return local if local.is_file() else ROOT / self.DEFAULT
+    def example_text(self) -> str:
+        """The shipped ``SYSTEM.md.example``: for a human to read, and loaded by nothing."""
+        return (ROOT / self.EXAMPLE).read_text(encoding="utf-8")
 
     def root_with_runtime(self, **files: str) -> Path:
-        """A root the renderer can actually run against: prompt files plus the config template.
+        """A root the renderer can actually run against: prompt files plus the runtime sources.
 
-        ``render_runtime.py`` reads only those two things from ``--root``, so this is enough to
-        stage a prompt under test without copying the repository.
+        ``render_runtime.py`` reads only those from ``--root``, so this is enough to stage a prompt
+        under test without copying the repository. The contract source is copied alongside the
+        config template because it is tier two of the all-lane document, which every render reads.
         """
         root = self.root_with(**files)
         (root / "runtime").mkdir()
-        shutil.copy(ROOT / "runtime" / "config.toml", root / "runtime" / "config.toml")
+        for name in ("config.toml", "AGENTS.md"):
+            shutil.copy(ROOT / "runtime" / name, root / "runtime" / name)
         return root
 
-    def staged_prompt(
-        self, files: dict[str, str], *, omit: str | None = None, guidance: str = ""
-    ) -> str:
-        """Render a project root holding exactly ``files``, and return the staged prompt."""
+    def stage(
+        self,
+        files: dict[str, str],
+        *,
+        off: tuple[str, ...] = (),
+        guidance: str = "",
+    ) -> Path:
+        """Render a project root holding exactly ``files``, with every panel option on except those
+        named in ``off``, and return the runtime directory the renderer wrote into."""
         root = self.root_with_runtime(**files)
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            state = self.fixture(base, omit=omit)
-            if guidance:
-                (state / render_runtime.MODULE_GUIDANCE_FILE).write_text(guidance)
-            self.render(state, base / "resolved.env", root=root)
-            self.assertEqual(os.stat(state / "SYSTEM.md").st_mode & 0o777, 0o600)
-            return (state / "SYSTEM.md").read_text()
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        base = Path(holder.name)
+        state = self.fixture(base)
+        prompt_context.save_prefs(
+            state / prompt_context.PREFS_FILE,
+            {option: option not in off for option in prompt_context.OPTION_IDS},
+        )
+        if guidance:
+            (state / render_runtime.MODULE_GUIDANCE_FILE).write_text(guidance)
+        self.render(state, base / "resolved.env", root=root)
+        return state
 
-    def test_the_operators_file_wins_over_the_harness_default(self):
-        root = self.root_with(**{self.LOCAL: "# mine\n", self.DEFAULT: "# harness default\n"})
-        self.assertEqual(render_runtime.system_prompt(root), "# mine\n")
+    def staged_prompt(self, files: dict[str, str], **values) -> str:
+        """The main agent's staged document."""
+        state = self.stage(files, **values)
+        self.assertEqual(os.stat(state / "SYSTEM.md").st_mode & 0o777, 0o600)
+        return (state / "SYSTEM.md").read_text()
 
-    def test_the_harness_default_is_used_without_an_operators_file(self):
-        root = self.root_with(**{self.DEFAULT: "# harness default\n"})
-        self.assertEqual(render_runtime.system_prompt(root), "# harness default\n")
+    def staged_agents(self, files: dict[str, str], **values) -> str:
+        """The all-lane staged contract, which is a different document from the one above."""
+        state = self.stage(files, **values)
+        self.assertEqual(os.stat(state / "AGENTS.md").st_mode & 0o777, 0o600)
+        return (state / "AGENTS.md").read_text()
 
-    def test_an_empty_operators_file_does_not_fall_back_to_the_default(self):
-        """An empty prompt file is a decision, not a missing file: it stays empty."""
-        root = self.root_with(**{self.LOCAL: "", self.DEFAULT: "# harness default\n"})
-        self.assertEqual(render_runtime.system_prompt(root), "")
+    def test_the_operators_file_is_what_gets_read(self):
+        root = self.root_with(**{self.LOCAL: "# mine\n", self.EXAMPLE: "# harness default\n"})
+        self.assertEqual(prompt_context.system_source(root), root / self.LOCAL)
+
+    def test_the_operators_contract_beats_the_harness_default(self):
+        root = self.root_with_runtime(**{self.CONTRACT: "# mine\n"})
+        self.assertEqual(prompt_context.context_source(root), root / self.CONTRACT)
+
+    def test_the_harness_default_is_the_second_tier(self):
+        """With no operator file the contract is this harness's own, which is a real file."""
+        root = self.root_with_runtime()
+        self.assertEqual(prompt_context.context_source(root), root / "runtime" / "AGENTS.md")
+
+    def test_neither_example_file_is_ever_loaded(self):
+        """A file named as an example is documentation, so its presence must change nothing."""
+        root = self.root_with(**{self.EXAMPLE: "# harness default\n"})
+        self.assertIsNone(prompt_context.system_source(root))
+        root = self.root_with(**{self.CONTRACT_EXAMPLE: "# harness default\n"})
+        self.assertIsNone(prompt_context.context_source(root))
+
+    def test_an_empty_operators_file_is_a_prompt_of_its_own(self):
+        """An empty prompt file is a decision, not a missing file: it is still what gets read."""
+        root = self.root_with(**{self.LOCAL: "", self.EXAMPLE: "# harness default\n"})
+        self.assertEqual(prompt_context.system_source(root), root / self.LOCAL)
 
     def test_no_prompt_file_at_all_leaves_kimi_on_its_own_prompt(self):
         """The last tier is the only one that means "we have no opinion about the prompt"."""
-        self.assertIsNone(render_runtime.system_prompt(self.root_with()))
+        self.assertIsNone(prompt_context.system_source(self.root_with()))
 
     def test_prompt_files_below_the_project_root_are_not_prompt_files(self):
         """The names resolve at the root only, so a module's own prompt file is never picked up."""
         root = self.root_with()
         (root / "modules" / "comfyui").mkdir(parents=True)
         (root / "runtime").mkdir()
-        (root / "modules" / "comfyui" / self.DEFAULT).write_text("# module\n")
-        (root / "runtime" / self.LOCAL).write_text("# runtime\n")
-        self.assertIsNone(render_runtime.system_prompt(root))
+        for name in (self.LOCAL, self.CONTRACT):
+            (root / "modules" / "comfyui" / name).write_text("# module\n")
+            (root / "runtime" / name).write_text("# runtime\n")
+        self.assertIsNone(prompt_context.system_source(root))
+        self.assertIsNone(prompt_context.context_source(root))
 
     def test_a_prompt_without_the_placeholder_replaces_kimis_own_prompt(self):
         """Total replacement is a supported mode, not a launch failure."""
         replacement = "You are ${product_name} in ${cwd} on ${os}.\n"
-        root = self.root_with(**{self.LOCAL: replacement})
-        self.assertEqual(render_runtime.system_prompt(root), replacement)
+        staged = self.staged_prompt({self.LOCAL: replacement}, off=prompt_context.OPTION_IDS)
+        self.assertEqual(staged, replacement)
 
-    def test_the_envelope_is_appended_to_the_prompt_by_default(self):
-        staged = self.staged_prompt({self.LOCAL: "# mine\n"})
-        self.assertTrue(staged.startswith("# mine\n"))
-        self.assertIn(self.HEADING, staged)
+    def test_the_generated_blocks_are_on_by_default(self):
+        """Nothing was ever asked to be omitted, so both documents carry their blocks."""
+        agents = self.staged_agents({self.LOCAL: "# mine\n"})
+        self.assertIn(self.LIMITS, agents)
+        prompt = self.staged_prompt({self.LOCAL: "# mine\n"})
+        self.assertTrue(prompt.startswith("# mine\n"))
+        self.assertIn(self.ENVELOPE, prompt)
+        self.assertIn(self.PARALLELISM, prompt)
 
-    def test_an_absent_flag_and_a_blank_one_both_keep_the_envelope(self):
-        """The envelope ships by default, so "unset" and "set to nothing" must not omit it."""
-        for omit in (None, ""):
-            with self.subTest(omit=repr(omit)):
-                staged = self.staged_prompt({self.LOCAL: "# mine\n"}, omit=omit)
-                self.assertIn(self.HEADING, staged)
+    def test_the_contract_holds_nothing_the_voice_owns_and_vice_versa(self):
+        """No text reaches the main agent twice: it gets the contract through ``${agents_md}``."""
+        agents = self.staged_agents({self.LOCAL: "# mine\n"})
+        prompt = self.staged_prompt({self.LOCAL: "# mine\n"})
+        self.assertNotIn(self.ENVELOPE, agents)
+        self.assertNotIn(self.PARALLELISM, agents)
+        self.assertNotIn(self.LIMITS, prompt)
 
-    def test_a_value_that_is_not_truthy_keeps_the_envelope(self):
-        """The flag is named after the omission, so only a truthy value may perform it."""
-        for value in ("0", "false", "no", "off", "flase", "maybe", "2"):
-            with self.subTest(value=value):
-                staged = self.staged_prompt({self.LOCAL: "# mine\n"}, omit=value)
-                self.assertIn(self.HEADING, staged)
+    def test_a_single_block_can_be_switched_off_without_touching_the_others(self):
+        prompt = self.staged_prompt({self.LOCAL: "# mine\n"}, off=(policy.OPTION_LANE_TABLE,))
+        self.assertIn(self.PARALLELISM, prompt)
+        self.assertNotIn(self.ENVELOPE, prompt)
+        agents = self.staged_agents({self.LOCAL: "# mine\n"}, off=(policy.OPTION_LANE_TABLE,))
+        self.assertIn(self.LIMITS, agents)
 
-    def test_omitting_the_envelope_stages_the_prompt_file_byte_for_byte(self):
-        """The omission has to reach Kimi's own prompt too, so nothing at all may be appended."""
-        for value in ("1", "true", "yes", "on", "ON", "Yes", " 1 "):
-            with self.subTest(value=value):
-                staged = self.staged_prompt({self.LOCAL: "# mine\n\n"}, omit=value)
-                self.assertEqual(staged, "# mine\n\n")
-                self.assertNotIn(self.HEADING, staged)
+    def test_switching_off_every_block_stages_the_operators_text_and_nothing_else(self):
+        """With nothing selected the operator's text is the whole document. Edge newlines are
+        normalised by the composer; no add-on text is appended."""
+        staged = self.staged_prompt({self.LOCAL: "# mine\n\n"}, off=prompt_context.OPTION_IDS)
+        self.assertEqual(staged, "# mine\n")
+        self.assertNotIn(self.ENVELOPE, staged)
 
-    def test_omitting_the_envelope_with_no_prompt_file_at_all_stages_nothing(self):
-        """No file is tier three, which Kimi answers with its own prompt - so stay blank."""
-        self.assertEqual(self.staged_prompt({}, omit="1"), "")
+    def test_no_blocks_and_no_prompt_file_at_all_stages_nothing(self):
+        """No file is the tier that means no opinion, which Kimi answers with its own prompt."""
+        self.assertEqual(self.staged_prompt({}, off=prompt_context.OPTION_IDS), "")
 
-    def test_an_empty_prompt_file_with_the_envelope_stages_the_envelope_only(self):
-        """Neither the harness default nor the built-in prompt sneaks in behind an empty file."""
-        root = self.root_with_runtime(**{self.LOCAL: "", self.DEFAULT: "# harness default\n"})
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            state = self.fixture(base)
-            self.render(state, base / "resolved.env", root=root)
-            staged = (state / "SYSTEM.md").read_text()
-            plan = json.loads((state / "model-policy.json").read_text())
-        self.assertEqual(staged, policy.render_guidance(plan).strip("\n") + "\n")
+    def test_an_absent_prompt_file_still_wraps_kimis_prompt_when_a_block_is_on(self):
+        """Appending to a staged file that Kimi reads as empty would replace its prompt, so the
+        wrapper goes in - as the 14-character placeholder, never as expanded text."""
+        staged = self.staged_prompt({}, off=(policy.OPTION_LANE_TABLE,))
+        self.assertTrue(staged.startswith(prompt_context.BASE_PROMPT_WRAPPER + "\n"))
+        self.assertEqual(staged.count(prompt_context.BASE_PROMPT_WRAPPER), 1)
+
+    def test_an_empty_prompt_file_with_blocks_stages_the_blocks_only(self):
+        """Neither the example file nor the built-in prompt sneaks in behind an empty file.
+
+        Existence determines authority and emptiness determines payload, so the enabled blocks
+        become the entire prompt. That is the intended reading of a decision the operator made.
+        """
+        state = self.stage({self.LOCAL: "", self.EXAMPLE: "# harness default\n"})
+        plan = json.loads((state / "model-policy.json").read_text())
+        staged = (state / "SYSTEM.md").read_text()
+        expected = policy.render_guidance(plan, "main").strip("\n") + "\n"
+        self.assertEqual(staged, expected)
         self.assertNotIn("harness default", staged)
+        self.assertNotIn(prompt_context.BASE_PROMPT_WRAPPER, staged)
 
-    def test_an_empty_prompt_file_that_omitted_the_envelope_stages_a_period(self):
+    def test_an_empty_prompt_file_with_no_blocks_stages_a_period(self):
         """Kimi Code swaps its built-in prompt in for anything blank, so an empty prompt is
         expressed as the shortest string that survives that check."""
-        staged = self.staged_prompt({self.LOCAL: ""}, omit="1")
-        self.assertEqual(staged, render_runtime.EMPTY_PROMPT_SENTINEL + "\n")
+        staged = self.staged_prompt({self.LOCAL: ""}, off=prompt_context.OPTION_IDS)
+        self.assertEqual(staged, prompt_context.EMPTY_PROMPT_SENTINEL + "\n")
         self.assertTrue(staged.strip())
 
-    def test_a_whitespace_only_prompt_file_that_omitted_the_envelope_stages_a_period(self):
+    def test_a_whitespace_only_prompt_file_with_no_blocks_stages_a_period(self):
         """Trimming happens upstream, so whitespace is as blank as nothing."""
-        staged = self.staged_prompt({self.LOCAL: "\n\n"}, omit="on")
-        self.assertEqual(staged, render_runtime.EMPTY_PROMPT_SENTINEL + "\n")
+        staged = self.staged_prompt({self.LOCAL: "\n\n"}, off=prompt_context.OPTION_IDS)
+        self.assertEqual(staged, prompt_context.EMPTY_PROMPT_SENTINEL + "\n")
 
-    def test_module_guidance_is_appended_before_the_envelope(self):
-        staged = self.staged_prompt(
+    def test_module_guidance_reaches_the_contract_not_the_voice(self):
+        """A module's guidance is for every agent that touches it, which is the all-lane file."""
+        guidance = "## Module: Demo\n\nuse the demo\n"
+        agents = self.staged_agents({self.LOCAL: "# mine\n"}, guidance=guidance)
+        self.assertLess(agents.index(self.LIMITS), agents.index("## Module: Demo"))
+        prompt = self.staged_prompt({self.LOCAL: "# mine\n"}, guidance=guidance)
+        self.assertNotIn("use the demo", prompt)
+
+    def test_turning_module_guidance_off_silences_it(self):
+        """It is an option like any other, so the operator can decline it - and the panel says
+        which modules then lose the only route their own text has to the agent."""
+        agents = self.staged_agents(
             {self.LOCAL: "# mine\n"},
+            off=("module_guidance",),
             guidance="## Module: Demo\n\nuse the demo\n",
         )
-        self.assertLess(staged.index("# mine"), staged.index("## Module: Demo"))
-        self.assertLess(staged.index("## Module: Demo"), staged.index(self.HEADING))
+        self.assertNotIn("use the demo", agents)
+        self.assertIn(self.LIMITS, agents)
 
-    def test_a_blank_prompt_file_with_module_guidance_needs_no_sentinel(self):
-        """The period only exists to keep a blank prompt from being discarded, and appended text
-        is not blank."""
-        staged = self.staged_prompt(
-            {self.LOCAL: ""}, omit="1", guidance="## Module: Demo\n\nuse the demo\n"
-        )
-        self.assertEqual(staged, "## Module: Demo\n\nuse the demo\n")
-
-    def test_omitting_the_envelope_does_not_silence_module_guidance(self):
-        """A module's guidance is the only path its own ``AGENTS.md`` has to reach the agent, so
-        it is functionally required rather than policy decoration."""
-        staged = self.staged_prompt(
-            {self.LOCAL: "# mine\n"},
-            omit="1",
+    def test_an_empty_contract_still_gets_its_blocks_and_its_modules(self):
+        """The sentinel exists to keep a *voice* document from being discarded. The contract is a
+        bind-mounted file whose emptiness is simply silence, so its add-ons follow it unchanged."""
+        agents = self.staged_agents(
+            {self.CONTRACT: ""},
+            off=(policy.OPTION_LANE_TABLE,),
             guidance="## Module: Demo\n\nuse the demo\n",
         )
-        self.assertIn("use the demo", staged)
-        self.assertNotIn(self.HEADING, staged)
+        self.assertIn(self.LIMITS, agents)
+        self.assertIn("## Module: Demo", agents)
 
-    def test_the_harness_default_ships_at_the_project_root(self):
-        self.assertTrue((ROOT / self.DEFAULT).is_file())
+    def test_the_example_is_a_documentation_file(self):
+        self.assertTrue((ROOT / self.EXAMPLE).is_file())
 
-    def test_the_harness_default_wraps_kimis_prompt_exactly_once(self):
-        default = self.prompt_source().read_text()
-        self.assertTrue(default.strip())
+    def test_the_example_shows_a_wrapper_around_kimis_prompt(self):
+        """Not a load-bearing claim about this session's prompt - a lint on the worked example, so
+        the pattern the docs teach is a pattern that actually works.
+
+        Checked on the text an operator would get after staging, because that is the only
+        version that has ever shipped anywhere: help comments in the example are stripped by
+        the same rule that strips them from the real file.
+        """
+        staged = prompt_context.strip_html_comments(self.example_text())
+        self.assertTrue(staged.strip())
         # Substituted everywhere, so a second occurrence would duplicate the whole built-in prompt.
-        self.assertEqual(default.count("${base_prompt}"), 1)
-        # Comments survive into the prompt, so the shipped default carries none.
-        self.assertNotIn("<!--", default)
+        self.assertEqual(staged.count("${base_prompt}"), 1)
+        # Every placeholder the example advertises in its prose must be one Kimi actually binds,
+        # or the example teaches a variable that reaches the model as a literal. ${HOME} is the
+        # one deliberate exception: it is shown as an example of prose that survives untouched.
+        documented = set(prompt_context.PLACEHOLDER_PATTERN.findall(self.example_text()))
+        self.assertIn("${base_prompt}", self.example_text())
+        documented -= {"HOME"}
+        known = set(prompt_context.known_placeholders()) | {"base_prompt"}
+        self.assertEqual(
+            sorted(name for name in documented if name not in known), [],
+            "the example documents a placeholder nothing binds",
+        )
+        # Nothing is loaded from this file, so an operator's own SYSTEM.md may carry the HTML
+        # comments this example uses to explain itself without any of them reaching the prompt.
+        self.assertIn("<!--", self.example_text())
 
 
 if __name__ == "__main__":

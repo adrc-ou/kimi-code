@@ -8,6 +8,33 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# The repository root as well as tools/, so that `tests.helpers` resolves under every way of
+# running the suite; this file also shells out to the tools, so it needs both on the path.
+for _directory in (ROOT, ROOT / "tools"):
+    if str(_directory) not in sys.path:
+        sys.path.insert(0, str(_directory))
+
+from tests.helpers import shipped_plan  # noqa: E402
+
+
+def _front_matter_list(text: str, key: str) -> list[str]:
+    """Read one ``key:`` sequence out of a role file's front matter.
+
+    The files are YAML, but PyYAML is not a dependency of this repository and a role listing is
+    a flat block of ``- item`` lines, so reading it directly is cheaper than acquiring one.
+    """
+    body = text.split("---", 2)
+    if len(body) < 3:
+        raise AssertionError("role file has no front matter")
+    entries: list[str] = []
+    inside = False
+    for line in body[1].splitlines():
+        if not line.startswith(" "):
+            inside = line.strip() == f"{key}:"
+            continue
+        if inside and line.strip().startswith("- "):
+            entries.append(line.strip()[2:].strip())
+    return entries
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -34,6 +61,57 @@ class ConfigurationTests(unittest.TestCase):
             and not call.get("includes")
         ]
         self.assertTrue(allowed)
+
+    def test_every_role_grants_only_an_enabled_mcp_server(self):
+        """A grant naming a disabled server is not inert - it is a hole in the role's contract.
+
+        ``repo-researcher`` shipped four ``mcp__*`` wildcards for three servers that were
+        switched off or absent, so the role advertised reach it did not have and the panel
+        could not tell the operator which tools were real.
+        """
+        document = json.loads((ROOT / "runtime" / "mcp.json").read_text())
+        enabled = {
+            name for name, server in document["mcpServers"].items() if server.get("enabled")
+        }
+        self.assertTrue(enabled)
+        for path in sorted((ROOT / "runtime" / "agents").glob("*.md")):
+            for grant in _front_matter_list(path.read_text(), "tools"):
+                if not grant.startswith("mcp__"):
+                    continue
+                server = grant.split("__")[1]
+                self.assertIn(
+                    server, enabled, f"{path.name} grants the disabled server {server!r}"
+                )
+
+    def test_every_role_file_carries_the_contract(self):
+        """A file-discovered profile inherits nothing.
+
+        Kimi's built-in role prefix is interpolated into its own literals at module load and
+        never applied to a profile loaded from a file, so a role that does not ask for
+        ``${agents_md}`` runs without the operating contract - and asking for ``${base_prompt}``
+        instead would hand it the main agent's voice.
+        """
+        for path in sorted((ROOT / "runtime" / "agents").glob("*.md")):
+            text = path.read_text()
+            with self.subTest(role=path.name):
+                self.assertIn("${agents_md}", text)
+                self.assertNotIn("${base_prompt}", text)
+                self.assertIn("handoff", text.lower(), "a role must state its own handoff")
+
+    def test_the_contract_names_both_staged_documents(self):
+        """The contract is addressed to the agent, so it names what the agent can observe.
+
+        Where the files come from is an operator question and belongs in the `.example` files
+        and the docs; naming them here would read as an instruction to go and edit them.
+        """
+        text = (ROOT / "runtime" / "AGENTS.md").read_text()
+        self.assertIn("`AGENTS.md`", text)
+        self.assertIn("`SYSTEM.md`", text)
+        self.assertIn("Model usage limits", text)
+        self.assertIn("Model runtime envelope", text)
+        # And it says plainly which of the two a subagent is missing, so a subagent that
+        # looks for the lane table and finds none is not left guessing whether that is a bug.
+        self.assertIn("never sees", text)
 
     def test_all_base_images_are_digest_pinned(self):
         for relative in (
@@ -99,6 +177,32 @@ class ConfigurationTests(unittest.TestCase):
         models = (ROOT / "tools" / "models.py").read_text()
         self.assertIn("last used", models)
 
+    def test_the_measurement_job_waits_for_a_real_prompt_then_leaves_nothing_behind(self):
+        # A profile.bind record only exists after the operator's first request, so the job is
+        # deferred; and the tree it copies holds conversation text, so the order of its two
+        # operations is a security property rather than a style one.
+        launcher = (ROOT / "start.sh").read_text()
+        job = launcher[launcher.index("measure_prompts_after_first_request()"):]
+        job = job[: job.index("\n}\n") + 3]
+        self.assertLess(job.index("grep -lq"), job.index("compose cp"), "poll before copying")
+        self.assertLess(job.index("compose cp"), job.index("prompt_measure.py"))
+        self.assertLess(job.index("prompt_measure.py"), job.rindex("rm -rf"), "copy is deleted")
+        self.assertIn("--plan \"${HARNESS_RUNTIME_DIR}/model-policy.json\"", job)
+        self.assertIn("prompt-measurements.jsonl", job)
+        # A finished measurement job is not a crashed module: the watchdog at the end of start.sh
+        # treats any MODULE_PIDS exit as a reason to tear the stack down.
+        self.assertNotIn("MODULE_PIDS", job)
+        killed = launcher[launcher.index("cleanup() {"): launcher.index("trap cleanup EXIT")]
+        self.assertIn('"${PROMPT_MEASURE_PID}"', killed)
+        self.assertEqual(killed.count("PROMPT_MEASURE_PID"), 2, "kill and wait")
+        # The history persists; the scratch tree and its log do not.
+        deleted = launcher[launcher.index("  for file in proxy-token"):
+                           launcher.index("harness_unlock")]
+        self.assertIn("prompt-measure.log", deleted)
+        self.assertIn("prompt-sessions", deleted)
+        self.assertNotIn("prompt-measurements.jsonl", deleted)
+        self.assertNotIn("prompt-context.json", deleted)
+
     def test_picker_ordering_is_alphabetical_by_the_label_the_operator_reads(self):
         # Directory ids deliberately sort the opposite way to the labels: an implementation
         # that ordered by id would return alpha, bravo, delta, mike, zeta and fail here. The
@@ -143,31 +247,6 @@ def compose_value(key: str) -> int:
     return int(match.group(1))
 
 
-def shipped_plan() -> dict:
-    """Resolve the checked-in definitions exactly as ./start.sh does."""
-    if str(ROOT / "tools") not in sys.path:
-        sys.path.insert(0, str(ROOT / "tools"))
-    import definitions
-    import policy
-
-    providers, models = definitions.load_definitions(ROOT)
-    resolved = {}
-    for provider_id, provider in providers.items():
-        # The launcher only applies .env overrides; tests must not read operator state.
-        resolved[provider_id] = dict(provider)
-    return policy.resolve(
-        resolved,
-        {model["id"]: model for model in models},
-        {"primary": models[0]["id"], "subagent": models[0]["id"]},
-        reserved_context_size=policy_reserved(),
-    )
-
-
-def policy_reserved() -> int:
-    with (ROOT / "runtime" / "config.toml").open("rb") as source:
-        return tomllib.load(source)["loop_control"]["reserved_context_size"]
-
-
 class NoHardcodedModelFactsTests(unittest.TestCase):
     """The point of ./models and ./providers: nothing else may restate them."""
 
@@ -209,15 +288,15 @@ class NoHardcodedModelFactsTests(unittest.TestCase):
             self.assertIn(needle, section, "the two key scopes are no longer described")
         self.assertIn("grep", section, "the template no longer says how to find the names")
 
-    def test_env_example_documents_the_envelope_omission(self):
-        """The flag is read out of ``.env``, so the template names it and says what on means."""
-        self.assertIn("KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=0", ENV_EXAMPLE)
-        self.assertIn("Model runtime envelope", ENV_EXAMPLE)
-        section = ENV_EXAMPLE.split("# Kimi system prompt", 1)[1].split(
+    def test_env_example_has_no_context_opt_out_variable(self):
+        """The launch panel is the only control, so `.env` must not offer a second one."""
+        self.assertNotIn("KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE", ENV_EXAMPLE)
+        self.assertNotRegex(ENV_EXAMPLE, r"(?m)^KIMI_(OMIT|[A-Z_]*OMIT[A-Z_]*)=")
+        section = ENV_EXAMPLE.split("# Kimi session context", 1)[1].split(
             "# Optional GitHub MCP", 1
         )[0]
-        for needle in ("SYSTEM.md", "1", "true", "default"):
-            self.assertIn(needle, section, "the omission is no longer explained where it is set")
+        for needle in ("panel", "./prompts.sh", "SYSTEM.md", "CONTEXT.md", "remembered"):
+            self.assertIn(needle, section, "the template no longer says where context is chosen")
 
     def test_no_tracked_file_mentions_litellm_except_the_nrp_endpoint(self):
         # LiteLLM is one gateway an operator might happen to have behind the endpoint, and the
@@ -263,9 +342,12 @@ class NoHardcodedModelFactsTests(unittest.TestCase):
         text = (ROOT / "runtime" / "AGENTS.md").read_text()
         for token in ("262,144", "1,000,000", "320,000", "350,000", "64,000", "200,000"):
             self.assertNotIn(token, text)
-        # The contract must send the reader to the envelope appended to its own system prompt,
-        # and never into the workspace's AGENTS.md, which the harness does not write.
+        # The contract must name the two generated blocks after the headings it actually
+        # composes them under, and never point into the workspace's AGENTS.md, which the
+        # harness does not write. The lane table lives in the main prompt only; the limits
+        # section is the one every lane receives.
         self.assertIn("Model runtime envelope", text)
+        self.assertIn("Model usage limits", text)
         self.assertNotIn("workspace `AGENTS.md`", text)
 
     def test_bootstrap_declares_every_name_the_definitions_read(self):
@@ -481,20 +563,31 @@ class ResolvedEnvelopeTests(unittest.TestCase):
             sys.path.insert(0, str(ROOT / "tools"))
         import policy as policy_module
 
-        text = policy_module.render_guidance(self.plan)
         limit = self.plan["limits"]["subagent_concurrency"]
-        self.assertIn(f"up to {limit} subagents concurrently", text)
-        self.assertIn("Use the whole envelope", text)
-        self.assertIn("Model runtime envelope", text)
+        main = policy_module.render_guidance(self.plan, "main")
+        lane = policy_module.render_guidance(self.plan, "lane")
         # This text is appended to a prompt that Kimi Code renders with a global template
         # substitution, so a dollar-brace here would expand into whatever the session defines.
-        self.assertNotIn("${", text)
-        # The statement of the limits also names the switch that leaves it out of the prompt.
-        self.assertIn("KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1", text)
-        # The provider's published terms are cited so a reader can check the transcription.
-        self.assertIn(self.plan["providers"]["nrp"]["policy_url"], text)
-        for lane in self.plan["lanes"].values():
-            self.assertIn(lane["alias"], text)
+        for text in (main, lane):
+            self.assertNotIn("${", text)
+        self.assertIn("Model runtime envelope", main)
+        self.assertIn(f"up to {limit} subagents concurrently", main)
+        self.assertIn("## Parallel work", main)
+        for lane_entry in self.plan["lanes"].values():
+            self.assertIn(lane_entry["alias"], main)
+        # The lane core is what a subagent gets, and it is the part that is true of it: the
+        # provider's published terms, and the budget every request spends whoever sends it.
+        self.assertIn(self.plan["providers"]["nrp"]["policy_url"], lane)
+        self.assertIn("## Model usage limits", lane)
+        # What a subagent cannot act on must not be in its prompt. Roughly six hundred tokens of
+        # parallelism advice reached every lane before the split, and none of it was usable.
+        self.assertNotIn(f"up to {limit} subagents concurrently", lane)
+        self.assertNotIn("## Parallel work", lane)
+        for lane_entry in self.plan["lanes"].values():
+            self.assertNotIn(lane_entry["alias"], lane)
+        # Nothing names an opt-out variable any more: the startup panel is the only control.
+        for text in (main, lane):
+            self.assertNotIn("KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE", text)
 
 
 if __name__ == "__main__":

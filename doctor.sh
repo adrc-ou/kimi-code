@@ -21,5 +21,20 @@ container=$(docker ps --filter "label=com.docker.compose.project=${COMPOSE_PROJE
   echo "Expected one running agent container. Run ./start.sh first." >&2
   exit 1
 }
+# Host-side and deliberately non-fatal. The staged documents are installed read-only and immutable,
+# so an edit to CONTEXT.md or SYSTEM.md cannot reach a running session; this says so in words instead
+# of leaving the operator to guess why their change had no effect.
+PYTHONPATH="${root}/tools" python3 - "${root}" "${HARNESS_RUNTIME_DIR}" <<'PY' || true
+import pathlib
+import sys
+
+import prompt_context
+
+root = pathlib.Path(sys.argv[1])
+runtime_dir = pathlib.Path(sys.argv[2])
+for notice in prompt_context.stale_sources(root, runtime_dir):
+    print(notice)
+PY
+
 docker exec "${container}" \
   /opt/serena/bin/python /opt/kimi-runtime/tools/check_services.py "$@"

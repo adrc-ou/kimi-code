@@ -44,6 +44,8 @@ def classify_error(error):
     # Async MCP transports wrap tool errors in ExceptionGroup on context exit.
     if isinstance(error, BaseExceptionGroup):
         results = [classify_error(child) for child in error.exceptions]
+        if not results:  # an empty group reports no cause, which is a failure, not a setup
+            return "FAIL", "MCP transport failed without reporting a cause"
         return next((result for result in results if result[0] == "SETUP"), results[0])
     if isinstance(error, NeedsSetup):
         return "SETUP", "Serena needs an active coding project; see verification guide"

@@ -64,28 +64,33 @@ flags. Keep every file that carries provider policy re-pinned at launch rather
 than trusting in-session edits, keep the policy merge default-deny, and keep the
 initializer failing closed if the flags are not honoured.
 
-The session system prompt resolves the project-root `SYSTEM.md` first, then the
-tracked `SYSTEM.md.example`, then nothing — the same override/default pair as
-`.env` and `.env.example`, with the operator's file kept out of git. An empty
-file is a decision rather than a missing file and must not fall back to the
-default — but Kimi Code discards a prompt that is blank once trimmed, so a
-deliberately empty prompt stages as a lone period and only an absent pair of
-files stages nothing at all. Whatever is chosen is staged through the same
-protection, so never make it writable from inside the session. Amendment and
-replacement are both supported: a file bearing the `${base_prompt}` placeholder
-wraps Kimi Code's own prompt, and one without it replaces that prompt completely.
-Do not copy the built-in prompt into either file — use the placeholder, or name
-the individual template variables that the built-in prompt would have carried.
-Keep comments out of the tracked default: Markdown comments are not stripped and
-ship inside every request.
+Two harness-owned documents carry instructions that are not the user's prompt:
+the project-root `SYSTEM.md`, staged as Kimi's system prompt, and the
+project-root `CONTEXT.md`, staged as the runtime `AGENTS.md` every lane reads.
+Each resolves in two tiers and no more: the operator's file if it exists,
+otherwise this harness's own text (`runtime/AGENTS.md` for `CONTEXT.md`, and for
+`SYSTEM.md` a `${base_prompt}` wrapper that lets Kimi supply its own built-in
+prompt). `.example` files are documentation of these conventions and must never
+appear in a fallback chain — an operator who deletes or ignores an `.example`
+file is entitled to believe it inert. Existence decides authority and emptiness
+decides payload: a non-empty file is amended by the enabled add-ons, an empty one
+leaves the add-ons as the whole prompt, and an empty one with no add-ons stages
+the `EMPTY_PROMPT_SENTINEL`, because Kimi Code discards a prompt that is blank
+once trimmed and would silently reinstate its own. Only an absent `SYSTEM.md` may
+reach the built-in prompt. Amendment and replacement are both supported: a file
+bearing `${base_prompt}` wraps Kimi's prompt, one without it replaces that prompt
+completely. Do not copy the built-in prompt into either file — use the
+placeholder, the `${kimi.*}` names that extract the individual built-in blocks
+from the running image, or the template variables Kimi would have expanded.
+`<!-- ... -->` comments are stripped before staging so the tracked defaults can
+explain themselves without costing tokens in every request.
 
-`tools/render_runtime.py` appends to that text, in order, the selected modules'
-guidance and the generated Model runtime envelope. Module guidance is not behind
-any flag: staging it is the only path a module's own `AGENTS.md` has to reach the
-agent. The envelope is appended unless
-`KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE` in `.env`, read through
-`compose.bootstrap.yaml`, holds a truthy value — the flag names the omission, so
-an unset, blank, or unrecognised value appends it, which is the default.
+Whatever is chosen is staged through the same protection, so never make it
+writable from inside the session. The add-ons — the generated usage limits, lane
+table, parallelism guidance, and module guidance — are selected on the launch
+panel, which is the only control: no `.env` variable governs session context, and
+`tools/prompt_context.py` reads `prompt-context.json` from the instance runtime
+directory rather than the environment. Never reintroduce an opt-out variable.
 Appending is what keeps the workspace sacrosanct. Nothing in the harness writes
 the workspace's `AGENTS.md`: that file belongs to whatever project the agent is
 working on, so never reintroduce a managed section, a marker pair, or any other

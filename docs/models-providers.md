@@ -298,10 +298,14 @@ Every derived number is the largest the provider's rules allow after the declare
 margin. Under-using a paid allowance buys nothing and costs wall-clock time, so
 `./start.sh` also derives Kimi's subagent fan-out from the same plan the proxy
 enforces — Kimi fills the envelope exactly instead of hoping two hand-written
-numbers agree. `tools/policy.py render_guidance()` turns the plan into a table of
-lanes, budgets and ceilings plus an explicit instruction to run the full allowed
-number of subagents, and that text is what the launcher appends to the session's
-system prompt.
+numbers agree. `tools/prompt_context.py enabled_guidance()` turns the plan into
+audience-scoped blocks - a table of lanes, budgets and ceilings, and an explicit instruction to
+run the full allowed number of subagents - and the composed text is what the launcher appends to
+the session's system prompt. Blocks are rendered one at a time rather than all at once so that a
+block the operator switched off costs nothing and can be measured on its own.
+`tools/policy.py render_guidance()` renders the same blocks for a whole audience in one call;
+nothing in the launch path uses it, and `tests/test_prompt_context.py` asserts the composed
+additions are byte-identical to it, which is what keeps the two from drifting.
 
 ## Artifacts and lifetimes
 
@@ -330,33 +334,42 @@ a property of the selected model and Compose silently drops undeclared names.
 declares, and a missing declaration looks exactly like an operator who left the
 key blank.
 
-## System prompt composition
+## How the envelope reaches a prompt
 
 The generated envelope never enters the workspace. `tools/models.py resolve`
-writes the plan, and `tools/render_runtime.py` renders `policy.render_guidance()`
-from that same plan and appends it to the staged session prompt. The order is
-fixed: the prompt file (`SYSTEM.md` or `SYSTEM.md.example`), then the selected
-modules' guidance, then the envelope.
+writes the plan, and the two prompt documents are composed from it:
+`CONTEXT.md` (falling back to `runtime/AGENTS.md`) becomes the all-lane
+`AGENTS.md`, and `SYSTEM.md` becomes the main agent's system prompt.
+`tools/render_runtime.py` does the composing, in a fixed order per audience:
+the document's own text, then the lane-audience blocks for the contract
+(usage limits, then module guidance) and the main-audience blocks for the
+prompt (the per-model lane table, then parallelism guidance).
 
 Nothing writes into `<workspace>/AGENTS.md`. That file belongs to the project Kimi
 is working on, and an operator is entitled to find the harness left it untouched —
 which is also why module guidance is staged in the instance runtime directory as
-`module-guidance.md` rather than merged into it. Both are re-stamped at every
-launch and neither carries a credential, so neither is session material that the
-launcher has to delete on exit.
+`module-guidance.md` rather than merged into it. Both composed documents are
+re-stamped at every launch and neither carries a credential, so neither is session
+material that the launcher has to delete on exit.
 
-Appending the envelope is the default. Set `KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1`
-(or `true`, `yes`, `on`) in `.env` and the prompt is staged with nothing appended
-to it; the flag is named after the omission, so a value that is not truthy omits
-nothing. Module guidance is not behind that flag, since staging it is the only
-path a module's own `AGENTS.md` has to reach the agent. Appended text goes through
-Kimi's template substitution like the rest of the prompt, which is why the
-generated envelope is written without a single `${...}`.
+Which blocks are composed in is a launch-panel choice, recorded in
+`prompt-context.json` in the instance runtime directory and changeable with
+`./prompts.sh --configure --enable ID --disable ID`. No `.env` variable governs it, and the earlier
+`KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE` is retired. Switching the blocks off changes no
+limit: `model-proxy` reads the plan from `model-policy.json` and enforces it
+whether or not any prompt says so. Guidance text goes through Kimi's template
+substitution like the rest of the prompt, which is why every generated block is
+written without a single `${...}`.
 
-Kimi Code discards a system prompt that is blank once trimmed and substitutes its
-own built-in prompt, so a deliberately empty prompt file stages as a lone period
-rather than nothing. Only an absent `SYSTEM.md` with an absent `SYSTEM.md.example`
-stages a blank file, and that tier means "use whatever Kimi ships".
+Each document resolves in two tiers: the operator's file if it exists, otherwise
+the harness's default. `SYSTEM.md.example` and `CONTEXT.md.example` document those
+conventions and are in no fallback chain. Kimi Code discards a system prompt that
+is blank once trimmed and substitutes its own built-in prompt, so an absent
+`SYSTEM.md` composes as a `${base_prompt}` wrapper when any add-on is enabled and
+stages nothing at all when none is — that is the only route to Kimi's own prompt. A
+present-but-empty `SYSTEM.md` is honoured as a decision instead: its add-ons become
+the whole prompt, and with every add-on off it stages a lone period so that "no
+prompt" survives upstream.
 
 ## Adding a model
 

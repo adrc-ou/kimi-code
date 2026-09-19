@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -75,10 +76,20 @@ class ComposeHygieneTests(unittest.TestCase):
         hygiene.check_agent_mounts(self.services, self.workspace, self.runtime)
 
     def test_conforming_configuration_passes(self):
-        self.check_mounts()
-        hygiene.check_credentials(self.services, self.runtime, "nrp__default")
-        hygiene.check_read_only_roots(self.services)
-        hygiene.check_loopback_ports(self.services)
+        """The fixture is the launch shape, so every check must accept it.
+
+        One subTest per check: a bare sequence would stop at the first refusal and report only
+        that the fixture is wrong, not which of the four guards it trips.
+        """
+        for name, check in (
+            ("mounts", self.check_mounts),
+            ("credentials", lambda: hygiene.check_credentials(
+                self.services, self.runtime, "nrp__default")),
+            ("read-only roots", lambda: hygiene.check_read_only_roots(self.services)),
+            ("loopback ports", lambda: hygiene.check_loopback_ports(self.services)),
+        ):
+            with self.subTest(check=name):
+                check()
 
     def test_extension_snapshot_bind_is_allowed(self):
         snapshot = Path(self.runtime) / "extension-snapshot"
@@ -136,7 +147,7 @@ class ComposeHygieneTests(unittest.TestCase):
         self.services["kimi-agent"]["ports"] = [
             {"host_ip": "0.0.0.0", "published": "5494"}  # noqa: S104
         ]
-        with self.assertRaisesRegex(SystemExit, "127.0.0.1"):
+        with self.assertRaisesRegex(SystemExit, r"publishes 5494 on 0\.0\.0\.0"):
             hygiene.check_loopback_ports(self.services)
 
     def test_service_losing_read_only_root_is_refused(self):
@@ -192,6 +203,29 @@ class ComposeHygieneTests(unittest.TestCase):
             self.assertRaisesRegex(SystemExit, "no services section"),
         ):
             hygiene.main()
+
+
+class ConfigScriptSuppliesRequiredNamesTests(unittest.TestCase):
+    """A ``${NAME:?…}`` the fixture script never exports fails the check that uses it."""
+
+    COMPOSE_FILES = ("compose.yaml", "compose.search.yaml")
+    SCRIPT = Path("tests/compose-config.sh")
+
+    def test_every_required_name_is_exported_by_the_fixture(self):
+        required: set[str] = set()
+        for name in self.COMPOSE_FILES:
+            required |= set(
+                re.findall(r"\$\{([A-Z0-9_]+):\?", (ROOT / name).read_text(encoding="utf-8"))
+            )
+        self.assertTrue(required, "no Compose interpolation guards found to check")
+        script = (ROOT / self.SCRIPT).read_text(encoding="utf-8")
+        exported = set(re.findall(r"^export ([A-Z0-9_]+)=", script, re.MULTILINE))
+        missing = sorted(required - exported)
+        self.assertEqual(
+            missing,
+            [],
+            f"{self.SCRIPT} must export these, or the check aborts on the guard",
+        )
 
 
 if __name__ == "__main__":

@@ -26,21 +26,24 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "${fixture}/workspace" "${fixture}/empty" "${fixture}/assets/skills" \
   "${fixture}/assets/agents" "${fixture}/assets/tools" "${fixture}/credentials"
-touch "${fixture}/config.toml" "${fixture}/SYSTEM.md" "${fixture}/secret" "${fixture}/cert.crt" \
+touch "${fixture}/config.toml" "${fixture}/SYSTEM.md" "${fixture}/AGENTS.md" "${fixture}/secret" \
+  "${fixture}/cert.crt" \
   "${fixture}/assets/mcp.json" "${fixture}/model-policy.json" \
   "${fixture}/credentials/nrp__default"
-chmod 600 "${fixture}/"{config.toml,SYSTEM.md,secret,cert.crt,model-policy.json}
+chmod 600 "${fixture}/"{config.toml,SYSTEM.md,AGENTS.md,secret,cert.crt,model-policy.json}
 chmod 600 "${fixture}/credentials/nrp__default"
 export HARNESS_RUNTIME_DIR="${fixture}"
 export HARNESS_TEST_FIXTURE="${fixture}"
 export WORKSPACE_PATH="${fixture}/workspace"
 export HARNESS_IMAGE_SUFFIX=test
 export KIMI_RENDERED_CONFIG="${fixture}/config.toml"
+export KIMI_RENDERED_AGENTS_MD="${fixture}/AGENTS.md"
 export KIMI_SYSTEM_MD="${fixture}/SYSTEM.md"
 export MODEL_PROXY_POLICY_FILE="${fixture}/model-policy.json"
 export MODEL_PROXY_INTERNAL_TOKEN_FILE="${fixture}/secret"
 export MODEL_PROXY_CACHE_SALT_FILE="${fixture}/secret"
 export KIMI_SUBAGENT_CONCURRENCY=5
+export KIMI_CODE_PERMISSION_MODE_REMINDER=true
 export KIMI_BACKGROUND_TASK_SLOTS=8
 export KIMI_BACKGROUND_BASH_TASK_TIMEOUT_S=0
 export SEARCH_ADAPTER_TOKEN=test-search-token-with-at-least-32-characters

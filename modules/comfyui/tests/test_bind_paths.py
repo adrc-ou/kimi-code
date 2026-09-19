@@ -4,10 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from modules.comfyui.scripts.verify_bind_paths import snapshot
+from modules.comfyui.scripts.verify_bind_paths import KINDS, snapshot
 
 
 class BindPathTests(unittest.TestCase):
+    def make_sources(self, workspace: Path) -> Path:
+        """Every published kind, as ``sources()`` names it, each under workspace/comfyui."""
+        for kind in KINDS:
+            (workspace / "comfyui" / kind).mkdir(parents=True, exist_ok=True)
+        return workspace
+
     def test_refuses_nested_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -21,14 +27,13 @@ class BindPathTests(unittest.TestCase):
 
     def test_records_real_directories(self):
         with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory).resolve() / "workspace"
-            for kind in ("models", "custom_nodes", "input", "output", "temp", "user"):
-                (workspace / "comfyui" / kind).mkdir(parents=True, exist_ok=True)
+            workspace = self.make_sources(Path(directory).resolve() / "workspace")
             result = snapshot(workspace)
-            self.assertEqual(
-                set(result), {"models", "custom_nodes", "input", "output", "temp", "user"}
-            )
-            json.dumps(result)
+            self.assertEqual(set(result), set(KINDS))
+            # The snapshot is written to a JSON manifest and re-read from it by the verify pass,
+            # which compares the decoded structure rather than the bytes, so a value that will
+            # not survive a JSON round trip is a failed launch rather than a false match.
+            self.assertEqual(json.loads(json.dumps(result)), result)
 
 
     def test_refuses_parent_reference(self):
@@ -36,9 +41,7 @@ class BindPathTests(unittest.TestCase):
         # refusal keeps the bind source inside the tree the operator configured.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            workspace = root / "workspace"
-            for kind in ("models", "custom_nodes", "input", "output", "temp", "user"):
-                (workspace / "comfyui" / kind).mkdir(parents=True)
+            workspace = self.make_sources(root / "workspace")
             escaped = workspace / "comfyui" / ".." / ".." / "outside"
             (root / "outside").mkdir()
             self.addCleanup(os.environ.pop, "COMFYUI_MODELS_PATH", None)
@@ -48,9 +51,7 @@ class BindPathTests(unittest.TestCase):
 
     def test_records_the_verified_identity(self):
         with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory).resolve() / "workspace"
-            for kind in ("models", "custom_nodes", "input", "output", "temp", "user"):
-                (workspace / "comfyui" / kind).mkdir(parents=True)
+            workspace = self.make_sources(Path(directory).resolve() / "workspace")
             result = snapshot(workspace)
             models = workspace / "comfyui" / "models"
             self.assertEqual(result["models"]["path"], str(models))

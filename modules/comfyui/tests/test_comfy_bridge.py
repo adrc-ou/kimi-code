@@ -12,8 +12,8 @@ except ImportError as exc:
     # Reported as a skip naming the prerequisite, not as one loader error that silently
     # stands in for this module's whole suite.
     raise unittest.SkipTest(
-        f"the bridge cannot be imported without its dependencies ({exc}); "
-        "install aiohttp==3.14.3 to run these tests"
+        f"the bridge cannot be imported without its dependencies ({exc}); install what "
+        "proxy/requirements.in pins to run these tests"
     ) from None
 
 
@@ -25,10 +25,6 @@ class Request:
             "Host": "untrusted.example",
             "Content-Type": "application/json",
         }
-
-
-class Headers(dict):
-    pass
 
 
 class BridgeTests(unittest.TestCase):

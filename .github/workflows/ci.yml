@@ -16,14 +16,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
-      - run: pip install aiohttp==3.14.3 ruff==0.13.2
+          python-version: "3.13"
+      # aiohttp comes from the proxy's own pin rather than a second copy of the version, so
+      # CI cannot drift onto a version the shipped image never had.
+      - run: pip install -r proxy/requirements.in ruff==0.13.2
       - run: |
           python -m unittest discover -s tests -v
           for suite in modules/*/tests; do
             [ ! -d "$suite" ] || python -m unittest discover -s "$suite" -v
           done
-      - run: python -m compileall -q proxy scripts search-adapter tests tools modules
+      - run: python -m compileall -q proxy scripts search-adapter tests tools modules container
       - run: ruff check .
       - run: python scripts/check_locks.py
       - run: sudo apt-get update && sudo apt-get install -y shellcheck

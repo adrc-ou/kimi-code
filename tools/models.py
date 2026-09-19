@@ -32,16 +32,16 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
-    from . import model_config, policy
-    from .definitions import DefinitionError, load_definitions
+    from . import policy
+    from .definitions import LANES, DefinitionError, load_definitions
     from .env_values import read_env_values
+    from .private_file import write_private, write_private_json
 else:
-    import model_config
     import policy
-    from definitions import DefinitionError, load_definitions
+    from definitions import LANES, DefinitionError, load_definitions
     from env_values import read_env_values
+    from private_file import write_private, write_private_json
 
-LANES = ("primary", "long", "subagent")
 SELECTABLE = ("primary", "subagent")
 SELECTION = "model-selection.json"
 PREVIOUS_SELECTION = "last-model-selection.json"
@@ -56,21 +56,17 @@ Refusal = (DefinitionError, policy.ResolutionError, OSError, ValueError)
 
 
 def write_text(path: Path, text: str) -> None:
-    """Publish a session artifact atomically, readable only by its owner."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(fd, text.encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    temporary.replace(path)
-    path.chmod(0o600)
+    """Publish a session artifact atomically, readable only by its owner.
+
+    The temp name used to be a fixed ``<name>.tmp`` created with ``O_EXCL``: a launch killed
+    between the write and the rename left that file behind, and every launch after it died on
+    ``FileExistsError`` with no path to recovery. ``write_private`` picks a unique name.
+    """
+    write_private(path, text)
 
 
 def write_json(path: Path, value: object) -> None:
-    write_text(path, json.dumps(value, indent=2) + "\n")
+    write_private_json(path, value)
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -218,7 +214,7 @@ def apply_endpoint_overrides(
 
 
 #: Names the launcher itself needs out of ``.env``, beyond any one provider's definitions.
-HARNESS_BOOTSTRAP_NAMES = ("KIMI_BACKGROUND_TASK_SLOTS", "KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE")
+HARNESS_BOOTSTRAP_NAMES = ("KIMI_BACKGROUND_TASK_SLOTS",)
 BOOTSTRAP_COMPOSE = "compose.bootstrap.yaml"
 
 
@@ -474,18 +470,16 @@ def cmd_resolve(root: Path, runtime: Path) -> int:
     return 0
 
 
-def kimi_config(plan: dict[str, Any]) -> str:
-    """The generated half of Kimi's ``config.toml`` for one plan, as TOML text."""
-    return model_config.render(plan)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["select", "resolve"])
     parser.add_argument("--non-interactive", action="store_true")
     args = parser.parse_args()
     root = Path(os.environ.get("HARNESS_ROOT", Path(__file__).resolve().parents[1]))
-    runtime = Path(os.environ["HARNESS_RUNTIME_DIR"])
+    directory = os.environ.get("HARNESS_RUNTIME_DIR")
+    if not directory:
+        raise ValueError("HARNESS_RUNTIME_DIR must name the instance runtime directory")
+    runtime = Path(directory)
     runtime.mkdir(parents=True, exist_ok=True)
     if args.action == "select":
         return cmd_select(root, runtime, non_interactive=args.non_interactive)

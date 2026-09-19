@@ -134,6 +134,14 @@ harness_compose() {
   docker compose --env-file "${HARNESS_ROOT}/.env" "${HARNESS_COMPOSE_FILES[@]}" "$@"
 }
 
+# The digest of the agent image this instance built, or empty when there is no such image yet.
+# Kimi's cached prompt literals are keyed on this exact string, so every producer has to call this
+# one function: if the launcher and ./prompts.sh derived it differently, a hand-run refresh would
+# write a file that no launch ever reads back.
+harness_prompt_image_id() {
+  docker image inspect "adrc-kimi-agent:${HARNESS_IMAGE_SUFFIX}" --format '{{.Id}}' 2>/dev/null || true
+}
+
 harness_validate_compose() {
   harness_compose config --format json >"${HARNESS_COMPOSE_DIR}/resolved.json"
   chmod 600 "${HARNESS_COMPOSE_DIR}/resolved.json"
@@ -144,13 +152,22 @@ harness_validate_compose() {
     --label launch <"${HARNESS_COMPOSE_DIR}/resolved.json"
 }
 
+# The host tools every entry point shells out for. Checked by both initialisation paths, so a
+# read-only command like ./prompts.sh --live notices a missing docker instead of failing
+# somewhere far less legible inside compose.
+harness_require_commands() {
+  local command
+  for command in docker git python3 shasum; do
+    command -v "${command}" >/dev/null 2>&1 ||
+      harness_die "Required command not found: ${command}" || return
+  done
+}
+
 harness_init() {
   HARNESS_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
   export HARNESS_ROOT
   umask 077
-  for command in docker git python3 shasum; do
-    command -v "${command}" >/dev/null 2>&1 || harness_die "Required command not found: ${command}" || return
-  done
+  harness_require_commands || return
   harness_platform
   harness_resolve_bootstrap_env
   harness_instance
@@ -165,18 +182,21 @@ harness_init_readonly() {
   HARNESS_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
   export HARNESS_ROOT
   umask 077
+  harness_require_commands || return
   harness_platform
   harness_resolve_bootstrap_env
   harness_instance
   unset HARNESS_BOOTSTRAP_ENV
 }
 
-# Migration notices for .env keys that stopped meaning something when model facts moved into
-# ./models and provider rules into ./providers. Setting a key from the first group has no
+# Migration notices for .env keys that stopped meaning something: model facts moved into ./models
+# and provider rules into ./providers, and the session context is now chosen on the launch panel
+# rather than by a variable. Setting a key from the first group has no
 # effect: the equivalent numbers are derived from the selected definitions. A key from the
 # second group still works but answers to a MODEL_PROXY_* name. Printed, never fatal: an
 # untidy .env must not stop a workspace from starting.
 harness_retired_env=(
+  KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE
   LITELLM_API_KEY
   LITELLM_UPSTREAM_ORIGIN
   LITELLM_MODEL_ID

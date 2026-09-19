@@ -460,19 +460,20 @@ def _parse_model(model_id: str, path: Path) -> dict[str, Any]:
         "key_env": str(key_env or ""),
         "advertised_tokens": advertised,
         "lanes": lanes,
-        "capabilities": _string_list(document, "capabilities", where, required=False),
-        "support_efforts": _string_list(document, "support_efforts", where, required=False),
+        "capabilities": _string_list(document, "capabilities", where),
+        "support_efforts": _string_list(document, "support_efforts", where),
         "default_effort": document.get("default_effort", ""),
     }
 
 
-def _string_list(
-    document: dict[str, Any], key: str, where: str, *, required: bool
-) -> list[str]:
+def _string_list(document: dict[str, Any], key: str, where: str) -> list[str]:
+    """Read an optional list of single-line strings; absence is an empty list, not an error.
+
+    Both capabilities and effort levels may legitimately be undeclared, so a missing key has one
+    answer here. A required list would have to be spelled by a caller that does not exist.
+    """
     value = document.get(key)
     if value is None:
-        if required:
-            raise DefinitionError(f"{where}.{key} must be a non-empty list of strings")
         return []
     if not isinstance(value, list) or not all(
         isinstance(item, str) and item and not any(ord(c) < 32 for c in item) for item in value

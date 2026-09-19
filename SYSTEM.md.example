@@ -1,34 +1,52 @@
+<!--
+  This is an EXAMPLE. Copy it to `SYSTEM.md` in this project root to take it into use;
+  nothing reads this file at launch. `SYSTEM.md` is the main agent's own voice, staged
+  into `~/.kimi-code/SYSTEM.md` and delivered to the main agent alone - a subagent gets
+  the contract in `CONTEXT.md` and never sees this document.
+
+  Three states, and they mean different things:
+
+    no SYSTEM.md    Kimi Code's built-in system prompt is used, untouched. This is the
+                    default, and it is not the same as the file being empty.
+    SYSTEM.md       Whatever you write here, in full. It replaces the built-in prompt
+                    unless you ask for it below.
+    empty SYSTEM.md An empty prompt. The startup panel's add-ons are appended after it,
+                    so an empty file plus add-ons is a session whose entire system prompt
+                    is those add-ons; an empty file with every add-on switched off is a
+                    single period, which is as close to silence as Kimi Code permits.
+
+  Template values. Kimi Code substitutes these when it renders the prompt, so they are
+  available here whatever else you do:
+
+    ${base_prompt}        Kimi Code's own built-in system prompt, in full
+    ${agents_md}          the staged contract - `CONTEXT.md` plus its generated sections
+    ${cwd} ${os} ${shell} where the session is running
+    ${cwd_listing}        a directory listing of the workspace
+    ${product_name} ${reply_style_guide} ${role_additional}
+    ${skills} ${skills_section} ${plugin_sections}
+    ${additional_dirs_info} ${additional_dirs_section}
+    ${notify_user_guidance} ${windows_notes}
+
+  `${base_prompt}` may appear at most once; a second copy would duplicate the whole
+  built-in prompt. It also already contains the contract, so do not write `${agents_md}`
+  beside it - that names the same text twice and ships it twice. Reference `${agents_md}`
+  on its own instead, in a prompt that replaces Kimi Code's rather than wrapping it.
+
+  Anything that is not one of the names above is left exactly as written, so a shell
+  example like ${HOME} in your own prose is safe - but a misspelling of a real name is
+  caught at launch rather than shipped to the model as a literal.
+
+  HTML comments like this one are stripped at staging and never reach the model, so a
+  file you maintain can explain itself for free.
+-->
+
 ${base_prompt}
 
-# Parallel work
+<!--
+  Everything below this line is yours. This wrapper keeps Kimi Code's own prompt and adds
+  a single rule to it, which is the common case. To write the whole prompt yourself,
+  delete the wrapper line above and start from scratch - including ${agents_md} somewhere
+  in it, which is how the contract gets there once the prompt that carried it is gone.
+-->
 
-The generated "Model runtime envelope" section states how many subagents this session may
-run at once, and the model proxy enforces that same ceiling. It is capacity that has already been
-bought, so treat the published number as the default fan-out for any step that splits into
-independent parts, and read running below it as a cost rather than as caution.
-
-Choosing the shape of the work:
-
-- Three or more independent lookups, reads, searches, or investigations belong in one
-  `AgentSwarm` call rather than several narrower ones. Each call ramps its own launches up, so
-  splitting a fan-out across calls pays that ramp repeatedly.
-- Delegate work whose bulk output this context would otherwise absorb. Several children that each
-  hand back a short conclusion are cheaper than one search that returns its raw results here.
-- Do not delegate a read whose path is already known, or a step that depends on reasoning this
-  turn is still holding. Handoff has a price; pay it when the child does the work, not when it
-  carries it.
-- Investigate in parallel, write serially. Many agents may read; only one may touch a given set
-  of files at a time.
-
-Respect the shared budget as well as the agent count:
-
-- A lane reserves its full window the moment it is admitted, whether or not the prompt is that
-  large. The envelope therefore holds either a drained swarm or the parent's next turn, rarely
-  both, so let a wide fan-out finish instead of generating alongside it.
-- Backgrounded agents consume background task slots, and exceeding those slots fails outright
-  rather than queueing. Stay under the published slot count.
-- Waiting on the proxy is normal operation. Never dodge a queue with extra connections, lanes,
-  containers, or credentials.
-
-Before starting one agent, ask how many things could be true at the same time. That number, not
-the number of questions you happen to have written down, is the fan-out to use.
+Reply in the language the user writes in.

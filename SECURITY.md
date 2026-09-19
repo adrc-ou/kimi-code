@@ -42,12 +42,24 @@ mount:
 - the three operator files that live inside the agent-owned Kimi home
   (`AGENTS.md`, `SYSTEM.md`, `mcp.json`) additionally carry the ext4 immutable
   flag, set by the initializer after it writes them. Ownership and mode cannot
-  protect them: `may_delete()` lets a process that owns a directory remove any
-  entry in it, and the sticky bit is precisely the exception for callers who do
-  *not* own the directory. The flag survives the container and outlives the
+  protect them: unlinking is governed by the ownership of the containing
+  directory and not of the entry, so an agent that owns its home can delete a
+  root-owned file inside it, as `container/initialize-agent-state.py:4-6`
+  records. The flag survives the container and outlives the
   session, and the agent cannot clear it because it does not hold
   `LINUX_IMMUTABLE`. Staging fails closed if the volume filesystem does not
   honour the flag;
+- the prompt records the harness keeps beside the rest of its per-instance state —
+  the panel's choices (`prompt-context.json`), the digests of what was staged
+  (`prompt-sources.json`), measured prompt sizes
+  (`prompt-measurements.jsonl`), and Kimi's built-in blocks read from the image
+  (`kimi-prompts/literals.json`) — are mode `0600`, never mounted into the agent,
+  and hold no credential: the history file records byte and token counts, never prompt
+  text. Reading it requires the same copy `./prompts.sh --live` makes — the agent's Kimi
+  home, out of the container, because `profile.bind` records live only inside the
+  session — and that copy does contain conversation text, so it is staged under
+  `.local/runtime/<instance>/` and deleted before and after, including by the launcher's
+  exit trap;
 - policy that the agent is allowed to change is confined to the user-owned keys
   listed in `runtime/config-policy.json`. Everything else in `config.toml` is
   re-rendered from `runtime/config.toml` at each launch, so an in-session edit
@@ -108,9 +120,15 @@ module's documentation for its application-specific trust boundary.
 All container bases use immutable digests. Application source uses immutable
 commits or verified release checksums. Python and npm dependencies use checked-in
 locks, and CI verifies the lock metadata. Run `scripts/generate_sbom.sh` for each
-built image and review the Grype result. A vulnerability exception must name an
-owner, explain the decision, and have a future expiry date in
-`vulnerability-exceptions.json`.
+image you ship and review the Grype result; the `security` CI job currently does this for the
+two Python service images, which are the only images it tags - `build-agent` verifies that the
+agent image builds on both platforms and leaves it untagged, so scanning it is a manual step.
+
+`scripts/check_locks.py` enforces that every entry in
+`vulnerability-exceptions.json` carries all five of `package`, `vulnerability`,
+`owner`, `reason`, and `expires`, and fails when `expires` is earlier than today.
+The boundary is inclusive: an exception dated today is still valid today and fails
+tomorrow, so renew or remove it before the expiry date, not on it.
 
 ## Reporting
 

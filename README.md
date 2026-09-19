@@ -29,7 +29,9 @@ may use at once are derived from the definitions you picked at launch.
 For startup status checks, functional tool tests, and step-by-step optional
 account setup, see [the verification guide](docs/verification.md). `./start.sh`
 runs a quick service/MCP check; use `./doctor.sh --full` while it is running for
-read-only functional probes.
+read-only functional probes. `./prompts.sh` inspects and edits the session context
+described below without starting a session, and reports a prompt file you changed
+without restarting.
 
 Hosts need:
 
@@ -326,12 +328,14 @@ generated for that session.
 
 ## Validation
 
-Install the test prerequisites first. `aiohttp` is what the proxy module imports, so
-without it the policy-enforcement suite reports a skip instead of running — a green
-`OK` that has not checked a single rate, reservation, retry, or route assertion:
+Install the test prerequisites first. `aiohttp` is what the proxy module imports, and
+`proxy/requirements.in` is the file that pins its version, so install from there rather
+than repeating a number that will go stale. Without it the policy-enforcement suite
+reports a skip instead of running — a green `OK` that has not checked a single rate,
+reservation, retry, or route assertion:
 
 ```bash
-python3 -m pip install aiohttp==3.14.3
+python3 -m pip install -r proxy/requirements.in
 ```
 
 If your `TMPDIR` sits on a `noexec` filesystem (a tmpfs `/tmp` usually is), the launcher
@@ -412,64 +416,124 @@ starting Kimi with broken configuration.
 Model provider credentials, the per-instance base URL, and the internal proxy
 token are regenerated each launch and are never read back from the volume.
 
-## Customising the system prompt
+## Customising the session context
 
-The session's system prompt comes from the first of these that exists in the
-project root: `SYSTEM.md`, then `SYSTEM.md.example`, then nothing at all. The
-pair behaves exactly like `.env` and `.env.example` — the tracked
-`SYSTEM.md.example` is the harness's default prompt, and an untracked
-`SYSTEM.md` (already in `.gitignore`) is yours to override it with. An empty
-file is a decision rather than a missing one, so it does not fall back to the
-default. Kimi Code throws away a system prompt that is blank once trimmed and
-silently uses its own, so a deliberately empty prompt is staged as a lone period
-— one token, no instructions — and only an absent pair of files stages nothing.
+Two documents carry instructions that are not the user's prompt, and both are
+yours to edit in the project root:
 
-Appended on top of that text, in this order, are the selected modules' guidance
-and the generated Model runtime envelope. `tools/render_runtime.py` stages the
-result as `SYSTEM.md` in the instance runtime directory — the prompt file
-untouched when there is nothing to append — `start.sh` passes that path to
-Compose as `KIMI_SYSTEM_MD`, and the root-only initializer installs it as
-`/home/agent/.kimi-code/SYSTEM.md`, root-owned, mode `440`, and immutable — the
-same protection as the runtime `AGENTS.md`. Editing either file and restarting
-changes the agent's instructions; the agent cannot change them from inside a
-session, so a mid-session edit does nothing until the next launch.
+| file | what it becomes | who receives it |
+| --- | --- | --- |
+| `SYSTEM.md` | the session's system prompt | the primary agent |
+| `CONTEXT.md` | the runtime operating contract, installed as `AGENTS.md` in Kimi's home | the primary agent and every subagent |
 
-The file is the complete prompt for the session, and two modes are equally
-supported. Include the literal `${base_prompt}` where you want Kimi Code's own
-built-in prompt, and your text amends it — the shipped default does this, with
-`${base_prompt}` first and an added section after it. Omit the placeholder and
-your text *is* the prompt, which replaces Kimi's built-in one outright.
+Each is loaded the same way: the file is used if it exists, and Kimi's or this
+harness's own text is used if it does not. `SYSTEM.md.example` and
+`CONTEXT.md.example` are written documentation of those conventions and are
+**never loaded** — an `.example` file is an example, and a harness that quietly
+read it would make a surprise of the one file the operator expected to be inert.
+`CONTEXT.md` falls back to `runtime/AGENTS.md`, which is this harness's own
+contract; `SYSTEM.md` falls back to Kimi Code's built-in prompt, which the
+harness reaches by staging a `${base_prompt}` wrapper rather than by copying the
+text out of the binary.
 
-Replacement is deliberate power: much of what makes the prompt useful arrives
-through it rather than being fixed text, including the working directory and its
-listing, the applicable `AGENTS.md` files, the skills listing, and the plugin
-sections. A replacement prompt that does not name them loses them, so if you
-write one, name the variables you want. The runtime envelope is the exception:
-the launcher appends it after your text, so replacing the prompt does not lose
-it. These are the ones Kimi itself substitutes,
-available in either mode and resolved whether or not `${base_prompt}` appears:
-`base_prompt`, `role_additional`, `product_name`, `reply_style_guide`,
-`notify_user_guidance`, `os`, `windows_notes`, `shell`, `cwd`, `cwd_listing`,
-`agents_md`, `additional_dirs_info`, `additional_dirs_section`, `skills`,
-`skills_section`, and `plugin_sections`. An unrecognised name is left in the
-prompt as literal text rather than expanded.
+An empty file is a decision, not a missing file. Existence picks the authority
+and emptiness picks the payload: a non-empty `SYSTEM.md` is amended by whatever
+add-ons are switched on, an empty one leaves those add-ons as the whole prompt,
+and an empty one with every add-on off asks for no instructions at all. Kimi
+discards a prompt that is blank once trimmed and silently uses its own, so that
+last case is staged as a lone period — one token, no instructions. Only an absent
+`SYSTEM.md` can reach the built-in prompt.
 
-Substitution replaces *every* occurrence, so mention `${base_prompt}` in prose or
-a comment and the whole built-in prompt appears a second time. The same is true
-of the other variables, and it is why the shipped default carries no comments:
-Markdown comments are invisible in a reader and fully visible to the model. It
-also applies to the appended sections, which is why the generated envelope is
-written without a single `${...}`.
+Both documents are written into the instance runtime directory by
+`tools/render_runtime.py`, passed to Compose as `KIMI_SYSTEM_MD` and
+`KIMI_RENDERED_AGENTS_MD`, and installed by the root-only initializer as
+root-owned, mode `440`, immutable files. Editing them and restarting changes the
+agent's instructions; the agent cannot change them from inside a session, so a
+mid-session edit does nothing until the next launch.
 
-The appended envelope states what the proxy will enforce for this session — the
-per-lane windows, the shared in-flight context budget, the subagent ceiling — and
-tells the agent to use all of it. Appending it is the default; set
-`KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1` in `.env` (also `true`, `yes`, or `on`) to
-append nothing at all. The flag is named after the omission, so a blank, zero, or
-misspelled value still appends the envelope. Turning it off changes no limit: the
-proxy enforces the same plan either way, and the agent is simply no longer told
-what that plan is. Module guidance is not behind this flag, because staging it is
-the only path a module's own `AGENTS.md` has to reach the agent.
+### What the startup panel adds
+
+`./start.sh` opens a context panel before it renders anything: a diagram of the
+documents above with their resolved sizes, then a checkbox for each block the
+harness can add. Everything starts enabled and your changes are remembered for
+the next launch. Run `./prompts.sh --configure --enable ID --disable ID` to
+change them without starting a session (`--configure` alone only prints the current
+selection), or `./prompts.sh --show` to see what an unattended launch will apply — a
+launch with no terminal cannot prompt, so it prints the remembered selection
+instead of asking. `./prompts.sh --live` reads what the running session's model
+actually received, and `./prompts.sh --vars` lists every placeholder a prompt file
+may hold and who resolves it.
+
+Sizes on that screen are token counts, which is the unit the context window is
+denominated in, each shown against the input cap of the lane serving that audience. A
+number marked `~` is the harness pricing its own text before Kimi has rendered
+anything; a bare number is a real request measured from this workspace's own session
+logs, so it describes the previous launch rather than this one, and it ages on screen
+instead of being presented as current. Kimi's framing cannot be priced without having
+been seen, which is why a first launch shows `?` for the whole figure.
+
+The blocks are the ones generated from this repository's own definitions rather
+than written by you:
+
+- **Usage limits** and the **per-model lane table** state the numbers derived
+  from `./models` and `./providers`, which are the numbers `model-proxy`
+  enforces. The table is for the primary agent, which is the one that decides how
+  to fan out; the limits reach every lane, because every request spends them.
+- **Parallelism guidance** is for the primary agent only, since a subagent cannot
+  start one.
+- **Module guidance** is each selected module's own `AGENTS.md`, which has no
+  other route to the agent.
+- **Skills, subagent roles, the full skill listing, and the permission banner**
+  are the Kimi settings that decide which capabilities load at all.
+
+Switching a block off changes no limit: the proxy enforces the same plan either
+way, and the agent is simply no longer told what that plan is. Turning every
+block off and emptying both prompt files is the tabula rasa — what reaches the
+model is your own prompt and the tool schemas, nothing else.
+
+### Placeholders
+
+`SYSTEM.md` is the complete prompt for the primary agent, and two modes are
+equally supported. Include the literal `${base_prompt}` where you want Kimi
+Code's own built-in prompt and your text amends it, which is the pattern
+`SYSTEM.md.example` demonstrates. Omit the placeholder and your text *is* the
+prompt, replacing Kimi's built-in one outright.
+
+Substitution happens after the harness strips comments, so every variable is
+available in either mode: `base_prompt`, `role_additional`, `product_name`,
+`reply_style_guide`, `notify_user_guidance`, `os`, `windows_notes`, `shell`,
+`cwd`, `cwd_listing`, `agents_md`, `additional_dirs_info`,
+`additional_dirs_section`, `skills`, `skills_section`, and `plugin_sections`.
+That is deliberate power: much of what makes the built-in prompt useful arrives
+through those variables rather than being fixed text — the working directory and
+its listing, the applicable `AGENTS.md` files, the skills listing, and the plugin
+sections. A replacement prompt that does not name them loses them, so name the
+ones you want.
+
+Five more names are resolved by the harness before staging rather than by Kimi.
+`${harness.date}` expands to today's date, and `${kimi.system_default}`,
+`${kimi.coder_role}`, `${kimi.explore_overlay}`, and `${kimi.task_agent_prefix}`
+expand to Kimi Code's own built-in blocks read from the running image, so you can
+quote a piece of it instead of copying it.
+
+Substitution replaces *every* occurrence, so mentioning `${base_prompt}` twice
+would make the whole built-in prompt appear twice. A misspelling would otherwise reach the
+model as literal text with no error anywhere to be seen, so the launcher refuses
+to start on a `${...}` within two characters of a real name, and on a duplicated
+`${base_prompt}`. Every other `${...}` passes through untouched, and anything
+inside a code span is exempt — quoting `$HOME` in an example is prose, not an
+intention.
+
+`<!-- ... -->` comments are stripped from both files before staging, which is
+what lets `SYSTEM.md.example` and `CONTEXT.md.example` explain these conventions
+in the place you would look for them. A comment is invisible in a Markdown reader
+and fully visible to the model, so write them freely in `SYSTEM.md` and `CONTEXT.md`
+and pay nothing for them.
+
+Stripping happens before anything is measured, so the file you edit is not the
+byte count you are charged for. A `CONTEXT.md` that reads as 12 KB in your editor
+and costs 4 KB on the panel is behaving correctly; `wc -c` describes your draft,
+and `./prompts.sh --show` describes the prompt.
 
 ## What the agent can see of the host
 

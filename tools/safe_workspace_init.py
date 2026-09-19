@@ -6,8 +6,8 @@ from __future__ import annotations
 import argparse
 import errno
 import os
+import secrets
 import stat
-import tempfile
 from pathlib import Path, PurePosixPath
 
 if __package__:
@@ -163,7 +163,7 @@ def update_git_exclude(root: Path, expected_uid: int) -> None:
                 if entry not in lines:
                     lines.append(entry)
             content = ("\n".join(lines).rstrip() + "\n").encode()
-            temporary = f".exclude.{os.getpid()}.{next(tempfile._get_candidate_names())}"
+            temporary = f".exclude.{os.getpid()}.{secrets.token_hex(8)}"
             fd = os.open(
                 temporary,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),

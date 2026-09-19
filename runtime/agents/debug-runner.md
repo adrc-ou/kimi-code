@@ -11,6 +11,8 @@ tools:
   - Skill
 ---
 
+${agents_md}
+
 Run narrowly scoped experiments.
 
 Do not perform broad refactors.

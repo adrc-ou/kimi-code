@@ -12,10 +12,6 @@ elif [[ $# -ne 0 ]]; then
   exit 2
 fi
 
-for command in docker git python3 shasum; do
-  command -v "${command}" >/dev/null 2>&1 || { echo "Required command not found: ${command}" >&2; exit 1; }
-done
-
 # LOCAL_UID becomes the container user, so a root launch would build the agent image with
 # USER 0:0 and leave every host artifact owned by root. The in-container initializer refuses
 # root too, but it runs inside Compose and cannot cover the build or the version probe.
@@ -26,6 +22,9 @@ fi
 
 # shellcheck disable=SC1091
 source "${root}/tools/runtime.sh"
+# Before the lock and the runtime directory exist, so a host missing docker fails with this
+# sentence rather than with a compose error after a bind source has already been created.
+harness_require_commands || exit 1
 harness_traps
 echo "Preparing Kimi workspace..."
 harness_init
@@ -35,18 +34,19 @@ docker info >/dev/null || { echo "Docker is not ready. Start Docker Desktop and 
 MODULE_PIDS=()
 MODULE_SESSION_FILES=()
 COMPOSE_PID=""
+PROMPT_MEASURE_PID=""
 stack_started=false
 
 cleanup() {
   status=$?
   trap - EXIT INT TERM ERR
   set +e
-  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}"; do
+  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}"; do
     if [[ -n "${pid}" ]]; then
       kill "${pid}" 2>/dev/null || true
     fi
   done
-  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}"; do
+  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}"; do
     if [[ -n "${pid}" ]]; then
       wait "${pid}" 2>/dev/null || true
     fi
@@ -54,9 +54,26 @@ cleanup() {
   if [[ "${stack_started}" == true ]]; then
     harness_compose down --remove-orphans >/dev/null 2>&1 || true
   fi
-  for file in proxy-token search-token kimi-config.toml runtime.env session.env module.env model-selection.json model-policy.json model.env compose/models.json compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
+  # Session material is deleted on exit. The module guidance is regenerated before every render,
+  # and a stale extension snapshot must never outlive the approval that produced it.
+  #
+  # The two composed prompt documents are the deliberate exception, and sit alongside each other
+  # for the same reason: they carry no secret, they are rewritten from scratch on every launch,
+  # and once the stack is down they are the only surviving evidence of what this launcher actually
+  # put in front of the model.
+  #
+  # prompt-context.json and prompt-measurements.jsonl persist too and must never join this list:
+  # the first is the startup panel's remembered choices and the second is the history the panel
+  # reads its token counts from. Extending the list by analogy with a neighbour would wipe the
+  # operator's settings on every exit, which is the inverse of the feature.
+  for file in proxy-token search-token kimi-config.toml runtime.env session.env module.env model-selection.json model-policy.json model.env module-guidance.md prompt-measure.log compose/models.json compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
     [[ -f "${HARNESS_RUNTIME_DIR}/${file}" ]] && find "${HARNESS_RUNTIME_DIR}/${file}" -delete
   done
+  [[ -d "${HARNESS_RUNTIME_DIR}/extension-snapshot" ]] && rm -rf -- "${HARNESS_RUNTIME_DIR}/extension-snapshot"
+  # The measurement job copies the agent's home out of the container to read it. Being killed
+  # between the copy and its own cleanup must not leave conversation text on the host, and a job
+  # that exits early takes its pid down with it, so this directory is cleared unconditionally.
+  [[ -d "${HARNESS_RUNTIME_DIR}/prompt-sessions" ]] && rm -rf -- "${HARNESS_RUNTIME_DIR}/prompt-sessions"
   # Provider keys are session material: empty the directory, including any file a
   # renamed credential left behind.
   [[ -d "${HARNESS_RUNTIME_DIR}/credentials" ]] && find "${HARNESS_RUNTIME_DIR}/credentials" -mindepth 1 -delete
@@ -132,6 +149,14 @@ python3 tools/safe_workspace_init.py "${workspace}"
 python3 tools/resource_check.py "${workspace}"
 python3 tools/modules.py assemble
 
+# Both halves of the context decision happen here, after the modules are known and before anything
+# is rendered: the panel is the only place the resolved prompt graph is ever visible, and the file it
+# writes is what render_runtime.py composes against. An unattended launch prints the same screen with
+# --plain, so the log records the choices it applied instead of silently applying them.
+panel=(python3 tools/prompt_panel.py --root "${root}" --runtime-dir "${HARNESS_RUNTIME_DIR}")
+[[ "${non_interactive}" == true ]] && panel+=(--plain)
+"${panel[@]}"
+
 python3 tools/render_runtime.py --root "${root}" --runtime-dir "${HARNESS_RUNTIME_DIR}" --resolved-env "${HARNESS_RESOLVED_BOOTSTRAP}"
 set -a
 # shellcheck disable=SC1091
@@ -144,11 +169,14 @@ python3 tools/approve_extensions.py prepare --workspace "${workspace}" --manifes
 harness_modules prepare
 harness_compose_files
 harness_validate_compose
+# First of two verifications by design: this one fails before the image build, the second runs
+# immediately before Compose starts, because a bind source can be replaced during the build.
 harness_modules verify
 
 harness_modules install
 
 harness_compose build
+PROMPT_IMAGE_ID=$(harness_prompt_image_id)
 actual_kimi=$(harness_compose run -T --rm --no-deps kimi-agent kimi --version)
 [[ "${actual_kimi}" == *"${KIMI_CODE_VERSION}"* ]] || { echo "Built Kimi version mismatch: ${actual_kimi}" >&2; exit 1; }
 harness_modules check_build
@@ -179,6 +207,79 @@ PY
   return 1
 }
 
+# Kimi's own prompt literals live in the 182 MB bundle, which exists at a known path only inside
+# the agent image. An operator's SYSTEM.md is allowed to quote one (${kimi.coder_role} and friends)
+# so that a custom prompt inherits upstream edits, and that promise has to be kept without the
+# operator doing anything: the stack that already has the bundle extracts it. Same transport as
+# ./prompts.sh --extract, so a hand-run refresh and an automatic one produce the same file.
+#
+# Bounded and silent on failure. A cold cache only matters to a prompt that quotes a literal, and
+# render_runtime reports that case by name rather than substituting anything wrong.
+cache_kimi_literals() {
+  local log="${HARNESS_RUNTIME_DIR}/prompt-measure.log"
+  local cache="${HARNESS_RUNTIME_DIR}/kimi-prompts"
+  local attempt tmp
+  mkdir -p -- "${cache}" && chmod 700 -- "${cache}"
+  tmp=$(mktemp) || return 0
+  for ((attempt = 1; attempt <= 20; attempt++)); do
+    sleep 3
+    if harness_compose exec -T kimi-agent python3 /opt/kimi-runtime/tools/kimi_prompts.py \
+        --print --image "${PROMPT_IMAGE_ID:-unknown}" >"${tmp}" 2>>"${log}"; then
+      if cp -- "${tmp}" "${cache}/literals.json" && chmod 600 -- "${cache}/literals.json"; then
+        rm -f -- "${tmp}"
+        return 0
+      fi
+    fi
+  done
+  rm -f -- "${tmp}"
+  echo "no Kimi prompt literals this session: the container never returned them" >>"${log}"
+  return 0
+}
+
+# Token accounting has to wait for the stack: a profile.bind record only exists once the operator
+# has sent a first prompt, and that record carries the finished system prompt, which is the only
+# honest measurement of what this session costs. Probing the rendered text ourselves would mean
+# reimplementing Kimi's placeholder renderer a second time.
+#
+# Best-effort by construction. Every failure is written to the log and dropped, because a number
+# that never landed must never cost a working stack; a launch with no history simply shows ~.
+measure_prompts_after_first_request() {
+  local log="${HARNESS_RUNTIME_DIR}/prompt-measure.log"
+  local staging="${HARNESS_RUNTIME_DIR}/prompt-sessions"
+  local prefs="${HARNESS_RUNTIME_DIR}/prompt-context.json"
+  local attempt options
+  # The first prompt is the only moment a profile.bind record exists, and nobody knows when the
+  # operator will send it, so this waits on a deadline rather than assuming. Three seconds times
+  # sixty attempts, and a number that never lands costs a log line and nothing else.
+  local poll_seconds=3 poll_attempts=60
+  : >"${log}" && chmod 600 "${log}"
+  # Concurrent by intent: the measurement loop has its own patience, so waiting for the bundle
+  # never costs the token figures their chance to land in this session.
+  cache_kimi_literals &
+  for ((attempt = 1; attempt <= poll_attempts; attempt++)); do
+    sleep "${poll_seconds}"
+    # Poll with exec rather than by copying: the copy carries conversation content and is only
+    # worth making once a record actually exists.
+    harness_compose exec -T kimi-agent /bin/sh -c \
+      "grep -lq '\"profile.bind\"' /home/agent/.kimi-code/sessions/*/*/agents/*/wire.jsonl 2>/dev/null" \
+      >>"${log}" 2>&1 || continue
+    options=$(shasum -a 256 "${prefs}" 2>/dev/null | cut -c1-12)
+    rm -rf -- "${staging}"
+    if harness_compose cp kimi-agent:/home/agent/.kimi-code "${staging}" >>"${log}" 2>&1; then
+      python3 tools/prompt_measure.py \
+        --sessions-dir "${staging}" \
+        --plan "${HARNESS_RUNTIME_DIR}/model-policy.json" \
+        --out "${HARNESS_RUNTIME_DIR}/prompt-measurements.jsonl" \
+        --image "${PROMPT_IMAGE_ID:-unknown}" --prefs "${options:-default}" >>"${log}" 2>&1
+    fi
+    # The tree holds conversation text, so it leaves the host filesystem the same way it arrived.
+    rm -rf -- "${staging}"
+    return 0
+  done
+  echo "no prompt measurement this session: no first request within $((poll_seconds * poll_attempts))s" >>"${log}"
+  return 0
+}
+
 harness_modules start
 echo "Instance:  ${HARNESS_INSTANCE_ID}"
 echo "Press Ctrl-C to stop everything."
@@ -189,6 +290,8 @@ harness_modules verify
 harness_compose up --remove-orphans --abort-on-container-failure &
 COMPOSE_PID=$!
 stack_started=true
+measure_prompts_after_first_request &
+PROMPT_MEASURE_PID=$!
 if wait_for_url http://127.0.0.1:5494/api/v1/healthz "" "" 90; then
   harness_compose exec -T kimi-agent python3 /opt/kimi-runtime/tools/register_workspace.py
   echo "Kimi Code: http://127.0.0.1:5494 (workspace ready)"

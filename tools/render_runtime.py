@@ -11,18 +11,21 @@ API keys are materialised as per-credential files that only the proxy container 
 values themselves never enter ``.env``, any environment file the agent can read, or the
 rendered configuration.
 
-The staged system prompt is the first of the project-root ``SYSTEM.md`` or ``SYSTEM.md.example``
-that exists, and nothing otherwise, which leaves Kimi Code on its own built-in prompt. Selected
-module guidance and the generated runtime envelope are appended to that text unless
-``KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE`` says to leave them out, so nothing is ever written inside the
-workspace. A prompt file that is blank and has nothing appended stages as a lone period instead,
-because Kimi Code reads a blank file as "no file" and substitutes its own prompt.
+The harness stages two documents, not one. ``CONTEXT.md`` composes into the all-lane contract at
+``~/.kimi-code/AGENTS.md``, which Kimi substitutes into the main agent's prompt and every
+subagent's alike; ``SYSTEM.md`` composes into the main agent's own prompt and reaches nobody else.
+Both are assembled by ``tools/prompt_context.py`` from the operator's files, the selected modules'
+guidance, and the generated envelope sections the startup panel left switched on - the panel's
+choices are the only way to omit any of it, and nothing is ever written inside the workspace. An
+empty ``SYSTEM.md`` with every main-only add-on switched off stages as a lone period, because Kimi
+Code reads a blank file as "no file" and substitutes its own prompt.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import json
 import os
 import secrets
 import shlex
@@ -30,49 +33,33 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
-    from . import policy
+    from . import prompt_context
     from .env_values import read_env_values
+    from .kimi_prompts import substitutions as kimi_substitutions
     from .model_config import render as render_model_tables
     from .models import POLICY_FILE, load_plan, materialise_credentials
+    from .private_file import write_private
 else:
-    import policy
+    import prompt_context
     from env_values import read_env_values
+    from kimi_prompts import substitutions as kimi_substitutions
     from model_config import render as render_model_tables
+    from private_file import write_private
 
     from models import POLICY_FILE, load_plan, materialise_credentials
 
 #: Marker comment in runtime/config.toml that the generated tables replace.
 MODEL_MARKER = "#__KIMI_MODEL_CONFIG__"
-#: System prompt sources, tried in order from the project root, the way ``.env`` and
-#: ``.env.example`` are tried: the operator's own untracked file, then the harness default. No
-#: file at all means stage nothing, which is how Kimi Code is told to use its own.
-SYSTEM_PROMPT_FILES = ("SYSTEM.md", "SYSTEM.md.example")
-#: Where ``tools/modules.py`` stages the selected modules' guidance, appended to the prompt. The
-#: modules write it before this tool runs, and it is never merged into a workspace file.
+#: Where ``tools/modules.py`` stages the selected modules' guidance. The modules write it before
+#: this tool runs, and it is never merged into a workspace file.
 MODULE_GUIDANCE_FILE = "module-guidance.md"
-#: Switch read from the resolved ``.env``. The name carries the omission, so a truthy value is what
-#: leaves the runtime envelope out of the prompt; unset, blank, or a value that is not truthy omits
-#: nothing and leaves the envelope appended, which is the shipped default.
-OMIT_ENVELOPE_FLAG = "KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE"
-TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
-#: Kimi Code drops any system prompt that is blank once trimmed and silently uses its built-in
-#: prompt, so an operator who asks for no prompt cannot have one through the file. A lone period
-#: survives that check, costs one token, and carries no instruction of its own.
-EMPTY_PROMPT_SENTINEL = "."
 ALIAS_MARKER = "__KIMI_PRIMARY_ALIAS__"
 PLACEHOLDER_MARKER = "__MODEL_PROXY_TOKEN__"
 
 
 def write_secret(path: Path, value: str) -> None:
-    temporary = path.with_suffix(".tmp")
-    temporary.unlink(missing_ok=True)
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(fd, value.encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(temporary, path)
+    """Stage one rendered file at mode 0600. See :func:`private_file.write_private`."""
+    write_private(path, value)
 
 
 def ensure_secret(path: Path, generator) -> str:
@@ -107,64 +94,10 @@ def kimi_config(root: Path, plan: dict[str, Any], token: str) -> str:
     return rendered
 
 
-def system_prompt(root: Path) -> str | None:
-    """Read the session's prompt file: the operator's own, else the harness default.
-
-    ``None`` means no prompt file exists at all - the documented last tier, which stages nothing
-    and leaves Kimi Code on its own built-in prompt. The text of a file that does exist is the
-    whole prompt for the session, so a file that omits the ``${base_prompt}`` placeholder is a
-    complete replacement of Kimi Code's own prompt rather than an error. An empty file is a
-    decision and not a missing file: it yields empty text instead of falling back to the default,
-    and ``session_prompt`` turns that into ``EMPTY_PROMPT_SENTINEL``, because Kimi Code reads a
-    blank file the same way it reads no file at all.
-    """
-    for relative in SYSTEM_PROMPT_FILES:
-        path = root / relative
-        if path.is_file():
-            return path.read_text(encoding="utf-8")
-    return None
-
-
-def envelope_omitted(values: dict[str, str]) -> bool:
-    """Whether the operator asked for the runtime envelope to be left out of the prompt.
-
-    The flag is named after the omission, so only a truthy value performs it. Unset, blank, or a
-    value that is not truthy omits nothing, which keeps the envelope in the prompt - the shipped
-    default that an operator who never heard of the flag gets.
-    """
-    return values.get(OMIT_ENVELOPE_FLAG, "").strip().lower() in TRUTHY_VALUES
-
-
 def module_guidance(runtime_dir: Path) -> str:
     """The guidance ``tools/modules.py`` staged for the selected modules, if any."""
     path = runtime_dir / MODULE_GUIDANCE_FILE
     return path.read_text(encoding="utf-8") if path.is_file() else ""
-
-
-def session_prompt(
-    root: Path, runtime_dir: Path, plan: dict[str, Any], values: dict[str, str]
-) -> str:
-    """Assemble what Kimi reads: prompt file, module guidance, then the envelope.
-
-    The prompt file keeps its meaning as a complete replacement for Kimi's own, and an empty prompt
-    file stays empty in its own right - it is only the blankness of the final text that matters,
-    since Kimi Code would read that as "no file" and answer with its built-in prompt. So when there
-    is nothing to append - no module selected and the envelope omitted - an empty prompt file stages
-    as ``EMPTY_PROMPT_SENTINEL``, while an absent one stages as nothing at all. Appended sections
-    are trimmed of edge newlines and separated by a blank line, so the prompt file's own trailing
-    newlines cannot pile up.
-    """
-    text = system_prompt(root)
-    extra = [module_guidance(runtime_dir)]
-    if not envelope_omitted(values):
-        extra.append(policy.render_guidance(plan))
-    additions = [part.strip("\n") for part in extra if part.strip()]
-    if not additions:
-        if text is None:
-            return ""
-        return text if text.strip() else EMPTY_PROMPT_SENTINEL + "\n"
-    base = [text.strip("\n")] if text and text.strip() else []
-    return "\n\n".join([*base, *additions]) + "\n"
 
 
 def main() -> None:
@@ -172,12 +105,18 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--runtime-dir", type=Path, required=True)
     parser.add_argument("--resolved-env", type=Path, required=True)
+    parser.add_argument("--prompt-context", type=Path)
     args = parser.parse_args()
     args.runtime_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(args.runtime_dir, 0o700)
     values = read_env_values(args.resolved_env)
     plan = load_plan(args.runtime_dir)
     materialise_credentials(plan, args.runtime_dir, values)
+    # The startup panel's choices, or every option on when nobody drew the panel. This is the only
+    # read of that file outside the panel and prompts.sh, and it is what keeps the picture the
+    # operator approved and the bytes the container mounts from disagreeing.
+    prefs_path = args.prompt_context or args.runtime_dir / prompt_context.PREFS_FILE
+    enabled = prompt_context.load_prefs(prefs_path)
     ephemeral = {
         "proxy-token": secrets.token_urlsafe(32),
         "search-token": secrets.token_urlsafe(32),
@@ -190,26 +129,53 @@ def main() -> None:
         args.runtime_dir / "cache-salt",
         lambda: base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="),
     )
-    rendered = kimi_config(args.root, plan, ephemeral["proxy-token"])
+    rendered = prompt_context.apply_config_toggles(
+        kimi_config(args.root, plan, ephemeral["proxy-token"]), enabled
+    )
     write_secret(args.runtime_dir / "kimi-config.toml", rendered)
-    # The prompt file's own text plus whatever the harness appends, or an empty string that leaves
-    # Kimi Code on its built-in prompt. Whatever lands here is installed by the initializer as
-    # root-owned and immutable, so customising the prompt never hands the agent a writable one.
-    system_markdown = args.runtime_dir / "SYSTEM.md"
+    # Both documents are installed by the initializer as root-owned and immutable, so customising
+    # a prompt never hands the agent a writable one. The all-lane file is always written, even when
+    # it resolves to empty: Docker turns a missing bind source into a directory, and that fails at
+    # container start rather than here.
+    # Placeholders the harness resolves itself, before anything is staged: its own dynamic values,
+    # plus any Kimi literals cached from this image. A literal that was never extracted is a
+    # staging error rather than a silent literal, so the mapping is assembled even when neither
+    # operator file is expected to use one.
+    template_values = kimi_substitutions(args.runtime_dir)
+    agents_markdown = args.runtime_dir / prompt_context.STAGED_AGENTS
+    system_markdown = args.runtime_dir / prompt_context.STAGED_SYSTEM
+    agents_markdown.unlink(missing_ok=True)
     system_markdown.unlink(missing_ok=True)
-    write_secret(system_markdown, session_prompt(args.root, args.runtime_dir, plan, values))
+    write_secret(
+        agents_markdown,
+        prompt_context.compose_agents_document(
+            args.root, plan, module_guidance(args.runtime_dir), enabled, template_values
+        ),
+    )
+    write_secret(
+        system_markdown,
+        prompt_context.compose_system_document(args.root, plan, enabled, template_values),
+    )
     runtime_env = {
         "SEARCH_ADAPTER_TOKEN": ephemeral["search-token"],
         "MODEL_PROXY_POLICY_FILE": str(args.runtime_dir / POLICY_FILE),
         "MODEL_PROXY_INTERNAL_TOKEN_FILE": str(args.runtime_dir / "proxy-token"),
         "MODEL_PROXY_CACHE_SALT_FILE": str(args.runtime_dir / "cache-salt"),
         "KIMI_RENDERED_CONFIG": str(args.runtime_dir / "kimi-config.toml"),
+        "KIMI_RENDERED_AGENTS_MD": str(agents_markdown),
         "KIMI_SYSTEM_MD": str(system_markdown),
     }
+    prompt_context.apply_env_toggles(runtime_env, enabled)
     content = "".join(f"{key}={shlex.quote(value)}\n" for key, value in runtime_env.items())
     path = args.runtime_dir / "runtime.env"
     path.unlink(missing_ok=True)
     write_secret(path, content)
+    # The staged documents are installed read-only and immutable, so an edit after this moment
+    # cannot take effect. Recording what each one was composed from is what lets prompts.sh and
+    # doctor.sh say that in words instead of leaving the operator to guess why nothing changed.
+    sources = args.runtime_dir / prompt_context.SOURCES_FILE
+    sources.unlink(missing_ok=True)
+    write_secret(sources, json.dumps(prompt_context.document_sources(args.root), indent=1) + "\n")
     print(f"cache_salt_chars={len(cache_salt)}")
 
 

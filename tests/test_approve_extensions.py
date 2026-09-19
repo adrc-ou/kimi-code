@@ -138,6 +138,14 @@ class ApproveExtensionTests(unittest.TestCase):
                 set(inspect_path(workspace, ".agents/skills")),
                 {".agents/skills/", ".agents/skills/demo/", ".agents/skills/demo/SKILL.md"},
             )
+            # The name is about the copy rather than the scan: a real ``.agents`` ancestor has to
+            # be walkable by copy_snapshot too, which is the positive half of the refusal the
+            # next test checks for a link planted after the scan.
+            copy_snapshot(workspace, root / "state", ".agents/skills")
+            self.assertEqual(
+                (root / "state" / ".agents" / "skills" / "demo" / "SKILL.md").read_text(),
+                "safe\n",
+            )
 
 
 if __name__ == "__main__":

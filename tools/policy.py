@@ -23,32 +23,41 @@ from a number in ``.env``.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NamedTuple
 
 if __package__:
     from .definitions import (
         CONTEXT_RULE_KINDS,
         COUNT_RULE_KINDS,
+        LANES,
         NAME_SEPARATOR,
         PER_REQUEST_RULE_KINDS,
         RATE_RULE_KINDS,
         RATE_RULE_UNITS,
+        SCHEMA_VERSION,
         DefinitionError,
     )
 else:
     from definitions import (
         CONTEXT_RULE_KINDS,
         COUNT_RULE_KINDS,
+        LANES,
         NAME_SEPARATOR,
         PER_REQUEST_RULE_KINDS,
         RATE_RULE_KINDS,
         RATE_RULE_UNITS,
+        SCHEMA_VERSION,
         DefinitionError,
     )
 
-SCHEMA_VERSION = 1
-LANE_ORDER = ("primary", "long", "subagent")
 LANE_DISPLAY = {"primary": "Primary", "long": "Long Context", "subagent": "Subagent"}
+
+#: Which generated guidance a caller may ask for. ``lane`` is what every audience gets - the
+#: numbers that bound it - and ``main`` adds the blocks only the primary agent can act on.
+#: Neither is a lane name, and the two vocabularies stay deliberately separate.
+AUDIENCE_LANE = "lane"
+AUDIENCE_MAIN = "main"
+
 
 #: Every keying scope a counter may be built for, narrowest first. ``model`` is included
 #: because a rate rule about one model still needs its own ledger at that scope.
@@ -411,13 +420,12 @@ def resolve(
     members: dict[str, list[tuple[str, str]]] = {}
     for role in ("primary", "subagent"):
         model = models[selection[role]]
-        lane = role if role == "subagent" else "primary"
-        members.setdefault(lane, []).append((role, model["id"]))
+        members.setdefault(role, []).append((role, model["id"]))
         if role == "primary" and "long" in model["lanes"]:
             members.setdefault("long", []).append(("primary-long", model["id"]))
 
     selected: dict[str, dict[str, Any]] = {}
-    for lane in LANE_ORDER:
+    for lane in LANES:
         if lane not in members:
             continue
         _, model_id = members[lane][0]
@@ -613,105 +621,295 @@ def _derive_limits(
     return limits
 
 
-def render_guidance(plan: dict[str, Any]) -> str:
-    """Human- and model-readable statement of the resolved envelope.
+#: Every generated guidance block belongs to exactly one startup-panel option and is written for
+#: exactly one audience. ``lane`` text reaches every agent, because ``${agents_md}`` is substituted
+#: into the main prompt and each subagent's alike; ``main`` text reaches only the main agent,
+#: through the staged system prompt. Main carries no lane text, so nothing arrives twice.
+GUIDANCE_AUDIENCES = ("lane", "main")
+#: The option ids that switch each generated block on or off.
+OPTION_LANE_LIMITS = "lane_limits"
+OPTION_LANE_TABLE = "lane_table"
+OPTION_PARALLELISM = "parallelism"
 
-    This text is appended to the staged system prompt at every launch, unless the operator set
-    ``KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE`` to a truthy value. It states the numbers and then
-    instructs the agent to use all of them: a limit that is respected but not reached is a slower
-    workspace, not a safer one.
+
+class GuidanceSection(NamedTuple):
+    """One generated block: the option that toggles it, the audience it addresses, its text."""
+
+    option: str
+    audience: str
+    lines: list[str]
+
+
+def _context_counters(plan: dict[str, Any]):
+    return (c for c in plan["counters"].values() if c["family"] == "context")
+
+
+def _lane_order(plan: dict[str, Any]) -> list[str]:
+    return [name for name in LANES if name in plan["lanes"]]
+
+
+def _lane_limit_lines(plan: dict[str, Any]) -> list[str]:
+    """What every agent must respect, because every request spends the same capacity.
+
+    Free of anything only the main agent can act on. A subagent has no spawning tool, so
+    concurrency advice in its prompt is several hundred tokens about a thing it cannot do.
     """
-    lines: list[str] = [
-        "## Model runtime envelope (generated at launch)",
+    lines = [
+        "## Model usage limits (generated at launch)",
         "",
         "The harness derived these numbers from the selected model definitions and their",
-        "providers' policy rules and appends them here at every start, so nothing in this",
-        "section is maintained by hand, and the model proxy enforces them independently of",
-        "anything written below.",
+        "providers' policy rules at every start, and the model proxy enforces every one of them",
+        "independently of this text. Nothing in this section is maintained by hand.",
         "",
     ]
-    for provider_id, provider in sorted(plan["providers"].items()):
-        source = provider["policy_url"] or "no published policy URL"
-        lines.append(f"- Provider **{provider['label']}** (`providers/{provider_id}`): {source}")
-    lines.append("")
-    lines.append(
-        "| Lane | Model | Alias | Context | Input cap | Output clamp | "
-        "In-flight cost | Runs alone |"
-    )
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
-    for lane_name in LANE_ORDER:
-        lane = plan["lanes"].get(lane_name)
-        if lane is None:
-            continue
+    lines += [
+        f"- Provider **{provider['label']}** (`providers/{provider_id}`): "
+        f"{provider['policy_url'] or 'no published policy URL'}"
+        for provider_id, provider in sorted(plan["providers"].items())
+    ]
+    for counter in _context_counters(plan):
+        margin = plan["providers"][counter["provider"]]["context_margin_percent"]
         lines.append(
-            f"| `{lane_name}` | {lane['label']} | `{lane['alias']}` | "
+            f"- Every request spends one shared in-flight context budget: "
+            f"**{counter['budget']:,} tokens** for `{counter['subject']}`. The provider's own "
+            f"threshold is {counter['ceiling']:,} and the declared safety margin is {margin}%. "
+            "A request you delegate spends that budget exactly as your own does."
+        )
+        if counter.get("exclusive_at") is not None:
+            lines.append(
+                f"- A single request at or above {counter['exclusive_at']:,} tokens runs alone: "
+                "the proxy admits it only when nothing else is in flight and holds every other "
+                "request queued until it finishes."
+            )
+    for counter in plan["counters"].values():
+        if counter["family"] != "rate":
+            continue
+        unit = counter.get("unit", "output_tokens")
+        lines.append(
+            f"- Rate: **{counter['capacity']:,} {RATE_UNIT_LABELS.get(unit, unit)}** booked per "
+            f"minute against `{counter['subject']}`, measured in the unit the provider meters."
+        )
+    lines.append("- Per-lane ceilings, as window / input cap / output clamp:")
+    for name in _lane_order(plan):
+        lane = plan["lanes"][name]
+        lines.append(
+            f"  - `{name}` {lane['context_tokens']:,} / {lane['input_tokens']:,} / "
+            f"{lane['output_clamp_tokens']:,}"
+        )
+    lines += [
+        "  Each input cap sits below its own window on purpose: the proxy clamps the response's",
+        "  output budget, so a request that filled its window would lose its tail. Compacting a",
+        "  little early is the intended response, not a truncation.",
+        "- Queueing is normal operation. A permit you are waiting for belongs to a request that",
+        "  will still run, and the proxy holds it while it waits.",
+        "- HTTP 429 and provider server errors are backpressure, not a licence to widen",
+        "  concurrency. Never answer them by opening extra connections, containers, credentials",
+        "  or sessions, and never call a provider endpoint around the proxy: each spends",
+        "  capacity the proxy cannot see.",
+        "- Only the main agent in this workspace has a subagent-spawning tool. If you are reading",
+        "  this as a subagent you cannot delegate further, and the lane serving you is bound by",
+        "  the harness - do not try to change it.",
+        "",
+    ]
+    return lines
+
+
+def _lane_table_lines(plan: dict[str, Any]) -> list[str]:
+    """The per-lane shape of the session, which is only useful to the agent that chooses lanes.
+
+    It restates the pool these lanes draw from rather than pointing at the all-lane block for it.
+    The two are separate checkboxes, so a table whose "Runs alone" column meant nothing without a
+    sibling would be a hole in the prompt the moment an operator unchecked one.
+    """
+    lines = [
+        "## Model runtime envelope (generated at launch)",
+        "",
+        "The per-lane shape of this session's capacity. The proxy enforces every number below and",
+        "the launcher configures Kimi's own dispatch limit to match, so the two cannot disagree.",
+        "",
+        "| Lane | Model | Alias | Context | Input cap | Output clamp | In-flight cost | "
+        "Runs alone |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for name in _lane_order(plan):
+        lane = plan["lanes"][name]
+        lines.append(
+            f"| `{name}` | {lane['label']} | `{lane['alias']}` | "
             f"{lane['context_tokens']:,} | {lane['input_tokens']:,} | "
             f"{lane['output_clamp_tokens']:,} | {lane['reservation']:,} | "
             f"{'yes' if lane['exclusive'] else 'no'} |"
         )
-    lines.append("")
+    lines += [
+        "",
+        "What that capacity is drawn from, so the table reads on its own:",
+        "",
+    ]
+    lines += [
+        f"- Provider **{plan['providers'][provider_id]['label']}** serves `{model}` under "
+        f"`providers/{provider_id}`."
+        for provider_id, model in sorted(
+            {(lane["provider"], lane["model"]) for lane in plan["lanes"].values()}
+        )
+        if plan["providers"].get(provider_id, {}).get("label")
+    ]
+    for counter in _context_counters(plan):
+        lines.append(
+            f"- The `{counter['subject']}` pool that every one of those rows reserves against "
+            f"holds **{counter['budget']:,} tokens** in flight in total, not per lane. Opening a "
+            "lane is a reservation against it, and closing a request is what releases it."
+        )
+        if counter.get("exclusive_at") is not None:
+            lines.append(
+                f"- The **Runs alone** column is decided by one figure: at or above "
+                f"{counter['exclusive_at']:,} tokens a request is admitted only when the pool is "
+                "otherwise empty."
+            )
     for counter in plan["counters"].values():
-        if counter["family"] == "context":
-            budget = counter["budget"]
-            ceiling = counter["ceiling"]
+        if counter["family"] != "rate":
+            continue
+        unit = counter.get("unit", "output_tokens")
+        lines.append(
+            f"- The pool is also metered by time: **{counter['capacity']:,} "
+            f"{RATE_UNIT_LABELS.get(unit, unit)}** against `{counter['subject']}`, "
+            "booked before a request runs and settled against what it used."
+        )
+    for counter in _context_counters(plan):
+        if counter.get("max") is not None:
             lines.append(
-                f"- Aggregate in-flight context for `{counter['subject']}`: **{budget:,} tokens** "
-                f"(provider threshold {ceiling:,}, margin "
-                f"{plan['providers'][counter['provider']]['context_margin_percent']}%), "
-                f"shared by lanes {', '.join(f'`{lane}`' for lane in counter['lanes'])}"
+                f"- At most {counter['max']} concurrent requests for `{counter['subject']}`."
             )
-            if counter.get("exclusive_at") is not None:
-                lines.append(
-                    f"- Any single request at or above {counter['exclusive_at']:,} tokens "
-                    "runs alone."
-                )
-            if counter.get("max") is not None:
-                lines.append(f"- At most {counter['max']} concurrent requests for that model.")
-        elif counter["family"] == "rate":
-            unit = counter.get("unit", "output_tokens")
-            lines.append(
-                f"- Rate for `{counter['subject']}`: **{counter['capacity']:,} "
-                f"{RATE_UNIT_LABELS.get(unit, unit)}** booked, measured in the unit "
-                "the provider meters."
-            )
-        elif counter["family"] == "count":
+    for counter in plan["counters"].values():
+        if counter["family"] == "count":
             lines.append(
                 f"- At most {counter['max']} concurrent requests across `{counter['subject']}`."
             )
-    lines.append("")
+    per_lane = plan["limits"].get("lane_concurrency") or {}
+    if per_lane:
+        ceilings = ", ".join(
+            f"`{name}` {per_lane[name]}" for name in _lane_order(plan) if name in per_lane
+        )
+        lines.append(f"- Per-lane request ceiling: {ceilings}.")
     subagent_limit = plan["limits"].get("subagent_concurrency")
     if subagent_limit:
         basis = plan["limits"].get("subagent_concurrency_basis") or "the tightest provider rule"
-        lines += [
-            f"- Kimi may run **up to {subagent_limit} subagents concurrently** ({basis}), and the "
-            "proxy holds the same ceiling; one more than that simply queues.",
-            "",
-            "### Use the whole envelope",
-            "",
-            f"- Delegate to subagents whenever the work splits, and run all {subagent_limit} "
-            "at once when it is independent. Do not self-limit below the published concurrency: "
-            "under-using the allowance buys nothing and costs wall-clock time.",
-            "- Do not open more than that number, and do not retry around a queue. Waiting for "
-            "a permit inside the proxy is normal behaviour, not a failure, and the request is "
-            "not lost.",
-            "- Keep primary traffic in the primary lane. The subagent model is bound by the "
-            "harness and is not a way to obtain extra concurrency.",
-            "- A long-context request runs alone by policy. Let it finish instead of trimming the "
-            "other lanes to make room for it.",
-            "- Context is the scarce resource: prefer concise evidence in a subagent hand-back, "
-            "because every token in flight is charged against the shared budget above.",
-        ]
+        lines.append(
+            f"- Kimi may run **up to {subagent_limit} subagents concurrently** ({basis}); one "
+            "more than that simply queues at the proxy rather than failing."
+        )
     else:
-        lines += [
+        lines.append(
             "- This selection publishes no subagent concurrency ceiling; the proxy still enforces "
             "whatever provider rules do apply."
-        ]
+        )
     lines += [
-        "",
-        "Provider terms may change and model windows differ. To alter any number here, edit the",
-        "definitions in `./models` and `./providers`, then restart the stack - never `.env`.",
-        "Setting `KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1` leaves this section out of the system",
-        "prompt altogether; it changes no number.",
+        "- Keep the default model as launched. A primary request must never be deliberately routed",
+        "  through the subagent lane, and the subagent model is bound by the harness rather than",
+        "  chosen per call.",
+        "- A long-context request is a bigger primary step, not a way to obtain subagent-style",
+        "  concurrency: it is served alone precisely because it is large. Let it finish instead of",
+        "  trimming the other lanes to make room for it.",
+        "- Backgrounded agents and background Bash share one task-slot pool, separate from these",
+        "  lanes, and exceeding it fails outright rather than queueing.",
+        "- Subagent and swarm wall-clock limits are unlimited, so a long run is bounded by the",
+        "  proxy and by context instead. A stalled stream is a reason to resume the work, not to",
+        "  redesign it.",
+        "- Provider terms change and model windows differ. To alter any number here, edit the",
+        "  definitions in `./models` and `./providers`, then restart the stack - never `.env`.",
+        "  This section states the limits and changes none.",
+        "- Queueing at the proxy is normal, so never retry around a queue you are waiting on.",
         "",
     ]
-    return "\n".join(lines)
+    return lines
+
+
+def _parallelism_lines(plan: dict[str, Any]) -> list[str]:
+    """How wide to fan out, stated with its own numbers so it reads coherently on its own."""
+    subagent_limit = plan["limits"].get("subagent_concurrency")
+    if subagent_limit:
+        basis = plan["limits"].get("subagent_concurrency_basis") or "the tightest provider rule"
+        opening = (
+            f"This session may run up to {subagent_limit} subagents at once - {basis} - and the "
+            "model proxy enforces that same ceiling, so it is capacity that has already been paid "
+            f"for. Treat {subagent_limit} as the default fan-out for any step that splits into "
+            "independent parts, and read running below it as a cost rather than as caution."
+        )
+    else:
+        opening = (
+            "The model proxy publishes no subagent ceiling for this selection, but it still "
+            "enforces whatever provider rules do apply, so delegate freely and let the proxy "
+            "pace you."
+        )
+    return [
+        "## Parallel work",
+        "",
+        opening,
+        "",
+        "Choosing the shape of the work:",
+        "",
+        "- Three or more independent lookups, reads, searches, or investigations belong in one",
+        "  `AgentSwarm` call rather than several narrower ones. Each call ramps its own launches",
+        "  up, so splitting a fan-out across calls pays that ramp repeatedly.",
+        "- Delegate work whose bulk output this context would otherwise absorb. Several children",
+        "  that each hand back a short conclusion are cheaper than one search that returns its",
+        "  raw results here.",
+        "- Do not delegate a read whose path is already known, or a step that depends on reasoning",
+        "  this turn is still holding. Handoff has a price; pay it when the child does the work,",
+        "  not when it carries it.",
+        "- Investigate in parallel, write serially. Many agents may read; only one may touch a",
+        "  given set of files at a time.",
+        "",
+        "Respect capacity as well as count:",
+        "",
+        "- A lane reserves its full window the moment it is admitted, whether or not the prompt is",
+        "  that large, so a wide fan-out holds the whole allowance until it finishes. Let it",
+        "  finish instead of generating alongside it.",
+        "- Prefer concise evidence in a hand-back: every token a child holds is charged against",
+        "  the shared in-flight budget rather than against its own lane alone.",
+        "- Waiting for a permit at the proxy is normal pacing, not a failure, and the request is",
+        "  not lost. Never dodge a queue with extra connections, lanes, containers or credentials.",
+        "",
+        "Before starting one agent, ask how many things could be true at the same time. That",
+        "number, not the number of questions you happen to have written down, is the fan-out to",
+        "use.",
+        "",
+    ]
+
+
+def guidance_block(section: GuidanceSection) -> str:
+    """One generated section as text, edge newlines off.
+
+    Both the composer and :func:`render_guidance` go through here, so a block measured on its own
+    in the panel is byte-identical to the same block inside a composed document.
+    """
+    return "\n".join(section.lines).strip("\n")
+
+
+def guidance_sections(plan: dict[str, Any], audience: str) -> list[GuidanceSection]:
+    """The generated blocks written for one audience, in the order they are appended."""
+    if audience == AUDIENCE_LANE:
+        return [GuidanceSection(OPTION_LANE_LIMITS, audience, _lane_limit_lines(plan))]
+    if audience == AUDIENCE_MAIN:
+        return [
+            GuidanceSection(OPTION_LANE_TABLE, audience, _lane_table_lines(plan)),
+            GuidanceSection(OPTION_PARALLELISM, audience, _parallelism_lines(plan)),
+        ]
+    raise ValueError(f"unknown guidance audience: {audience}")
+
+
+def render_guidance(
+    plan: dict[str, Any], audience: str, enabled: dict[str, bool] | None = None
+) -> str:
+    """The generated envelope text for one audience, honouring the panel's choices.
+
+    ``audience`` is what keeps harness talk aimed at the agent that can act on it: ``lane`` is the
+    core every request obeys regardless of who sends it, and ``main`` is the lane table and the
+    fan-out advice, which are meaningless to an agent that cannot pick a lane or start a child.
+    ``enabled`` maps an option id to a boolean; ``None`` means every option is on, which is the
+    shipped default and what a non-interactive launch with no saved choices gets.
+    """
+    blocks = [
+        guidance_block(section)
+        for section in guidance_sections(plan, audience)
+        if enabled is None or enabled.get(section.option, True)
+    ]
+    return "\n\n".join(blocks) + "\n" if blocks else ""

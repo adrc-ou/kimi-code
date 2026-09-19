@@ -86,9 +86,6 @@ class VersionSelectionTests(unittest.TestCase):
     def test_installed_version_replaces_tenth_choice(self):
         catalog = [{"version": f"1.{minor}.0"} for minor in range(20, 0, -1)]
         choices = MODULE.visible_choices(catalog, "1.1.0")
-        self.assertEqual(len(choices), 10)
-        self.assertIn("1.1.0", {item["version"] for item in choices})
-        self.assertNotIn("1.11.0", {item["version"] for item in choices})
         self.assertEqual(
             [item["version"] for item in choices],
             [f"1.{minor}.0" for minor in range(20, 11, -1)] + ["1.1.0"],

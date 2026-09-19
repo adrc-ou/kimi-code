@@ -12,9 +12,6 @@ services:
       QWEN3_API_KEY: "${QWEN3_API_KEY:-}"
       NRP_BASE_URL: "${NRP_BASE_URL:-}"
       KIMI_BACKGROUND_TASK_SLOTS: "${KIMI_BACKGROUND_TASK_SLOTS:-}"
-      # Leaving the generated runtime envelope out of the system prompt. The renderer reads it from
-      # the resolved bootstrap, so an undeclared name would silently keep the default.
-      KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE: "${KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE:-}"
       GITHUB_RELEASES_TOKEN: "${GITHUB_RELEASES_TOKEN:-}"
       COMFYUI_MODELS_PATH: "${COMFYUI_MODELS_PATH:-}"
       COMFYUI_CUSTOM_NODES_PATH: "${COMFYUI_CUSTOM_NODES_PATH:-}"

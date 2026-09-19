@@ -8,7 +8,14 @@ cd "${root}"
 # shellcheck disable=SC1091
 source tools/runtime.sh
 harness_traps
-harness_init
+# `list` only renders the approval manifest, so it initialises without the launcher lock and stays
+# usable while a session is running. `approve` and `revoke` write that manifest and still take the
+# lock exclusively, which is what stops a revocation landing under a live container's bind.
+if [[ "${command_name}" == list ]]; then
+  harness_init_readonly
+else
+  harness_init
+fi
 python3 tools/approve_extensions.py "${command_name}" \
   --workspace "${HARNESS_WORKSPACE}" \
   --manifest "${HARNESS_RUNTIME_DIR}/extension-approval.json"

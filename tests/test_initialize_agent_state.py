@@ -1,27 +1,22 @@
-import importlib.util
 import os
 import shutil
+import sys
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
-from types import ModuleType
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tests.helpers import load_script  # noqa: E402
+
 GID = os.getgid()
 
-
-def load(name: str, relative: Path) -> ModuleType:
-    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-init = load("initialize_agent_state", Path("container/initialize-agent-state.py"))
-merge = load("kimi_config_merge", Path("tools/kimi_config_merge.py"))
+init = load_script("initialize_agent_state", Path("container/initialize-agent-state.py"))
+merge = load_script("kimi_config_merge", Path("tools/kimi_config_merge.py"))
 
 BASELINE = """default_model = "qwen3-primary"
 default_permission_mode = "manual"
@@ -158,7 +153,10 @@ class ConfigMergeIntegrationTests(unittest.TestCase):
         info = (self.fixture.home / "config.toml").stat()
         self.assertEqual(info.st_mode & 0o777, 0o600)
         self.assertEqual((info.st_uid, info.st_gid), (self.uid, self.gid))
-        self.assertEqual(self.merged()["default_model"], "qwen3-primary")
+        # First launch is a copy, so the whole document is the contract. Comparing one key to a
+        # string from this file's own baseline proves nothing; equality also catches a key that
+        # is quietly dropped on the way in.
+        self.assertEqual(self.merged(), tomllib.loads(BASELINE))
 
     def test_settings_written_by_the_ui_survive_but_model_choice_does_not(self):
         init.merge_config(self.fixture.stage, self.fixture.home, self.MODULE, self.uid, self.gid)
@@ -185,7 +183,8 @@ class ConfigMergeIntegrationTests(unittest.TestCase):
         self.assertEqual(outcome, "baseline")
         quarantined = list(self.fixture.home.glob("config.toml.unreadable-*"))
         self.assertEqual(len(quarantined), 1)
-        self.assertEqual(self.merged()["default_model"], "qwen3-primary")
+        # The rebuild has to be a usable document, not merely a present file.
+        self.assertEqual(self.merged(), tomllib.loads(BASELINE))
 
     def test_unusable_baseline_fails_closed(self):
         (self.fixture.stage / "kimi-config.toml").write_text("= broken\n")

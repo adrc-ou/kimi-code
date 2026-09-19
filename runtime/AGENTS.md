@@ -1,5 +1,12 @@
 # Engineering agent operating contract
 
+This is the harness's contract with every agent in the session, and it reaches them
+through two staged documents. This text, plus the generated "Model usage limits"
+section, is composed into `AGENTS.md` and read by the main agent and every subagent.
+The main agent additionally receives `SYSTEM.md` - its own voice, plus the generated
+"Model runtime envelope" lane table - which a subagent never sees, so nothing here
+depends on it, and nothing here is addressed to whoever maintains either file.
+
 ## Workspace boundary
 
 The writable development workspace is `/workspace`.
@@ -78,27 +85,12 @@ Before completion summarize:
 
 ## Sub-agents
 
-The root agent is normally the sole writer in a shared worktree.
+Only the main agent in this workspace has a tool that can start a subagent. If you
+are reading this as a subagent, you cannot delegate further and should not look for
+a way to; finish your own work and hand back a conclusion.
 
-Use read-only sub-agents aggressively for:
-
-- repository archaeology;
-- documentation research;
-- architecture analysis;
-- tensor-contract verification;
-- independent review.
-
-Fair use caps how many sub-agents the provider will *serve* at once, not how much
-work you may line up. The exact ceiling for the current model pair is stated in the
-generated "Model runtime envelope" section that the launcher appends to this
-agent's system prompt, and the launcher configures `AgentSwarm` to dispatch no more
-than that number concurrently. The policy proxy enforces the same ceiling upstream,
-so extra background tasks queue at the proxy instead of oversubscribing the
-credential. Prefer to fan independent, bounded research out across every available
-lane rather than serialising it, and treat waiting at the proxy as normal pacing,
-not as a failure.
-
-Do not let several agents edit overlapping files concurrently.
+The root agent is normally the sole writer in a shared worktree. Do not let several
+agents edit overlapping files concurrently.
 
 ## Long-running debugging
 
@@ -152,95 +144,28 @@ Do not commit unless requested.
 
 Use `git status` and `git diff` frequently.
 
-## Managed model provider policy
+## Model provider rules
 
-The model serving this workspace and the provider terms it is served under are
-chosen by the operator at launch, not here. Every concrete number - context
-window per lane, aggregate in-flight budget, concurrency ceiling, per-minute
-allowance - is stated in the generated "Model runtime envelope" section the
-launcher appends to this agent's system prompt, is recomputed on every start, and
-is enforced independently by the model proxy. Read that section for the numbers;
-treat this section as the rules that hold whatever the numbers turn out to be.
+The numbers move with the model and the provider's published terms, so they are not
+written here. They arrive in the generated sections the launcher appends at startup,
+and the model proxy enforces every one of them independently of this text.
 
-The proxy enforces three families of provider rule:
+What a table cannot state is what not to do:
 
-- **Context.** Concurrent requests share an aggregate in-flight token budget
-  derived from the provider's own fraction of the model window, applied with the
-  provider's declared safety margin. A lane's cost is its input ceiling plus its
-  output clamp, read from Kimi's live rendered configuration rather than
-  hard-coded, so a configuration the proxy cannot honour fails closed with HTTP
-  503 instead of sending unverifiable traffic.
-- **Exclusivity.** A single request at or above the provider's threshold runs
-  alone. The proxy admits it only when nothing else is in flight, and holds the
-  others queued until it finishes.
-- **Rate.** Rolling per-minute ledgers, booked at the lane's full output
-  allowance before the request starts and settled against usage measured out of
-  the response stream. Where the gateway reports less remaining quota than the
-  proxy does, the gateway's number wins.
+- Never route a primary request through the subagent lane on purpose, and never try
+  to override the model a subagent is bound to. The lane is chosen by the harness.
+- Never call a provider endpoint directly, and never start a second stack, another
+  proxy, or another credential that spends the same provider allowance. Both consume
+  capacity the proxy cannot see, which turns a limit it is enforcing into one it is
+  not.
+- A queue is not a failure and a 429 is not a licence to widen concurrency. Waiting
+  for a permit costs nothing and holds nothing; the request is not lost.
+- When a task needs more context than its lane offers, narrow the task or let the
+  main agent do it in sequence. Do not exceed a shared budget to avoid a pause.
+- Subagent and swarm runs have no wall-clock limit, so a long run is bounded by the
+  proxy and by context instead. A stalled stream is a reason to resume the work, not
+  to redesign it.
 
-### Primary requests
-
-Primary-agent traffic uses the primary provider lane, and the long-context lane
-when the operator selected a model that declares one. Both are primary requests: a
-long request is a bigger primary step, never a way to obtain subagent-style
-concurrency, and it is served alone precisely because it is large.
-
-Keep the default model as launched. Each lane's input ceiling sits below its own
-window on purpose, because the proxy clamps the response's output budget and a
-truncated thinking step is worse than compacting slightly earlier.
-
-A primary request must never be deliberately routed through the subagent lane.
-
-### Subagents
-
-Every subagent is forced onto the subagent lane, and its context is bound to the
-lane the harness published. Do not attempt to override the secondary model with
-`primary`, and do not bypass the configured model proxy.
-
-Do not directly invoke a provider endpoint with curl, Python HTTP clients, or
-other tools, and do not start another independent Kimi stack that would use the
-same provider credential unless it shares the same policy scheduler. Both actions
-spend capacity the proxy cannot see.
-
-### Parallel work
-
-Use parallel agents primarily for independent, bounded research tasks, and run as
-many as the published envelope allows. Under-using the allowance buys nothing.
-
-Prefer concise evidence handoffs rather than allowing every subagent to consume
-its entire context window: context is the scarce resource, and every token in
-flight is charged against the shared budget.
-
-If a task needs substantially more context than the subagent lane offers,
-perform it sequentially in the primary agent, or use the long-context lane if the
-primary model declares one, rather than exceeding the aggregate budget.
-
-### Long-running work
-
-Subagent and swarm wall-clock limits are unlimited. `timeout_ms = 0` in the
-rendered `config.toml` (`[subagent]` and `[swarm]`) is the only place to express
-that: those tables are policy-pinned and re-stamped at every start, while
-`KIMI_SUBAGENT_TIMEOUT_MS` and `KIMI_CODE_SWARM_TIMEOUT_MS` outrank the file and
-accept only a positive integer, so they cannot say "no limit".
-
-A long subagent run is bounded by the proxy instead. No upstream read may stall
-for longer than `MODEL_PROXY_SOCK_READ_TIMEOUT`, and one client request may not
-be retried for longer than `MODEL_PROXY_MAX_REQUEST_SECONDS`. Both exist so a
-wedged stream cannot keep a scarce permit; neither is a task-length limit, and
-hitting one is a reason to resume the work, not to redesign it.
-
-### Backpressure
-
-The provider may temporarily return HTTP 429 or server errors.
-
-Treat these as backpressure, not as a reason to increase concurrency.
-
-Allow the configured proxy to retry with backoff. Bookings are released while the
-proxy is backing off, so waiting for the provider never spends capacity, and a
-request queued behind a permit is not a failed request.
-
-Never work around a provider limit by opening additional connections, containers,
-credentials, or sessions.
 
 ## Project extensions
 

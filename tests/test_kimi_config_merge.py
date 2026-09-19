@@ -1,23 +1,17 @@
-import importlib.util
 import json
+import sys
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
-from types import ModuleType
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
+from tests.helpers import load_script  # noqa: E402
 
-def load(name: str, relative: Path) -> ModuleType:
-    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-merge = load("kimi_config_merge", Path("tools/kimi_config_merge.py"))
+merge = load_script("kimi_config_merge", Path("tools/kimi_config_merge.py"))
 
 BASELINE = """default_model = "qwen3-primary"
 default_permission_mode = "manual"
@@ -141,14 +135,23 @@ class MergeTests(unittest.TestCase):
         with self.assertRaises(merge.ConfigMergeError):
             merge.merge_text(BASELINE, self.policy, "default_model = ")
 
-    def test_unknown_top_level_values_from_the_baseline_are_preserved(self):
-        merged = merge.merge(self.baseline, self.policy, None)
-        self.assertEqual(merged["loop_control"]["reserved_context_size"], 8192)
+    def test_a_table_the_policy_never_mentions_survives_a_populated_current(self):
+        """The overlay is default-deny, so everything else comes from the baseline side.
+
+        ``current=None`` cannot show this: that path returns the baseline untouched, which
+        ``test_missing_current_yields_the_baseline`` already proves by whole-document equality.
+        The case worth pinning is a stored config that *was* parsed and simply has no such table.
+        """
+        self.baseline["novel"] = {"reserved": 8192}
+        merged = merge.merge(self.baseline, self.policy, {"default_model": "another-model"})
+        self.assertEqual(merged["novel"], {"reserved": 8192})
 
 
 class EmitterTests(unittest.TestCase):
     def test_repository_baseline_round_trips(self):
-        text = (ROOT / "runtime" / "config.toml").read_text().replace("__MODEL_PROXY_TOKEN__", "t")
+        # The repository baseline holds no proxy placeholder: render_runtime substitutes that
+        # into the generated tables, and test_render_runtime asserts it never survives there.
+        text = (ROOT / "runtime" / "config.toml").read_text()
         parsed = tomllib.loads(text)
         emitted = merge.emit(parsed)
         self.assertEqual(tomllib.loads(emitted), parsed)

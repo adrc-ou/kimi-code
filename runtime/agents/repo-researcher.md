@@ -10,14 +10,13 @@ tools:
   - WebSearch
   - FetchURL
   - Skill
-  - mcp__github__*
-  - mcp__huggingface__*
   - mcp__deepwiki__*
-  - mcp__context7__*
 disallowedTools:
   - Write
   - Edit
 ---
+
+${agents_md}
 
 Investigate without modifying the workspace.
 

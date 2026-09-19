@@ -33,9 +33,10 @@ runs, and a green result means nothing about fair-use enforcement.
    ./doctor.sh --full
    ```
 
-Quick mode checks Kimi web, proxy health, search-adapter health, authenticated
-enabled module service probes, and every enabled harness MCP server's initialization and
-tool catalog (including configured tool allowlists). It also calls Chrome's
+Quick mode checks Kimi web, proxy health, search-adapter health, the local
+toolchain (every launcher requirement present on `PATH`, and the Playwright CLI able to start),
+authenticated enabled module service probes, and every enabled harness MCP server's
+initialization and tool catalog (including configured tool allowlists). It also calls Chrome's
 `list_pages` to actually launch Chromium and Serena's `get_current_config` to
 detect missing project setup. Probes run concurrently, each bounded to 25 seconds.
 
@@ -107,9 +108,13 @@ return CAPTCHAs; a healthy container cannot rule that out.
 
 Stop the stack before changing `.env` or core or module `runtime/mcp.json`, then restart it.
 Do not paste credentials into chat, tracked JSON, shell command arguments, or a
-project MCP file. The two optional bearer variables below are now forwarded to
-the agent by Compose; declaring a variable in `.env` alone does not otherwise
-make it available inside a container.
+project MCP file. The credential variables below are forwarded to the agent by
+Compose; declaring a variable in `.env` alone does not otherwise make it available
+inside a container. Core `compose.yaml` forwards two of them,
+`GITHUB_PERSONAL_ACCESS_TOKEN` and `CONTEXT7_API_KEY`. `HF_TOKEN` is a third and is
+different: it is forwarded only by the ComfyUI module overlays, because the Hugging
+Face MCP entry lives in that module, so it reaches the container only while the
+module is selected.
 
 ### GitHub MCP: repository, issue and PR tools
 
@@ -242,13 +247,14 @@ ledger's `capacity` and `unit`. `./doctor.sh` condenses the same data to
 counter(s))`; a bare `HTTP ready` or a FAIL means the proxy has stopped
 verifying policy, not merely that it is slow.
 
-The same envelope is appended to the session's system prompt, so what Kimi was
-told is readable without a container shell: the staged copy is
-`.local/runtime/<instance>/SYSTEM.md` on the host, and
-`/home/agent/.kimi-code/SYSTEM.md` inside the sandbox. Check that the numbers
-there match `/healthz`; both come from the one plan, so a mismatch means a stale
-launch. `KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1` appends nothing at all, so a missing
-section is a setting rather than a fault — the proxy still enforces the plan.
+The same plan is composed into the two prompt documents, so what Kimi was told is
+readable without a container shell: the staged copies are
+`.local/runtime/<instance>/SYSTEM.md` and `.../AGENTS.md` on the host, and
+`/home/agent/.kimi-code/SYSTEM.md` and `.../AGENTS.md` inside the sandbox. Check
+that the numbers there match `/healthz`; both come from the one plan, so a mismatch
+means a stale launch. The launch panel can switch either block off, so a missing
+section is a setting rather than a fault — the proxy still enforces the plan, and
+`./prompts.sh --show` prints which blocks the next unattended launch will compose.
 
 With the shipped definitions the model advertises 1,000,000 tokens, of which
 262,144 are native and the rest requires YaRN extension upstream. The primary lane
@@ -373,7 +379,9 @@ prepares before the agent starts. Check both halves after any change to
 
    Every `UNPROTECTED` line must be absent, the rename above (the exact mechanism
    the settings UI uses) must succeed, and ordinary file tools in `/workspace`
-   must keep working. `chattr` exists in the image but cannot work without
+   must keep working. `container/Dockerfile` never installs `chattr` (the initializer
+   talks to the kernel through `fcntl.ioctl` instead), so the binary is only here through the
+   base image and could disappear on a rebase; it cannot work at all without
    `LINUX_IMMUTABLE`.
 4. Check what the agent can see of the host. Still inside `./shell.sh`:
 
@@ -395,64 +403,73 @@ prepares before the agent starts. Check both halves after any change to
    immutable flags. Read the `agent-state-init` service log; it fails closed
    with the path and ioctl that were rejected rather than starting an
    unprotected agent.
-6. Confirm the selected prompt and the appended envelope reached the model rather
-   than only the volume. The staged file is the input; what Kimi actually sent is
-   recorded in the session's `profile.bind` record. Inside `./shell.sh`, after at
-   least one turn of a new session:
+6. Confirm the selected prompt documents and the enabled add-on blocks reached the
+   model rather than only the volume. The staged files are the input; what Kimi
+   actually sent is recorded in the session's `profile.bind` record. Inside
+   `./shell.sh`, after at least one turn of a new session:
 
    ```bash
    python3 - <<'PY'
    import json, pathlib
    root = pathlib.Path("/workspace")
-   source = next((root / name for name in
-       ("SYSTEM.md", "SYSTEM.md.example") if (root / name).is_file()), None)
-   own = source.read_text() if source else ""
+   own = (root / "SYSTEM.md").read_text() if (root / "SYSTEM.md").is_file() else None
    staged = pathlib.Path("/home/agent/.kimi-code/SYSTEM.md")
-   text = staged.read_text() if staged.is_file() else ""
+   contract = pathlib.Path("/home/agent/.kimi-code/AGENTS.md")
+   prompt = staged.read_text() if staged.is_file() else ""
+   body = contract.read_text() if contract.is_file() else ""
    logs = sorted(pathlib.Path("/home/agent/.kimi-code/sessions").glob(
-       "*/agents/main/wire.jsonl"), key=lambda p: p.stat().st_mtime)
+       "*/*/agents/main/wire.jsonl"), key=lambda p: p.stat().st_mtime)
    for line in logs[-1].open():
        record = json.loads(line)
        if record.get("type") == "profile.bind":
-           prompt = record["systemPrompt"]
-           lines = own.strip().splitlines()
+           sent = record["systemPrompt"]
+           lines = (own or "").strip().splitlines()
            last = lines[-1].lstrip("# ").strip() if lines else ""
+           print("operator SYSTEM.md present:", own is not None)
            print("staged prompt starts with the prompt file:",
-                 not own.strip() or text.startswith(own.strip("\n")))
-           print("amending:", "${base_prompt}" in text)
-           print("built-in prompt kept:", prompt.startswith("You are "))
-           print("placeholder consumed:", "${base_prompt}" not in prompt)
-           print("prompt file kept:", not last or last in prompt)
-           print("envelope appended:", "Model runtime envelope" in prompt)
+                 not (own or "").strip() or prompt.startswith(own.strip("\n")))
+           print("amending:", "${base_prompt}" in prompt)
+           print("built-in prompt kept:", sent.startswith("You are "))
+           print("placeholder consumed:", "${base_prompt}" not in sent)
+           print("prompt file kept:", not last or last in sent)
+           print("lane table in prompt:", "Model runtime envelope" in sent)
+           print("parallel work in prompt:", "## Parallel work" in sent)
+           print("usage limits in contract:", "Model usage limits" in body)
            break
    PY
    ```
 
-   With `SYSTEM.md.example` in place and the flag at its default, expect
-   `staged prompt starts with the prompt file`, `amending`, `built-in prompt
-   kept`, `placeholder consumed`, `prompt file kept`, and `envelope appended` all
-   `True`. A `False` on `built-in prompt kept` while `amending` is `True` is a
-   bug: Kimi substitutes every occurrence of the placeholder, so a second one in
-   prose or a comment brings the built-in prompt in twice.
+   The last four lines are the panel's main-audience blocks for the prompt and the
+   contract's lane-audience block, so they track the selection rather than a fixed
+   expectation: an operator who switches a block off on the launch panel should see
+   that line read `False` and nothing else change. With `SYSTEM.md` absent and
+   everything left enabled, expect `operator SYSTEM.md present` `False`, then
+   `amending`, `built-in prompt kept`, `placeholder consumed`, `lane table in
+   prompt`, `parallel work in prompt`, and `usage limits in contract` all `True`. A
+   `False` on `built-in prompt kept` while `amending` is `True` is a bug: Kimi
+   substitutes every occurrence of the placeholder, so a second one in prose brings
+   the built-in prompt in twice.
 
-   A prompt file with no `${base_prompt}` is a supported replacement, not a
+   A `SYSTEM.md` with no `${base_prompt}` is a supported replacement, not a
    misconfiguration, and `amending` reads `False` for it. Then `built-in prompt
    kept` is expected to read `False` as well, and that is the point — nothing
    supplies the working directory, the applicable `AGENTS.md` files, the skills
    listing, or the plugin sections unless the prompt names those variables
-   itself. The envelope is the exception: it is appended after your text either
-   way, and only `KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE=1` removes it, which is when
-   `envelope appended` should read `False`. Check for the rest by reading the
-   recorded `prompt` before you accept a replacement prompt as working.
+   itself. The generated blocks are the exception: they are composed after your
+   text either way, and only switching them off on the panel removes them. Check
+   for the rest by reading the recorded `sent` prompt before you accept a
+   replacement prompt as working.
 
    An empty `SYSTEM.md` is a decision, not a missing file: the prompt file
-   contributes nothing, and the staged prompt is then exactly the appended
-   envelope. With the envelope omitted there is nothing left to say, and since
-   Kimi Code discards a prompt that is blank once trimmed, the staged file is a
-   lone period and the recorded `prompt` is that period — `built-in prompt kept`
-   reads `False`, which is what an empty prompt looks like from here. Only an
-   absent `SYSTEM.md` with an absent `SYSTEM.md.example` stages nothing, and that
-   is the case where Kimi supplies its own prompt.
+   contributes nothing, and the staged prompt is then exactly the enabled blocks.
+   With every block off there is nothing left to say, and since Kimi Code discards
+   a prompt that is blank once trimmed, the staged file is a lone period and the
+   recorded prompt is that period — `built-in prompt kept` reads `False`, which is
+   what a tabula rasa looks like from here. Only an absent `SYSTEM.md` stages
+   nothing at all, and that is the case where Kimi supplies its own prompt. Note
+   that `usage limits in contract` can still read `True` beside it: the all-lane
+   contract is a separate document with its own tier-one file, `CONTEXT.md`, and an
+   emptied `SYSTEM.md` says nothing about that one.
 
 ## 6. Optional module verification
 

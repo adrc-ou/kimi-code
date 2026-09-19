@@ -16,12 +16,17 @@ import tty
 from pathlib import Path
 
 if __package__:
+    from .definitions import ENV_VAR, ID
+    from .private_file import write_private_json
     from .safe_workspace_init import UnsafeWorkspace, components, initialize
 else:
+    from definitions import ENV_VAR, ID
+    from private_file import write_private_json
     from safe_workspace_init import UnsafeWorkspace, components, initialize
 
-ID = re.compile(r"[a-z][a-z0-9_]*\Z")
-ENV = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+#: A module directory name is an ``ID``, and an environment key an ``ENV_VAR``; both patterns are
+#: defined once in ``definitions.py`` because a name accepted there and rejected here would make
+#: a valid module impossible to select.
 
 
 def discover(root):
@@ -53,7 +58,7 @@ def discover(root):
             if not re.fullmatch(r"[a-z0-9][a-z0-9._/-]*", image):
                 raise ValueError("Invalid image name")
         for item in doc.get("environment", []):
-            if not ENV.fullmatch(item["name"]) or not isinstance(item.get("prompt"), str):
+            if not ENV_VAR.fullmatch(item["name"]) or not isinstance(item.get("prompt"), str):
                 raise ValueError("Invalid module environment declaration")
         result.append({**doc, "id": path.name, "path": path})
     return result
@@ -127,11 +132,11 @@ def choose(modules, previous, non_interactive):
 
 
 def write_json(path, value):
-    path.write_text(json.dumps(value, indent=2) + "\n")
-    path.chmod(0o600)
+    """Stage JSON at mode 0600, atomically, through the launcher's only such writer."""
+    write_private_json(path, value)
 
 
-def module_guidance(modules):
+def module_agents_text(modules):
     """The module text that has to reach the agent, staged for the system prompt.
 
     Each selected module's own ``AGENTS.md`` is the guidance, verbatim under a heading naming the
@@ -186,7 +191,7 @@ def assemble(root, runtime, modules, workspace):
     else:
         from render_runtime import MODULE_GUIDANCE_FILE, write_secret
 
-    write_secret(runtime / MODULE_GUIDANCE_FILE, module_guidance(modules))
+    write_secret(runtime / MODULE_GUIDANCE_FILE, module_agents_text(modules))
 
 
 def reconcile_installed(runtime, modules):
@@ -207,7 +212,10 @@ def reconcile_installed(runtime, modules):
         for image in images:
             if not re.fullmatch(r"[a-z0-9][a-z0-9._/-]*", image):
                 raise ValueError("Invalid stored image name")
-            tag = f"{image}:{os.environ['HARNESS_IMAGE_SUFFIX']}"
+            suffix = os.environ.get("HARNESS_IMAGE_SUFFIX")
+            if not suffix:
+                raise ValueError("HARNESS_IMAGE_SUFFIX must be set to remove a module image")
+            tag = f"{image}:{suffix}"
             exists = (
                 subprocess.run(
                     ["docker", "image", "inspect", tag],

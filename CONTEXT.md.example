@@ -1,0 +1,42 @@
+<!--
+  This is an EXAMPLE. Copy it to `CONTEXT.md` in this project root to take it into use;
+  nothing reads this file at launch. `CONTEXT.md` is the operating contract for every
+  agent in the session - the main agent and each subagent it starts - staged into
+  `~/.kimi-code/AGENTS.md` and injected into all of them. It is where behaviour belongs,
+  not voice. Tone, language, and reply shape belong in `SYSTEM.md`, which the main agent
+  alone receives.
+
+  Three states:
+
+    no CONTEXT.md  this harness's own contract is used, from `runtime/AGENTS.md`. That is
+                   the default and it is a real file with real authority, not a stub.
+    CONTEXT.md     whatever you write here, instead. The harness contract is then not
+                   loaded at all - this replaces it, it does not extend it.
+    empty          no contract for anyone. Rarely what you want, and worth saying: the
+                   project's own `AGENTS.md` still arrives alongside this, and you cannot
+                   switch that one off from here.
+
+  Template values. Two things read this text, and they substitute different names:
+
+    ${harness.date}   filled in by the launcher at staging, so it costs nothing to use
+    ${cwd} ${os} ...  filled in by Kimi Code in a system prompt, NOT here. Writing one of
+                      them in this file puts the literal characters in front of the model.
+                      `${agents_md}` is the one to be careful of: it names this very
+                      document, so referencing it from inside the document produces a
+                      sentence about itself rather than the contract.
+
+  HTML comments like this one are stripped at staging and never reach the model, so a
+  file you maintain can explain itself for free.
+-->
+
+# Project operating contract
+
+## What this workspace is
+
+The project here is built and tested as described in its own `AGENTS.md`, which arrives
+with this contract and outranks nothing in it. Where the two disagree about how a task
+is done in this repository, follow the project.
+
+## How to work here
+
+State your result in terms a reviewer can check. Staged on ${harness.date}.
