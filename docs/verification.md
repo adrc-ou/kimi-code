@@ -23,7 +23,7 @@ runs, and a green result means nothing about fair-use enforcement.
    | --- | --- |
    | `PASS` | The named check succeeded. Read the description for its scope. |
    | `SKIP` | The MCP server is disabled. It was not tested. |
-   | `SETUP` | The server runs but needs configuration, such as Serena project activation. |
+   | `SETUP` | The server runs but needs configuration, such as Serena project activation, or it declares a bearer variable the environment leaves empty and Kimi will not mount it. |
    | `MANUAL` | Authentication must be checked in Kimi, such as an OAuth connection. |
    | `FAIL` | The service failed, timed out, rejected credentials, or returned an unexpected tool/schema response. |
 
@@ -95,7 +95,7 @@ file; it does not merge project overrides or reuse Kimi's OAuth token store.
 | Hugging Face MCP | Hugging Face's servers | Public Hub access; optional HF account/token for authenticated access | When ComfyUI selected; only `hf_fs` exposed |
 | DeepWiki MCP | Hosted by Cognition | Public indexed repositories; no account required | On |
 | GitHub MCP | Executable in agent container, calling GitHub's API | GitHub account and PAT | Off; read-only toolsets configured |
-| Context7 MCP | Hosted by Upstash | Public access with limits; optional account/API key | Off |
+| Context7 MCP | Hosted by Upstash | No key needed; anonymous calls work at a reduced rate limit. A key raises limits and is the only route to private repositories | On |
 | NVIDIA CUDA docs MCP | NVIDIA's servers | NVIDIA Developer sign-in / OAuth | ComfyUI module; off until configured |
 | SearXNG | Separate local container | Queries outside search engines; no SearXNG account | On |
 | Search adapter | Separate local container | Uses only your SearXNG instance | On |
@@ -202,13 +202,28 @@ Private Devin access is a different service and is not configured here.
 
 ### Context7
 
-1. Sign in at the [Context7 dashboard](https://context7.com/dashboard) and create
-   an API key if you need authenticated access/higher limits.
-2. Set `CONTEXT7_API_KEY` in `.env`; the MCP entry uses that variable as a bearer token.
-3. Set `context7.enabled` to `true` in core or module `runtime/mcp.json`.
-4. Restart, which runs the full check by itself, then ask Kimi to resolve a library and query
-   its documentation. The automatic test covers resolution; test `query-docs`
-   separately with the returned library ID.
+No credential is required. Upstash documents anonymous basic usage on the same remote
+endpoint this harness uses, and the core `context7` entry carries no `bearerTokenEnvVar`,
+so a fresh launch gets both Context7 tools with nothing to configure. Anonymous calls
+land in a reduced shared rate limit that Context7 does not size in its own documentation,
+and that is the only thing a key changes: a free key raises the allowance to 1,000 calls
+per month, and private repositories need a paid plan.
+
+To authenticate anyway:
+
+1. Sign in at the [Context7 dashboard](https://context7.com/dashboard) and create an API key.
+2. Set `CONTEXT7_API_KEY` in `.env`.
+3. Add `"bearerTokenEnvVar": "CONTEXT7_API_KEY"` to the `context7` entry in core or module
+   `runtime/mcp.json`, then restart. Naming the variable is what sends it as a bearer token,
+   and it is also what makes Kimi require a non-empty value. With the variable declared and
+   empty, the server fails closed and contributes no tools at all, which is why the keyless
+   default omits the line instead of leaving it blank.
+4. Ask Kimi to resolve a library and query its documentation. The automatic test covers
+   resolution; test `query-docs` separately with the returned library ID.
+
+The quick check reports `SETUP`, not `PASS`, for any server that declares a bearer variable
+the environment leaves empty, so the keyless default cannot regress into an unmounted server
+without saying so.
 
 No local `npx` installation is needed. See [Context7's official setup](https://github.com/upstash/context7#installation).
 

@@ -53,6 +53,31 @@ class LanguageServerUnavailable(Exception):
 LANGUAGE_SERVER_STATUS = re.compile(r"^Language server status: (.*)$", re.MULTILINE)
 
 
+class UnmountedBearerVariable(Exception):
+    """Kimi will not mount a server whose declared bearer variable is empty.
+
+    Only the variable's name is carried, never its value, so the verdict stays reportable.
+    """
+
+    def __init__(self, variable):
+        super().__init__(variable)
+        self.variable = variable
+
+
+def unmounted_bearer_variable(config, env):
+    """Return the bearer variable that Kimi fails closed on, or ``None`` if there is none.
+
+    Kimi's remote MCP client rejects a server whose ``bearerTokenEnvVar`` names a variable that is
+    unset or empty, so that server never reaches a session at all. A probe cannot see this on its
+    own: connecting without the header still succeeds against services that accept anonymous calls,
+    which is how a server nobody can call gets reported as working.
+    """
+    variable = config.get("bearerTokenEnvVar")
+    if variable and not env.get(variable, "").strip():
+        return variable
+    return None
+
+
 def serena_language_server(text):
     """Return Serena's language server status, refusing to report success without one.
 
@@ -83,6 +108,12 @@ def classify_error(error):
         return "FAIL", (
             "no language server running, so symbol tools are unavailable; check that the image "
             "builds pyright-langserver and that ls_path in runtime/serena-config.yml names it"
+        )
+    if isinstance(error, UnmountedBearerVariable):
+        return "SETUP", (
+            f"reachable, but Kimi will not mount it: bearer variable {error.variable} is unset or "
+            "empty, so a session gets no tools from it; give it a value or remove "
+            "bearerTokenEnvVar and use the server anonymously"
         )
     if isinstance(error, NeedsSetup):
         return "SETUP", "Serena needs an active coding project; see verification guide"
@@ -140,6 +171,11 @@ async def mcp_probe(name, config, full):
         if not names:
             raise ValueError("no usable tools")
         detail = f"MCP initialized; {len(names)} configured tools discovered"
+        # Discovery above is anonymous, so it only proves the server answers. Kimi applies its own
+        # gate when loading the session, and a server it refuses to mount has no tools to report.
+        unmounted = unmounted_bearer_variable(config, os.environ)
+        if unmounted:
+            raise UnmountedBearerVariable(unmounted)
         # A server that answers its own tool calls is not yet one that can do its job: Chromium
         # has to actually start, and Serena's language servers have to have come up.
         call = SMOKE_CALLS.get(name) if full or name in {"chrome-devtools", "serena"} else None

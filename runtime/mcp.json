@@ -8,14 +8,13 @@
         "--toolsets=context,repos,issues,pull_requests"
       ],
       "cwd": "/workspace",
-      "enabled": false,
+      "enabled": true,
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
     },
     "context7": {
       "url": "https://mcp.context7.com/mcp",
-      "bearerTokenEnvVar": "CONTEXT7_API_KEY",
-      "enabled": false,
+      "enabled": true,
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
     },

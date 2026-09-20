@@ -284,16 +284,21 @@ Enabled by default:
 
 - DeepWiki;
 - Chrome DevTools;
-- Serena.
+- Serena;
+- Context7, which needs no credential at all: Upstash answers anonymous calls at a reduced
+  rate limit, so enabling it is a config flag, not a signup task.
 
 Disabled pending operator credentials or configuration:
 
-- GitHub;
-- Context7.
+- GitHub.
 
-The Context7 URL is already set to `https://mcp.context7.com/mcp`. Configure and
-authenticate one remote service at a time, create a fresh session, inspect `/mcp`,
-and make one harmless read-only call before enabling the next.
+Configure and authenticate one remote service at a time, create a fresh session,
+inspect `/mcp`, and make one harmless read-only call before enabling the next.
+
+Setting `CONTEXT7_API_KEY` raises Context7's limits and unlocks private repositories, but it
+changes nothing while `runtime/mcp.json` omits `bearerTokenEnvVar` from that entry. Adding the
+line is what activates the key, and it also makes Kimi require a non-empty value: an empty one
+fails the server closed instead of falling back to anonymous access.
 
 For GitHub, use a dedicated fine-grained read-only token restricted to required
 repositories. The Kimi process can access any token placed in its environment.

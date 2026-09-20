@@ -83,6 +83,19 @@ class ConfigurationTests(unittest.TestCase):
                     server, enabled, f"{path.name} grants the disabled server {server!r}"
                 )
 
+    def test_context7_is_mountable_without_a_credential(self):
+        """A server documented as keyless must not name a bearer variable.
+
+        Kimi's remote MCP client throws CONFIG_INVALID when ``bearerTokenEnvVar`` names a variable
+        that is unset or empty, and ``.env.example`` ships ``CONTEXT7_API_KEY=`` blank. Naming the
+        variable therefore removed every Context7 tool from the session while the anonymous probe,
+        which does not apply Kimi's gate, still reported a pass.
+        """
+        document = json.loads((ROOT / "runtime" / "mcp.json").read_text())
+        server = document["mcpServers"]["context7"]
+        self.assertTrue(server["enabled"], "Context7 needs no credential, so nothing gates it off")
+        self.assertNotIn("bearerTokenEnvVar", server)
+
     def test_every_role_file_carries_the_contract(self):
         """A file-discovered profile inherits nothing.
 

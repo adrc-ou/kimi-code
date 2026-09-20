@@ -22,6 +22,31 @@ class ServiceCheckTests(unittest.TestCase):
         self.assertEqual(status, "SETUP")
         self.assertNotIn("private project name", detail)
 
+    def test_bearer_verdict_names_the_variable_and_never_a_value(self):
+        status, detail = checks.classify_error(checks.UnmountedBearerVariable("CTX_KEY"))
+        self.assertEqual(status, "SETUP")
+        self.assertIn("CTX_KEY", detail)
+        self.assertIn("bearerTokenEnvVar", detail)
+
+    def test_declared_but_empty_bearer_variable_is_not_a_pass(self):
+        # An anonymous probe connects happily to a server Kimi will never mount, so the empty
+        # variable has to become the finding instead of a green check the operator trusts.
+        for value in ("", "   "):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    checks.unmounted_bearer_variable({"bearerTokenEnvVar": "CTX_KEY"},
+                                                     {"CTX_KEY": value}),
+                    "CTX_KEY",
+                )
+        self.assertIsNone(
+            checks.unmounted_bearer_variable({"bearerTokenEnvVar": "CTX_KEY"}, {"CTX_KEY": "k"})
+        )
+
+    def test_keyless_server_has_nothing_to_fail_closed_on(self):
+        self.assertIsNone(
+            checks.unmounted_bearer_variable({"url": "https://example.invalid"}, {})
+        )
+
     def test_allowlist_and_blocklist_match_exposed_tools(self):
         tools = [SimpleNamespace(name=name) for name in ("read", "write", "list")]
         self.assertEqual(checks.selected_tools(
