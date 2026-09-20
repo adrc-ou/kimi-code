@@ -234,13 +234,14 @@ cache_kimi_literals() {
   local log="${HARNESS_RUNTIME_DIR}/prompt-measure.log"
   local cache="${HARNESS_RUNTIME_DIR}/kimi-prompts"
   local attempt tmp
-  mkdir -p -- "${cache}" && chmod 700 -- "${cache}"
+  # A "--" is only portable in option position: BSD chmod reads one after the mode as a filename.
+  mkdir -p -- "${cache}" && chmod 700 "${cache}"
   tmp=$(mktemp) || return 0
   for ((attempt = 1; attempt <= 20; attempt++)); do
     sleep 3
     if harness_compose exec -T kimi-agent python3 /opt/kimi-runtime/tools/kimi_prompts.py \
         --print --image "${PROMPT_IMAGE_ID:-unknown}" >"${tmp}" 2>>"${log}"; then
-      if cp -- "${tmp}" "${cache}/literals.json" && chmod 600 -- "${cache}/literals.json"; then
+      if cp -- "${tmp}" "${cache}/literals.json" && chmod 600 "${cache}/literals.json"; then
         rm -f -- "${tmp}"
         return 0
       fi

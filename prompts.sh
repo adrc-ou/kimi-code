@@ -71,13 +71,14 @@ require_running_stack() {
 extract_literals() {
   local cache="${HARNESS_RUNTIME_DIR}/kimi-prompts"
   local tmp status=0 image
-  mkdir -p -- "${cache}" && chmod 700 -- "${cache}"
+  # A "--" is only portable in option position: BSD chmod reads one after the mode as a filename.
+  mkdir -p -- "${cache}" && chmod 700 "${cache}"
   tmp=$(mktemp) || exit 1
   image=$(harness_prompt_image_id)
   harness_compose exec -T kimi-agent python3 /opt/kimi-runtime/tools/kimi_prompts.py \
     --print --image "${image:-unknown}" >"${tmp}" || status=$?
   if [[ ${status} -eq 0 ]]; then
-    cp -- "${tmp}" "${cache}/literals.json" && chmod 600 -- "${cache}/literals.json" || status=$?
+    cp -- "${tmp}" "${cache}/literals.json" && chmod 600 "${cache}/literals.json" || status=$?
   else
     echo "the container did not extract a bundle; see the error above" >&2
   fi
