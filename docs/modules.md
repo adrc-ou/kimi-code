@@ -168,7 +168,7 @@ every published port to sit on `127.0.0.1` and every container to keep a
 read-only root filesystem.
 
 Optional `runtime/tools/service_<id>.py` files define `probe(full)` and return a
-short success description. The doctor discovers only selected probes and runs
+short success description. The launcher's checker discovers only selected probes and runs
 them with its bounded subprocess wrapper. Do not return response bodies,
 credentials or sensitive URLs in diagnostics.
 

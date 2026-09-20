@@ -28,8 +28,9 @@ may use at once are derived from the definitions you picked at launch.
 
 For startup status checks, functional tool tests, and step-by-step optional
 account setup, see [the verification guide](docs/verification.md). `./start.sh`
-runs a quick service/MCP check; use `./doctor.sh --full` while it is running for
-read-only functional probes. `./prompts.sh` inspects and edits the session context
+runs a quick service/MCP check at readiness and then the full functional pass in
+the background once the stack settles, recording both in
+`.local/runtime/<instance>/service-check.json`. `./prompts.sh` inspects and edits the session context
 described below without starting a session, and reports a prompt file you changed
 without restarting.
 
@@ -385,10 +386,15 @@ ownership to the configured agent UID/GID and stages operator-controlled content
 into those volumes: the rendered runtime `AGENTS.md` and `SYSTEM.md`, the merged
 MCP declaration, and the selected skills/agents/tools tree. It then writes
 `config.toml` by overlaying the user-owned keys from whatever the volume already
-holds onto the freshly rendered baseline. Everything it stages is root-owned and
-readable but never writable by the agent; the three files that sit inside the
-agent-owned Kimi home additionally carry ext4 per-file immutable flags, because
-owning a directory lets you unlink anything in it regardless of the file's
+holds onto the freshly rendered baseline, and writes Serena's global
+configuration from `runtime/serena-config.yml` into the Serena volume so that a
+session cannot leave the language server selection altered. Those two are
+agent-owned and re-pinned at every launch instead of flagged, because the tool
+that owns each file rewrites it through its own directory and an immutable flag
+would make that fatal at first use. Everything else it stages is root-owned and
+readable but never writable by the agent; the three files inside the agent-owned
+Kimi home additionally carry ext4 per-file immutable flags, because owning a
+directory lets you unlink anything in it regardless of the file's
 owner. That is what allows the Kimi home volume to be writable at all. The
 initializer mounts only its own script, the staging inputs, and those volumes: no
 workspace, Docker socket, network, or credentials. Kimi itself remains non-root

@@ -662,7 +662,7 @@ before and after whatever else happens, and nothing under
 on the next launch. Until that file exists a `${kimi.*}` reference is reported rather than
 guessed at, and `start.sh` refreshes it unattended after every build.
 
-Both the panel and `doctor.sh` compare the documents on disk against
+Both the panel and `start.sh` compare the documents on disk against
 `prompt-sources.json`, the digest record the renderer leaves beside the pair it staged,
 and name any file that moved afterwards: staged documents are immutable, so that edit
 needs a restart. At startup the panel deliberately skips the comparison, because it is

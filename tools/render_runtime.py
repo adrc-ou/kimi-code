@@ -171,8 +171,9 @@ def main() -> None:
     path.unlink(missing_ok=True)
     write_secret(path, content)
     # The staged documents are installed read-only and immutable, so an edit after this moment
-    # cannot take effect. Recording what each one was composed from is what lets prompts.sh and
-    # doctor.sh say that in words instead of leaving the operator to guess why nothing changed.
+    # cannot take effect. Recording what each one was composed from is what lets the launcher at
+    # readiness, and the prompt panel afterwards, say that in words instead of leaving the operator
+    # to guess why nothing changed.
     sources = args.runtime_dir / prompt_context.SOURCES_FILE
     sources.unlink(missing_ok=True)
     write_secret(sources, json.dumps(prompt_context.document_sources(args.root), indent=1) + "\n")

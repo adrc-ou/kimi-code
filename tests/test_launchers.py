@@ -28,7 +28,6 @@ class LauncherTests(unittest.TestCase):
             "start.sh",
             "shell.sh",
             "extensions.sh",
-            "doctor.sh",
             "prompts.sh",
             "tools/runtime.sh",
             "tools/modules.py",
@@ -159,16 +158,6 @@ exit 1
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No running runtime", result.stderr)
 
-    def test_doctor_reports_missing_runtime(self):
-        result = self.run_script("doctor.sh")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("No prepared runtime", result.stderr)
-
-    def test_doctor_rejects_unknown_arguments(self):
-        result = self.run_script("doctor.sh", "--unknown")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("usage:", result.stderr)
-
     def test_failed_command_diagnostic_does_not_echo_its_arguments(self):
         self.command("docker", "exit 17\n")
         result = self.run_script("start.sh", "--non-interactive")
@@ -286,7 +275,9 @@ if [[ "$*" == *"kimi --version" ]]; then echo 0.42.0; exit 0; fi
 if [[ "$*" == *"/register_workspace.py" ]]; then
   echo register-workspace >>"$TEST_EVENTS"; exit 0
 fi
-if [[ "$*" == *"/check_services.py" ]]; then echo check-services >>"$TEST_EVENTS"; exit 0; fi
+if [[ "$*" == *"/check_services.py"* ]]; then echo check-services >>"$TEST_EVENTS"; exit 0; fi
+if [[ "$*" == *"cp kimi-agent:"* ]]; then echo '{"mode":"fixture"}' >"${@: -1}"; exit 0; fi
+if [[ "$*" == *"logs --no-color"* ]]; then echo browser >>"$TEST_EVENTS"; exit 0; fi
 if [[ "$*" == *"up --remove-orphans"* ]]; then sleep 1; exit 0; fi
 exit 0
 """,
@@ -297,12 +288,17 @@ exit 0
             (self.base / "events").read_text().splitlines(),
             [
                 "configure", "kimi-version", "module-version", "prepare", "install",
-                "start", "register-workspace", "check-services",
+                "start", "register-workspace", "check-services", "browser",
             ],
         )
         data = self.workspace / "demo/user/data"
         data.write_text("keep")
         runtime = next((self.root / ".local/runtime").iterdir())
+        # The check runs before the browser is opened, so a probe never competes with the first
+        # session it displaces, and its report is carried out of the container and left private.
+        report = runtime / "service-check.json"
+        self.assertEqual(os.stat(report).st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(report.read_text()), {"mode": "fixture"})
         # A module's own guidance has exactly one route to the agent, and it is the all-lane
         # contract rather than the main agent's voice.
         contract = (runtime / "AGENTS.md").read_text()
@@ -320,7 +316,7 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             (self.base / "events").read_text(),
-            "kimi-version\nregister-workspace\ncheck-services\n",
+            "kimi-version\nregister-workspace\ncheck-services\nbrowser\n",
         )
         self.assertEqual(data.read_text(), "keep")
         self.assertNotIn("Demo instructions", (runtime / "AGENTS.md").read_text())
@@ -481,6 +477,35 @@ exit 99
                 result = self.run_script("prompts.sh", mode)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("is not running", result.stderr)
+
+
+class RetiredEntrypointTests(unittest.TestCase):
+    """`./doctor.sh` was a habit, and habits are what the launch is supposed to replace."""
+
+    def test_the_standalone_doctor_is_gone_and_unmentioned(self):
+        # Its value - the deep pass, the stale-prompt notice, a check that runs without being asked
+        # for - now happens on every launch. A reference that outlives the file would teach the
+        # next reader to run a command that no longer exists, so none may remain.
+        self.assertFalse((ROOT / "doctor.sh").exists(), "the retired launcher is back")
+        for path in sorted(ROOT.rglob("*")):
+            if (
+                not path.is_file()
+                or ".git" in path.parts
+                or ".local" in path.parts
+                or ".agent-state" in path.parts
+                or "__pycache__" in path.parts
+                or ".ruff_cache" in path.parts
+                or path.suffix in {".so", ".pyc"}
+            ):
+                continue
+            try:
+                text = path.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            where = path.relative_to(ROOT).as_posix()
+            if where == "tests/test_launchers.py":
+                continue  # this test, and only this one
+            self.assertNotIn("doctor.sh", text, f"{where} still points at ./doctor.sh")
 
 
 if __name__ == "__main__":

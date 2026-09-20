@@ -54,8 +54,8 @@ harness_init_readonly
   exit 1
 }
 
-# The two container-backed jobs share one precondition, checked the way doctor.sh checks it: by
-# label, so this script never has to open the credential-bearing resolved Compose file.
+# The two container-backed jobs share one precondition, checked by label rather than by reading the
+# compose files, so this script never has to open the credential-bearing resolved configuration.
 require_running_stack() {
   local container
   container=$(docker ps --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \

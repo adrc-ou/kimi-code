@@ -13,9 +13,10 @@ runs, and a green result means nothing about fair-use enforcement.
 ## 1. Start with the automatic checks
 
 1. Start the stack with `./start.sh`.
-2. After Kimi web becomes reachable, the launcher runs a quick service check.
-   It probes from inside the agent container, so DNS, networking, TLS and file
-   permissions match the agent's environment.
+2. After Kimi web becomes reachable, the launcher prints a quick service check
+   and then runs the full check unattended in the background once the stack has
+   settled. Both probe from inside the agent container, so DNS, networking, TLS
+   and file permissions match the agent's environment.
 3. Read every result:
 
    | Result | Meaning |
@@ -26,19 +27,38 @@ runs, and a green result means nothing about fair-use enforcement.
    | `MANUAL` | Authentication must be checked in Kimi, such as an OAuth connection. |
    | `FAIL` | The service failed, timed out, rejected credentials, or returned an unexpected tool/schema response. |
 
-4. In a second terminal, rerun either check while the stack stays running:
+4. The background pass writes its own verdict when it lands:
 
    ```bash
-   ./doctor.sh
-   ./doctor.sh --full
+   cat .local/runtime/<instance>/service-check.log
+   python3 -m json.tool .local/runtime/<instance>/service-check.json
    ```
+
+   The JSON report is whichever pass ran last, so it stamps itself with
+   `generated_at` and `mode` and holds one `{kind, name, status, detail}` entry
+   per check plus a `counts` summary and the exit verdict. It survives the launch
+   that produced it; the log, which also carries raw container output, does not.
+
+   Nothing has to be rerun to check a configuration change. The agent's MCP file
+   is an immutable staged copy, so an edit only takes effect after a restart, and
+   a restart checks the stack again by itself. To probe the running stack again
+   by hand, `./shell.sh` opens a container shell and
+   `/opt/serena/bin/python /opt/kimi-runtime/tools/check_services.py --full`
+   repeats the pass there.
 
 Quick mode checks Kimi web, proxy health, search-adapter health, the local
 toolchain (every launcher requirement present on `PATH`, and the Playwright CLI able to start),
 authenticated enabled module service probes, and every enabled harness MCP server's
 initialization and tool catalog (including configured tool allowlists). It also calls Chrome's
 `list_pages` to actually launch Chromium and Serena's `get_current_config` to
-detect missing project setup. Probes run concurrently, each bounded to 25 seconds.
+detect missing project setup. The Serena check only passes when that response
+also reports `Language server status: ready`; a server that initialises but whose
+language servers failed to start, or were never initialised, is a `FAIL` rather
+than a `PASS`, because every symbol tool is dead in that state. Probes run
+concurrently, each bounded to 25 seconds. A probe that never answers within its
+budget is retried once, because a container that is still busy starting produces a
+timeout no checker can attribute to a service; a probe that answers with a failure
+is reported immediately, and a result reached on the retry says so in its detail.
 
 Full mode allows 60 seconds per probe and adds a real public web search through
 the authenticated search adapter and SearXNG, enabled module functional probes,
@@ -49,18 +69,19 @@ repository queries, or arbitrary discovered tools are executed. MCP processes
 may create their ordinary local caches/logs; the browser probe uses an isolated
 profile, and probe process groups are terminated on completion or timeout.
 
-The standalone command exits `0` for successful checks (disabled servers may be
-skipped), `1` for a failure, and `2` for setup/manual work without other failures.
-Startup reports these results but keeps the stack running so you can diagnose it.
-Raw server responses, credentials and stderr are not printed by the checker.
-Use Kimi's `/mcp` and the service logs to investigate a failed connection.
+Each pass exits `0` for successful checks (disabled servers may be skipped), `1`
+for a failure, and `2` for setup/manual work without other failures. Startup
+records that verdict in the report and keeps the stack running so you can diagnose
+it; neither pass can fail a launch. Raw server responses, credentials and stderr
+are not printed by the checker, and the report holds only the redacted status
+lines. Use Kimi's `/mcp` and the service logs to investigate a failed connection.
 
 **A green check is not proof that every tool and every credential scope works.**
 Discovery proves that tools can be loaded; one read-only call proves that path
-works. Editing, private data access, project language servers, model-driven tool
-selection, OAuth sessions, and approved project/plugin extensions need the
-functional checks below. The checker uses the harness MCP file; it does not
-merge project overrides or reuse Kimi's OAuth token store.
+works. Editing, private data access, symbol queries against a specific project,
+model-driven tool selection, OAuth sessions, and approved project/plugin
+extensions need the functional checks below. The checker uses the harness MCP
+file; it does not merge project overrides or reuse Kimi's OAuth token store.
 
 ## 2. Understand what runs where
 
@@ -70,7 +91,7 @@ merge project overrides or reuse Kimi's OAuth token store.
 | Model policy proxy | Separate local container | The selected provider's credential | On |
 | Chrome DevTools MCP | Agent container; launches sandboxed Chromium | No account; browsed sites may require login | On |
 | Playwright CLI and skill | Agent container; browser automation | No account; website access is external | Installed; not a separate MCP server |
-| Serena MCP | Agent container; code navigation/refactoring and language servers | No hosted account; needs a coding project and its language tooling | On |
+| Serena MCP | Agent container; code navigation/refactoring and language servers | No hosted account; needs a coding project; its Python language server is built into the image and pinned by `runtime/serena-config.yml`, so nothing is downloaded at activation | On |
 | Hugging Face MCP | Hugging Face's servers | Public Hub access; optional HF account/token for authenticated access | When ComfyUI selected; only `hf_fs` exposed |
 | DeepWiki MCP | Hosted by Cognition | Public indexed repositories; no account required | On |
 | GitHub MCP | Executable in agent container, calling GitHub's API | GitHub account and PAT | Off; read-only toolsets configured |
@@ -130,7 +151,8 @@ module is selected.
 6. Copy the token once into `GITHUB_PERSONAL_ACCESS_TOKEN` in your local `.env`.
 7. In core or module `runtime/mcp.json`, change only `github.enabled` to `true`. Keep `--read-only`
    and the limited toolsets.
-8. Restart. Run `./doctor.sh --full`; `get_me` verifies authentication. Then ask
+8. Restart, which runs the full check by itself; its `get_me` call is what
+   verifies authentication. Then ask
    Kimi to read a known file, list issues, and list PRs in each selected repository.
    Identity success alone does not validate repository permissions.
 
@@ -162,7 +184,7 @@ For authenticated access:
    [Access Tokens](https://huggingface.co/settings/tokens).
 4. Set `HF_TOKEN` in `.env`. The harness MCP entry uses
    `bearerTokenEnvVar: "HF_TOKEN"`; keep `enabledTools: ["hf_fs"]`.
-5. Restart and run the full doctor check. Then test any specific private/gated
+5. Restart, which runs the full check by itself. Then test any specific private/gated
    repository you need in Kimi. Gated models also require accepting the model's
    access terms; a token alone does not grant access.
 
@@ -184,7 +206,7 @@ Private Devin access is a different service and is not configured here.
    an API key if you need authenticated access/higher limits.
 2. Set `CONTEXT7_API_KEY` in `.env`; the MCP entry uses that variable as a bearer token.
 3. Set `context7.enabled` to `true` in core or module `runtime/mcp.json`.
-4. Restart, run `./doctor.sh --full`, then ask Kimi to resolve a library and query
+4. Restart, which runs the full check by itself, then ask Kimi to resolve a library and query
    its documentation. The automatic test covers resolution; test `query-docs`
    separately with the returned library ID.
 
@@ -199,7 +221,7 @@ No local `npx` installation is needed. See [Context7's official setup](https://g
    flow. Use `./shell.sh`, then `kimi`, to open the TUI if needed.
 4. Check `/mcp` in a fresh session and ask for CUDA documentation with a source link.
 
-Once the server is enabled, the doctor reports it as `MANUAL`: its independent MCP
+Once the server is enabled, the service check reports it as `MANUAL`: its independent MCP
 client does not read or copy Kimi's OAuth token store. If browser callback handling
 fails across Docker, use the web UI's MCP authentication controls and inspect the
 reported flow error; do not put OAuth tokens in tracked JSON or open arbitrary ports
@@ -242,7 +264,7 @@ for the selection; then per lane its alias, model, endpoint, credential, context
 window, input cap, output clamp, computed reservation, whether that reservation
 runs alone, and the counter ids it holds. `counters` reports each context gate's
 `context_budget` against its provider threshold, and `rates` each rolling
-ledger's `capacity` and `unit`. `./doctor.sh` condenses the same data to
+ledger's `capacity` and `unit`. The launcher's quick check condenses the same data to
 `policy enforced (3 lanes; 5 subagent permits; context budget 332500; rate 1
 counter(s))`; a bare `HTTP ready` or a FAIL means the proxy has stopped
 verifying policy, not merely that it is slow.
@@ -292,7 +314,7 @@ Do not test by bypassing the proxy or launching extra concurrent model sessions.
 
 Open a **fresh Kimi session** after configuration changes. Run `/mcp` and compare
 its enabled servers/tools with core or module `runtime/mcp.json`. Project MCP entries override
-same-named user entries, so the standalone doctor's result may differ from that
+same-named user entries, so the launcher's check may differ from that
 session. `/mcp-config` edits to the harness MCP declaration do not persist: the
 agent's copy is an immutable staged file, so configure servers on the host and
 restart. Section 5 shows how to confirm settings persistence.
@@ -318,9 +340,14 @@ Serena's current `--project-from-cwd` setting discovers `.git` or
 automatically a code project. Activate the actual repository you intend to edit
 (for example a custom-node repository), rather than initializing Git over model
 storage merely to silence the check. Activation/onboarding may create project
-metadata and download required language servers. Confirm the language backend
-works using real symbol queries. A separately activated project in a session is
-not necessarily the next doctor's default project.
+metadata; it will not download a language server for Python, because the image
+already builds the pinned `pyright-langserver` and `runtime/serena-config.yml`
+names it through `ls_specific_settings`. That file is where Serena's global
+settings are changed: the initializer re-stages it at every launch, and a
+project's `.serena/project.yml` cannot redirect a language server because the
+workspace is deliberately untrusted. Confirm the language backend works using
+real symbol queries. A separately activated project in a session is not
+necessarily the next check's default project.
 
 For write/refactoring tools, use only a disposable source fixture: rename its
 function, verify references still run, then undo the edit. For Serena memory
@@ -484,7 +511,7 @@ This uploads a tiny fixture, executes an `EmptyImage → SaveImage` workflow,
 waits for completion, downloads the result into
 `comfyui/output/acceptance-download`, and checks network/credential isolation
 and read-only extension mounts. It requires no downloaded model weights.
-It does write test input/output files, unlike the routine doctor probes.
+It does write test input/output files, unlike the routine service probes.
 Inspect the resulting 64×64 image. This validates workflow execution and file
 transfer, but not a particular model's numerical correctness or performance.
 Run one small known workflow for each model/custom-node combination you depend on.
@@ -501,7 +528,8 @@ MCP servers need their own equivalent connection, read and disposable-write test
 - A UI settings change saved without an error and survived a restart, and the
   agent's mount table contains no harness file paths beyond its workspace and any
   approved project-extension snapshots.
-- Quick and full doctor checks have no unexplained failures; every `SETUP` or
+- The quick and full service checks the launcher ran have no unexplained
+  failures; every `SETUP` or
   `MANUAL` result has been resolved or explicitly recorded as unused.
 - Each relevant tool family has an observed successful call with checked output.
 - GitHub/private repository access and OAuth are tested separately from discovery.

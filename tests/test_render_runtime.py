@@ -141,7 +141,7 @@ class RenderRuntimeTests(LaunchSteps, unittest.TestCase):
             self.assertFalse((state / "user-agents").exists())
 
     def test_the_staged_documents_are_recorded_beside_themselves(self):
-        """The sidecar is what lets doctor.sh explain an edit that had no effect.
+        """The sidecar is what lets the launcher explain an edit that had no effect.
 
         Nothing the agent can read may carry a credential, but the mode and the rotation behaviour
         are still the renderer's to get right: this file names operator documents, and it is

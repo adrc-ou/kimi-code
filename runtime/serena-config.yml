@@ -1,0 +1,88 @@
+# Serena's global configuration, owned by the launcher.
+#
+# container/initialize-agent-state.py stages this into the serena-state volume as
+# serena_config.yml before the agent container starts, so whatever a session writes here is
+# re-pinned at the next launch. Every value is stated rather than left to Serena's default so
+# that this file is the whole answer to "what does Serena run with", and so that a Serena
+# upgrade changing a default shows up as a deliberate diff instead of a silent behaviour shift.
+#
+# Serena refuses to start if the `projects` key is absent, so it is present even though the
+# list is empty at launch.
+#
+# language server protocol backend: the JetBrains backend needs an IDE this container cannot
+# reach.
+language_backend: LSP
+
+line_ending: native
+
+gui_log_window: false
+
+# The dashboard is what makes a dead language server visible to a human, and `--open-web-dashboard
+# false` in runtime/mcp.json already keeps it from trying to open a browser that is not there.
+web_dashboard: true
+web_dashboard_open_on_launch: true
+web_dashboard_interface:
+web_dashboard_listen_address: 127.0.0.1
+web_dashboard_trusted_hosts:
+- 127.0.0.1
+- localhost
+
+jetbrains_plugin_server_address: 127.0.0.1
+jetbrains_launch_command:
+
+log_level: 20
+
+trace_lsp_communication: false
+
+# Serena resolves pyright at startup by running `uvx -p 3.13 --from pyright==<pin>
+# pyright-langserver`, keeping uv's state under $HOME. The agent container has a read-only root
+# filesystem and no writable $HOME path for uv, so that spawn dies with "Read-only file system
+# (os error 30)" and every symbol tool then reports that the language server manager is not
+# initialised. The image builds pyright from container/package-lock.json instead, at the version
+# Serena itself pins, and `ls_path` launches it directly, bypassing uv entirely.
+#
+# This setting cannot live in the project's .serena/project.yml: Serena ignores project-level
+# ls_specific_settings unless the project path is trusted, and the workspace is deliberately not
+# trusted, because the session can write it.
+ls_specific_settings:
+  python:
+    ls_path: /usr/local/bin/pyright-langserver
+
+ls_priorities:
+
+ignored_paths: []
+
+read_only_memory_patterns: []
+
+ignored_memory_patterns: []
+
+tool_timeout: 240
+
+excluded_tools: []
+
+included_optional_tools: []
+
+fixed_tools: []
+
+base_modes:
+- interactive
+- editing
+
+default_modes:
+
+default_max_tool_answer_chars: 150000
+
+token_count_estimator: CHAR_COUNT
+
+symbol_info_budget: 10
+
+project_serena_folder_location: "$projectDir/.serena"
+
+# Serena's own default trusts every path, which would let a session point a language server at an
+# arbitrary executable through .serena/project.local.yml. Nothing in this container needs that:
+# the workspace is agent-writable, so an accepted project is never a source of authority.
+trusted_project_path_patterns: []
+
+# Populated by Serena itself: runtime/mcp.json starts the server with --project-from-cwd, which
+# registers /workspace on first use.
+projects: []

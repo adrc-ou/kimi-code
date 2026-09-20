@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import sys
@@ -49,6 +50,7 @@ class Fixture:
         (self.stage / "SYSTEM.md").write_text("")
         (self.stage / "kimi-config.toml").write_text(BASELINE)
         shutil.copy(ROOT / "runtime" / "config-policy.json", self.stage / "config-policy.json")
+        shutil.copy(ROOT / "runtime" / "serena-config.yml", self.stage / "serena-config.yml")
         for category in ("skills", "agents", "tools"):
             (self.assets_source / category).mkdir(parents=True)
         (self.assets_source / "skills" / "playwright-cli").mkdir()
@@ -93,6 +95,36 @@ class StagingTests(unittest.TestCase):
         (self.fixture.stage / "AGENTS.md").unlink()
         with self.assertRaises(init.StagingError):
             init.stage_managed_files(self.fixture.stage, self.fixture.home, GID)
+
+    def stage_serena(self):
+        return init.stage_serena_config(
+            self.fixture.stage, self.fixture.serena, os.getuid(), GID
+        )
+
+    def test_serena_config_is_staged_as_agent_owned_writable_content(self):
+        target = self.stage_serena()
+        info = target.stat()
+        self.assertEqual(target.name, init.SERENA_CONFIG_TARGET)
+        self.assertEqual(info.st_uid, os.getuid())
+        self.assertEqual(info.st_mode & 0o777, 0o600)
+        self.assertEqual(
+            target.read_text(),
+            (self.fixture.stage / init.SERENA_CONFIG_SOURCE).read_text(),
+        )
+        # Serena re-saves this file itself when it registers the project it was pointed at, so
+        # the flag that protects the managed kimi-home files would make first use fatal.
+        self.require_immutable.assert_not_called()
+
+    def test_serena_config_edited_by_a_session_is_re_pinned_at_the_next_launch(self):
+        target = self.stage_serena()
+        target.write_text("language_backend: JetBrains\nprojects: []\n")
+        self.stage_serena()
+        self.assertIn("language_backend: LSP", target.read_text())
+
+    def test_missing_serena_config_source_fails_closed(self):
+        (self.fixture.stage / init.SERENA_CONFIG_SOURCE).unlink()
+        with self.assertRaises(init.StagingError):
+            self.stage_serena()
 
     def test_assets_tree_is_readable_and_only_executables_stay_executable(self):
         count = init.stage_assets_tree(self.fixture.stage, self.fixture.assets, GID)
@@ -269,6 +301,48 @@ class StaticPolicyTests(unittest.TestCase):
                         "KIMI_EMPTY_USER_SKILLS", "KIMI_EMPTY_USER_PLUGINS"):
             self.assertNotIn(retired, self.compose)
         self.assertIn("KIMI_SYSTEM_MD", self.compose)
+
+
+class SerenaConfigTemplateTests(unittest.TestCase):
+    """What the shipped Serena configuration has to satisfy to start at all."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.document = (ROOT / "runtime" / init.SERENA_CONFIG_SOURCE).read_text()
+
+    def test_the_one_key_serena_refuses_to_default_is_present(self):
+        # Serena aborts with "`projects` key not found in Serena configuration" rather than
+        # treating a missing project list as empty.
+        self.assertIn("\nprojects: []\n", self.document)
+
+    def test_the_python_language_server_is_the_binary_the_image_builds(self):
+        self.assertIn("ls_path: /usr/local/bin/pyright-langserver", self.document)
+        dockerfile = (ROOT / "container" / "Dockerfile").read_text()
+        self.assertIn(
+            "ln -s /opt/node-tools/node_modules/.bin/pyright-langserver"
+            " /usr/local/bin/pyright-langserver",
+            dockerfile,
+        )
+
+    def test_the_workspace_is_not_a_trusted_project_path(self):
+        # Serena's own default is ["**"], which would let a session name an arbitrary language
+        # server executable through the agent-writable .serena/project.local.yml.
+        self.assertIn("trusted_project_path_patterns: []", self.document)
+
+    def test_pyright_is_pinned_and_hashed_in_the_reviewed_lock(self):
+        manifest = json.loads((ROOT / "container" / "package.json").read_text())
+        lock = json.loads((ROOT / "container" / "package-lock.json").read_text())
+        pin = manifest["dependencies"]["pyright"]
+        entry = lock["packages"]["node_modules/pyright"]
+        self.assertEqual(entry["version"], pin)
+        self.assertTrue(entry["integrity"].startswith("sha512-"), entry.get("integrity"))
+        self.assertEqual(sorted(entry["bin"]), ["pyright", "pyright-langserver"])
+
+    def test_the_initializer_mounts_and_stages_it(self):
+        compose = (ROOT / "compose.yaml").read_text()
+        self.assertIn("- ./runtime/serena-config.yml:/stage/serena-config.yml:ro", compose)
+        initializer = (ROOT / "container" / "initialize-agent-state.py").read_text()
+        self.assertIn("stage_serena_config(args.stage, args.serena_home", initializer)
 
 
 if __name__ == "__main__":

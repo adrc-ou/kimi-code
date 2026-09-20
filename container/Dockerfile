@@ -79,12 +79,17 @@ RUN test -n "${KIMI_CODE_VERSION}" \
     && rm /tmp/kimi-code.tar.gz \
     && kimi --version
 
-# Local browser tooling still requires Node.js. Install from the reviewed lock.
+# Node.js carries the local browser tooling and Serena's Python language server. Both are baked
+# in at build time from the reviewed lock: the agent container's root filesystem is read-only and
+# $HOME has no writable state directory, so Serena's default of resolving pyright through `uvx`
+# at startup can never succeed here. Keep the pin on Serena's own PYRIGHT_VERSION, which
+# runtime/serena-config.yml selects through ls_path.
 WORKDIR /opt/node-tools
 COPY container/package.json container/package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts \
     && ln -s /opt/node-tools/node_modules/.bin/chrome-devtools-mcp /usr/local/bin/chrome-devtools-mcp \
-    && ln -s /opt/node-tools/node_modules/.bin/playwright-cli /usr/local/bin/playwright-cli
+    && ln -s /opt/node-tools/node_modules/.bin/playwright-cli /usr/local/bin/playwright-cli \
+    && ln -s /opt/node-tools/node_modules/.bin/pyright-langserver /usr/local/bin/pyright-langserver
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_GC=1
@@ -132,6 +137,11 @@ USER ${AGENT_UID}:${AGENT_GID}
 ENV HOME=/home/agent
 ENV KIMI_CODE_HOME=/home/agent/.kimi-code
 ENV CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS=1
+
+# npm defaults its cache to $HOME/.npm, which cannot be created: only the paths above are
+# writable under the read-only root filesystem. Point it at the .cache tmpfs instead so that
+# in-session npm commands work the way XDG_CONFIG_HOME already does for other tool state.
+ENV npm_config_cache=/home/agent/.cache/npm
 
 WORKDIR /workspace
 

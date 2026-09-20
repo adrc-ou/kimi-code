@@ -3,6 +3,7 @@
 
 Use /opt/serena/bin/python: its pinned environment already contains the MCP SDK.
 No model inference, GPU jobs, or arbitrary discovered tool calls are performed.
+``--report PATH`` records the same conclusions as JSON for the launcher to keep.
 """
 
 from __future__ import annotations
@@ -13,13 +14,18 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
+from collections import Counter
 from contextlib import AsyncExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 
 CONFIG = Path("/home/agent/.kimi-code/mcp.json")
+# One retry, and only for a timeout. See run_probe.
+PROBE_ATTEMPTS = 2
 SMOKE_CALLS = {
     "chrome-devtools": ("list_pages", {}),
     "serena": ("get_current_config", {}),
@@ -40,6 +46,32 @@ class NeedsSetup(Exception):
     """A reachable server needs operator configuration before it is useful."""
 
 
+class LanguageServerUnavailable(Exception):
+    """Serena answered, but none of the language servers behind its symbol tools are running."""
+
+
+LANGUAGE_SERVER_STATUS = re.compile(r"^Language server status: (.*)$", re.MULTILINE)
+
+
+def serena_language_server(text):
+    """Return Serena's language server status, refusing to report success without one.
+
+    ``get_current_config`` is a successful call whether or not any language server started, so
+    the status line inside its text is the only part of it that a symbol tool depends on. The
+    status is ``ready``, ``not initialized``, or ``error (<reason>)``; the reason is Serena's own
+    exception text, which is never surfaced here.
+    """
+    match = LANGUAGE_SERVER_STATUS.search(text)
+    if match is None:
+        raise NeedsSetup("activate a coding project in Serena before symbol tools")
+    status = match.group(1).strip()
+    if status.startswith("error"):
+        raise LanguageServerUnavailable(status)
+    if status != "ready":
+        raise NeedsSetup(f"Serena language server is {status}")
+    return status
+
+
 def classify_error(error):
     # Async MCP transports wrap tool errors in ExceptionGroup on context exit.
     if isinstance(error, BaseExceptionGroup):
@@ -47,6 +79,11 @@ def classify_error(error):
         if not results:  # an empty group reports no cause, which is a failure, not a setup
             return "FAIL", "MCP transport failed without reporting a cause"
         return next((result for result in results if result[0] == "SETUP"), results[0])
+    if isinstance(error, LanguageServerUnavailable):
+        return "FAIL", (
+            "no language server running, so symbol tools are unavailable; check that the image "
+            "builds pyright-langserver and that ls_path in runtime/serena-config.yml names it"
+        )
     if isinstance(error, NeedsSetup):
         return "SETUP", "Serena needs an active coding project; see verification guide"
     status = getattr(getattr(error, "response", None), "status_code", None)
@@ -103,7 +140,8 @@ async def mcp_probe(name, config, full):
         if not names:
             raise ValueError("no usable tools")
         detail = f"MCP initialized; {len(names)} configured tools discovered"
-        # Starting Chromium catches failures that MCP discovery alone cannot.
+        # A server that answers its own tool calls is not yet one that can do its job: Chromium
+        # has to actually start, and Serena's language servers have to have come up.
         call = SMOKE_CALLS.get(name) if full or name in {"chrome-devtools", "serena"} else None
         if call and call[0] in names:
             result = await session.call_tool(*call)
@@ -113,6 +151,12 @@ async def mcp_probe(name, config, full):
                 ):
                     raise NeedsSetup("activate a coding project in Serena before symbol tools")
                 raise ValueError("smoke tool returned an error")
+            if name == "serena":
+                # get_current_config answers normally even when no language server ever started,
+                # and it is the language servers that every symbol tool depends on.
+                detail += "; language server " + serena_language_server(
+                    "\n".join(getattr(item, "text", "") for item in result.content)
+                )
             if name == "huggingface":
                 records = (result.structuredContent or {}).get("results", [])
                 if not records or not all(
@@ -192,36 +236,75 @@ def service_probe(name, full):
 
 
 def run_probe(kind, name, full, config_path, timeout):
+    """Run one probe in its own process group, retrying once if it never answers.
+
+    A timeout is the one result that cannot be told apart from a cold start: while the stack comes
+    up, the agent container is also starting Chromium, the language servers and the first session,
+    and a probe that could not get a child scheduled has not yet shown anything about its server.
+    Only that case pays for a second bounded window. A probe that answers with a failure, a bad
+    status or an unusable response is reported the moment it speaks.
+    """
     command = [sys.executable, str(Path(__file__).resolve()), "--worker", kind,
                "--name", name, "--config", str(config_path)]
     if full:
         command.append("--full")
-    process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, start_new_session=True,
-    )
-    try:
-        output, _ = process.communicate(timeout=timeout)
-        if process.returncode:
-            return "FAIL", "probe process failed; see verification guide"
-        return tuple(json.loads(output))
-    except subprocess.TimeoutExpired:
-        return "FAIL", f"timed out after {timeout}s; check /mcp and service logs"
-    except (ValueError, TypeError):
-        return "FAIL", "invalid probe response"
-    finally:
-        # Also reap browser/language-server descendants left behind by a probe.
+    for attempt in range(PROBE_ATTEMPTS):
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, start_new_session=True,
+        )
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+            output, _ = process.communicate(timeout=timeout)
+            if process.returncode:
+                return "FAIL", "probe process failed; see verification guide"
+            status, detail = json.loads(output)
+            if attempt:
+                detail = f"{detail}; retried after a timeout"
+            return status, detail
+        except subprocess.TimeoutExpired:
+            continue
+        except (ValueError, TypeError):
+            return "FAIL", "invalid probe response"
+        finally:
+            # Also reap browser/language-server descendants left behind by a probe.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+    return "FAIL", (
+        f"timed out after {timeout}s on each of {PROBE_ATTEMPTS} attempts; "
+        "check /mcp and service logs"
+    )
+
+
+def write_report(path, mode, results, code):
+    """Record what this pass concluded, so the verdict outlives the terminal that printed it.
+
+    The launcher copies this file to the host, which is the only way a result stays readable after
+    the stack is down; nobody has to rerun a check to find out what the last launch concluded. The
+    detail strings are the redacted ones the probes and classify_error already produce: never a
+    response body, a credential, or a path from inside a server's own error text.
+    """
+    if __package__:
+        from .private_file import write_private_json
+    else:
+        from private_file import write_private_json
+    write_private_json(path, {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "mode": mode,
+        "exit_code": code,
+        "counts": dict(Counter(result["status"] for result in results)),
+        "checks": sorted(results, key=lambda result: (result["kind"], result["name"])),
+    })
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--config", type=Path, default=CONFIG)
+    parser.add_argument("--report", type=Path,
+                        help="write a machine-readable summary of this pass to PATH")
     parser.add_argument("--worker", choices=("mcp", "service"), help=argparse.SUPPRESS)
     parser.add_argument("--name", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -246,12 +329,17 @@ def main():
                 for path in Path(__file__).parent.glob("service_*.py"))
     print("Service check (full)" if args.full else "Service check (quick)", flush=True)
     manual = False
+    results = []
     for name, server in config.items():
         if not server.get("enabled", True):
             print(f"SKIP  MCP {name}: disabled", flush=True)
+            results.append({"kind": "mcp", "name": name, "status": "SKIP",
+                            "detail": "server is disabled"})
         elif server.get("auth") == "oauth" or name == "nvidia-cuda-docs":
             print(f"MANUAL MCP {name}: verify OAuth connection in Kimi /mcp", flush=True)
             manual = True
+            results.append({"kind": "mcp", "name": name, "status": "MANUAL",
+                            "detail": "OAuth connection is checked in Kimi"})
         else:
             jobs.append(("mcp", name))
     failed = False
@@ -265,9 +353,13 @@ def main():
             status, detail = future.result()
             failed |= status == "FAIL"
             manual |= status == "SETUP"
+            results.append({"kind": kind, "name": name, "status": status, "detail": detail})
             print(f"{status:5} {kind} {name}: {detail}", flush=True)
     print("Scope: harness MCP config only; project/plugin tools + model routing need Kimi checks.")
-    return 1 if failed else 2 if manual else 0
+    code = 1 if failed else 2 if manual else 0
+    if args.report:
+        write_report(args.report, "full" if args.full else "quick", results, code)
+    return code
 
 
 if __name__ == "__main__":

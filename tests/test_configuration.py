@@ -520,7 +520,8 @@ class ResolvedEnvelopeTests(unittest.TestCase):
                 self.assertIn(f"{value:,}", readme, f"README does not state the {name}")
         fan_out = self.plan["limits"]["subagent_concurrency"]
         self.assertIn(f"which is {fan_out} at once", readme)
-        # doctor.sh's condensed line is documented with the same budget, lane and permit count.
+        # The condensed line the launcher prints is documented with the same budget, lane and
+        # permit count.
         self.assertIn(f"context budget {counter['budget']}", verification)
         self.assertIn(f"{fan_out} subagent permits", verification)
         self.assertIn(f"{len(self.lanes)} lanes", verification)

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-09-14",
+  "generated_at": "2026-09-19",
   "images": {
     "ghcr.io/astral-sh/uv:0.8.22": "sha256:9874eb7afe5ca16c363fe80b294fe700e460df29a55532bbfea234a0f12eddb1",
     "golang:1.27-bookworm": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
@@ -15,7 +15,7 @@
   },
   "files": {
     "proxy/requirements.lock": "sha256:476e040b96fd0542472a586a144c094c2136ae724ad4d5e8951b0f1293e61810",
-    "container/package-lock.json": "sha256:f292053c71df1147be8ee1f0a1ab40e10a22d6dd69b399832b8ad7d75e4df385",
+    "container/package-lock.json": "sha256:7488f388ed9b9ba3e57a177c493fce73ef735fbb0b1b030a03efb82a8cbd1a8f",
     "container/serena.lock": "sha256:cb1f3d408c0a91f34c8b3701cba1e789312f91e8f72880b42bf5dd1d197e1001",
     "proxy/Dockerfile": "sha256:61fccbfccc433a79b1cb3748c3e7b9e306a8802dda2e09218b5c621d7bcb47eb",
     "search-adapter/Dockerfile": "sha256:143b6cfabe9b82b024825d0696e531b6139cb034fd5c68e4684c235ff49dcd03"

@@ -49,6 +49,18 @@ mount:
   session, and the agent cannot clear it because it does not hold
   `LINUX_IMMUTABLE`. Staging fails closed if the volume filesystem does not
   honour the flag;
+- Serena's global configuration is staged the same way but is intentionally *not*
+  flagged: `runtime/serena-config.yml` becomes `serena_config.yml` in the Serena
+  volume, agent-owned mode `0600`, because Serena re-saves that whole document
+  when it registers a project and an immutable flag would turn its first use
+  into a fatal error. What protects the content is that the initializer
+  overwrites it at every launch, so the language server selection stays the
+  launcher's: it names the `pyright-langserver` built into the image rather than
+  one uv downloads into a `$HOME` that is read-only here. A session cannot
+  redirect a language server through the workspace either, because project-level
+  `ls_specific_settings` is honoured only for a trusted project path and the
+  staged configuration pins `trusted_project_path_patterns` to an empty list
+  even though Serena's own default would trust every path;
 - the prompt records the harness keeps beside the rest of its per-instance state —
   the panel's choices (`prompt-context.json`), the digests of what was staged
   (`prompt-sources.json`), measured prompt sizes

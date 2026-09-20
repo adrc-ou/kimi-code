@@ -29,6 +29,10 @@ FS_IMMUTABLE_FL = 0x00000010
 MANAGED_FILES = {"AGENTS.md": "AGENTS.md", "SYSTEM.md": "SYSTEM.md", "mcp.json": "assets/mcp.json"}
 SUPPRESSED_DIRECTORIES = ("agents", "skills", "plugins")
 
+# Serena's global configuration, named as Serena names it inside its own state volume.
+SERENA_CONFIG_SOURCE = "serena-config.yml"
+SERENA_CONFIG_TARGET = "serena_config.yml"
+
 # Staged content is root-owned and only ever read by the agent, which reaches it through its
 # primary group. Directories need the group execute bit to be traversable and helper tools need it
 # to stay runnable; both make bandit-style linters report a "permissive mask" even though nothing
@@ -131,6 +135,22 @@ def stage_managed_files(stage: Path, home: Path, gid: int) -> None:
             raise StagingError(f"missing staged source: {source}")
         write_private(home / name, origin.read_bytes(), uid=0, gid=gid, mode=STAGED_FILE_MODE)
         require_immutable(home / name)
+
+
+def stage_serena_config(stage: Path, home: Path, uid: int, gid: int) -> Path:
+    """Publish Serena's global configuration, re-pinning whatever a previous session left.
+
+    Unlike `MANAGED_FILES` this file is agent-owned and carries no immutable flag, because Serena
+    rewrites it itself: registering the project it was pointed at re-saves the whole document
+    through its directory, which a flag would turn into a fatal error at first use. Re-pinning it
+    here on every launch is what keeps the language server selection the launcher's to make.
+    """
+    origin = stage / SERENA_CONFIG_SOURCE
+    if not origin.is_file():
+        raise StagingError(f"missing staged source: {SERENA_CONFIG_SOURCE}")
+    target = home / SERENA_CONFIG_TARGET
+    write_private(target, origin.read_bytes(), uid=uid, gid=gid, mode=0o600)
+    return target
 
 
 def clear_contents(path: Path) -> None:
@@ -248,6 +268,7 @@ def main() -> None:
         finally:
             os.close(fd)
     stage_managed_files(args.stage, args.kimi_home, args.gid)
+    stage_serena_config(args.stage, args.serena_home, args.uid, args.gid)
     assets = stage_assets_tree(args.stage, args.assets, args.gid)
     stage_suppressions(args.managed, args.gid)
     outcome = merge_config(args.stage, args.kimi_home, args.merge_module, args.uid, args.gid)

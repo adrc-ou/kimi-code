@@ -35,18 +35,29 @@ MODULE_PIDS=()
 MODULE_SESSION_FILES=()
 COMPOSE_PID=""
 PROMPT_MEASURE_PID=""
+DEEP_CHECK_PID=""
 stack_started=false
+
+# The agent container keeps a read-only root filesystem, so the checker writes its machine-readable
+# report to the container's tmpfs and the launcher carries it out afterwards. The report holds only
+# the redacted status lines the checker already printed - never a response body, a credential, or
+# a server's own error text.
+SERVICE_REPORT_CONTAINER=/tmp/service-check.json
+SERVICE_REPORT_NAME=service-check.json
+# Long enough for Chromium, the language servers and a first session to finish starting: the whole
+# point of the background pass is to judge a settled stack rather than a busy one.
+SERVICE_SETTLE_SECONDS=45
 
 cleanup() {
   status=$?
   trap - EXIT INT TERM ERR
   set +e
-  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}"; do
+  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}"; do
     if [[ -n "${pid}" ]]; then
       kill "${pid}" 2>/dev/null || true
     fi
   done
-  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}"; do
+  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}"; do
     if [[ -n "${pid}" ]]; then
       wait "${pid}" 2>/dev/null || true
     fi
@@ -66,7 +77,11 @@ cleanup() {
   # the first is the startup panel's remembered choices and the second is the history the panel
   # reads its token counts from. Extending the list by analogy with a neighbour would wipe the
   # operator's settings on every exit, which is the inverse of the feature.
-  for file in proxy-token search-token kimi-config.toml runtime.env session.env module.env model-selection.json model-policy.json model.env module-guidance.md prompt-measure.log compose/models.json compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
+  #
+  # service-check.json is the same kind of exception: it is the verdict the last launch reached,
+  # it stamps itself, and the next launch overwrites it. Its log does not survive, because that one
+  # carries the raw output of an exec rather than a redacted conclusion.
+  for file in proxy-token search-token kimi-config.toml runtime.env session.env module.env model-selection.json model-policy.json model.env module-guidance.md prompt-measure.log service-check.log compose/models.json compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
     [[ -f "${HARNESS_RUNTIME_DIR}/${file}" ]] && find "${HARNESS_RUNTIME_DIR}/${file}" -delete
   done
   [[ -d "${HARNESS_RUNTIME_DIR}/extension-snapshot" ]] && rm -rf -- "${HARNESS_RUNTIME_DIR}/extension-snapshot"
@@ -280,6 +295,52 @@ measure_prompts_after_first_request() {
   return 0
 }
 
+# The staged prompt documents are installed read-only and immutable, so an edit to CONTEXT.md or
+# SYSTEM.md cannot reach a session that is already running. Saying so at readiness is what keeps an
+# operator from spending a session wondering why their change had no effect. Non-fatal by design:
+# a notice about a prompt is never a reason to stop a working stack.
+warn_stale_prompts() {
+  PYTHONPATH="${root}/tools" python3 - "${root}" "${HARNESS_RUNTIME_DIR}" <<'PY' || true
+import pathlib
+import sys
+
+import prompt_context
+
+for notice in prompt_context.stale_sources(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])):
+    print(notice)
+PY
+}
+
+# Carry the checker's report out of the container's tmpfs. Silent when there is nothing to carry:
+# the human-readable results have already been printed or logged by then, and a report is a copy of
+# them rather than the only record.
+collect_service_report() {
+  local host="${HARNESS_RUNTIME_DIR}/${SERVICE_REPORT_NAME}"
+  if harness_compose cp kimi-agent:"${SERVICE_REPORT_CONTAINER}" "${host}" >/dev/null 2>&1; then
+    chmod 600 "${host}" 2>/dev/null || true
+  fi
+}
+
+# The quick pass proves that ports answer and enabled servers initialise; the full pass is the one
+# that calls a representative tool on each of them. Both run unattended on every launch now, and the
+# deep one waits for a settled stack so it is not judging the container while it is still busy
+# starting. Its verdict lands in the log and replaces the report; a launch is never failed by it.
+deep_service_check() {
+  local log="${HARNESS_RUNTIME_DIR}/service-check.log"
+  : >"${log}" && chmod 600 "${log}"
+  echo "Full service check starts in ${SERVICE_SETTLE_SECONDS}s." >>"${log}"
+  sleep "${SERVICE_SETTLE_SECONDS}"
+  if harness_compose exec -T kimi-agent /opt/serena/bin/python \
+      /opt/kimi-runtime/tools/check_services.py --full \
+      --report "${SERVICE_REPORT_CONTAINER}" >>"${log}" 2>&1; then
+    echo "Full service check passed." >>"${log}"
+  else
+    echo "Full service check reported problems; see the results above." >>"${log}"
+  fi
+  collect_service_report
+  return 0
+}
+
 harness_modules start
 echo "Instance:  ${HARNESS_INSTANCE_ID}"
 echo "Press Ctrl-C to stop everything."
@@ -295,10 +356,22 @@ PROMPT_MEASURE_PID=$!
 if wait_for_url http://127.0.0.1:5494/api/v1/healthz "" "" 90; then
   harness_compose exec -T kimi-agent python3 /opt/kimi-runtime/tools/register_workspace.py
   echo "Kimi Code: http://127.0.0.1:5494 (workspace ready)"
-  python3 tools/open_kimi_browser.py docker compose --env-file "${root}/.env" "${HARNESS_COMPOSE_FILES[@]}" || true
-  if ! harness_compose exec -T kimi-agent /opt/serena/bin/python /opt/kimi-runtime/tools/check_services.py; then
-    echo "Service checks need attention. The stack remains running; see docs/verification.md and rerun ./doctor.sh." >&2
+  warn_stale_prompts
+  # Checked before the browser opens, on purpose: a readiness probe that competes with a first
+  # session booting beside it can time out for reasons that say nothing about the service.
+  if ! harness_compose exec -T kimi-agent /opt/serena/bin/python \
+      /opt/kimi-runtime/tools/check_services.py --report "${SERVICE_REPORT_CONTAINER}"; then
+    echo "Service checks need attention. The stack remains running; the results are above, and the full pass follows." >&2
   fi
+  collect_service_report
+  echo "Full service check runs in ${SERVICE_SETTLE_SECONDS}s; verdict: ${HARNESS_RUNTIME_DIR}/service-check.log"
+  # Detached from the terminal on purpose: the job runs while the operator is already working, and
+  # its value is the log and the report, not a block of text that lands in the middle of a reply.
+  # Redirecting at the launch site is also what keeps a backgrounded sleep from holding the
+  # launcher's own stdout open after the launch has finished.
+  deep_service_check >/dev/null 2>&1 &
+  DEEP_CHECK_PID=$!
+  python3 tools/open_kimi_browser.py docker compose --env-file "${root}/.env" "${HARNESS_COMPOSE_FILES[@]}" || true
 else
   echo "Kimi web did not become ready for workspace registration; inspect the startup logs." >&2
   exit 1
