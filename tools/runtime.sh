@@ -261,10 +261,26 @@ harness_warn_env_migration() {
 }
 
 # Hooks execute only operator-owned code installed in this harness, never workspace extensions.
+#
+# The identifiers are read into an array before any hook runs, rather than by redirecting the file
+# into the loop that calls them, because a hook inherits this shell's stdin and one of them puts a
+# screen on it: the version menu that module_select_version draws takes its keystrokes from stdin
+# (tools/tui/term.py). Redirecting modules.list into the loop body replaces that with the rest of a
+# text file, and the selector's answer is to refuse a menu it cannot get input from -- which left an
+# interactive launch that had selected a module unable to finish asking for its version.
 harness_modules() {
   local phase=$1 module hook
+  local modules=()
   [[ -f "${HARNESS_RUNTIME_DIR}/modules.list" ]] || return 0
   while IFS= read -r module; do
+    modules+=("${module}")
+  done <"${HARNESS_RUNTIME_DIR}/modules.list"
+  # `read` fills the variable and reports failure together on a final line with no newline, so the
+  # loop above drops that module unless it is appended here.
+  [[ -z "${module:-}" ]] || modules+=("${module}")
+  # The `${array[@]+...}` spelling is the launcher's idiom for a possibly empty array, which bare
+  # `set -u` on Apple's bash 3.2 treats as an error; a launch with no module selected is one.
+  for module in ${modules[@]+"${modules[@]}"}; do
     [[ "${module}" =~ ^[a-z][a-z0-9_]*$ ]] || harness_die "Invalid module identifier" || return
     MODULE_DIR="${HARNESS_ROOT}/modules/${module}"
     [[ -f "${MODULE_DIR}/module.sh" ]] || harness_die "Session module removed; stop and restart the stack" || return
@@ -274,5 +290,5 @@ harness_modules() {
     # shellcheck disable=SC1091
     source "${MODULE_DIR}/module.sh"
     if declare -F "module_${phase}" >/dev/null; then "module_${phase}"; fi
-  done <"${HARNESS_RUNTIME_DIR}/modules.list"
+  done
 }

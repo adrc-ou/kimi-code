@@ -109,6 +109,10 @@ The launcher calls hooks for each selected module in selection order:
 | `module_start` | Start any native services and wait for readiness; Compose starts afterward. |
 
 All version and required-environment questions complete before installation.
+Hooks run in the launcher's own shell and keep its stdin, which is what lets a
+version hook put a menu on the terminal; a hook that runs a one-shot container
+command must therefore pass `-T` to `compose run`, or it takes over the terminal
+the launch is asking its questions with.
 Version hooks can reuse `scripts/select_versions.py` utilities: `choose`,
 `load_state`, `write_environment`, release fetching and checksum validation.
 Keep application catalogs and backend-specific compatibility rules in the module.

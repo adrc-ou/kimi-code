@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -11,10 +12,12 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT / "tools") not in sys.path:
-    sys.path.insert(0, str(ROOT / "tools"))
+for _directory in (ROOT, ROOT / "tools"):
+    if str(_directory) not in sys.path:
+        sys.path.insert(0, str(_directory))
 
 import prompt_context  # noqa: E402
+from tests.helpers import run_in_pty  # noqa: E402
 
 
 class LauncherTests(unittest.TestCase):
@@ -388,6 +391,82 @@ print(json.dumps(configuration))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("exposes host bind", result.stderr)
         self.assertNotIn("register-workspace", (self.base / "events").read_text())
+
+
+class ModuleHookTerminalTests(unittest.TestCase):
+    """``harness_modules`` calls a hook with the launcher's own stdin, not with its module list.
+
+    Every phase runs in the launcher's shell, and one of them draws a screen: the version menu a
+    module's ``select_version`` hook puts up takes its keystrokes from stdin. Reading the list into
+    the loop that runs the hooks replaces that stdin with the rest of a text file, and the selector
+    answers by refusing to draw a menu it cannot get keys from. It is a module-only failure and an
+    interactive one, so nothing else in a suite that runs everything through pipes can see it.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        base = Path(self.temporary.name).resolve()
+        self.root = base / "harness"
+        self.runtime = base / "runtime"
+        self.runtime.mkdir(parents=True)
+        # Both halves of the contract a hook needs from its caller: that the terminal is still
+        # there to read keys from, and that MODULE_DIR names the module being asked.
+        hook = """
+module_select_version() {
+  python3 -c 'import sys; print("TTY" if sys.stdin.isatty() else "REDIRECTED", flush=True)'
+  echo "HOOK:${MODULE_DIR##*/}"
+}
+"""
+        for name in ("demo", "second"):
+            module = self.root / "modules" / name
+            module.mkdir(parents=True)
+            (module / "module.sh").write_text(hook)
+
+    def run_phase(self, listing: str, phase: str = "select_version"):
+        """Run one hook phase over ``listing`` with the launcher's terminal attached to stdin."""
+        (self.runtime / "modules.list").write_text(listing)
+        script = f"""
+set -euo pipefail
+source {shlex.quote(str(ROOT / "tools" / "runtime.sh"))}
+HARNESS_ROOT={shlex.quote(str(self.root))}
+HARNESS_RUNTIME_DIR={shlex.quote(str(self.runtime))}
+harness_modules {phase}
+"""
+        return run_in_pty(["bash", "-c", script], timeout=20)
+
+    def test_every_module_is_asked_and_keeps_the_terminal(self):
+        session = self.run_phase("demo\nsecond\n")
+        self.assertEqual(session.status, 0, session.screen)
+        self.assertEqual(
+            session.screen.split(), ["TTY", "HOOK:demo", "TTY", "HOOK:second"]
+        )
+
+    def test_last_module_needs_no_trailing_newline(self):
+        session = self.run_phase("demo")
+        self.assertEqual(session.status, 0, session.screen)
+        self.assertEqual(session.screen.split(), ["TTY", "HOOK:demo"])
+
+    def test_no_module_selected_is_not_a_failure(self):
+        # ``tools/modules.py`` writes an empty list when nothing is selected, and the launcher
+        # still runs every phase against it.
+        session = self.run_phase("")
+        self.assertEqual(session.status, 0, session.screen)
+        self.assertEqual(session.screen.split(), [])
+
+    def test_invalid_identifier_stops_the_launch(self):
+        session = self.run_phase("demo\nBad Module\n")
+        self.assertNotEqual(session.status, 0)
+        self.assertIn("Invalid module identifier", session.screen)
+        self.assertEqual(session.screen.split()[:2], ["TTY", "HOOK:demo"])
+
+    def test_a_module_that_implements_the_phase_is_not_a_failure(self):
+        # ``configure`` runs on every launch and most modules have nothing to say in it; an empty
+        # module.sh is the shape of that, and it must stay quiet rather than trip ``set -e``.
+        (self.root / "modules" / "demo" / "module.sh").write_text("")
+        session = self.run_phase("demo\n", phase="configure")
+        self.assertEqual(session.status, 0, session.screen)
+        self.assertEqual(session.screen.split(), [])
 
 
 class PromptsScriptTests(unittest.TestCase):

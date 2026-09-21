@@ -114,7 +114,10 @@ module_install() {
 
 module_check_build() {
   if [[ "${COMFYUI_BACKEND}" == cuda ]]; then
-    harness_compose run --rm --no-deps comfyui python -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name())'
+    # -T for the same reason the launcher puts it on its own one-shot `compose run`: a hook is
+    # called with the launcher's terminal on stdin, and without this flag `run` would attach that
+    # terminal and allocate a pty for a command whose whole job is to print one line and exit.
+    harness_compose run -T --rm --no-deps comfyui python -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name())'
   fi
 }
 
