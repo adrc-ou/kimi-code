@@ -101,9 +101,12 @@ counts only the screens you will actually be shown, so a skipped step is never
 enumerated and the first screen you see is always step 1. Content scrolls inside
 its own region when it does not fit, and a footer lists the keys that step answers
 — in the order that matters when a narrow window makes it drop some.
-↑/↓ move the focus marker and Enter continues; `Space` toggles the row under focus,
-`Backspace` returns to the previous step, and `Ctrl-R` puts the currently visible
-choices back to their starting state. Nothing is answered by typing a menu number,
+↑/↓ move the focus marker, which is where `Space` lands: it ticks a checkbox row,
+and on a radio list it moves the mark to the row under the cursor. `Enter` continues
+with the answer as the screen shows it — whatever is ticked, or whichever row
+carries the mark — so the cursor is never the answer by itself. `Backspace` returns
+to the previous step, and `Ctrl-R` puts the currently visible choices back to their
+starting state. Nothing is answered by typing a menu number,
 and no key does anything the step has not named. `?` opens the full reference —
 every spelling of every key, including `k` and `j` for the arrows, which the footer
 keeps to one spelling each to stay short — on the steps that list something; the
@@ -125,8 +128,10 @@ and are checked; each group is alphabetical by label. On the first run all modul
 are unchecked. If none are compatible, this step is skipped.
 
 Next comes the existing Kimi version menu, followed by each selected module's
-version menu. Missing required module variables are prompted for this session
-only; add them to `.env` yourself to persist them. Secret inputs are hidden.
+version menu — radio rows both, so `Space` puts the mark on a version and `Enter`
+takes the one carrying it. Missing required module variables are prompted for
+this session only; add them to `.env` yourself to persist them. Secret inputs are
+hidden.
 
 After all choices, the launcher initializes the workspace, installs selected
 versions, and generates private runtime configuration. That is where each

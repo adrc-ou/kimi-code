@@ -184,12 +184,14 @@ class AskTests(unittest.TestCase):
         self.assertEqual(step.title, PRIMARY)
         self.assertEqual(step.prompt, f"Choose the {PRIMARY}")
 
-    def test_the_step_is_a_radio_step_so_space_is_not_advertised(self):
-        # A legend that offers a key the step ignores is the defect this redesign removes, and
-        # SINGLE mode is what makes the footer drop it.
+    def test_the_step_is_a_radio_step_that_selects_with_space(self):
+        # One answer per list, so Space moves the mark instead of ticking a box, and the footer says
+        # which of the two the key does. A radio that offered no key at all would leave its own mark
+        # as decoration.
         step, _, _ = self.ask()
         self.assertEqual(step.mode, SINGLE)
-        self.assertFalse(step.toggleable)
+        self.assertTrue(step.toggleable)
+        self.assertEqual(step.toggle_hint, "select")
 
     def test_the_rows_are_the_lanes_candidates_in_the_lanes_order(self):
         step, _, _ = self.ask()

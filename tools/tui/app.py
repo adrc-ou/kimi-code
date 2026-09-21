@@ -20,7 +20,7 @@ viewport. A surface with genuinely long content can still turn it on without the
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from . import layout as L
 from .caps import Caps
@@ -82,10 +82,10 @@ def navigation() -> tuple[Binding, ...]:
     """The keys every step answers, in legend order.
 
     Order is a budget decision as much as a discoverability one: the footer fills left to right and
-    truncates on the right, so what leads is what survives a narrow window. The keys that end a
-    step come first — ``Enter``, ``Space``, and ``Backspace`` where there is a step to go back to —
-    then reset and the key reference, and only then the scrolling group, which the least experienced
-    user needs least and the arrow keys already cover.
+    truncates on the right, so what leads is what survives a narrow window. The keys that decide an
+    answer come first — ``Enter``, ``Space``, and ``Backspace`` where there is a step to go back
+    to — then reset and the key reference, and only then the scrolling group, which the least
+    experienced user needs least and the arrow keys already cover.
 
     Aliases follow the canonical spelling and are never printed: ``k``/``j`` work because people
     reach for them, and the legend says ``↑``/``↓`` because that is what everyone else reads.
@@ -245,9 +245,16 @@ class Step:
     #: Shorter name for this step, for the step rail. Where it equals :attr:`title` the rail says
     #: only the position, since the title row has already named the step.
     rail: str = ""
-    #: Whether ``Space`` means anything here. A radio step says no and the legend drops the entry,
-    #: rather than advertising a key that would be ignored.
+    #: Whether ``Space`` means anything here. A step that has handed the space bar to something else
+    #: says no, and the legend drops the entry rather than advertising a key that would be ignored.
+    #: A text field is the case this exists for: there a space is a character of the answer.
     toggleable: bool = True
+    #: What the legend calls the ``Space`` binding, because the key does a different job on each
+    #: shape of answer: it ticks a box on a checkbox list, moves the dot on a radio, and cycles a
+    #: tri-state switch. One word for all three would have to be wrong about two of them, so a step
+    #: whose key means something more specific than "toggle" restates it here and the footer and the
+    #: key reference both pick the new word up, being generated from this table.
+    toggle_hint: str = "toggle"
     #: Whether a character that answers no binding should reach :meth:`typed`. Only a step
     #: that takes text says yes. Everywhere else a stray letter is noise, and the note row is
     #: what tells the user that the keypress was seen rather than dropped.
@@ -340,13 +347,19 @@ class Step:
         return BLANK
 
     def toggled(self, state: object, target: object) -> object:
+        """``Space`` landed on this row, on a step that says the key means something.
+
+        What it means is the step's: tick a box, move a radio's mark, cycle a switch. The base
+        answer is to change nothing, which is what a step with :attr:`toggleable` clear relies on.
+        """
         return state
 
     def chosen(self, state: object, target: object) -> object:
         """``Enter`` landed on this row, which is not the same as committing.
 
-        A radio list records the choice here; a multi-select usually ignores it and commits whatever
-        is checked.
+        A radio list records the row under the cursor here only while its mark is nowhere; once a
+        row carries the mark, ``Enter`` answers with that row and this records nothing. A
+        multi-select ignores the landing altogether and commits whatever is checked.
         """
         del target
         return state
@@ -420,7 +433,10 @@ class Step:
         priority: what ends a step, what changes the answer, what this step uniquely offers, and
         only then how to move around inside it.
         """
-        table = list(navigation())
+        table = [
+            replace(item, description=self.toggle_hint) if item.action == TOGGLE else item
+            for item in navigation()
+        ]
         index = next(
             (position for position, item in enumerate(table) if item.action == ACCEPT),
             len(table) - 1,

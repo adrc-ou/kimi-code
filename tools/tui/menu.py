@@ -10,10 +10,13 @@ subclasses :class:`~.app.Step` directly and inherits the same frame. This module
 top of that contract, not a replacement for it.
 
 Two modes, because the launcher asks two different questions. ``multi`` is "which of these" and
-answers with a set, so ``Space`` means something and ``Enter`` accepts whatever is checked.
-``single`` is "which one" and answers with one id, so ``Enter`` on a row *is* the choice and
-``Space`` is not offered at all; a legend that advertises a key the step ignores is exactly the
-defect this redesign exists to remove.
+answers with a set: ``Space`` ticks the row under the cursor and ``Enter`` accepts whatever is
+ticked. ``single`` is "which one" and answers with one id: ``Space`` moves the mark to the row under
+the cursor, and ``Enter`` accepts whichever row carries the mark. The cursor is therefore where the
+next ``Space`` lands and never the answer itself, on either mode — a row can only be the answer by
+looking like it, which is what the mark is for. Both modes answer ``Space``, and the legend names
+the key after the job it does in each, since a hint that describes the other mode's key misleads
+exactly as surely as one that advertises a key the step ignores.
 """
 
 from __future__ import annotations
@@ -78,13 +81,14 @@ class ListStep(Step):
     """A titled list of :class:`Choice` rows that answers with ids."""
 
     @property
-    def toggleable(self) -> bool:
-        """``Space`` is offered exactly when there is more than one answer to collect.
+    def toggle_hint(self) -> str:
+        """What the footer calls ``Space``, which depends on what it can do to a row here.
 
-        Derived from the mode rather than declared beside it, so a radio list cannot advertise a key
-        that would be ignored — the failure the generated legend exists to prevent.
+        A checkbox has two states and the key walks between them, so it ticks. A radio has one state
+        shared by the whole list and the key moves it, so it selects. Saying "toggle" to the second
+        one promises a key that switches the answer off, which is the thing a radio cannot do.
         """
-        return self.mode == MULTI
+        return "select" if self.mode == SINGLE else "toggle"
 
     def __init__(
         self,
@@ -145,6 +149,21 @@ class ListStep(Step):
         if not options:
             return None
         return options[min(max(state.focus, 0), len(options) - 1)]
+
+    def picked(self, state: ListState) -> Choice | None:
+        """The row a radio step answers with, which is the marked one.
+
+        The mark is the answer's only visible form, so it is also what the status row and ``Enter``
+        both read — a screen that shows one row checked and returns another is the failure this step
+        class exists not to repeat. A list that opens with nothing marked, because it has neither a
+        remembered answer nor a declared default, has no mark to read, and takes the cursor's row
+        rather than answering with nothing.
+        """
+        chosen = set(state.chosen)
+        for choice in self.selectable():
+            if choice.id in chosen:
+                return choice
+        return self.option(state)
 
     def initial(self) -> ListState:
         """The opening state, with the cursor already on the answer it starts with.
@@ -236,7 +255,7 @@ class ListStep(Step):
     def status(self, state: object) -> Line:
         assert isinstance(state, ListState)
         if self.mode == SINGLE:
-            option = self.option(state)
+            option = self.picked(state)
             if option is None:
                 return BLANK
             return Line(
@@ -265,9 +284,15 @@ class ListStep(Step):
         return replace(state, focus=index)
 
     def toggled(self, state: object, target: object) -> object:
+        """``Space``: tick the row under the cursor, or move the mark onto it.
+
+        The mark never leaves a radio list, not even when the key is pressed on the row that already
+        carries it: one of those rows has to be the answer, and a key that could empty it would
+        leave ``Enter`` with nothing to commit.
+        """
         assert isinstance(state, ListState)
-        if self.mode != MULTI:
-            return state
+        if self.mode == SINGLE:
+            return self._marked(state, target)
         chosen = set(state.chosen)
         if target in chosen:
             chosen.discard(target)
@@ -276,8 +301,15 @@ class ListStep(Step):
         return replace(state, chosen=self._in_order(chosen))
 
     def chosen(self, state: object, target: object) -> object:
+        """``Enter`` landed on this row, which only answers for a radio with no mark on it yet."""
         assert isinstance(state, ListState)
-        if self.mode == SINGLE and any(choice.id == target for choice in self.selectable()):
+        if self.mode == SINGLE and not state.chosen:
+            return self._marked(state, target)
+        return state
+
+    def _marked(self, state: ListState, target: object) -> ListState:
+        """The state with the mark on ``target``, unchanged for a row the cursor cannot reach."""
+        if any(choice.id == target for choice in self.selectable()):
             return replace(state, chosen=(target,))
         return state
 
@@ -287,11 +319,11 @@ class ListStep(Step):
 
     def commit(self, state: object) -> Result:
         assert isinstance(state, ListState)
-        labels = {choice.id: choice.label for choice in self.choices}
         if self.mode == SINGLE:
-            if not state.chosen:
+            option = self.picked(state)
+            if option is None:
                 return Result()
-            value = state.chosen[0]
-            return Result(value=value, summary=labels.get(value, value))
+            return Result(value=option.id, summary=option.label)
+        labels = {choice.id: choice.label for choice in self.choices}
         value = list(self._in_order(set(state.chosen)))
         return Result(value=value, summary=", ".join(labels.get(id_, id_) for id_ in value))

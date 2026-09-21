@@ -72,7 +72,7 @@ from tools.tui.layout import (  # noqa: E402
     visible_window,
     wrap,
 )
-from tools.tui.menu import SINGLE, Choice, ListStep  # noqa: E402
+from tools.tui.menu import MULTI, SINGLE, Choice, ListStep  # noqa: E402
 
 _ENV = ("TERM", "COLORTERM", "NO_COLOR", "TERM_PROGRAM", "LANG", "LC_ALL", "LC_CTYPE", "COLUMNS")
 
@@ -1292,14 +1292,70 @@ class MenuTests(unittest.TestCase):
         self.assertIn("needs a GPU", shown)
         self.assertIn("[-]", shown)
 
-    def test_enter_on_a_radio_is_the_choice_and_space_is_not_even_offered(self):
+    def test_space_moves_the_mark_and_enter_answers_with_the_mark(self):
         step = self.step(mode=SINGLE, previous=["beta"])
-        modal = self.modal(step, keys=[Key("Space"), Key("Down"), Key("Enter")])
+        modal = self.modal(step, keys=[Key("Enter")])
+        # The remembered answer opens as both the mark and the cursor, so nothing can tell the two
+        # apart until a key moves one of them.
+        self.assertIn("(x) Beta", self.shown(modal))
+        self.assertIsNone(modal.handle(Key("Down")))
         shown = self.shown(modal)
-        self.assertNotIn("Space toggle", shown)
+        # Arrowing moves where the next Space lands, not the answer. The mark is the only visible
+        # form the answer has, so a cursor step that moved it would leave the screen describing an
+        # answer the user never chose.
+        self.assertIn("(x) Beta", shown)
+        self.assertIn("( ) Gamma", shown)
+        self.assertIsNone(modal.handle(Key("Space")))
+        shown = self.shown(modal)
+        self.assertIn("( ) Beta", shown)
+        self.assertIn("(x) Gamma", shown)
         result = modal.run()
         self.assertEqual(result.value, "gamma")
         self.assertEqual(result.summary, "Gamma")
+
+    def test_a_radio_mark_cannot_be_switched_off(self):
+        # Exactly one radio is always on: a key that could empty the answer would leave Enter with
+        # nothing to return, and the row the cursor is on is the only one Space can act on.
+        step = self.step(mode=SINGLE, previous=["beta"])
+        modal = self.modal(step, keys=[Key("Enter")])
+        for _ in range(3):
+            self.assertIsNone(modal.handle(Key("Space")))
+        self.assertEqual(self.shown(modal).count("(x)"), 1)
+        self.assertEqual(modal.run().value, "beta")
+
+    def test_the_status_row_names_the_marked_row_rather_than_the_cursor(self):
+        options = [
+            Choice("alpha", "Alpha", "adds a GPU service"),
+            Choice("beta", "Beta", "adds an editor"),
+        ]
+        step = self.step(mode=SINGLE, options=options, previous=["alpha"])
+        modal = self.modal(step, keys=[Key("Enter")])
+        modal.handle(Key("Down"))
+        status = self.shown(modal).splitlines()[modal.frame.status.top]
+        self.assertIn("Alpha", status)
+        self.assertNotIn("Beta", status)
+        self.assertEqual(modal.run().value, "alpha")
+
+    def test_a_radio_that_opens_with_nothing_marked_answers_with_the_cursor(self):
+        # A list with no remembered answer and no declared default has no mark to read, so the
+        # cursor stands in for it rather than the step handing the launcher nothing at all.
+        step = self.step(mode=SINGLE, initial=())
+        self.assertEqual(step.initial().chosen, ())
+        modal = self.modal(step, keys=[Key("Down"), Key("Enter")])
+        self.assertEqual(modal.run().value, "beta")
+
+    def test_both_list_modes_answer_space_and_each_calls_it_by_its_own_name(self):
+        # Dropping the key from a radio was the defect: the mark it left behind meant nothing. What
+        # the two modes may still not share is the word, because a radio cannot be toggled off.
+        self.assertEqual(self.step().toggle_hint, "toggle")
+        self.assertEqual(self.step(mode=SINGLE).toggle_hint, "select")
+        for mode, hint in ((MULTI, "toggle"), (SINGLE, "select")):
+            step = self.step(mode=mode)
+            table = step.keys(step.initial(), View())
+            with self.subTest(mode=mode):
+                self.assertEqual(lookup(table, Key("Space"), View()), TOGGLE)
+                legend = "\n".join(legend_lines(table, View(), QUIET, rows=2))
+                self.assertIn(f"Space {hint}", legend)
 
     def test_a_radio_marks_its_row_with_parentheses_a_checkbox_with_brackets(self):
         # Two states that look alike are two ways to misread one screen.
@@ -1735,10 +1791,22 @@ sys.exit(result.status)
         self.assertIn('RESULT=["gamma"]', session.screen)
         self.assertTrue(session.restored)
 
-    def test_a_radio_menu_offers_no_toggle_key_at_all(self):
-        session = self.run_menu(b"\x1b[B\r", mode="single", expect=b"( )")
-        self.assertNotIn("Space toggle", session.screen)
+    def test_a_radio_menu_marks_the_row_space_was_pressed_on(self):
+        # Chunked, so the frame between the mark moving and the answer being taken is on screen and
+        # not lost between two keystrokes applied at once.
+        session = self.run_menu(
+            [b"\x1b[B", b" ", b"\x1b[A", b"\r"], mode="single", expect=b"(x) Beta"
+        )
         self.assertIn('RESULT="gamma"', session.screen)
+        self.assertIn("Space select", session.screen)
+        self.assertNotIn("Space toggle", session.screen)
+        self.assertTrue(session.restored)
+
+    def test_a_radio_menu_answers_the_mark_rather_than_the_cursor_it_walked_off(self):
+        # One Down and no Space: the cursor is on Gamma, the mark is still on the remembered Beta,
+        # and Beta is what the launcher is given. This is the mismatch the mark exists to prevent.
+        session = self.run_menu(b"\x1b[B\r", mode="single", expect=b"( )")
+        self.assertIn('RESULT="beta"', session.screen)
         self.assertTrue(session.restored)
 
 
