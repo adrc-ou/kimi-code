@@ -87,6 +87,7 @@ services:
       COMFYUI_MAX_JSON_BYTES: "${COMFYUI_MAX_JSON_BYTES:-16777216}"
       COMFYUI_MAX_TRANSFER_BYTES: "${COMFYUI_MAX_TRANSFER_BYTES:-17179869184}"
       COMFYUI_URL: "http://comfyui:8188"
+      COMFYUI_UI_URL: "http://comfyui:8188"
       COMFYUI_TOKEN: ""
     networks:
       agent-comfy: {}

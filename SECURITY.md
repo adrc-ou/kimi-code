@@ -127,6 +127,36 @@ Module hooks and Compose overlays must receive the same review as core changes.
 Native module applications run with the host user's permissions; see each
 module's documentation for its application-specific trust boundary.
 
+## Module service frontends
+
+A module that serves a browser UI has to satisfy it without weakening the
+credential that guards the same service's API. ComfyUI on macOS is that case: the
+host application listens on loopback only, and the bridge which makes it reachable
+from the sandbox demands a bearer token on every path, including the ones a page
+loads on the user's behalf.
+
+The token is never given to a browser. A client already holding it exchanges it
+for one single-use grant; the grant reaches the page in a URL fragment, which a
+browser transmits to no one, logs nowhere, and repeats in no `Referer`; and that
+page redeems the grant for an HttpOnly, SameSite=Strict session cookie before
+rewriting its own address. Grants are valid once and for seconds. Sessions are
+short, bounded in number, and bound to the host that minted them. Every path still
+authenticates; only the form of proof a browser can carry has changed.
+
+Reachability is not widened either. The sandbox origin is a plaintext listener on
+a private network it shares with no container but the agent, and it forwards every
+byte to the bridge over TLS verified against the bridge's own certificate, so no
+credential crosses a network in the clear and nothing off that network can connect
+at all. It publishes no host port, so its cookie omits `Secure` by construction
+rather than by choice. The alternative — teaching the sandbox browser to accept the
+bridge's per-launch self-signed certificate — would mean relaxing core browser
+policy for the sake of one module, which is the trade this boundary refuses.
+
+On the host side the launcher opens ComfyUI's own loopback address in the default
+browser, the way it opens Kimi's UI, and refuses to open any URL that is not
+loopback. That is the operator's browser on the operator's machine, holding no
+credential of any kind: it reaches the service directly, not through the bridge.
+
 ## Dependency and vulnerability maintenance
 
 All container bases use immutable digests. Application source uses immutable

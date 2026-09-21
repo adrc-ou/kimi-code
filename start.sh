@@ -36,6 +36,9 @@ MODULE_SESSION_FILES=()
 COMPOSE_PID=""
 PROMPT_MEASURE_PID=""
 DEEP_CHECK_PID=""
+# Deliberately not in MODULE_PIDS: the watch loop treats an exited module pid as a failed launch,
+# and a Mac whose caffeinate went away has lost a convenience, not a service.
+KEEPWAKE_PID=""
 stack_started=false
 # Declared up here rather than beside the flow that sets it, because cleanup is trapped for the
 # whole script and `set -u` would turn an early failure into a second one: a trap that errors
@@ -74,12 +77,12 @@ cleanup() {
   if [[ -s "${flow_notes:-/nonexistent}" ]]; then
     cat "${flow_notes}"
   fi
-  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}"; do
+  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}" "${KEEPWAKE_PID}"; do
     if [[ -n "${pid}" ]]; then
       kill "${pid}" 2>/dev/null || true
     fi
   done
-  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}"; do
+  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}" "${KEEPWAKE_PID}"; do
     if [[ -n "${pid}" ]]; then
       wait "${pid}" 2>/dev/null || true
     fi
@@ -125,6 +128,32 @@ cleanup() {
   exit "${status}"
 }
 trap cleanup EXIT
+
+# macOS runs its idle timer on its own schedule, and a Mac that dozes takes the containers, the
+# model proxy and any ComfyUI job down with it for the length of the sleep. `caffeinate -i` refuses
+# that idle timer while it lives and `-s` refuses system sleep on AC power; both flags predate
+# Apple silicon and behave identically on Intel, so this is one assertion for either host. `-w $$`
+# ties the assertion to this shell's own pid, which is what stops a hard-killed launcher from
+# leaving a Mac permanently awake. Anywhere that is not macOS - Linux, WSL2, a Git Bash on Windows -
+# this returns without doing anything, and a host with no caffeinate warns instead of failing.
+harness_keepawake() {
+  [[ "$(uname -s)" == Darwin ]] || return 0
+  local setting value
+  setting=$(python3 scripts/read_env.py "${HARNESS_RESOLVED_BOOTSTRAP}" HARNESS_KEEPWAKE 2>/dev/null || true)
+  value=${setting:-${HARNESS_KEEPWAKE:-true}}
+  if [[ "${value}" == false || "${value}" == 0 ]]; then
+    echo "Keepawake is off; this Mac may idle to sleep while the harness runs."
+    return 0
+  fi
+  if ! command -v caffeinate >/dev/null 2>&1; then
+    echo "Keepawake: this Mac has no caffeinate, so it may idle to sleep while the harness runs." >&2
+    return 0
+  fi
+  caffeinate -is -w $$ >/dev/null 2>&1 &
+  KEEPWAKE_PID=$!
+  echo "Keepawake: this Mac will stay awake until the harness stops (HARNESS_KEEPWAKE=false to allow idle sleep)."
+}
+harness_keepawake
 
 platform_label=${HARNESS_PLATFORM_LABEL}
 kimi_asset=${HARNESS_KIMI_ASSET}

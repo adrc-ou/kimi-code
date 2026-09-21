@@ -26,7 +26,7 @@ module_configure() {
   export COMFYUI_PLATFORM COMFYUI_BACKEND
   comfy_backend
   local variable value
-  for variable in COMFYUI_MODELS_PATH COMFYUI_CUSTOM_NODES_PATH COMFYUI_INPUT_PATH COMFYUI_OUTPUT_PATH COMFYUI_TEMP_PATH COMFYUI_USER_PATH COMFYUI_MACOS_PYTHON COMFYUI_BRIDGE_MAX_BODY COMFYUI_BRIDGE_MAX_WS_MESSAGE COMFYUI_BRIDGE_MAX_CONNECTIONS; do
+  for variable in COMFYUI_MODELS_PATH COMFYUI_CUSTOM_NODES_PATH COMFYUI_INPUT_PATH COMFYUI_OUTPUT_PATH COMFYUI_TEMP_PATH COMFYUI_USER_PATH COMFYUI_MACOS_PYTHON COMFYUI_BRIDGE_MAX_BODY COMFYUI_BRIDGE_MAX_WS_MESSAGE COMFYUI_BRIDGE_MAX_CONNECTIONS COMFYUI_BRIDGE_GRANT_TTL COMFYUI_BRIDGE_SESSION_TTL COMFYUI_BRIDGE_MAX_SESSIONS COMFYUI_OPEN_FRONTEND; do
     value=$(python3 "${HARNESS_ROOT}/scripts/read_env.py" "${HARNESS_RESOLVED_BOOTSTRAP}" "${variable}" 2>/dev/null || true)
     [[ -z "${value}" ]] || export "${variable}=${value}"
   done
@@ -142,13 +142,28 @@ module_start() {
       --tls-cert "${COMFYUI_BRIDGE_CERT}" --tls-key "${COMFYUI_BRIDGE_KEY}" \
       --max-body "${COMFYUI_BRIDGE_MAX_BODY:-536870912}" \
       --max-ws-message "${COMFYUI_BRIDGE_MAX_WS_MESSAGE:-67108864}" \
-      --max-connections "${COMFYUI_BRIDGE_MAX_CONNECTIONS:-16}" >"${bridge_log}" 2>&1 &
+      --max-connections "${COMFYUI_BRIDGE_MAX_CONNECTIONS:-16}" \
+      --grant-ttl "${COMFYUI_BRIDGE_GRANT_TTL:-60}" \
+      --session-ttl "${COMFYUI_BRIDGE_SESSION_TTL:-43200}" \
+      --max-sessions "${COMFYUI_BRIDGE_MAX_SESSIONS:-8}" >"${bridge_log}" 2>&1 &
     COMFY_BRIDGE_PID=$!
     MODULE_PIDS+=("${COMFY_BRIDGE_PID}")
     wait_for_url https://127.0.0.1:8190/system_stats "${COMFYUI_TOKEN}" "${COMFYUI_BRIDGE_CERT}" 30 || { echo "ComfyUI bridge did not become ready. See ${bridge_log}" >&2; exit 1; }
+    # ComfyUI starts with --disable-auto-launch, so its own opener never fires here and the
+    # launcher opens the tab instead - once readiness is proven rather than hoped for. The URL is
+    # the host's loopback frontend, the same page this module has always told the operator to open,
+    # and it carries no bridge credential at all. A host with no desktop just fails this one line.
+    if [[ "${COMFYUI_OPEN_FRONTEND:-true}" != false ]]; then
+      python3 "${MODULE_DIR}/scripts/open_comfy_frontend.py" --url http://127.0.0.1:8188 || true
+    fi
   fi
 
   echo "ComfyUI: http://127.0.0.1:8188 (${COMFYUI_BACKEND})"
+  if [[ "${COMFYUI_BACKEND}" == mps ]]; then
+    # The origin the agent's own browser is meant to use. Both planes are the same ComfyUI and
+    # both still authenticate at the bridge; only the shape of the credential differs.
+    echo "ComfyUI frontend in the sandbox: http://comfyui-ui:8188"
+  fi
 }
 
 if [[ "${1:-}" == compatible ]]; then module_compatible; fi

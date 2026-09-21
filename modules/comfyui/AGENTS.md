@@ -7,6 +7,12 @@ Use `/opt/kimi-runtime/tools/comfyctl.py` and ComfyUI's machine-readable APIs fo
 schema inspection, input upload, queue inspection, workflow execution, history,
 output download, and interruption.
 
+To look at the web frontend itself, ask `comfyctl.py ui-url` for the address and
+open that link with the `chrome-devtools` tools. Do not reuse or store the link:
+it is a single-use login that expires in about a minute, so request a fresh one
+each time. Never put `COMFYUI_TOKEN` in a URL, a page, or a workflow, and do not
+expect ComfyUI's host loopback address to resolve from inside the sandbox.
+
 Custom-node source belongs under `/workspace/comfyui/custom_nodes`. Workflows
 belong under `/workspace/comfyui/user/default/workflows`. Both locations are
 intentionally writable.

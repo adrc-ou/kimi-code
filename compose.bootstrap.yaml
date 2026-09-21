@@ -19,3 +19,17 @@ services:
       COMFYUI_OUTPUT_PATH: "${COMFYUI_OUTPUT_PATH:-}"
       COMFYUI_TEMP_PATH: "${COMFYUI_TEMP_PATH:-}"
       COMFYUI_USER_PATH: "${COMFYUI_USER_PATH:-}"
+      # Optional module settings. A name a hook reads out of the resolved environment has to be
+      # declared here for the operator's .env value to reach it at all: Compose resolves only what
+      # a file names, so an undeclared knob keeps its module default however it is set. Each of
+      # these still carries its real default inside the module that uses it.
+      COMFYUI_BRIDGE_MAX_BODY: "${COMFYUI_BRIDGE_MAX_BODY:-}"
+      COMFYUI_BRIDGE_MAX_WS_MESSAGE: "${COMFYUI_BRIDGE_MAX_WS_MESSAGE:-}"
+      COMFYUI_BRIDGE_MAX_CONNECTIONS: "${COMFYUI_BRIDGE_MAX_CONNECTIONS:-}"
+      COMFYUI_BRIDGE_GRANT_TTL: "${COMFYUI_BRIDGE_GRANT_TTL:-}"
+      COMFYUI_BRIDGE_SESSION_TTL: "${COMFYUI_BRIDGE_SESSION_TTL:-}"
+      COMFYUI_BRIDGE_MAX_SESSIONS: "${COMFYUI_BRIDGE_MAX_SESSIONS:-}"
+      COMFYUI_OPEN_FRONTEND: "${COMFYUI_OPEN_FRONTEND:-}"
+      # Launcher behaviour rather than a module setting, and here for the same reason: start.sh
+      # asks this file what the operator wrote, not what the shell happens to have inherited.
+      HARNESS_KEEPWAKE: "${HARNESS_KEEPWAKE:-}"

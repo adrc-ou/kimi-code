@@ -99,7 +99,7 @@ file; it does not merge project overrides or reuse Kimi's OAuth token store.
 | NVIDIA CUDA docs MCP | NVIDIA's servers | NVIDIA Developer sign-in / OAuth | ComfyUI module; off until configured |
 | SearXNG | Separate local container | Queries outside search engines; no SearXNG account | On |
 | Search adapter | Separate local container | Uses only your SearXNG instance | On |
-| ComfyUI and `comfyctl.py` | Native MPS service on Mac; container on CUDA; helper in agent | No account for local execution; individual model downloads may require one | When module selected; REST/WebSocket |
+| ComfyUI, `comfyctl.py`, and its frontend | Native MPS service on Mac; container on CUDA; helper in agent | No account for local execution; individual model downloads may require one | When module selected; REST/WebSocket plus a browsable UI origin |
 | Harness skills | Read-only instruction files inside the agent | No account of their own; may direct use of the tools above | Installed |
 
 Remote MCP requests send tool arguments to their provider. Local execution does

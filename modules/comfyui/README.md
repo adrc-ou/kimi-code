@@ -1,7 +1,10 @@
 # ComfyUI module
 
 Enable **ComfyUI** in `./start.sh`, or set `HARNESS_MODULES=comfyui` for automation.
-The UI is available at http://127.0.0.1:8188 only for enabled sessions.
+Only enabled sessions serve a frontend. The host browser opens
+`http://127.0.0.1:8188`; inside the sandbox the equivalent origin is
+`http://comfyui:8188` on CUDA and `http://comfyui-ui:8188` on MPS, and
+`comfyctl.py ui-url` prints whichever one this session has.
 
 The Mac additionally needs:
 
@@ -68,6 +71,7 @@ python /opt/kimi-runtime/tools/comfyctl.py upload /workspace/comfyui/input/examp
 python /opt/kimi-runtime/tools/comfyctl.py run --wait /workspace/comfyui/user/default/workflows/example-api.json
 python /opt/kimi-runtime/tools/comfyctl.py download PROMPT_ID /workspace/comfyui/output/downloaded
 python /opt/kimi-runtime/tools/comfyctl.py interrupt
+python /opt/kimi-runtime/tools/comfyctl.py ui-url
 ```
 
 `COMFYUI_CONNECT_TIMEOUT`, `COMFYUI_READ_TIMEOUT`, and
@@ -84,6 +88,42 @@ HTTP/WebSocket bridge on port 8190 lets the container reach it through
 `host.docker.internal`. Its certificate covers the Docker host name and
 loopback, its private key never enters a container, and HTTP/WebSocket sizes and
 connections are bounded.
+
+## Opening the frontend
+
+ComfyUI's UI is a browser origin, and on macOS the bridge that makes the host
+service reachable authenticates every path, including `/`. A browser attaches no
+header to a navigation or to the scripts its page then asks for, so the two
+origins below exist instead of a hole in the bridge.
+
+The host gets ComfyUI's own loopback listener. On an MPS host, `module_start`
+waits for the service and then opens `http://127.0.0.1:8188` in the default
+browser, the way the launcher opens Kimi's web UI, so the operator sees the
+workflow editor without asking for it. `COMFYUI_OPEN_FRONTEND=false` suppresses
+it; nothing else changes. The opener refuses any URL that is not loopback and
+probes the origin before handing it over, so it can neither point the browser at
+someone else's host nor open a tab on a service that is still starting.
+
+The sandbox gets an origin it can simply open. On MPS, `comfyui-ui` is a
+plaintext listener on a private network with the agent, and it pumps every byte
+to the bridge over TLS verified against the bridge's own certificate. The bridge
+terminates that TLS, authenticates the request, and proxies it to ComfyUI on the
+host, so the credential in play is the browser's session and never the bearer
+token crossing a network in the clear.
+
+`comfyctl.py ui-url` prints the link to open. It holds the bearer token, spends
+it on one `POST /__bridge/grant`, and prints the returned frontend URL with the
+grant in the fragment, which is the only part of a URL a browser never transmits,
+never logs, and never repeats in a `Referer`. The page at that URL posts the
+grant once to `/__bridge/session` and gets back an HttpOnly, SameSite=Strict
+cookie, then rewrites its own location to `/` so the grant leaves the address
+bar. From then on every path carries that cookie and the bridge accepts it in
+place of the token. A grant works once and expires after
+`COMFYUI_BRIDGE_GRANT_TTL` seconds; a session lasts `COMFYUI_BRIDGE_SESSION_TTL`
+and is bound to the `Host` that minted it. Sessions are capped in number, and so
+are concurrent grants. The cookie omits `Secure` because the sandbox origin is
+plaintext by construction and publishes no port, so nothing outside the agent's
+own network can observe it; on the host, the origin is loopback.
 
 ## Persistent data and installation
 
@@ -118,7 +158,9 @@ Custom nodes are executable Python. CUDA isolates them in the application
 container with no model-provider credential. MPS requires native host execution:
 review custom nodes before loading them and keep secrets out of that process.
 The bridge uses TLS, bearer authentication, size limits and connection limits;
-its private key is never mounted into the agent container.
+its private key is never mounted into the agent container. Browsers satisfy that
+authentication with a short-lived session cookie minted from a single-use grant,
+so the bearer token stays out of every URL and out of the sandbox.
 
 ## Hardware verification
 

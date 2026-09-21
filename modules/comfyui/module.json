@@ -11,6 +11,7 @@
   ],
   "environment": [],
   "images": [
-    "adrc-comfyui-cuda"
+    "adrc-comfyui-cuda",
+    "adrc-comfyui-ui"
   ]
 }

@@ -24,6 +24,13 @@ TOTAL_TIMEOUT = float(os.environ.get("COMFYUI_TOTAL_TIMEOUT", "1800"))
 MAX_JSON_BYTES = int(os.environ.get("COMFYUI_MAX_JSON_BYTES", str(16 * 1024 * 1024)))
 MAX_TRANSFER_BYTES = int(os.environ.get("COMFYUI_MAX_TRANSFER_BYTES", str(16 * 1024**3)))
 CA_FILE = os.environ.get("COMFYUI_CA_FILE", "")
+#: The origin a browser is meant to open, which is not necessarily the API origin this client
+#: talks to: on an MPS host they are two planes of the same ComfyUI.
+UI_URL = os.environ.get("COMFYUI_UI_URL", "").rstrip("/")
+#: The bridge's frontend routes. The bridge owns these names; they are repeated here because this
+#: client runs in another container and cannot import it. tests/test_comfyctl.py keeps them equal.
+GRANT_PATH = "/__bridge/grant"
+SESSION_PATH = "/__bridge/session"
 
 
 def require_base_url() -> str:
@@ -170,6 +177,27 @@ def cmd_history(args: argparse.Namespace) -> None:
 
 def cmd_wait(args: argparse.Namespace) -> None:
     print_json(wait_for_prompt(args.prompt_id, args.timeout, args.interval))
+
+
+def cmd_ui_url(_args: argparse.Namespace) -> None:
+    """Print one URL that opens ComfyUI's frontend in a browser, and nothing else.
+
+    A browser cannot attach an ``Authorization`` header to a navigation, so this asks the bridge for
+    a single-use grant while holding the bearer token, and hands back a link carrying it in the
+    fragment - the one part of a URL that is never transmitted to a server, written to a log, or
+    repeated in a Referer. The token itself stays in this process's headers and never reaches an
+    address bar, a history entry, or a transcript.
+    """
+    origin = UI_URL or require_base_url()
+    if not AUTH_TOKEN:
+        # A frontend that asks for no credential: the origin is the whole answer.
+        print(origin)
+        return
+    link = request_json("POST", GRANT_PATH)
+    path = link.get("path") if isinstance(link, dict) else None
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise SystemExit("the bridge did not offer a frontend link")
+    print(f"{origin}{path}")
 
 
 def cmd_interrupt(_args: argparse.Namespace) -> None:
@@ -412,6 +440,9 @@ def main() -> None:
 
     command = sub.add_parser("interrupt")
     command.set_defaults(func=cmd_interrupt)
+
+    command = sub.add_parser("ui-url")
+    command.set_defaults(func=cmd_ui_url)
 
     command = sub.add_parser("upload")
     command.add_argument("file")

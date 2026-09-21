@@ -164,6 +164,15 @@ browser, including its authentication fragment. macOS uses `open`; Linux uses
 `xdg-open` (or `wslview` when installed on WSL). If no address is reachable or no
 browser opener is available, startup continues with a message for manual access.
 
+On a Mac the launcher also holds off the idle-sleep timer for as long as it runs,
+because a laptop that dozes takes the containers, the model proxy, and any module
+job down with it. It uses `caffeinate`, which is present on every macOS release
+and identical on Intel and Apple Silicon, and ties the assertion to the launcher's
+own process, so the machine is releasable again even if the launcher is killed
+outright. `HARNESS_KEEPWAKE=false` opts out and leaves the Mac on its normal
+schedule. The setting is ignored on Linux and Windows, where sleep is the host's
+business.
+
 For repeatable automation, set explicit choices and disable prompts:
 
 ```bash
