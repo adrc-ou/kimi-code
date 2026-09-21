@@ -1,10 +1,23 @@
 # syntax=docker/dockerfile:1
 
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+
+# The dependency lock the image installs with is the one the launcher resolved for the chosen
+# release, and it arrives as a named build context because it lives in the instance's runtime
+# directory, which `.dockerignore` keeps out of this context entirely.
+#
+# This stage declares the same name so the reference below always resolves. It ships the baseline
+# lock, which carries no provenance header, so a Compose old enough to have no `additional_contexts`
+# fails the digest check in the install step instead of quietly installing one release's
+# dependencies onto another.
+FROM scratch AS comfy-locks
+COPY modules/comfyui/backend/requirements-linux.lock /requirements.lock
+
 FROM ${PYTHON_IMAGE}
 
 ARG COMFYUI_COMMIT
 ARG COMFYUI_VERSION
+ARG COMFYUI_REQUIREMENTS_SHA256
 ARG APP_UID=1000
 ARG APP_GID=1000
 ARG TORCH_VERSION
@@ -37,10 +50,19 @@ RUN test -n "${COMFYUI_COMMIT}" \
     && git -C /opt/ComfyUI checkout --detach FETCH_HEAD \
     && test "$(git -C /opt/ComfyUI rev-parse HEAD)" = "${COMFYUI_COMMIT}"
 
-COPY modules/comfyui/backend/requirements-linux.lock /tmp/requirements-linux.lock
+COPY --from=comfy-locks requirements.lock /tmp/requirements-linux.lock
 COPY modules/comfyui/backend/requirements-custom.lock /tmp/requirements-custom.lock
 
-RUN test -n "${TORCH_VERSION}" \
+# Three bindings, checked before anything installs. The lock has to say it was built from this
+# commit's requirements — which is what stops one release's dependency set being installed onto
+# another — and it has to still carry the reviewed torch versions, which is the one part of the
+# dependency set that changes what hardware the image can use at all.
+RUN test -n "${COMFYUI_REQUIREMENTS_SHA256}" \
+    && printf '%s\n' "${COMFYUI_REQUIREMENTS_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
+    && grep -qx "# comfyui-commit=${COMFYUI_COMMIT}" /tmp/requirements-linux.lock \
+    && grep -qx "# comfyui-requirements-sha256=${COMFYUI_REQUIREMENTS_SHA256}" \
+       /tmp/requirements-linux.lock \
+    && test -n "${TORCH_VERSION}" \
     && test -n "${TORCHVISION_VERSION}" \
     && test -n "${TORCHAUDIO_VERSION}" \
     && test -n "${PYTORCH_CUDA_INDEX_URL}" \

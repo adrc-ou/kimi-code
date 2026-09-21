@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 6 ]]; then
-  echo "usage: install_comfy_macos.sh ROOT WORKSPACE VERSION COMMIT PYTHON INSTANCE" >&2
+if [[ $# -ne 8 ]]; then
+  echo "usage: install_comfy_macos.sh ROOT WORKSPACE VERSION COMMIT PYTHON INSTANCE LOCK REQUIREMENTS_SHA256" >&2
   exit 2
 fi
 
@@ -12,7 +12,23 @@ version=$3
 commit=$4
 python_command=$5
 instance_id=$6
+lock=$7
+requirements_sha256=$8
 [[ "${instance_id}" =~ ^[0-9a-f]{16}$ ]] || { echo "invalid instance id" >&2; exit 2; }
+[[ "${requirements_sha256}" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid requirements digest" >&2; exit 2; }
+[[ -f "${lock}" ]] || { echo "no dependency lock at ${lock}" >&2; exit 2; }
+# The same binding the CUDA build makes: this lock has to say it was resolved from this release's
+# requirements and this commit. Installing a lock that was built for another release under
+# --require-hashes does not fail, because every hash in it is correct for *its* dependency set --
+# which is precisely why the claim has to be read rather than assumed.
+grep -qx "# comfyui-requirements-sha256=${requirements_sha256}" "${lock}" || {
+  echo "The dependency lock ${lock} was not resolved from ComfyUI ${version}'s requirements." >&2
+  exit 1
+}
+grep -qx "# comfyui-commit=${commit}" "${lock}" || {
+  echo "The dependency lock ${lock} was not resolved from commit ${commit}." >&2
+  exit 1
+}
 base="${root}/.local/runtime/${instance_id}/module-data/comfyui/app"
 releases="${base}/releases"
 current="${base}/current"
@@ -23,14 +39,16 @@ release_created=false
 
 mkdir -p "${releases}"
 
-# Reinstall when application, backend pins, custom requirements, installer, or
-# the selected host Python executable changes.
+# Reinstall when the application, the resolved dependency set, the backend pins, custom
+# requirements, installer, or the selected host Python executable changes.
 fingerprint=$(
   {
-    printf '%s\n' "${version}" "${commit}" "${python_command}"
+    printf '%s\n' "${version}" "${commit}" "${requirements_sha256}" "${python_command}"
+    # Digest the lock's bytes rather than shasum's output for it, because the keyed path it is
+    # cached under changes with the resolver version while its contents need not.
+    shasum -a 256 <"${lock}"
     shasum -a 256 \
       "${root}/modules/comfyui/backend/backend.env" \
-      "${root}/modules/comfyui/backend/requirements-macos.lock" \
       "${root}/modules/comfyui/backend/requirements-custom.lock" \
       "${root}/modules/comfyui/scripts/install_comfy_macos.sh"
   } | shasum -a 256 | awk '{print $1}'
@@ -81,7 +99,7 @@ test "$(git -C "${release}/app" rev-parse HEAD)" = "${commit}"
 
 "${python_command}" -m venv "${release}/venv"
 "${release}/venv/bin/python" -m pip install --require-hashes \
-  --requirement "${root}/modules/comfyui/backend/requirements-macos.lock"
+  --requirement "${lock}"
 "${release}/venv/bin/python" -m pip install --require-hashes \
   --requirement "${root}/modules/comfyui/backend/requirements-custom.lock"
 

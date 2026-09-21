@@ -2,6 +2,9 @@
 # build context or a layer cache. Nothing the Dockerfiles COPY is listed: the agent image takes
 # only container/package.json, container/package-lock.json, container/serena.lock and
 # container/ensure-runtime-user.sh, and the ComfyUI backend build keeps modules/ in context.
+# That build also takes the resolved dependency lock as a named context, which is how a file
+# under .local/ reaches the image: the ignore list below keeps .local out of the build
+# filesystem itself, so a lock can only ever arrive through that explicit context.
 .git
 .env
 .local

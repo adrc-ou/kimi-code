@@ -83,12 +83,15 @@ class VersionSelectionTests(unittest.TestCase):
                 self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
                 self.assertTrue(context.check_hostname)
 
-    def test_installed_version_replaces_tenth_choice(self):
+    def test_installed_version_adds_an_eleventh_choice(self):
+        # The version a launch is already running is never the row that gets dropped to keep the
+        # window at ten: shortening the list would hide the newest release instead of the one the
+        # operator is using, so an older install is appended and the menu is one row longer.
         catalog = [{"version": f"1.{minor}.0"} for minor in range(20, 0, -1)]
         choices = MODULE.visible_choices(catalog, "1.1.0")
         self.assertEqual(
             [item["version"] for item in choices],
-            [f"1.{minor}.0" for minor in range(20, 11, -1)] + ["1.1.0"],
+            [f"1.{minor}.0" for minor in range(20, 10, -1)] + ["1.1.0"],
         )
 
     def test_existing_recent_install_does_not_expand_list(self):

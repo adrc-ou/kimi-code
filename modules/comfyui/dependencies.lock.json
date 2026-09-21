@@ -5,6 +5,11 @@
       "version": "3.12.14",
       "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-aarch64-apple-darwin-install_only.tar.gz",
       "digest": "sha256:3ee3ee547cedfeb7c2b16b2b7156039f7b470bb8f857e226fd3d2eb11db83c76"
+    },
+    "uv-resolver": {
+      "version": "0.12.17",
+      "image": "ghcr.io/astral-sh/uv:0.12.17",
+      "digest": "sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc"
     }
   },
   "files": {

@@ -19,9 +19,18 @@ comfy_backend() {
 }
 
 module_configure() {
-  case "$(uname -s):$(uname -m)" in
-    Darwin:arm64) COMFYUI_BACKEND=mps; COMFYUI_PLATFORM=darwin-arm64 ;;
-    *) COMFYUI_BACKEND=cuda; COMFYUI_PLATFORM=wsl2-x86_64 ;;
+  # The platform is derived once, by the launcher, and this module reads that conclusion instead of
+  # repeating the probe. Both installers get their backend from the same case, so the profile the
+  # version picker offers and the installer that later consumes its answer cannot disagree. Plain
+  # Linux and WSL2 share one profile: the CUDA path is containerised, so what it installs against is
+  # the container's architecture rather than whatever the host kernel calls itself.
+  case "${HARNESS_PLATFORM}" in
+    darwin-arm64) COMFYUI_BACKEND=mps; COMFYUI_PLATFORM=darwin-arm64 ;;
+    linux-x86_64|wsl2-x86_64) COMFYUI_BACKEND=cuda; COMFYUI_PLATFORM=wsl2-x86_64 ;;
+    *)
+      echo "ComfyUI has no backend profile for host platform ${HARNESS_PLATFORM:-unknown}." >&2
+      return 1
+      ;;
   esac
   export COMFYUI_PLATFORM COMFYUI_BACKEND
   comfy_backend
@@ -65,9 +74,34 @@ comfy_migrate() {
   fi
 }
 
+comfy_resolve() {
+  # The shipped lock was compiled from one release's requirements and is installed with
+  # `--require-hashes`, so any other release needs a lock of its own before anything installs it.
+  # This is the only place that asks for one, which is what keeps the two installers reading a
+  # single path and holds the network round trip to once per release per platform.
+  local announced="${HARNESS_RUNTIME_DIR}/comfyui/lock-path"
+  python3 "${MODULE_DIR}/resolve_locks.py" \
+    --platform "${COMFYUI_PLATFORM}" \
+    --version "${COMFYUI_VERSION}" \
+    --commit "${COMFYUI_COMMIT}" \
+    --requirements-sha256 "${COMFYUI_REQUIREMENTS_SHA256}" \
+    --runtime-dir "${HARNESS_RUNTIME_DIR}" \
+    --output "${announced}" || return 1
+  read -r COMFYUI_LOCK_PATH <"${announced}"
+  # The CUDA build takes the lock as a named context, and a context is a directory with a fixed
+  # file name in it: handing the build the keyed path instead would make the Dockerfile depend on
+  # a digest that changes with every release.
+  COMFYUI_LOCK_CONTEXT="${HARNESS_RUNTIME_DIR}/comfyui/build"
+  mkdir -p "${COMFYUI_LOCK_CONTEXT}" || return 1
+  cp -f -- "${COMFYUI_LOCK_PATH}" "${COMFYUI_LOCK_CONTEXT}/requirements.lock" || return 1
+  export COMFYUI_LOCK_PATH COMFYUI_LOCK_CONTEXT
+  printf 'export COMFYUI_LOCK_CONTEXT=%q\n' "${COMFYUI_LOCK_CONTEXT}" >>"${HARNESS_RUNTIME_DIR}/runtime.env"
+}
+
 module_prepare() {
   local bind_manifest bind_assignments assignment variable
   comfy_migrate
+  comfy_resolve
   mkdir -p "${HARNESS_RUNTIME_DIR}/module-data/comfyui"
   MODULE_SESSION_FILES+=(module-data/comfyui/bridge.crt module-data/comfyui/bridge.key)
   COMFYUI_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
@@ -108,7 +142,7 @@ module_install() {
   local mac_python
   if [[ "${COMFYUI_BACKEND}" == mps ]]; then
     mac_python=$(bash "${MODULE_DIR}/scripts/select_macos_python.sh")
-    bash "${MODULE_DIR}/scripts/install_comfy_macos.sh" "${HARNESS_ROOT}" "${HARNESS_WORKSPACE}" "${COMFYUI_VERSION}" "${COMFYUI_COMMIT}" "${mac_python}" "${HARNESS_INSTANCE_ID}"
+    bash "${MODULE_DIR}/scripts/install_comfy_macos.sh" "${HARNESS_ROOT}" "${HARNESS_WORKSPACE}" "${COMFYUI_VERSION}" "${COMFYUI_COMMIT}" "${mac_python}" "${HARNESS_INSTANCE_ID}" "${COMFYUI_LOCK_PATH}" "${COMFYUI_REQUIREMENTS_SHA256}"
   fi
 }
 

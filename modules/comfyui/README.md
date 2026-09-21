@@ -36,28 +36,63 @@ provides CUDA to WSL. Run this project from an Ubuntu/WSL shell, not Git Bash,
 and place both the repository and workspace in the WSL filesystem rather than
 under `/mnt/c`.
 
-ComfyUI selection is limited to exact tuples in `modules/comfyui/backend/compatibility.json`.
-Each tuple records the application commit, Python/GPU backend, dependency-lock
-digests, and certification evidence. A stable semantic version is not treated
-as compatible merely because of its tag. Entries marked `locked` have immutable
-dependency resolution but still require the recorded controlled hardware run;
-only entries marked `tested` may claim hardware certification.
+The version menu lists the ten most recent releases of the ComfyUI repository
+that matches the host platform, read from upstream when the launch happens. The
+installed release joins them as an eleventh row when it is older than those ten,
+so a pinned installation stays selectable without padding the list with
+releases nobody chose. Each row says where it came from: `stale` when upstream
+was unreachable and a cached listing past its twenty-four-hour window answered,
+and `local` when nothing upstream was reachable at all and only the releases
+this repository records could be offered. A launch never waits on GitHub.
+`modules/comfyui/releases.py` owns that catalog and caches it in
+`$HARNESS_RUNTIME_DIR/comfyui/releases.json`, and the menu itself is drawn by the
+same `scripts/select_versions.py` helpers the Kimi Code picker uses, so both
+offer ten rows and mark them the same way however the releases were obtained.
+
+`modules/comfyui/backend/compatibility.json` no longer decides what is selectable; it
+declares what a release is installed *with*. Each platform entry records its
+installer, architecture, Python, resolver platform, reviewed PyTorch pins and
+the files whose bytes the dependency lock is keyed by, and its `baseline` block
+records the one release the shipped lock was built for, by application commit,
+requirements digest and lock digests, with certification status. A release
+outside that record is installable and its lock is resolved on the host at
+launch; it is never presented as certified. Entries marked `locked` have
+immutable dependency resolution but still require the recorded controlled
+hardware run; only entries marked `tested` may claim hardware certification.
 
 PyTorch versions are pinned separately in `modules/comfyui/backend/backend.env`. They do not
 automatically move with ComfyUI releases because a framework upgrade can change
-CUDA driver requirements or MPS behavior. Review those pins deliberately.
+CUDA driver requirements or MPS behavior. Review those pins deliberately: a lock
+that resolved a different PyTorch is refused rather than installed, so a pin
+there is a requirement, not a preference.
 
-`modules/comfyui/backend/requirements-linux.lock`, `modules/comfyui/backend/requirements-macos.lock`, and
-`modules/comfyui/backend/requirements-custom.lock` are complete, hash-checked Python resolution
-artifacts. `modules/comfyui/backend/requirements-custom.txt` is the operator-reviewed input for
-custom nodes and accepts exact `name==version` pins only. After changing the
-input or certified ComfyUI version, regenerate the affected locks with `uv pip
-compile --generate-hashes` for Python 3.12 and the exact target platform. The
-CUDA lock must retain the reviewed direct-wheel URLs and hashes from
-`modules/comfyui/backend/torch-cuda-constraints.txt`; the macOS lock uses
-`modules/comfyui/backend/torch-constraints.txt`. Update digests in `modules/comfyui/dependencies.lock.json` and
-`modules/comfyui/backend/compatibility.json`, then run the backend acceptance test. Do not add
-automatic custom-node dependency installation to container startup.
+Whatever release is chosen, the installers read one file: a hash-checked lock
+under `$HARNESS_RUNTIME_DIR/comfyui/locks/`, named by a key over the platform
+profile, the chosen release's `requirements.txt` digest, the resolver's version,
+and the reviewed PyTorch, constraint and custom-node inputs. Another release,
+platform, reviewed pin or resolver is another key, so an existing lock can only
+ever answer for the inputs it was built from. The baseline release's shipped
+lock is copied to that path with its provenance header prepended, which is why
+the default launch resolves nothing at all.
+
+Resolution runs in the digest-pinned `uv` container recorded in
+`modules/comfyui/dependencies.lock.json`, so a build tool stays off the host. Setting
+`COMFYUI_UV_BIN` points the same plan at a native `uv` instead, for reviewing a
+lock without pulling an image; the resolver's version is part of the key either
+way, so the two can never stand in for each other.
+
+`modules/comfyui/backend/requirements-linux.lock` and `modules/comfyui/backend/requirements-macos.lock`
+are the shipped baseline locks and `modules/comfyui/backend/requirements-custom.lock` the
+custom-node lock. `modules/comfyui/backend/requirements-custom.txt` is the operator-reviewed
+input for custom nodes and accepts exact `name==version` pins only. Editing any
+reviewed input moves the key, so the next launch resolves a replacement by
+itself: there is no lock to hand-compile with `uv pip compile` and no digest to
+transcribe by hand. The CUDA lock retains the reviewed direct-wheel URLs and
+hashes from `modules/comfyui/backend/torch-cuda-constraints.txt`, and the macOS lock uses
+`modules/comfyui/backend/torch-constraints.txt`. Update `modules/comfyui/dependencies.lock.json` and
+the baseline block of `modules/comfyui/backend/compatibility.json` only when replacing a
+shipped lock itself, then run the backend acceptance test. Do not add automatic
+custom-node dependency installation to container startup.
 
 ## ComfyUI access from Kimi
 

@@ -1,73 +1,70 @@
 #!/usr/bin/env python3
-"""Select only backend-certified, immutable ComfyUI releases."""
+"""Select the ComfyUI release to launch, from the releases this platform can install.
 
-import json
+Which releases exist is a question for the upstream repository; which of them can be installed
+here, and with what dependencies, is a question for ``releases.py`` and the backend profile beside
+this module. This file is only the launcher's step: it assembles a catalog, asks, and writes down
+what was answered.
+"""
+
 import os
-import re
 import sys
 from pathlib import Path
 
 # This runs as a script, so both of the paths it reads from are added by hand: ``scripts/`` for the
 # shared release selector, and ``tools/`` for the modal engine, under the same flat identity that
-# ``tools/*.py`` itself uses when it is run as a program.
+# ``tools/*.py`` itself uses when it is run as a program. ``releases`` is imported flat for the same
+# reason it lives in this directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-from select_versions import (
-    SEMVER_RE,
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import releases  # noqa: E402  (the path above is what makes this import work)
+from select_versions import (  # noqa: E402
     choose,
     load_state,
     running_flow,
-    semver_key,
     write_environment,
 )
 from tui import flow
 from tui.app import View
 
 # What this module contributes to the session file, so that a replay can tell a settled answer from
-# a half-written one.
-MODULE_KEYS = ("COMFYUI_VERSION", "COMFYUI_COMMIT")
+# a half-written one. The requirements digest is part of the answer rather than something the
+# installers re-derive, because the dependency lock has to be keyed by the digest that was verified
+# when the operator confirmed the version — not by whatever the file happens to contain later.
+MODULE_KEYS = ("COMFYUI_VERSION", "COMFYUI_COMMIT", "COMFYUI_REQUIREMENTS_SHA256")
 
 
-def comfy_catalog(platform_key: str, path: Path | None = None) -> tuple[list[dict[str, str]], str]:
-    """The certified backends for one platform, newest first, with the newest version.
+def comfy_catalog(
+    platform_key: str,
+    path: Path | None = None,
+    *,
+    cache: Path | None = None,
+    now: float | None = None,
+) -> tuple[list[dict[str, str]], str]:
+    """The installable releases for one platform, newest first, with the newest of them.
 
-    ``path`` is the compatibility document; it defaults to the one shipped beside this module,
-    and a caller may point it at another so the ordering and the refusals can be exercised
-    without waiting for the shipped file to contain a second release.
+    ``path`` is the backend profile document, defaulting to the one shipped beside this module, and
+    ``cache`` is where the fetched listing is kept. A caller may point either at another so the
+    ordering, the provenance marks and the offline refusals can be exercised without touching the
+    network or waiting for the shipped file to change.
     """
-    if path is None:
-        path = Path(__file__).resolve().parent / "backend" / "compatibility.json"
-    document = json.loads(path.read_text())
-    entries = document.get("entries", [])
-    if not isinstance(entries, list):
-        raise SystemExit("Invalid ComfyUI compatibility catalog")
-    catalog = []
-    for entry in entries:
-        if not isinstance(entry, dict) or entry.get("platform") != platform_key:
-            continue
-        status = entry.get("status")
-        if status not in {"locked", "tested"}:
-            continue
-        version = str(entry.get("comfyui_version", ""))
-        commit = str(entry.get("comfyui_commit", ""))
-        if not SEMVER_RE.fullmatch(version) or not re.fullmatch(r"[0-9a-f]{40}", commit):
-            raise SystemExit("Invalid ComfyUI compatibility entry")
-        catalog.append({"version": version, "commit": commit, "status": status})
-    catalog.sort(key=lambda item: semver_key(item["version"]), reverse=True)
-    return catalog, catalog[0]["version"] if catalog else ""
+    return releases.catalog_for(platform_key, profile_path=path, cache=cache, now=now)
 
 
 def main() -> None:
-    catalog, latest = comfy_catalog(os.environ["COMFYUI_PLATFORM"])
+    platform = os.environ["COMFYUI_PLATFORM"]
+    cache = releases.cache_path()
+    catalog, latest = comfy_catalog(platform, cache=cache)
     path = Path(os.environ["HARNESS_SESSION_FILE"])
     override = os.environ.get("COMFYUI_VERSION", "").strip()
     non_interactive = os.environ["MODULE_NON_INTERACTIVE"] == "true"
     launch = running_flow()
     if launch and not launch.should_render(flow.MODULE_VERSION):
         # A replay: this pass renders no screen because a previous one already asked and the answer
-        # is on disk. The pass that asked certified what it wrote and everything downstream
-        # re-checks the compatibility document anyway, so there is nothing left to decide — and
-        # re-deriving the default here would overwrite the version the user chose.
+        # is on disk. The pass that asked resolved what it wrote and everything downstream re-checks
+        # the backend profile anyway, so there is nothing left to decide — and re-deriving the
+        # default here would overwrite the version the user chose.
         carried = load_state(path)
         if all(carried.get(key, "").strip() for key in MODULE_KEYS):
             return
@@ -103,8 +100,17 @@ def main() -> None:
         # This menu is one screen with nothing earlier inside it, so Back means the previous step of
         # the launch, and the pass has to be restarted from the top to get there.
         flow.back_from(launch, flow.MODULE_VERSION)
+
+    # Only the row that was picked gets its commit and requirements digest looked up. The catalog
+    # deliberately carries neither for the rows nobody chose, so scrolling past nine releases does
+    # not cost nineteen requests.
+    chosen = releases.resolve(chosen, platform, cache=cache)
     values = load_state(path)
-    values.update(COMFYUI_VERSION=chosen["version"], COMFYUI_COMMIT=chosen["commit"])
+    values.update(
+        COMFYUI_VERSION=chosen["version"],
+        COMFYUI_COMMIT=chosen["commit"],
+        COMFYUI_REQUIREMENTS_SHA256=chosen["requirements_sha256"],
+    )
     write_environment(path, values)
     if launch and asking:
         launch.commit(flow.MODULE_VERSION, chosen["version"])

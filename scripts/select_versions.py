@@ -26,6 +26,14 @@ from tui.menu import SINGLE, Choice, ListStep
 
 GITHUB_API = "https://api.github.com"
 KIMI_REPOSITORY = "MoonshotAI/kimi-code"
+# How many of the newest releases a version menu offers. An installed release older than this
+# many is appended rather than dropped, so the row the launcher already runs is always reachable.
+RECENT_RELEASES = 10
+# Provenance values a menu row should advertise, because each one qualifies how far the row can be
+# trusted: the list behind it is either older than the source or not from the source at all. The
+# remaining provenance is a release listed from the source just now, which needs no mark because
+# that is the assumption a reader already makes.
+QUALIFIED_PROVENANCE = ("stale", "local")
 MAX_METADATA_BYTES = 4 * 1024 * 1024
 SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 KIMI_TAG_RE = re.compile(r"^@moonshot-ai/kimi-code@(\d+\.\d+\.\d+)$")
@@ -209,26 +217,29 @@ def add_installed_entry(
 
 
 def visible_choices(catalog: list[dict[str, str]], installed: str) -> list[dict[str, str]]:
+    """The releases a menu offers: the newest ``RECENT_RELEASES``, plus the installed one.
+
+    An installed release older than the window is appended rather than taking a slot, so the
+    version the launcher is already running stays reachable without shortening that window by
+    one. It is necessarily older than everything in ``recent`` — otherwise the version check
+    above would have returned — so the list needs no second sort.
+    """
     catalog = sorted(
         catalog,
         key=lambda item: semver_key(item["version"]),
         reverse=True,
     )
-    first_ten = catalog[:10]
-    if not installed or any(item["version"] == installed for item in first_ten):
-        return first_ten
+    recent = catalog[:RECENT_RELEASES]
+    if not installed or any(item["version"] == installed for item in recent):
+        return recent
 
     installed_item = next(
         (item for item in catalog if item["version"] == installed),
         None,
     )
     if installed_item is None:
-        return first_ten
-    return sorted(
-        [*catalog[:9], installed_item],
-        key=lambda item: semver_key(item["version"]),
-        reverse=True,
-    )
+        return recent
+    return [*recent, installed_item]
 
 
 def choose(
@@ -295,14 +306,20 @@ def choose(
 def _release(item: dict[str, str], latest: str, installed: str) -> Choice:
     """One release row, with whatever the launcher already knows about it in the hint column.
 
-    Both marks can appear on one row, which is why they are joined rather than chosen between: the
-    newest release is usually also the installed one, and saying only half of that would be wrong.
+    Marks accumulate rather than compete, which is why they are joined: the newest release is
+    usually also the installed one, and saying only half of that would be wrong. A catalogue may
+    also say where a row came from, and only the provenances that qualify what the row is worth
+    are shown — a release listed from the source just now needs no mark, because that is the
+    assumption a reader already makes.
     """
     labels = []
     if item["version"] == latest:
         labels.append("latest")
     if item["version"] == installed:
         labels.append("installed")
+    provenance = item.get("provenance", "")
+    if provenance in QUALIFIED_PROVENANCE:
+        labels.append(provenance)
     return Choice(
         id=item["version"],
         label=item["version"],

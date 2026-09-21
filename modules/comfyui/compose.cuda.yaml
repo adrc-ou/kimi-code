@@ -4,9 +4,15 @@ services:
     build:
       context: .
       dockerfile: modules/comfyui/backend/Dockerfile.cuda
+      # The lock the resolved release installs with, staged by the ComfyUI module's prepare hook.
+      # It is a named context rather than a path in this repository because per-release locks are
+      # generated state, and `.dockerignore` keeps generated state out of the build context.
+      additional_contexts:
+        comfy-locks: "${COMFYUI_LOCK_CONTEXT:?Resolved by the ComfyUI module}"
       args:
         COMFYUI_VERSION: "${COMFYUI_VERSION:?}"
         COMFYUI_COMMIT: "${COMFYUI_COMMIT:?}"
+        COMFYUI_REQUIREMENTS_SHA256: "${COMFYUI_REQUIREMENTS_SHA256:?}"
         APP_UID: "${LOCAL_UID:-1000}"
         APP_GID: "${LOCAL_GID:-1000}"
         TORCH_VERSION: "${COMFYUI_TORCH_VERSION:?}"

@@ -100,7 +100,7 @@ The launcher calls hooks for each selected module in selection order:
 | Hook | Responsibility |
 | --- | --- |
 | `module_configure` | Export module defaults/backend configuration; no installation or prompts. |
-| `module_select_version` | After the Kimi menu, present the module's version menu and append validated version/commit values to `HARNESS_SESSION_FILE`. |
+| `module_select_version` | After the Kimi menu, present the module's version menu and append validated version, commit and dependency-digest values to `HARNESS_SESSION_FILE`. |
 | `module_prepare` | After declarative directory/runtime setup and project extension approval, generate session secrets/certificates and record bind identities. |
 | `module_compose` | Append trusted overlays to `HARNESS_COMPOSE_FILES`. Also used by `shell.sh`; no installation or secrets generation. |
 | `module_verify` | Recheck module bind identities before install/start and when opening a shell. |
@@ -115,7 +115,12 @@ command must therefore pass `-T` to `compose run`, or it takes over the terminal
 the launch is asking its questions with.
 Version hooks can reuse `scripts/select_versions.py` utilities: `choose`,
 `load_state`, `write_environment`, release fetching and checksum validation.
-Keep application catalogs and backend-specific compatibility rules in the module.
+`visible_choices` fixes what a menu shows — the ten most recent releases, plus
+the installed one as an eleventh row when it is older than those ten — so a
+module that fetches its own catalog still draws the same menu as the Kimi Code
+picker. Keep application catalogs and backend-specific compatibility rules in the
+module, and derive anything a release is installed with only after it is chosen,
+so listing the options stays cheaper than acting on one.
 Only version metadata belongs in `HARNESS_SESSION_FILE`; it becomes persistent
 `state.env`. Never write tokens or paths supplied as secrets there.
 

@@ -20,8 +20,10 @@ intentionally writable.
 Do not modify the replaceable ComfyUI application or install packages at runtime.
 When a custom node needs another dependency, identify and pin the exact package
 version and report that `modules/comfyui/backend/requirements-custom.txt` in the operator-managed
-harness must be reviewed, its hash-checked lock regenerated, and the selected
-backend recertified.
+harness must be reviewed. That file is one of the inputs the dependency lock is
+keyed by, so once it is reviewed the next launch resolves a lock that agrees
+with it; no lock is hand-compiled, and the running backend is only as certified
+as the release record the chosen version came from.
 
 Treat custom nodes as executable code. Inspect their source and dependency
 metadata before asking the operator to restart and load them.

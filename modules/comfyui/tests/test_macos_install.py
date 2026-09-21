@@ -146,6 +146,80 @@ cp "$TEST_ARCHIVE" "$2"
         python.chmod(0o700)
         (release / "FINGERPRINT").write_text("fixture\n")
         (base / "current").symlink_to("releases/fixture")
+        # A lock the installer will accept: it has to claim this commit and these requirements
+        # before the script gets as far as the MPS probe whose failure this test is about.
+        lock = self.base / "requirements.lock"
+        lock.write_text(
+            "# comfyui-commit=test-commit\n"
+            f"# comfyui-requirements-sha256={'a' * 64}\n"
+            "torch==2.11.0 \\\n    --hash=sha256:" + ("b" * 64) + "\n"
+        )
+        result = self.run_script(
+            "modules/comfyui/scripts/install_comfy_macos.sh",
+            str(self.root),
+            str(self.workspace),
+            "test-version",
+            "test-commit",
+            "python3",
+            "0123456789abcdef",
+            str(lock),
+            "a" * 64,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        # The failure this test is about is the MPS probe, which is downstream of everything the
+        # lock is checked for; a lock the script rejected would pass the assertion above alone.
+        self.assertNotIn("dependency lock", result.stderr)
+        self.assertTrue(python.is_file())
+        self.assertTrue((base / "current").is_dir())
+
+    def test_installer_refuses_a_lock_resolved_from_another_release(self):
+        # The hashes in a lock are all correct for the release it was resolved from, so installing
+        # the wrong one under --require-hashes succeeds. The provenance header is the only thing
+        # that can catch it, and it has to stop the run before a venv is made.
+        self.command("shasum", 'cat >/dev/null\nprintf "fixture\\n"\n')
+        lock = self.base / "requirements.lock"
+        lock.write_text(
+            "# comfyui-commit=test-commit\n"
+            f"# comfyui-requirements-sha256={'c' * 64}\n"
+        )
+        result = self.run_script(
+            "modules/comfyui/scripts/install_comfy_macos.sh",
+            str(self.root),
+            str(self.workspace),
+            "test-version",
+            "test-commit",
+            "python3",
+            "0123456789abcdef",
+            str(lock),
+            "a" * 64,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("was not resolved from ComfyUI test-version", result.stderr)
+
+    def test_installer_refuses_a_lock_resolved_from_another_commit(self):
+        self.command("shasum", 'cat >/dev/null\nprintf "fixture\\n"\n')
+        lock = self.base / "requirements.lock"
+        lock.write_text(
+            "# comfyui-commit=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n"
+            f"# comfyui-requirements-sha256={'a' * 64}\n"
+        )
+        result = self.run_script(
+            "modules/comfyui/scripts/install_comfy_macos.sh",
+            str(self.root),
+            str(self.workspace),
+            "test-version",
+            "test-commit",
+            "python3",
+            "0123456789abcdef",
+            str(lock),
+            "a" * 64,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("was not resolved from commit test-commit", result.stderr)
+
+    def test_installer_requires_a_lock(self):
+        # Passing nothing used to mean installing the one shipped lock whatever was selected; the
+        # argument is now load-bearing, so its absence is a usage error rather than a default.
         result = self.run_script(
             "modules/comfyui/scripts/install_comfy_macos.sh",
             str(self.root),
@@ -155,6 +229,5 @@ cp "$TEST_ARCHIVE" "$2"
             "python3",
             "0123456789abcdef",
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(python.is_file())
-        self.assertTrue((base / "current").is_dir())
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage:", result.stderr)
