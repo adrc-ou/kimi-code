@@ -7,13 +7,28 @@ import re
 import sys
 from pathlib import Path
 
+# This runs as a script, so both of the paths it reads from are added by hand: ``scripts/`` for the
+# shared release selector, and ``tools/`` for the modal engine, under the same flat identity that
+# ``tools/*.py`` itself uses when it is run as a program.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-from select_versions import SEMVER_RE, choose, load_state, semver_key, write_environment
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+from select_versions import (
+    SEMVER_RE,
+    choose,
+    load_state,
+    running_flow,
+    semver_key,
+    write_environment,
+)
+from tui import flow
+from tui.app import View
+
+# What this module contributes to the session file, so that a replay can tell a settled answer from
+# a half-written one.
+MODULE_KEYS = ("COMFYUI_VERSION", "COMFYUI_COMMIT")
 
 
-def comfy_catalog(
-    platform_key: str, path: Path | None = None
-) -> tuple[list[dict[str, str]], str]:
+def comfy_catalog(platform_key: str, path: Path | None = None) -> tuple[list[dict[str, str]], str]:
     """The certified backends for one platform, newest first, with the newest version.
 
     ``path`` is the compatibility document; it defaults to the one shipped beside this module,
@@ -42,18 +57,58 @@ def comfy_catalog(
     return catalog, catalog[0]["version"] if catalog else ""
 
 
-if __name__ == "__main__":
+def main() -> None:
     catalog, latest = comfy_catalog(os.environ["COMFYUI_PLATFORM"])
-    chosen = choose(
-        "ComfyUI",
-        os.environ["HARNESS_PLATFORM_LABEL"],
-        catalog,
-        latest,
-        os.environ.get("COMFYUI_INSTALLED", ""),
-        os.environ.get("COMFYUI_VERSION", ""),
-        os.environ["MODULE_NON_INTERACTIVE"] == "true",
-    )
     path = Path(os.environ["HARNESS_SESSION_FILE"])
+    override = os.environ.get("COMFYUI_VERSION", "").strip()
+    non_interactive = os.environ["MODULE_NON_INTERACTIVE"] == "true"
+    launch = running_flow()
+    if launch and not launch.should_render(flow.MODULE_VERSION):
+        # A replay: this pass renders no screen because a previous one already asked and the answer
+        # is on disk. The pass that asked certified what it wrote and everything downstream
+        # re-checks the compatibility document anyway, so there is nothing left to decide — and
+        # re-deriving the default here would overwrite the version the user chose.
+        carried = load_state(path)
+        if all(carried.get(key, "").strip() for key in MODULE_KEYS):
+            return
+        # An answer the file cannot show is not an answer. Forgetting it makes this pass ask again,
+        # which is the only way to end up with a complete one.
+        launch.forget(flow.MODULE_VERSION)
+
+    # Whether this step would put a screen on the terminal. The flow has to know before the menu
+    # exists, because a step that answers itself has no screen in it and belongs to neither the
+    # count nor the sequence.
+    asking = not override and not non_interactive
+    rendering = launch.plan(flow.MODULE_VERSION, 1 if asking else 0) if launch else asking
+    view = None
+    if rendering:
+        position, total = launch.rail(flow.MODULE_VERSION) if launch else (1, 1)
+        view = View(
+            position=position,
+            total=total,
+            can_go_back=bool(launch and launch.previous(flow.MODULE_VERSION)),
+        )
+    try:
+        chosen = choose(
+            "ComfyUI",
+            os.environ["HARNESS_PLATFORM_LABEL"],
+            catalog,
+            latest,
+            os.environ.get("COMFYUI_INSTALLED", ""),
+            override,
+            non_interactive,
+            view,
+        )
+    except flow.BackRequested:
+        # This menu is one screen with nothing earlier inside it, so Back means the previous step of
+        # the launch, and the pass has to be restarted from the top to get there.
+        flow.back_from(launch, flow.MODULE_VERSION)
     values = load_state(path)
     values.update(COMFYUI_VERSION=chosen["version"], COMFYUI_COMMIT=chosen["commit"])
     write_environment(path, values)
+    if launch and asking:
+        launch.commit(flow.MODULE_VERSION, chosen["version"])
+
+
+if __name__ == "__main__":
+    main()

@@ -226,6 +226,146 @@ class AgentsDocumentTests(unittest.TestCase):
         self.assertEqual(self.staged("", ALL_OFF), "")
 
 
+class StaticOverrideTests(unittest.TestCase):
+    """The tri-state the panel offers for each file half of a document, and what it composes to.
+
+    ``off`` is what the resolver already composes when the operator's file is empty, and ``on``
+    is what it already composes when that file is absent. The feature moves a block between two
+    rows the table already has, which is why it needs no new staging path and writes no file in
+    the workspace.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plan = shipped_plan()
+        cls.main_addons = policy.render_guidance(cls.plan, "main").rstrip("\n")
+        cls.lane_addons = policy.render_guidance(cls.plan, "lane").rstrip("\n")
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name)
+        (self.root / "runtime").mkdir()
+        (self.root / "runtime" / "AGENTS.md").write_text("shipped contract\n", encoding="utf-8")
+
+    def system(self, text: str | None, state: str, enabled: dict | None = None) -> str:
+        if text is not None:
+            (self.root / pc.SYSTEM_FILE).write_text(text, encoding="utf-8")
+        return pc.compose_system_document(
+            self.root, self.plan, enabled, None, {pc.STATIC_SYSTEM: state}
+        )
+
+    def agents(self, text: str | None, state: str, enabled: dict | None = None) -> str:
+        if text is not None:
+            (self.root / pc.CONTEXT_FILE).write_text(text, encoding="utf-8")
+        return pc.compose_agents_document(
+            self.root, self.plan, "", enabled, None, {pc.STATIC_CONTEXT: state}
+        )
+
+    def test_auto_is_the_disk_and_is_byte_identical_to_no_opinion_at_all(self):
+        for state in (pc.AUTO, "anything else"):
+            with self.subTest(state=state):
+                self.assertEqual(self.system(f"{MINE}\n", state), self.system(f"{MINE}\n", pc.AUTO))
+        self.assertEqual(self.system(f"{MINE}\n", "wat"), f"{MINE}\n\n{self.main_addons}\n")
+
+    def test_off_blanks_the_file_half_and_leaves_every_addon_alone(self):
+        out = self.system(f"{MINE}\n", pc.OFF)
+        self.assertEqual(out, f"{self.main_addons}\n")
+        self.assertNotIn(MINE, out)
+        # The built-in prompt is what "absent" reaches, and a block the operator switched off is a
+        # decision about this prompt rather than a request for Kimi's.
+        self.assertNotIn(pc.BASE_PROMPT_WRAPPER, out)
+
+    def test_off_with_no_addons_is_the_sentinel_rather_than_nothing(self):
+        self.assertEqual(self.system(f"{MINE}\n", pc.OFF, ALL_OFF), pc.EMPTY_PROMPT_SENTINEL + "\n")
+
+    def test_on_treats_an_empty_file_as_no_file_at_all(self):
+        """One line: toggling on a block whose file is empty ignores that file."""
+        for blank in ("", "\n", "   \n\t\n"):
+            with self.subTest(blank=repr(blank)):
+                out = self.system(blank, pc.ON)
+                self.assertTrue(out.startswith(pc.BASE_PROMPT_WRAPPER))
+                self.assertIn(self.main_addons, out)
+
+    def test_on_and_auto_agree_the_moment_there_is_something_to_read(self):
+        for text in (f"{MINE}\n", None):
+            with self.subTest(text=text):
+                self.assertEqual(self.system(text, pc.ON), self.system(text, pc.AUTO))
+
+    def test_the_operators_contract_supersedes_the_shipped_one_under_auto(self):
+        out = self.agents(f"{MINE}\n", pc.AUTO)
+        self.assertTrue(out.startswith(MINE))
+        self.assertNotIn("shipped contract", out)
+
+    def test_an_empty_operators_contract_supersedes_the_shipped_one_under_auto(self):
+        """Today's behaviour, guarded: an empty file is a decision, and it stands."""
+        self.assertNotIn("shipped contract", self.agents("", pc.AUTO))
+
+    def test_on_walks_an_empty_operators_contract_aside(self):
+        out = self.agents("", pc.ON)
+        self.assertIn("shipped contract", out)
+        self.assertTrue(out.startswith("shipped contract"))
+
+    def test_off_blanks_the_chain_whatever_was_in_it(self):
+        for text in ("", f"{MINE}\n", None):
+            with self.subTest(text=text):
+                out = self.agents(text, pc.OFF)
+                self.assertEqual(out, f"{self.lane_addons}\n")
+                self.assertNotIn("shipped contract", out)
+                self.assertNotIn(MINE, out)
+
+    def test_off_with_no_addons_still_gives_the_writable_empty_document(self):
+        # Docker turns a missing bind source into a directory, so the all-lane file is always
+        # written; what changes here is that the contract in it is now nobody's.
+        self.assertEqual(self.agents(f"{MINE}\n", pc.OFF, ALL_OFF), "")
+
+    def test_a_state_only_reaches_the_document_it_was_given_for(self):
+        (self.root / pc.SYSTEM_FILE).write_text(f"{MINE}\n", encoding="utf-8")
+        (self.root / pc.CONTEXT_FILE).write_text("the operator's own contract\n", encoding="utf-8")
+        agents = pc.compose_agents_document(
+            self.root, self.plan, "", None, None,
+            {pc.STATIC_SYSTEM: pc.OFF, pc.STATIC_CONTEXT: pc.AUTO},
+        )
+        self.assertTrue(agents.startswith("the operator's own contract"))
+
+    def test_an_empty_file_on_disk_reads_as_off_and_a_file_with_text_reads_as_auto(self):
+        """The state the panel shows, which is the effect the operator is living with."""
+        for text, wanted in (
+            (None, pc.AUTO),
+            (f"{MINE}\n", pc.AUTO),
+            ("", pc.OFF),
+            (" \n", pc.OFF),
+        ):
+            with self.subTest(text=text):
+                if text is None:
+                    (self.root / pc.SYSTEM_FILE).unlink(missing_ok=True)
+                else:
+                    (self.root / pc.SYSTEM_FILE).write_text(text, encoding="utf-8")
+                self.assertEqual(pc.static_state(self.root, pc.STATIC_SYSTEM), wanted)
+
+    def test_a_forced_state_is_shown_as_forced_rather_than_as_the_disk(self):
+        (self.root / pc.SYSTEM_FILE).write_text("", encoding="utf-8")
+        forced = {pc.STATIC_SYSTEM: pc.ON}
+        self.assertEqual(pc.static_state(self.root, pc.STATIC_SYSTEM, forced), pc.ON)
+        self.assertEqual(pc.static_state(self.root, pc.STATIC_CONTEXT, forced), pc.AUTO)
+
+    def test_an_empty_harness_contract_is_off_too_rather_than_auto(self):
+        """Both tiers empty is still a blank document, whichever tier supplied it."""
+        (self.root / "runtime" / "AGENTS.md").write_text("\n", encoding="utf-8")
+        self.assertEqual(pc.static_state(self.root, pc.STATIC_CONTEXT), pc.OFF)
+        # And with no file anywhere the answer is auto, because auto is what "nothing to say" is.
+        (self.root / "runtime" / "AGENTS.md").unlink()
+        self.assertEqual(pc.static_state(self.root, pc.STATIC_CONTEXT), pc.AUTO)
+
+    def test_the_example_files_stay_documentation_under_every_state(self):
+        (self.root / pc.CONTEXT_EXAMPLE).write_text("help text\n", encoding="utf-8")
+        (self.root / pc.SYSTEM_EXAMPLE).write_text("help text\n", encoding="utf-8")
+        for state in pc.STATIC_STATES:
+            with self.subTest(state=state):
+                self.assertNotIn("help text", self.agents(None, state))
+                self.assertNotIn("help text", self.system(None, state))
+
+
 class CommentTests(unittest.TestCase):
     def test_comments_are_removed_including_multilingual_and_trailing_newline(self):
         self.assertEqual(pc.strip_html_comments("a<!--x-->b"), "ab")
@@ -341,6 +481,45 @@ class PrefsTests(unittest.TestCase):
             with self.subTest(junk=junk):
                 self.path.write_text(junk, encoding="utf-8")
                 self.assertEqual(pc.load_prefs(self.path), dict(pc.DEFAULT_ENABLED))
+                self.assertEqual(pc.load_static(self.path), dict(pc.STATIC_DEFAULT))
+
+    def test_the_static_states_share_the_file_and_survive_a_round_trip(self):
+        wanted = {pc.STATIC_CONTEXT: pc.OFF, pc.STATIC_SYSTEM: pc.ON}
+        pc.save_prefs(self.path, pc.DEFAULT_ENABLED, wanted)
+        self.assertEqual(pc.load_static(self.path), wanted)
+        self.assertEqual(pc.load_prefs(self.path), dict(pc.DEFAULT_ENABLED))
+
+    def test_saving_the_options_alone_keeps_a_document_the_operator_switched_off(self):
+        """The half a caller knows nothing about must not silently return.
+
+        A scripted --all-off, or any future writer of the options, that rewrote the file from its
+        own dict alone would hand the operator back a prompt they had just declined.
+        """
+        pc.save_prefs(self.path, pc.DEFAULT_ENABLED, {pc.STATIC_CONTEXT: pc.OFF})
+        pc.save_prefs(self.path, ALL_OFF)
+        remembered = dict(pc.STATIC_DEFAULT) | {pc.STATIC_CONTEXT: pc.OFF}
+        self.assertEqual(pc.load_static(self.path), remembered)
+        self.assertEqual(pc.load_prefs(self.path), dict(ALL_OFF))
+
+    def test_a_file_written_before_the_tri_state_existed_reads_as_all_auto(self):
+        self.path.write_text('{"lane_table": false}\n', encoding="utf-8")
+        self.assertEqual(pc.load_static(self.path), dict(pc.STATIC_DEFAULT))
+        self.assertFalse(pc.load_prefs(self.path)[policy.OPTION_LANE_TABLE])
+
+    def test_a_state_this_build_does_not_ship_is_auto_rather_than_a_blank_prompt(self):
+        for junk in ('{"static": "off"}', '{"static": []}', '{"static": {"context": "no"}}'):
+            with self.subTest(junk=junk):
+                self.path.write_text(junk, encoding="utf-8")
+                self.assertEqual(pc.load_static(self.path), dict(pc.STATIC_DEFAULT))
+
+    def test_resolve_static_keeps_every_block_it_was_given_and_drops_the_rest(self):
+        self.assertEqual(pc.resolve_static(None), dict(pc.STATIC_DEFAULT))
+        self.assertEqual(pc.resolve_static({}), dict(pc.STATIC_DEFAULT))
+        self.assertEqual(
+            pc.resolve_static({"system": " OFF "}),
+            {"context": pc.AUTO, "system": pc.OFF},
+        )
+        self.assertEqual(set(pc.resolve_static({"gone": "on"})), set(pc.STATIC_IDS))
 
     def test_a_name_this_build_does_not_ship_is_dropped_not_trusted(self):
         # An older or newer panel must not be able to silence a live mechanism by leaving a
@@ -510,8 +689,51 @@ class SourceRecordTests(unittest.TestCase):
 
     def test_a_document_with_no_source_records_no_digest(self):
         recorded = pc.document_sources(self.root)
-        self.assertEqual(recorded["system"], {"source": None, "digest": None})
-        self.assertEqual(recorded["agents"], {"source": None, "digest": None})
+        self.assertEqual(
+            recorded["system"], {"source": None, "digest": None, "mode": pc.AUTO}
+        )
+        self.assertEqual(
+            recorded["agents"], {"source": None, "digest": None, "mode": pc.AUTO}
+        )
+
+    def test_a_document_switched_off_records_no_file_rather_than_the_one_it_skipped(self):
+        """The sidecar describes the bytes that shipped, and there are no bytes to describe."""
+        (self.root / pc.SYSTEM_FILE).write_text("the voice\n", encoding="utf-8")
+        self.contract()
+        recorded = pc.document_sources(self.root, {pc.STATIC_SYSTEM: pc.OFF})
+        self.assertEqual(recorded["system"], {"source": None, "digest": None, "mode": pc.OFF})
+        self.assertEqual(recorded["agents"]["source"], "runtime/AGENTS.md")
+
+    def test_a_forced_state_records_the_file_it_actually_read(self):
+        (self.root / pc.CONTEXT_FILE).write_text("", encoding="utf-8")
+        self.contract()
+        recorded = pc.document_sources(self.root, {pc.STATIC_CONTEXT: pc.ON})
+        self.assertEqual(recorded["agents"]["source"], "runtime/AGENTS.md")
+        self.assertEqual(pc.document_sources(self.root)["agents"]["source"], pc.CONTEXT_FILE)
+
+    def test_editing_a_file_the_session_switched_off_is_not_reported_as_stale(self):
+        """A restart cannot apply an edit to text this session never read, so say nothing."""
+        (self.root / pc.SYSTEM_FILE).write_text("the voice\n", encoding="utf-8")
+        (self.runtime / pc.SOURCES_FILE).write_text(
+            json.dumps(pc.document_sources(self.root, {pc.STATIC_SYSTEM: pc.OFF})),
+            encoding="utf-8",
+        )
+        (self.root / pc.SYSTEM_FILE).write_text("a different voice\n", encoding="utf-8")
+        self.assertEqual(self.stale(), [])
+
+    def test_a_forced_state_survives_into_the_staleness_comparison(self):
+        """Re-deciding under the recorded mode is what keeps the two digests comparable."""
+        (self.root / pc.CONTEXT_FILE).write_text("", encoding="utf-8")
+        self.contract()
+        (self.runtime / pc.SOURCES_FILE).write_text(
+            json.dumps(pc.document_sources(self.root, {pc.STATIC_CONTEXT: pc.ON})),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.stale(), [])
+        (self.root / "runtime/AGENTS.md").write_text("# a new contract\n", encoding="utf-8")
+        self.assertEqual(
+            self.stale(), ["runtime/AGENTS.md changed since it was staged - restart to apply it"]
+        )
 
     def test_both_tiers_are_recorded_by_name_not_by_absolute_path(self):
         """An absolute path would make the record differ per checkout for no reason at all."""

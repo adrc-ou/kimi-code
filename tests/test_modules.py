@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from tools.modules import assemble, choose, discover, module_agents_text, ordered
 from tools.safe_workspace_init import UnsafeWorkspace, initialize
+from tools.tui.app import Result
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -214,7 +215,10 @@ class ModuleTests(unittest.TestCase):
         (self.root / ".env").write_text("")
         bootstrap = self.runtime / "bootstrap"
         bootstrap.write_text("")
-        token = "quote'${NRP_API_KEY}`literal`"
+        # A value with leading and trailing spaces in it on purpose: this environment never
+        # stripped what the user typed, and a secret whose spaces were trimmed would not match
+        # the file it was quoted into.
+        token = " quote'${NRP_API_KEY}`literal` "
         with (
             patch.dict(
                 os.environ,
@@ -226,7 +230,7 @@ class ModuleTests(unittest.TestCase):
             ),
             patch("sys.argv", ["modules.py", "environment"]),
             patch("sys.stdin.isatty", return_value=True),
-            patch("getpass.getpass", return_value=token),
+            patch("tools.modules.run", return_value=Result(value=token)) as asked,
         ):
             main()
         result = subprocess.run(
@@ -247,3 +251,9 @@ class ModuleTests(unittest.TestCase):
             overlay["services"]["kimi-agent"]["environment"]["DEMO_TOKEN"], token.replace("$", "$$")
         )
         self.assertEqual((self.root / ".env").read_text(), "")
+        # What was asked, not just what was stored: a declared secret is hidden while it is typed,
+        # and the spaces above survive only because this interface does not treat them as nothing.
+        step = asked.call_args.args[0]
+        self.assertTrue(step.masked)
+        self.assertTrue(step.complete(token))
+        self.assertEqual(asked.call_args.args[1].total, 1)

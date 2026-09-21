@@ -20,14 +20,11 @@ non-regular files inside a definition tree are refused rather than sanitised.
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import os
 import shlex
 import sys
-import termios
 import tomllib
-import tty
 from pathlib import Path
 from typing import Any
 
@@ -36,13 +33,24 @@ if __package__:
     from .definitions import LANES, DefinitionError, load_definitions
     from .env_values import read_env_values
     from .private_file import write_private, write_private_json
+    from .tui import flow
+    from .tui.app import View, run
+    from .tui.input import FieldStep
+    from .tui.menu import SINGLE, Choice, ListStep
 else:
     import policy
     from definitions import LANES, DefinitionError, load_definitions
     from env_values import read_env_values
     from private_file import write_private, write_private_json
+    from tui import flow
+    from tui.app import View, run
+    from tui.input import FieldStep
+    from tui.menu import SINGLE, Choice, ListStep
 
 SELECTABLE = ("primary", "subagent")
+#: Which step of the launch sequence each lane is asked on, so the flow can number the two screens
+#: separately: they are one process, but the user meets them as two steps.
+LANE_STEP = {"primary": flow.MODEL, "subagent": flow.SUBAGENT}
 SELECTION = "model-selection.json"
 PREVIOUS_SELECTION = "last-model-selection.json"
 POLICY_FILE = "model-policy.json"
@@ -122,6 +130,35 @@ def selectable(models: list[dict[str, Any]], lane: str) -> list[dict[str, Any]]:
     )
 
 
+def prompts(override: str, non_interactive: bool, choices: list[dict[str, Any]]) -> bool:
+    """Whether this lane will actually take the screen.
+
+    That is what decides whether Backspace can lead anywhere: a lane answered from an override,
+    a flag, or a single available model never asks the user anything, so stepping back to it would
+    be the dead unexplained key this redesign exists to eliminate. The caller cannot know this
+    without asking, because it depends on the override and the candidate list for a lane it may
+    not be looking at.
+    """
+    return not override and not non_interactive and len(choices) > 1
+
+
+def _option(model: dict[str, Any], previous: str, default: str) -> Choice:
+    """One candidate row: its name, and what the launcher already knows about it.
+
+    ``last used`` and ``default`` are mutually exclusive here exactly as they were in the old
+    printer, because an id that is both needs saying once.
+    """
+    marks = []
+    if previous and model["id"] == previous:
+        marks.append("last used")
+    elif model["id"] == default:
+        marks.append("default")
+    hint = f"[{model['provider']}]"
+    if marks:
+        hint = f"{hint} ({'; '.join(marks)})"
+    return Choice(id=model["id"], label=model["label"], hint=hint)
+
+
 def choose(
     lane: str,
     choices: list[dict[str, Any]],
@@ -129,8 +166,13 @@ def choose(
     *,
     non_interactive: bool,
     override: str,
+    view: View | None = None,
 ) -> str:
-    """Single-choice picker, matching the module picker's keys and terminal handling."""
+    """Single-choice picker on the shared modal engine.
+
+    ``view`` is the step rail this lane sits on, which only the launcher can supply: it knows how
+    many lanes there are and whether any earlier one is still able to ask a question.
+    """
     label = PROMPTS[lane]
     if not choices:
         raise DefinitionError(f"no available model declares a {lane} lane")
@@ -143,7 +185,7 @@ def choose(
             )
         return override
     default = previous if previous in by_id else choices[0]["id"]
-    if non_interactive or len(choices) == 1:
+    if not prompts(override, non_interactive, choices):
         return default
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise DefinitionError(
@@ -151,43 +193,19 @@ def choose(
             "or pass --non-interactive"
         )
 
-    index = next(position for position, model in enumerate(choices) if model["id"] == default)
-    fd = sys.stdin.fileno()
-    saved = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        print(f"Choose the {label}: up/down move, Enter continue", flush=True)
-        while True:
-            for position, model in enumerate(choices):
-                marks = []
-                if previous and model["id"] == previous:
-                    marks.append("last used")
-                elif model["id"] == default:
-                    marks.append("default")
-                suffix = f" ({'; '.join(marks)})" if marks else ""
-                print(
-                    f"\033[2K{'>' if position == index else ' '} {model['label']} "
-                    f"[{model['provider']}]{suffix}",
-                    flush=True,
-                )
-            key = os.read(fd, 1).decode()
-            if key in ("\r", "\n"):
-                break
-            if key in ("\x03", "\x04", ""):
-                raise KeyboardInterrupt
-            if key == "\x1b":
-                import select
-
-                if select.select([fd], [], [], 0.1)[0]:
-                    sequence = os.read(fd, 2)
-                    if sequence == b"[A":
-                        index = (index - 1) % len(choices)
-                    if sequence == b"[B":
-                        index = (index + 1) % len(choices)
-            print(f"\033[{len(choices)}A", end="", flush=True)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-    return choices[index]["id"]
+    step = ListStep(
+        title=label,
+        prompt=f"Choose the {label}",
+        mode=SINGLE,
+        choices=[_option(model, previous, default) for model in choices],
+        previous=[default],
+    )
+    result = run(step, view if view is not None else View())
+    if result.status == flow.GO_BACK:
+        raise flow.BackRequested(lane)
+    if not result.accepted:
+        raise SystemExit(result.status)
+    return str(result.value)
 
 
 def bootstrap_values(root: Path) -> dict[str, str]:
@@ -279,21 +297,100 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
     previous = read_json(runtime / PREVIOUS_SELECTION, {})
     if not isinstance(previous, dict):
         previous = {}
+    lanes = list(SELECTABLE)
+    options = {lane: selectable(models, lane) for lane in lanes}
+    overrides = {
+        lane: os.environ.get(f"HARNESS_{lane.upper()}_MODEL", "").strip() for lane in lanes
+    }
     selection: dict[str, str] = {}
-    for lane in SELECTABLE:
-        choices = selectable(models, lane)
-        chosen = choose(
-            lane,
-            choices,
-            str(previous.get(lane, "")),
-            non_interactive=non_interactive,
-            override=os.environ.get(f"HARNESS_{lane.upper()}_MODEL", "").strip(),
+    lines: dict[str, str] = {}
+    state = flow.running(runtime)
+    # This launch's own answers, which are what a replayed lane re-uses. The last launch's answers
+    # stay in ``previous`` and only ever seed the default.
+    answered = read_json(runtime / SELECTION, {})
+    if not isinstance(answered, dict):
+        answered = {}
+    index = 0
+    while index < len(lanes):
+        lane = lanes[index]
+        step = LANE_STEP[lane]
+        choices = options[lane]
+        ids = {item["id"] for item in choices}
+        # Back is offered only when an earlier lane would really re-open. Landing on a lane that
+        # answers itself from an override or a flag shows the same screen twice and calls it
+        # navigation.
+        back_available = index > 0 and any(
+            prompts(overrides[earlier], non_interactive, options[earlier])
+            for earlier in lanes[:index]
         )
+        asking = prompts(overrides[lane], non_interactive, choices)
+        replayed = ""
+        if state and asking and not state.should_render(step):
+            stored = str(answered.get(lane, ""))
+            if stored in ids:
+                replayed = stored
+            else:
+                # A model that stopped being offered mid-launch, which only an edit to ./models
+                # can do. An answer the user cannot give is not an answer to replay.
+                state.forget(step)
+        if replayed:
+            # Replaying leaves the screen count alone: the lane's screens were counted on the pass
+            # that drew them, and this one has none to add.
+            chosen = replayed
+        else:
+            rendering = state.plan(step, 1 if asking else 0) if state else asking
+            if state:
+                back_available = back_available or bool(state.previous(step))
+            position, total = state.rail(step) if state and rendering else (index + 1, len(lanes))
+            try:
+                chosen = choose(
+                    lane,
+                    choices,
+                    str(previous.get(lane, "")),
+                    non_interactive=non_interactive,
+                    override=overrides[lane],
+                    view=(
+                        View(
+                            position=position,
+                            total=total,
+                            label=PROMPTS[lane],
+                            can_go_back=back_available,
+                        )
+                        if rendering
+                        else None
+                    ),
+                )
+            except flow.BackRequested:
+                index = max(0, index - 1)
+                # The lane the user landed on loses its answer too. It is committed from the pass
+                # that just ran, and a committed lane replays rather than renders, so leaving it in
+                # place would take the Back keypress, redraw nothing, and move on.
+                for later in lanes[index:]:
+                    selection.pop(later, None)
+                    lines.pop(later, None)
+                    if state:
+                        # The answers the user just walked away from, so that walking forward
+                        # again asks them rather than replaying values that were never confirmed.
+                        state.forget(LANE_STEP[later])
+                continue
         selection[lane] = chosen
+        if state and asking:
+            # Only a lane that could have been asked commits. An answer from ``HARNESS_*_MODEL`` or
+            # from ``--non-interactive`` is a step with no screen in it, and committing would put it
+            # back on the rail that skipping just took it off.
+            state.commit(step, chosen)
         model = next(item for item in choices if item["id"] == chosen)
         suffix = " (last used)" if previous.get(lane) == chosen else ""
-        print(f"{PROMPTS[lane]}: {model['label']} [{model['provider']}]{suffix}")
-    write_json(runtime / SELECTION, selection)
+        # Held until the sequence settles rather than printed as each lane closes: going back would
+        # otherwise leave the superseded answer in the scrollback next to the one that replaced it,
+        # two lines that cannot both be true.
+        lines[lane] = f"{PROMPTS[lane]}: {model['label']} [{model['provider']}]{suffix}"
+        index += 1
+    for lane in lanes:
+        print(lines[lane])
+    # In lane order, not answer order: backing up and re-answering would otherwise reorder the
+    # document that the resolver and the proxy read.
+    write_json(runtime / SELECTION, {lane: selection[lane] for lane in lanes})
     return 0
 
 
@@ -343,6 +440,131 @@ def key_scopes(item: dict[str, str]) -> str:
     )
 
 
+def credential_origin(item: dict[str, str]) -> str:
+    """Which key is wanted and where it is issued, as one sentence."""
+    where = f" (issued at {item['key_url']})" if item["key_url"] else ""
+    return f"{item['provider_label']}: {item['label']}{where}."
+
+
+def credential_persistence(item: dict[str, str]) -> str:
+    """How to make one answer survive to the next launch, and how long it lasts without that.
+
+    Said twice on purpose - above the field where it is read once, and in the scrollback where it
+    is still readable after the screen has closed - and never varied, because it is the one piece
+    of advice the operator has to act on later.
+    """
+    return f"Set {key_scopes(item)} in .env to persist it; this value is for this session only."
+
+
+def ask_credential(item: dict[str, str], view: View) -> str:
+    """Ask for one credential on the shared modal engine.
+
+    The guard is on ``stdin`` alone, which is the contract this function had before the screen
+    existed: a caller that redirected the launcher's output still has a keyboard and still gets
+    asked, while a caller with no terminal at all gets the same named-variable error and the same
+    remedy. Widening it would turn a working piped-log launch into a failure.
+    """
+    if not sys.stdin.isatty():
+        where = f" (issued at {item['key_url']})" if item["key_url"] else ""
+        raise DefinitionError(
+            f"{item['provider_label']} needs a key for {item['label']}{where}: set "
+            f"{key_scopes(item)} in .env for non-interactive startup"
+        )
+    origin = credential_origin(item)
+    persistence = credential_persistence(item)
+    print(f"{origin} {persistence}")
+    step = FieldStep(
+        title=f"{item['provider_label']} key",
+        prompt=f"{item['prompt']} ({item['env']})",
+        head=(origin, persistence),
+        whitespace_is_value=False,
+    )
+    result = run(step, view)
+    if result.status == flow.GO_BACK:
+        raise flow.BackRequested(item["secret"])
+    if not result.accepted:
+        raise SystemExit(result.status)
+    return str(result.value).strip()
+
+
+def carried_credentials(used: list[dict[str, str]], runtime: Path) -> dict[str, str]:
+    """The keys this launch already wrote, read back so a replay asks for none of them.
+
+    ``.strip()`` is lossless here: an answer was stripped on the way in, so the file cannot hold
+    whitespace a second read would have to keep.
+    """
+    out: dict[str, str] = {}
+    for item in used:
+        path = runtime / CREDENTIALS_DIR / item["secret"]
+        if path.is_file():
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                out[item["env"]] = value
+    return out
+
+
+def credential_values(used, values, runtime=None, state=None):
+    """Every used credential that has no value yet, in the order the operator was asked.
+
+    Asking is separated from writing so that backing up re-opens a question instead of leaving a
+    credential file behind. Two credentials naming one variable are one question, since the same
+    answer fills both files, and the sequence is numbered over the questions rather than over the
+    credentials: the ``n of m`` in the rail is a count of screens the operator will see, and a
+    step that is walked past without a screen would make the last number wrong.
+
+    A flow that already asked them is replayed out of the files the answers were written to, which
+    is what stops Backspace from spending the operator's keystrokes a second time.
+    """
+    pending = []
+    asked = set()
+    replaying = bool(state) and not state.should_render(flow.CREDENTIALS)
+    if replaying and runtime is not None:
+        values = {**values, **carried_credentials(used, runtime)}
+    for item in used:
+        if item["env"] in asked or values.get(item["env"], "").strip():
+            continue
+        asked.add(item["env"])
+        pending.append(item)
+    if state and not replaying:
+        state.plan(flow.CREDENTIALS, len(pending))
+    answers: dict[str, str] = {}
+    index = 0
+    while index < len(pending):
+        item = pending[index]
+        title = f"{item['provider_label']} key"
+        try:
+            position, total = (
+                state.rail(flow.CREDENTIALS, index) if state else (index + 1, len(pending))
+            )
+            answers[item["env"]] = ask_credential(
+                item,
+                View(
+                    position=position,
+                    total=total,
+                    label=title,
+                    can_go_back=index > 0 or bool(state and state.previous(flow.CREDENTIALS)),
+                ),
+            )
+        except flow.BackRequested:
+            if index == 0:
+                # The first question has nothing earlier inside this step to land on, so Back means
+                # the previous step, which is another process's.
+                flow.back_from(state, flow.CREDENTIALS)
+            index -= 1
+            # The landing step's own answer goes with them. Answers are kept per variable name so
+            # that two credentials naming one variable ask once, and leaving the first answer in
+            # place would let the walk straight past the question the user just asked to return to.
+            for answered in pending[index:]:
+                answers.pop(answered["env"], None)
+            continue
+        index += 1
+    if state and pending:
+        # Names of the variables, never their values: this line is printed in the launch recap and
+        # written to a file the recap reads, and a key belongs to neither.
+        state.commit(flow.CREDENTIALS, " ".join(sorted(answers)))
+    return answers
+
+
 def materialise_credentials(plan: dict[str, Any], runtime: Path, values: dict[str, str]) -> None:
     """Write one mode-0600 file per used credential, ready to mount as a Docker secret.
 
@@ -356,22 +578,11 @@ def materialise_credentials(plan: dict[str, Any], runtime: Path, values: dict[st
     directory = runtime / CREDENTIALS_DIR
     directory.mkdir(parents=True, exist_ok=True)
     directory.chmod(0o700)
+    used = used_credentials(plan)
+    answers = credential_values(used, values, runtime, flow.running(runtime))
     wanted = set()
-    for item in used_credentials(plan):
-        secret = values.get(item["env"], "").strip()
-        if not secret:
-            where = f" (issued at {item['key_url']})" if item["key_url"] else ""
-            if not sys.stdin.isatty():
-                raise DefinitionError(
-                    f"{item['provider_label']} needs a key for {item['label']}{where}: set "
-                    f"{key_scopes(item)} in .env for non-interactive startup"
-                )
-            print(
-                f"{item['provider_label']}: {item['label']}{where}. Set {key_scopes(item)} in "
-                ".env to persist it; this value is for this session only."
-            )
-            while not secret:
-                secret = getpass.getpass(f"{item['prompt']} ({item['env']}): ").strip()
+    for item in used:
+        secret = values.get(item["env"], "").strip() or answers.get(item["env"], "")
         if any(character in secret for character in ("\n", "\r", "\x00")):
             raise DefinitionError("credential values must be single-line")
         target = directory / item["secret"]
@@ -491,5 +702,9 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit(130) from None
+    except flow.BackRequested:
+        # Only reachable if a lane asks to go back with nowhere to go, which cmd_select prevents.
+        # Deliberately outside Refusal: this is navigation, not a refusal, and must not print one.
+        raise SystemExit(flow.GO_BACK) from None
     except Refusal as error:
         raise SystemExit(f"Model setup refused: {error}") from error

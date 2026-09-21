@@ -16,11 +16,22 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+# The selectors are run as scripts from the repository root, so ``tools/`` has to be on the path by
+# hand, exactly as ``modules/comfyui/versions.py`` does for ``scripts/``. The engine is imported
+# flat under that identity, the same one ``tools/*.py`` uses when it is run as a program.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from tui import flow
+from tui.app import View, run
+from tui.menu import SINGLE, Choice, ListStep
+
 GITHUB_API = "https://api.github.com"
 KIMI_REPOSITORY = "MoonshotAI/kimi-code"
 MAX_METADATA_BYTES = 4 * 1024 * 1024
 SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 KIMI_TAG_RE = re.compile(r"^@moonshot-ai/kimi-code@(\d+\.\d+\.\d+)$")
+# The whole of what this selector contributes to the session file, and therefore the whole of what
+# has to be present for a previous pass to count as having answered the question.
+KIMI_KEYS = ("KIMI_CODE_VERSION", "KIMI_CODE_ASSET_URL", "KIMI_CODE_ASSET_SHA256")
 
 
 def release_ssl_context() -> ssl.SSLContext:
@@ -228,7 +239,14 @@ def choose(
     installed: str,
     override: str,
     non_interactive: bool,
+    view: View | None = None,
 ) -> dict[str, str]:
+    """Pick one release, in a modal step like every other menu in the launcher.
+
+    ``view`` is where this step sits in the launch sequence, which only ``start.sh`` knows. Left
+    out, the step renders alone and offers no Back, which is the honest default for a process that
+    cannot reach another process's earlier step.
+    """
     by_version = {item["version"]: item for item in catalog}
     if override:
         try:
@@ -247,35 +265,49 @@ def choose(
     default_version = installed if installed in by_version else latest
     if default_version not in {item["version"] for item in choices}:
         default_version = choices[0]["version"]
-    default_index = next(
-        index for index, item in enumerate(choices, start=1) if item["version"] == default_version
-    )
 
     if non_interactive:
-        return choices[default_index - 1]
+        return next(item for item in choices if item["version"] == default_version)
     if not sys.stdin.isatty():
         raise SystemExit(
             f"Cannot select {product} without a terminal; set explicit version "
             "environment variables or use --non-interactive"
         )
 
-    print(f"\nSelect {product} for {platform_label}:\n")
-    for index, item in enumerate(choices, start=1):
-        labels = []
-        if item["version"] == latest:
-            labels.append("latest")
-        if item["version"] == installed:
-            labels.append("installed")
-        suffix = f" ({') ('.join(labels)})" if labels else ""
-        print(f"  {index:2}) {item['version']}{suffix}")
+    step = ListStep(
+        title=f"{product} version",
+        prompt=f"Select {product} for {platform_label}",
+        mode=SINGLE,
+        choices=[_release(item, latest, installed) for item in choices],
+        previous=[default_version],
+    )
+    result = run(step, view if view is not None else View())
+    if result.status == flow.GO_BACK:
+        # This selector is its own process, so the previous step is not in here to be reached. The
+        # caller turns this into the status the launcher's loop reads and tells the flow where to
+        # land, because only the caller knows which step of the launch this menu is.
+        raise flow.BackRequested
+    if not result.accepted:
+        raise SystemExit(result.status)
+    return by_version[str(result.value)]
 
-    while True:
-        answer = input(f"\nChoice [{default_index}]: ").strip()
-        if not answer:
-            return choices[default_index - 1]
-        if answer.isdigit() and 1 <= int(answer) <= len(choices):
-            return choices[int(answer) - 1]
-        print(f"Enter a number from 1 to {len(choices)}.", file=sys.stderr)
+
+def _release(item: dict[str, str], latest: str, installed: str) -> Choice:
+    """One release row, with whatever the launcher already knows about it in the hint column.
+
+    Both marks can appear on one row, which is why they are joined rather than chosen between: the
+    newest release is usually also the installed one, and saying only half of that would be wrong.
+    """
+    labels = []
+    if item["version"] == latest:
+        labels.append("latest")
+    if item["version"] == installed:
+        labels.append("installed")
+    return Choice(
+        id=item["version"],
+        label=item["version"],
+        hint=f"({') ('.join(labels)})" if labels else "",
+    )
 
 
 def write_environment(path: Path, values: dict[str, str]) -> None:
@@ -285,6 +317,18 @@ def write_environment(path: Path, values: dict[str, str]) -> None:
     temporary.write_text(content, encoding="utf-8")
     temporary.chmod(0o600)
     temporary.replace(path)
+
+
+def running_flow() -> flow.Flow | None:
+    """The launch this selector is one step of, when the launcher said where that lives.
+
+    There is no ``--runtime-dir`` here because this selector predates the flow and is also run by
+    hand; the environment variable the launcher already exports for every other step carries it
+    instead. Absent is not an error: a bare invocation has no earlier step to go back to, so it
+    numbers itself alone, exactly as it did before there was a flow.
+    """
+    directory = os.environ.get("HARNESS_RUNTIME_DIR", "").strip()
+    return flow.running(directory) if directory else None
 
 
 def main() -> None:
@@ -297,29 +341,73 @@ def main() -> None:
     parser.add_argument("--non-interactive", action="store_true")
     args = parser.parse_args()
 
-    state = load_state(args.state)
-    kimi, latest_kimi = kimi_catalog(args.kimi_asset)
-    kimi = add_installed_entry(kimi, args.installed_kimi, state)
+    launch = running_flow()
+    override = os.environ.get("KIMI_CODE_VERSION", "").strip()
+    if launch and not launch.should_render(flow.KIMI_VERSION):
+        # A replay: this pass renders no screen because a previous one already asked and the answer
+        # is in the file this step owns.
+        carried = load_state(args.output)
+        if all(carried.get(key, "").strip() for key in KIMI_KEYS):
+            # Nothing to do, and nothing to fetch: the digest in that file was verified on the pass
+            # that wrote it, and the operator confirmed the version it belongs to. Asking the API
+            # again to re-derive a settled answer would also risk offering a release published in
+            # the meantime, and re-writing the file would overwrite the answer with a default.
+            return
+        # A half-written file is not an answer. Forgetting the step makes this pass ask again,
+        # which is the only way to end up with a complete one.
+        launch.forget(flow.KIMI_VERSION)
 
-    selected_kimi = choose(
-        "Kimi Code",
-        args.platform_label,
-        kimi,
-        latest_kimi,
-        args.installed_kimi,
-        os.environ.get("KIMI_CODE_VERSION", "").strip(),
-        args.non_interactive,
-    )
+    recorded = load_state(args.state)
+    kimi, latest_kimi = kimi_catalog(args.kimi_asset)
+    kimi = add_installed_entry(kimi, args.installed_kimi, recorded)
+
+    # Whether this step would put a screen on the terminal, which is the question the flow needs
+    # answered before it can number the steps: a version named in the environment or a launch that
+    # was told not to ask has no screen in it, and counting one would leave a hole in the rail.
+    asking = not override and not args.non_interactive
+    rendering = launch.plan(flow.KIMI_VERSION, 1 if asking else 0) if launch else asking
+    view = None
+    if rendering:
+        position, total = launch.rail(flow.KIMI_VERSION) if launch else (1, 1)
+        view = View(
+            position=position,
+            total=total,
+            can_go_back=bool(launch and launch.previous(flow.KIMI_VERSION)),
+        )
+    try:
+        selected_kimi = choose(
+            "Kimi Code",
+            args.platform_label,
+            kimi,
+            latest_kimi,
+            args.installed_kimi,
+            override,
+            args.non_interactive,
+            view,
+        )
+    except flow.BackRequested:
+        # This menu is one screen with nothing earlier inside it, so Back means the previous step of
+        # the launch, and the pass has to be restarted from the top to get there.
+        flow.back_from(launch, flow.KIMI_VERSION)
     selected_kimi["sha256"] = fetch_asset_checksum(selected_kimi)
 
-    write_environment(
-        args.output,
+    # The session file belongs to the launch, not to this step: the module selector writes its own
+    # keys to the same path afterwards. Keeping the rest of it is what lets a launch that went
+    # backwards and came forward again still have the answers it is not going to ask for twice.
+    values = load_state(args.output)
+    values.update(
         {
             "KIMI_CODE_VERSION": selected_kimi["version"],
             "KIMI_CODE_ASSET_URL": selected_kimi["url"],
             "KIMI_CODE_ASSET_SHA256": selected_kimi["sha256"],
-        },
+        }
     )
+    write_environment(args.output, values)
+
+    if launch and asking:
+        # Only a step that could have been asked commits, so that walking back to it re-opens a
+        # question rather than replaying a value nobody confirmed on this pass.
+        launch.commit(flow.KIMI_VERSION, selected_kimi["version"])
 
 
 if __name__ == "__main__":

@@ -57,6 +57,13 @@ class LauncherTests(unittest.TestCase):
             shutil.copy2(ROOT / relative, destination)
         for tree in ("models", "providers"):
             shutil.copytree(ROOT / tree, self.root / tree)
+        # The module picker renders through the shared modal engine, so a launcher fixture has to
+        # carry it: tools/modules.py is run as a script, which puts tools/ alone on the path.
+        shutil.copytree(
+            ROOT / "tools" / "tui",
+            self.root / "tools" / "tui",
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
         self.workspace.mkdir(parents=True, exist_ok=True)
         (self.root / ".env").touch()
         (self.root / "scripts/select_versions.py").write_text(
@@ -312,6 +319,13 @@ exit 0
         self.assertFalse((self.workspace / "AGENTS.md").exists())
         self.env["HARNESS_MODULES"] = ""
         (self.base / "events").write_text("")
+        # A launch that died mid-pass leaves its state machine and its secret answers behind,
+        # and the next one must sweep both rather than mistake the first for progress and the
+        # second for memory. Seeded here because the headless path creates neither file.
+        (runtime / "flow-state.json").write_text(
+            '{"live":true,"steps":["model"],"committed":{"model":"stub"}}'
+        )
+        (runtime / "module-values.json").write_text('{"DEMO_KEY":"stub-secret"}')
         result = self.run_script("start.sh", "--non-interactive")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -331,6 +345,10 @@ exit 0
         self.assertFalse((runtime / "model-policy.json").exists())
         self.assertFalse((runtime / "model.env").exists())
         self.assertFalse((runtime / "model-selection.json").exists())
+        # The two files seeded above are gone, so the next launch starts from the answers it can
+        # actually see rather than from a dead launch's notion of how far it got.
+        self.assertFalse((runtime / "flow-state.json").exists())
+        self.assertFalse((runtime / "module-values.json").exists())
         self.assertIn("primary", (runtime / "last-model-selection.json").read_text())
         # The panel's choices are memory: they survive the launch that made them and are honoured
         # by the next, which is the only way a headless session can express a selection at all.

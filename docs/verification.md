@@ -289,9 +289,11 @@ readable without a container shell: the staged copies are
 `.local/runtime/<instance>/SYSTEM.md` and `.../AGENTS.md` on the host, and
 `/home/agent/.kimi-code/SYSTEM.md` and `.../AGENTS.md` inside the sandbox. Check
 that the numbers there match `/healthz`; both come from the one plan, so a mismatch
-means a stale launch. The launch panel can switch either block off, so a missing
-section is a setting rather than a fault — the proxy still enforces the plan, and
-`./prompts.sh --show` prints which blocks the next unattended launch will compose.
+means a stale launch. The launch panel can switch any add-on off and can put either
+document on `on` or `off`, so a missing section is a setting rather than a fault —
+the proxy still enforces the plan, and `./prompts.sh --show` prints both halves of
+what the next unattended launch will compose: the two documents with their state,
+and the nine add-ons with theirs.
 
 With the shipped definitions the model advertises 1,000,000 tokens, of which
 262,144 are native and the rest requires YaRN extension upstream. The primary lane
@@ -512,6 +514,20 @@ prepares before the agent starts. Check both halves after any change to
    that `usage limits in contract` can still read `True` beside it: the all-lane
    contract is a separate document with its own tier-one file, `CONTEXT.md`, and an
    emptied `SYSTEM.md` says nothing about that one.
+
+   The context step is the operator-visible surface for both documents, and it is
+   one screen of the fullscreen modal the whole launch shares: ↑/↓ focus a row,
+   `Space` cycles the row under focus, `Enter` accepts the step, `Backspace` returns
+   to the previous step, `Ctrl-R` resets the visible choices, and `?` opens the full
+   key reference. The footer prints only the keys this step answers, so there is
+   nothing to guess. The two documents read `auto`, `on` or `off` rather than a mark,
+   because there are three answers and no surveyed terminal interface ships a
+   tri-state glyph. A block whose file is present but empty opens on `off`, which is
+   that emptiness being honoured, and moving it to `on` is what makes the check above
+   behave as though the file were absent. Neither move edits `SYSTEM.md` or
+   `CONTEXT.md`, and the answer is written to `prompt-context.json` only when the
+   step is accepted, so a launch you cancel with `Ctrl-C` leaves nothing behind to
+   undo.
 
 ## 6. Optional module verification
 

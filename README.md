@@ -89,21 +89,33 @@ Run:
 ./start.sh
 ```
 
+The questions come one per screen in a fullscreen modal that owns the terminal
+while it is open. Each step's human label is the top-left line of the window, with a
+rail under it reading `N of M` so you can see how much launch is left, content that
+scrolls inside its own region when it does not fit, and a footer of the keys that
+step answers — in the order that matters when a narrow window makes it drop some.
+↑/↓ move the focus marker and Enter continues; `Space` toggles the row under focus,
+`Backspace` returns to the previous step, and `Ctrl-R` puts the currently visible
+choices back to their starting state. Nothing is answered by typing a menu number,
+and no key does anything the step has not named. `?` opens the full reference —
+every spelling of every key, including `k` and `j` for the arrows, which the footer
+keeps to one spelling each to stay short — on the steps that list something; the
+steps that ask you to type a value hand `?` and `Space` to the value instead, so the
+only keys they print are the ones that still work there.
+
 The launcher first asks which model serves the primary agent and which serves
 subagents. Each picker lists the models defined in `./models` alphabetically by
 label, marks the last-used choice, and pre-selects it; only models whose provider
-exists in `./providers` are offered. Press ↑/↓ to move and Enter to continue.
-Answering non-interactively (`--non-interactive`, or a single available model)
-reuses the previous choice, and `HARNESS_PRIMARY_MODEL` /
-`HARNESS_SUBAGENT_MODEL` override one picker.
+exists in `./providers` are offered. Answering non-interactively
+(`--non-interactive`, or a single available model) reuses the previous choice, and
+`HARNESS_PRIMARY_MODEL` / `HARNESS_SUBAGENT_MODEL` override one picker.
 
 Both models then resolve against their providers' rules into one enforcement plan,
 and every number downstream — lane sizes, Kimi's model tables, the subagent
 fan-out, the proxy's gates — is derived from that plan. Next the launcher shows
-compatible modules in a checkbox menu. Use ↑/↓ to move, Space to toggle, and Enter
-to continue. Last session's enabled modules appear first and are checked; each
-group is alphabetical by label. On the first run all modules are unchecked. If
-none are compatible, this step is skipped.
+compatible modules as checkbox rows. Last session's enabled modules appear first
+and are checked; each group is alphabetical by label. On the first run all modules
+are unchecked. If none are compatible, this step is skipped.
 
 Next comes the existing Kimi version menu, followed by each selected module's
 version menu. Missing required module variables are prompted for this session
@@ -453,7 +465,11 @@ add-ons are switched on, an empty one leaves those add-ons as the whole prompt,
 and an empty one with every add-on off asks for no instructions at all. Kimi
 discards a prompt that is blank once trimmed and silently uses its own, so that
 last case is staged as a lone period — one token, no instructions. Only an absent
-`SYSTEM.md` can reach the built-in prompt.
+`SYSTEM.md` can reach the built-in prompt. The startup panel reads that emptiness
+as its own answer: a block whose file is there but empty opens as `off`, and
+switching it `on` makes this session ignore the empty file as if it were absent,
+which is Kimi's built-in prompt for `SYSTEM.md` and `runtime/AGENTS.md` for
+`CONTEXT.md`.
 
 Both documents are written into the instance runtime directory by
 `tools/render_runtime.py`, passed to Compose as `KIMI_SYSTEM_MD` and
@@ -464,18 +480,37 @@ mid-session edit does nothing until the next launch.
 
 ### What the startup panel adds
 
-`./start.sh` opens a context panel before it renders anything: a diagram of the
-documents above with their resolved sizes, then a checkbox for each block the
-harness can add. Everything starts enabled and your changes are remembered for
-the next launch. Run `./prompts.sh --configure --enable ID --disable ID` to
-change them without starting a session (`--configure` alone only prints the current
-selection), or `./prompts.sh --show` to see what an unattended launch will apply — a
-launch with no terminal cannot prompt, so it prints the remembered selection
-instead of asking. `./prompts.sh --live` reads what the running session's model
-actually received, and `./prompts.sh --vars` lists every placeholder a prompt file
-may hold and who resolves it.
+`./start.sh` opens a context panel before it renders anything: one tree holding
+both the documents above and every block the harness can add, each row with its
+resolved size. Branches are the composition — a source that appears inside more
+than one parent gets a `▶` at the joint, and a source some other file fully
+supersedes is labelled `unused` and dimmed rather than deleted, so you can see
+what you are not getting. The two documents carry a tri-state word, `auto`, `on`
+or `off`; the add-ons are checkboxes. Both answer to the same keys as the rest of
+the modal, and everything starts on `auto` or on. Your changes are remembered for
+the next launch.
 
-Sizes on that screen are token counts, which is the unit the context window is
+Run `./prompts.sh --configure --enable ID --disable ID --static ID=STATE` to
+change them without starting a session (`--configure` alone only prints the current
+selection), or `./prompts.sh --show` to see what an unattended launch will apply — it
+prints both halves, the two documents and the nine add-ons. A launch with no
+terminal cannot prompt, so it prints the remembered selection instead of asking.
+`./prompts.sh --live` reads what the running session's model actually received, and
+`./prompts.sh --vars` lists every placeholder a prompt file may hold and who
+resolves it.
+
+`auto` is the rule in the section above: the operator file if it exists, the
+fallback if it does not. `on` and `off` are this session's overrides of that rule,
+and neither one edits anything. Switching a document off stands a blank override in
+for its whole chain, so nothing `SYSTEM.md` or `CONTEXT.md` says reaches the
+session, while the add-ons you left switched on are still appended; switching it on
+reads the chain as though the file were absent. Both files stay on disk exactly as
+they were. No `.env` or `HARNESS_*` variable governs either document, so this tree
+is the only place to reach them, and the choice arrives intact because the launcher
+exports the generated `runtime.env` before Compose is given `.env`, which keeps the
+launcher's own paths above it.
+
+Sizes in that tree are token counts, which is the unit the context window is
 denominated in, each shown against the input cap of the lane serving that audience. A
 number marked `~` is the harness pricing its own text before Kimi has rendered
 anything; a bare number is a real request measured from this workspace's own session
@@ -498,9 +533,10 @@ than written by you:
   are the Kimi settings that decide which capabilities load at all.
 
 Switching a block off changes no limit: the proxy enforces the same plan either
-way, and the agent is simply no longer told what that plan is. Turning every
-block off and emptying both prompt files is the tabula rasa — what reaches the
-model is your own prompt and the tool schemas, nothing else.
+way, and the agent is simply no longer told what that plan is. Switching every
+block off and both documents off is the tabula rasa, askable in one screen with no
+file editing — what reaches the model is your own prompt and the tool schemas,
+nothing else.
 
 ### Placeholders
 

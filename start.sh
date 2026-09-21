@@ -81,7 +81,14 @@ cleanup() {
   # service-check.json is the same kind of exception: it is the verdict the last launch reached,
   # it stamps itself, and the next launch overwrites it. Its log does not survive, because that one
   # carries the raw output of an exec rather than a redacted conclusion.
-  for file in proxy-token search-token kimi-config.toml runtime.env session.env module.env model-selection.json model-policy.json model.env module-guidance.md prompt-measure.log service-check.log compose/models.json compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
+  #
+  # The two newest entries are here for opposite reasons and both matter. flow-state.json is the
+  # interactive sequence's live state machine: while it exists, a step that already answered replays
+  # its answer file instead of asking, so a crash partway through a pass must not leave one behind
+  # for the next launch to mistake for progress. modules.json is deliberately not in this list, since
+  # it is also the record of the last successful selection, which is exactly why the flow that reads
+  # it as a replay has to go. module-values.json is the module environment answers, secrets included.
+  for file in proxy-token search-token kimi-config.toml runtime.env session.env module.env model-selection.json model-policy.json model.env module-guidance.md flow-state.json module-values.json prompt-measure.log service-check.log compose/models.json compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
     [[ -f "${HARNESS_RUNTIME_DIR}/${file}" ]] && find "${HARNESS_RUNTIME_DIR}/${file}" -delete
   done
   [[ -d "${HARNESS_RUNTIME_DIR}/extension-snapshot" ]] && rm -rf -- "${HARNESS_RUNTIME_DIR}/extension-snapshot"
@@ -113,18 +120,21 @@ export MODULE_NON_INTERACTIVE=${non_interactive}
 module_args=()
 [[ "${non_interactive}" == true ]] && module_args+=(--non-interactive)
 
-# Model selection precedes the Kimi Code version choice: every downstream number -
-# lane sizes, the subagent fan-out, the proxy's enforcement plan - is derived from
-# the two models selected here rather than from .env.
-python3 tools/models.py select ${module_args[@]+"${module_args[@]}"}
-python3 tools/models.py resolve
-set -a
-# shellcheck disable=SC1091
-source "${HARNESS_RUNTIME_DIR}/model.env"
-set +a
-
-python3 tools/modules.py select ${module_args[@]+"${module_args[@]}"}
-harness_modules configure
+# --- the interactive sequence -------------------------------------------------
+#
+# Eight steps, one fullscreen modal screen each, and the only part of a launch that a Backspace can
+# return through. Everything from the commit point down builds or starts something, so the loop ends
+# above it and each of those phases runs exactly once.
+#
+# Model selection precedes the Kimi Code version choice: every downstream number - lane sizes, the
+# subagent fan-out, the proxy's enforcement plan - is derived from the two models selected there
+# rather than from .env.
+flow=(python3 tools/tui/flow.py --runtime-dir "${HARNESS_RUNTIME_DIR}")
+# The steps in the order they are asked, and the status a step leaves with when the user asked for
+# the one before it. tools/tui/flow.py owns both. A back-request is navigation rather than failure,
+# which is why it is the one status the pass does not report as one.
+flow_steps=model,subagent,modules,kimi-version,module-version,module-values,context,credentials
+flow_back=3
 
 state_file=${HARNESS_STATE_FILE}
 session_file=${HARNESS_SESSION_FILE}
@@ -134,49 +144,103 @@ state_value() {
   fi
 }
 
-installed_kimi=""
-state_kimi=$(state_value KIMI_CODE_VERSION)
-if [[ -n "${state_kimi}" ]]; then
-  image_kimi=$(docker image inspect "adrc-kimi-agent:${HARNESS_IMAGE_SUFFIX}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' 2>/dev/null || true)
-  [[ "${image_kimi}" == "${state_kimi}" ]] && installed_kimi=${state_kimi}
+# One command of a pass, plus the launcher's own diagnostic.
+#
+# A command whose status is tested never reaches the ERR trap, and testing the status is exactly how
+# a back-request is told apart from a failure, so this says the sentence the trap would have said. It
+# names the line rather than the command for the same reason the trap does: these commands can carry
+# a credential in their arguments.
+harness_flow_step() {
+  local rc=0
+  "$@" || rc=$?
+  if (( rc != 0 && rc != flow_back )); then
+    printf 'Harness failed at %s:%s (exit %s).\n' "${BASH_SOURCE[1]:-start.sh}" "${BASH_LINENO[0]}" \
+      "${rc}" >&2
+  fi
+  return "${rc}"
+}
+
+# A generated environment file, exported and sourced: what `set -a` around a source does at the top
+# level of the script. A file that will not source is a failed step, because every producer here
+# writes its output before it returns.
+harness_flow_source() {
+  local rc=0
+  set -a
+  # shellcheck disable=SC1090
+  source "$1" || rc=$?
+  set +a
+  return "${rc}"
+}
+
+# One pass over every step. The `|| return` on each line is load-bearing rather than decorative:
+# inside a function whose own status is tested errexit is switched off, so without it a step that
+# failed would be followed by every step after it.
+harness_flow_pass() {
+  # Both model lanes are answered in one process, so Backspace between them never has to leave it.
+  harness_flow_step python3 tools/models.py select ${module_args[@]+"${module_args[@]}"} || return
+  harness_flow_step python3 tools/models.py resolve || return
+  harness_flow_source "${HARNESS_RUNTIME_DIR}/model.env" || return
+
+  harness_flow_step python3 tools/modules.py select ${module_args[@]+"${module_args[@]}"} || return
+  harness_flow_step harness_modules configure || return
+
+  # Probed on every pass rather than remembered: which version is installed is a fact about the disk
+  # now, and the row the menu marks installed is only honest if it was read now.
+  installed_kimi=""
+  state_kimi=$(state_value KIMI_CODE_VERSION)
+  if [[ -n "${state_kimi}" ]]; then
+    image_kimi=$(docker image inspect "adrc-kimi-agent:${HARNESS_IMAGE_SUFFIX}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' 2>/dev/null || true)
+    [[ "${image_kimi}" == "${state_kimi}" ]] && installed_kimi=${state_kimi}
+  fi
+  GITHUB_RELEASES_TOKEN=$(python3 scripts/read_env.py "${HARNESS_RESOLVED_BOOTSTRAP}" GITHUB_RELEASES_TOKEN 2>/dev/null || true)
+  export GITHUB_RELEASES_TOKEN
+  selector=(python3 scripts/select_versions.py --platform-label "${platform_label}" --kimi-asset "${kimi_asset}" --state "${state_file}" --output "${session_file}" --installed-kimi "${installed_kimi}")
+  [[ "${non_interactive}" == true ]] && selector+=(--non-interactive)
+  harness_flow_step "${selector[@]}" || return
+
+  harness_flow_step harness_modules select_version || return
+  harness_flow_step python3 tools/modules.py environment ${module_args[@]+"${module_args[@]}"} || return
+  harness_flow_source "${HARNESS_RUNTIME_DIR}/module.env" || return
+  # Generated by scripts/select_versions.py from validated values.
+  harness_flow_source "${session_file}" || return
+
+  harness_flow_step python3 tools/safe_workspace_init.py "${workspace}" || return
+  harness_flow_step python3 tools/resource_check.py "${workspace}" || return
+  harness_flow_step python3 tools/modules.py assemble || return
+
+  # Both halves of the context decision happen here, after the modules are known and before anything
+  # is rendered: the panel is the only place the resolved prompt graph is ever visible, and the file
+  # it writes is what render_runtime.py composes against. An unattended launch prints the same screen
+  # with --plain, so the log records the choices it applied instead of silently applying them.
+  panel=(python3 tools/prompt_panel.py --root "${root}" --runtime-dir "${HARNESS_RUNTIME_DIR}")
+  [[ "${non_interactive}" == true ]] && panel+=(--plain)
+  harness_flow_step "${panel[@]}" || return
+
+  # Asking for the keys the chosen lanes use is the last question of the launch, and it lives here
+  # rather than beside the model picker because it needs the resolved plan: which credentials are
+  # actually used is a fact about both lanes together.
+  harness_flow_step python3 tools/render_runtime.py --root "${root}" --runtime-dir "${HARNESS_RUNTIME_DIR}" --resolved-env "${HARNESS_RESOLVED_BOOTSTRAP}" || return
+  harness_flow_source "${HARNESS_RUNTIME_DIR}/runtime.env" || return
+}
+
+# A flow is the interactive launch's state machine and nothing else. An unattended launch asks
+# nothing, so it has nothing to return to, and starting no flow leaves every step's own numbering,
+# its short-circuits, and its side effects exactly as they were.
+flow_live=false
+if [[ "${non_interactive}" != true ]]; then
+  "${flow[@]}" --steps "${flow_steps}" begin
+  flow_live=true
 fi
 
-GITHUB_RELEASES_TOKEN=$(python3 scripts/read_env.py "${HARNESS_RESOLVED_BOOTSTRAP}" GITHUB_RELEASES_TOKEN 2>/dev/null || true)
-export GITHUB_RELEASES_TOKEN
-selector=(python3 scripts/select_versions.py --platform-label "${platform_label}" --kimi-asset "${kimi_asset}" --state "${state_file}" --output "${session_file}" --installed-kimi "${installed_kimi}")
-[[ "${non_interactive}" == true ]] && selector+=(--non-interactive)
-"${selector[@]}"
-
-harness_modules select_version
-python3 tools/modules.py environment ${module_args[@]+"${module_args[@]}"}
-set -a
-# shellcheck disable=SC1091
-source "${HARNESS_RUNTIME_DIR}/module.env"
-set +a
-
-# Generated by scripts/select_versions.py from validated values.
-set -a
-# shellcheck disable=SC1090
-source "${session_file}"
-set +a
-
-python3 tools/safe_workspace_init.py "${workspace}"
-python3 tools/resource_check.py "${workspace}"
-python3 tools/modules.py assemble
-
-# Both halves of the context decision happen here, after the modules are known and before anything
-# is rendered: the panel is the only place the resolved prompt graph is ever visible, and the file it
-# writes is what render_runtime.py composes against. An unattended launch prints the same screen with
-# --plain, so the log records the choices it applied instead of silently applying them.
-panel=(python3 tools/prompt_panel.py --root "${root}" --runtime-dir "${HARNESS_RUNTIME_DIR}")
-[[ "${non_interactive}" == true ]] && panel+=(--plain)
-"${panel[@]}"
-
-python3 tools/render_runtime.py --root "${root}" --runtime-dir "${HARNESS_RUNTIME_DIR}" --resolved-env "${HARNESS_RESOLVED_BOOTSTRAP}"
-set -a
-# shellcheck disable=SC1091
-source "${HARNESS_RUNTIME_DIR}/runtime.env"
-set +a
+pass_status=0
+while :; do
+  pass_status=0
+  harness_flow_pass || pass_status=$?
+  [[ "${pass_status}" == 0 ]] && break
+  # A back-request cannot come from a launch with no flow to answer it, so any other status is a real
+  # failure, and harness_flow_step has already said which.
+  [[ "${flow_live}" == true && "${pass_status}" == "${flow_back}" ]] || exit "${pass_status}"
+done
 
 approval_manifest="${HARNESS_RUNTIME_DIR}/extension-approval.json"
 python3 tools/approve_extensions.py prepare --workspace "${workspace}" --manifest "${approval_manifest}" --state-dir "${HARNESS_RUNTIME_DIR}" --output "${HARNESS_COMPOSE_DIR}/approved-extensions.yaml"
@@ -196,6 +260,11 @@ actual_kimi=$(harness_compose run -T --rm --no-deps kimi-agent kimi --version)
 [[ "${actual_kimi}" == *"${KIMI_CODE_VERSION}"* ]] || { echo "Built Kimi version mismatch: ${actual_kimi}" >&2; exit 1; }
 harness_modules check_build
 
+# The questions are over: this is the commit point, and the first line of it says so to the
+# interactive sequence. Ending the flow here rather than only in cleanup() means a launch that goes
+# on to fail during the build leaves no live state machine behind, and every answer below this line
+# is durable state owned by state.env and last-*.json instead.
+"${flow[@]}" end
 cp -- "${session_file}" "${state_file}"
 chmod 600 "${state_file}"
 cp "${HARNESS_RUNTIME_DIR}/modules.json" "${HARNESS_RUNTIME_DIR}/last-modules.json"

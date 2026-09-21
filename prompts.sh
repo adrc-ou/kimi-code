@@ -19,6 +19,7 @@ usage: ./prompts.sh [--show] [--vars] [--configure [options]] [--live] [--extrac
   --vars       every placeholder a prompt file may hold, who resolves it, and its conditions
   --configure  set the launch panel's choices without a screen
                  --enable ID --disable ID    toggle named options
+                 --static ID=STATE           force a document: context|system = auto|on|off
                  --all-on | --all-off        reset the whole list
                  --show                      print the current selection and change nothing
   --live       the prompt actually sent, read from the running stack and measured exactly

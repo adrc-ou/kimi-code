@@ -312,8 +312,10 @@ advice, and 378 for a ComfyUI module's guidance, measured with the estimator in
 
 **Which blocks are composed in is a launch-panel choice.** `start.sh` runs
 `tools/prompt_panel.py` before `tools/render_runtime.py`; the selection is stored
-in `prompt-context.json` in the instance runtime directory, and
-`./prompts.sh --configure --enable ID --disable ID` changes it without a launch. There is no `.env`
+in `prompt-context.json` in the instance runtime directory — the nine add-ons under
+`enabled`, the two documents under the tri-state `static` key — and
+`./prompts.sh --configure --enable ID --disable ID --static ID=STATE` changes it
+without a launch. There is no `.env`
 variable for any of this. The retired `KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE` is named
 in `harness_retired_env` (`tools/runtime.sh`) so an operator's stale `.env` is
 reported rather than silently ignored.
@@ -337,6 +339,13 @@ that would reinstate the prompt the operator just declined: the blocks become th
 whole prompt, and with nothing enabled the stage is `EMPTY_PROMPT_SENTINEL`, a lone
 period, which is the only thing that survives Kimi's `text.trim().length === 0`
 check while telling it nothing.
+
+Those four rows describe `auto`. The panel's other two settings are this-session
+overrides of the same rule, resolved by the same `prompt_context.static_source()`:
+`on` reads the chain as though the file were absent, which for `SYSTEM.md` is
+row one, and `off` forces the row the empty file already meant. Nothing is written
+to the workspace; the override lives in `prompt-context.json` and dies with the
+launch.
 
 **Generated text carries no placeholders.** Appended blocks pass through Kimi's
 template substitution like the rest of the prompt, so every block is written with
@@ -612,7 +621,7 @@ The ratio worth acting on is unchanged: the harness's own contract is the larges
 thing every agent carries and the only large surface the harness fully controls,
 and the subagent pays for it without receiving the main prompt at all.
 
-The panel itself costs the model nothing: 75 lines and 4,428 characters
+The panel itself costs the model nothing: 75 lines and 4,343 characters
 of terminal output that the launcher prints and discards, none of which
 reaches a prompt. Worth saying, because the panel is otherwise the only
 place these figures are added up, and an instrument that measures a
@@ -640,7 +649,7 @@ Five modes, one per question an operator actually asks:
 | --- | --- |
 | `./prompts.sh` | what will the next unattended launch compose? (the panel's screen, drawn once, with no prompt) |
 | `./prompts.sh --vars` | which `${...}` names may I use, and who resolves each one? |
-| `./prompts.sh --configure --enable ID --disable ID` | set the block choices without launching (`--all-on`/`--all-off` reset the list, `--show` prints the current selection and the valid ids) |
+| `./prompts.sh --configure --enable ID --disable ID --static ID=STATE` | set the choices without launching (`--static` takes `context` or `system` as `auto`, `on` or `off`; `--all-on`/`--all-off` reset the add-ons and leave the documents alone; `--show` prints both halves and the valid ids) |
 | `./prompts.sh --live` | what did the running session's model actually receive? |
 | `./prompts.sh --extract` | re-read Kimi's own built-in blocks out of the running image |
 
@@ -714,15 +723,15 @@ anywhere in this repository — `${harness.date}` is the name we do resolve.
 
 | surface | can it be emptied? | how |
 | --- | --- | --- |
-| built-in template | yes | replacement `SYSTEM.md`, or agent file |
+| built-in template | yes | replacement `SYSTEM.md`, an agent file, or the panel's `system` row |
 | role overlay | **no** | hard-coded; only swappable by replacing the whole profile |
-| instruction files | yes | empty `CONTEXT.md`, and the workspace's own files are the user's |
+| instruction files | yes | the panel's `context` row, an empty `CONTEXT.md`, and the workspace's own files are the user's |
 | environment facts | mostly | omit the placeholders from a replacement template |
 | skill listing | yes | panel: Skills off, full listing off, product Skills off |
 | plugin, additional dirs | already nil | — |
 | reply style | **no** | CLI/server argument only |
 | notify guidance | **no** | force-appended by `renderAgentProfilePrompt` |
-| generated blocks | yes | panel, one checkbox per block |
+| generated blocks | yes | panel, one branch row per block |
 | module guidance | yes | panel, or deselect the module |
 | subagent roles | yes | panel: roles off, or delete the files |
 | permission banner | yes | panel |
@@ -731,13 +740,14 @@ anywhere in this repository — `${harness.date}` is the name we do resolve.
 | compaction | **no** | timing only; hook return values ignored |
 | title call | n/a | fixed to an unrouted model |
 
-A tabula rasa therefore has a floor. Switching every panel block off, emptying
-`SYSTEM.md` so it stages the sentinel, and emptying `CONTEXT.md` so the loader
-skips it removes everything this harness says. It does not remove Kimi's role
+A tabula rasa therefore has a floor. Switching every panel block off and setting
+both documents to `off` — nine checkboxes and two words on one screen, no file
+editing — removes everything this harness says. It does not remove Kimi's role
 overlay, its force-appended notification guidance, its per-step reminders, or the
 tool schemas, and no file in this repository can. That is the honest boundary of
-the mechanism, and the panel's diagram shows it: with those three choices made,
-the main row reads one token for the prompt and nothing for the contract.
+the mechanism, and the panel says so as it prices it: with those choices made the
+most this harness still stages is the main agent's lone period, and its contract
+row reads zero.
 
 ## Reproducing these numbers
 

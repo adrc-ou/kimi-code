@@ -5,6 +5,11 @@ resolved context before it is spent. These tests hold the properties that make i
 rather than pretty: the diagram sums, no figure is presented as measured when it is not, every
 option is reachable, a half-selected pair warns exactly once, and nothing at all happens to the
 operator's choices when they never had a terminal.
+
+Two renderers share those properties, so the suite does too: the flat screen an unattended launch
+prints, and the modal tree a person at a keyboard drives. What the old line-editor grammar used to
+answer with - a typed digit, or ``a``/``n``/``r`` - is asserted here through the tree's own keys,
+because a keypress has no aliases to forgive and no command to mis-type.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ import ast
 import datetime as dt
 import io
 import json
+import os
 import re
 import sys
 import tempfile
@@ -33,9 +39,74 @@ import prompt_context as pc  # noqa: E402
 import prompt_measure as pm  # noqa: E402
 import prompt_panel as pp  # noqa: E402
 
-from tests.helpers import measured_record, shipped_plan  # noqa: E402
+# Flat, like ``prompt_panel`` imports them: this suite loads the panel as a top-level module, and
+# the same engine reached two ways would be two sets of classes, so an ``isinstance`` here would
+# fail for the right reasons and a shared row type would not be shared at all.
+from tui import flow  # noqa: E402
+from tui.app import BACK_BINDING, View, navigation  # noqa: E402
+from tui.caps import NONE, Caps  # noqa: E402
+
+from tests.helpers import measured_record, run_in_pty, shipped_plan  # noqa: E402
 
 PLAN = shipped_plan()
+
+#: A painter that asks the terminal nothing, so a tree can be measured in a suite whose own
+#: standard output is a pipe.
+QUIET = Caps(color=NONE, columns=80, rows=24, probe=False)
+#: The harness's own tier of the all-lane contract, as the tree spells it: derived, so that
+#: renaming :data:`prompt_context.CONTRACT_SOURCE` moves every expectation with it.
+CONTRACT = "/".join(pc.CONTRACT_SOURCE)
+
+
+def tree(
+    root: Path,
+    *,
+    enabled: dict[str, bool] | None = None,
+    static: dict[str, str] | None = None,
+    latest: dict[str, dict] | None = None,
+    guidance: str = "module guidance text for the selected module",
+) -> pp.ContextStep:
+    """The modal tree over a workspace, wired the way :func:`prompt_panel.choose_context` wires it.
+
+    The graph stays on the step as ``.graph``, which is where the launcher keeps it too: an answer
+    map is only meaningful beside the object that composed the rows it came from.
+    """
+    graph = pp.ContextGraph(
+        PLAN,
+        root,
+        guidance,
+        latest or {},
+        dict(pc.resolve_enabled(enabled)),
+        dict(pc.resolve_static(static)),
+    )
+    step = pp.ContextStep(graph)
+    step.caps = QUIET
+    return step
+
+
+def tree_rows(step: pp.ContextStep, state: object | None = None) -> list[str]:
+    """Every row the tree paints, as plain text: the body without a terminal attached."""
+    live = step.initial() if state is None else state
+    return [row.line.text() for row in step.rows(live)]
+
+
+def prose(step: pp.ContextStep, state: object | None = None) -> str:
+    """The tree as one run of prose, for sentences that are wrapped over two rows.
+
+    A note is laid out inside its own column, so the second line of it starts with that column's
+    indentation. Row alignment is what :func:`tree_rows` is asserted against; a sentence's
+    *wording* has to be read the way the operator reads it, spaces and all.
+    """
+    return re.sub(r"\s+", " ", " ".join(tree_rows(step, state)))
+
+
+def stage_files(root: Path, files: dict[str, str]) -> Path:
+    """Write exactly these files under ``root``, making whatever directories they name."""
+    for name, text in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
 
 
 class PanelDrawTests(unittest.TestCase):
@@ -340,68 +411,297 @@ class WarningTests(unittest.TestCase):
         parent = next(o for o in pc.OPTIONS if o.companions)
         for other in parent.companions:
             enabled[other] = False
-        pp.warning(enabled)
-        after = pp.apply_command("n", enabled)[0]
+        self.assertTrue(pp.warning(enabled), "the pair has to be half-selected for this to mean")
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        step = tree(Path(holder.name), enabled=enabled)
+        drawn = {node.id: node for node, _, _, _ in step.rows_in_order()}
+        for name in (parent.id, *parent.companions):
+            self.assertTrue(drawn[name].editable, f"{name} is warned about, not refused")
+        # The all-off answer the old ``n`` produced is still reachable, one row at a time, and the
+        # sentence goes away with the half-selected pair rather than outliving it.
+        values = dict(step.graph.opening())
+        for option in pc.OPTIONS:
+            values[option.id] = pp.ON_OFF[1]
+        after, _ = step.graph.answer(values)
         self.assertEqual(after[parent.id], False, "all-off must not silently re-enable a pair")
+        self.assertFalse(any(after.values()))
         self.assertEqual(pp.warning(after), "", "nothing on can hardly be a half-selected pair")
 
 
-class CommandTests(unittest.TestCase):
+class AnswerTests(unittest.TestCase):
+    """What the tree answers: what the cursor can reach, what one key moves, and what undoes it.
+
+    These are the properties the old line-editor grammar used to be tested through. The grammar is
+    gone - a fullscreen tree answers a keypress, not a typed command - so each one is now checked
+    against the tree's own answers, which is where a regression would actually show.
+    """
+
     def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name)
+        # Three files with three different fates: the operator's two, each superseding nothing, and
+        # the harness contract below ``CONTEXT.md``, which the operator's file does supersede. One
+        # workspace, and every shape of row the tree can draw is in it.
+        stage_files(self.root, {
+            "SYSTEM.md": "# the operator's own voice\n",
+            "CONTEXT.md": "# the operator's own contract\n",
+            "runtime/AGENTS.md": "# this harness's contract\n",
+        })
         self.enabled = dict(pc.DEFAULT_ENABLED)
+        self.step = tree(self.root, enabled=self.enabled)
+        self.state = self.step.initial()
 
-    def test_a_digit_toggles_its_option(self) -> None:
-        for index, option in enumerate(pc.OPTIONS, start=1):
-            after, done = pp.apply_command(str(index), dict(self.enabled))
-            self.assertFalse(done)
-            self.assertIsNot(after[option.id], self.enabled[option.id], option.id)
+    def test_every_answer_is_a_row_the_cursor_can_reach(self) -> None:
+        """There are no numbers to type, so a row nobody can stop on is a row nobody can answer.
 
-    def test_an_out_of_range_digit_changes_nothing(self) -> None:
-        after, done = pp.apply_command(str(len(pc.OPTIONS) + 3), self.enabled)
-        self.assertFalse(done)
-        self.assertEqual(after, self.enabled)
+        This replaced a ceiling of nine options, which was only ever an artefact of the single
+        digit that used to select one.
+        """
+        reachable = {node.id for node in self.step.options()}
+        self.assertTrue(set(pc.OPTION_IDS) <= reachable, sorted(set(pc.OPTION_IDS) - reachable))
+        self.assertTrue(set(pc.STATIC_IDS) <= reachable)
+        by_id = {node.id: node for node in self.step.options()}
+        for option in pc.OPTIONS:
+            self.assertEqual(by_id[option.id].states, pp.ON_OFF, option.id)
 
-    def test_enter_accepts(self) -> None:
-        after, done = pp.apply_command("", self.enabled)
-        self.assertTrue(done)
-        self.assertEqual(after, self.enabled)
+    def test_space_moves_one_row_and_only_that_row(self) -> None:
+        """The whole contract of the key, over every row that answers it."""
+        for node in self.step.options():
+            moved = self.step.toggled(self.state, node.id)
+            changed = {
+                key for key in self.state.values if self.state.values[key] != moved.values[key]
+            }
+            self.assertEqual(changed, {node.id}, node.id)
+            self.assertIn(moved.values[node.id], node.states, node.id)
+            self.assertNotEqual(moved.values[node.id], self.state.values[node.id], node.id)
+            self.assertEqual(moved.focus, self.state.focus, "answering must not move the cursor")
+
+    def test_the_space_key_visits_every_state_a_row_offers(self) -> None:
+        """A tri-state switch that skipped ``on`` would be a two-state switch with a lie on it."""
+        for node in self.step.options():
+            seen: list[str] = []
+            state = self.state
+            for _ in range(len(node.states)):
+                state = self.step.toggled(state, node.id)
+                seen.append(state.values[node.id])
+            self.assertEqual(seen, list(node.states[1:]) + [node.states[0]], node.id)
+
+    def test_a_row_with_no_switch_cannot_be_moved_by_any_key(self) -> None:
+        """Headings and superseded sources hold the picture and refuse the keystroke.
+
+        The old test fed the grammar a number past the end of the list; the tree's equivalent is a
+        row the cursor was never meant to rest on, and the answer must be exactly "nothing".
+        """
+        still = [node for node, _, _, _ in self.step.rows_in_order() if not node.editable]
+        self.assertTrue(still, "a tree with nothing fixed in it is a form, not a diagram")
+        for node in still:
+            self.assertIs(self.step.toggled(self.state, node.id), self.state, node.id)
+        self.assertIs(self.step.toggled(self.state, "no-such-row"), self.state)
+
+    def test_accept_hands_over_the_whole_answer_and_nothing_else(self) -> None:
+        """Enter commits the map on screen, as a copy, in the halves the launcher composes from."""
+        result = self.step.commit(self.state)
+        self.assertEqual(result.value, self.state.values)
+        self.assertIsNot(result.value, self.state.values)
+        enabled, static = self.step.graph.answer(result.value)
+        self.assertEqual(set(enabled), set(pc.OPTION_IDS))
+        self.assertEqual(set(static), set(pc.STATIC_IDS))
 
     def test_all_off_reaches_the_tabula_rasa_selection(self) -> None:
-        after, _ = pp.apply_command("n", self.enabled)
-        self.assertFalse(any(after.values()))
-        self.assertEqual(set(after), set(pc.OPTION_IDS))
+        """The blank prompt has to be reachable by answers this screen actually offers.
+
+        Both halves at once, which is the part the flat list could not say: the add-ons switch off
+        one by one, and the two documents switch off beside the files they are read from.
+        """
+        values = dict(self.step.graph.opening())
+        for option in pc.OPTIONS:
+            values[option.id] = pp.ON_OFF[1]
+        for block in pc.STATIC_IDS:
+            values[block] = pc.OFF
+        enabled, static = self.step.graph.answer(values)
+        self.assertFalse(any(enabled.values()))
+        self.assertEqual(set(enabled), set(pc.OPTION_IDS))
+        self.assertEqual(static, dict.fromkeys(pc.STATIC_IDS, pc.OFF))
+        self.assertEqual(
+            pc.compose_agents_document(self.root, PLAN, "m", enabled, static=static), ""
+        )
+        self.assertEqual(
+            pc.compose_system_document(self.root, PLAN, enabled, static=static),
+            pc.EMPTY_PROMPT_SENTINEL + "\n",
+        )
 
     def test_reset_restores_this_builds_defaults(self) -> None:
-        after, _ = pp.apply_command("n", self.enabled)
-        after, _ = pp.apply_command("r", after)
-        self.assertEqual(after, dict(pc.DEFAULT_ENABLED))
+        """``Ctrl-R`` is an undo of the whole answer, cursor included, back to shipped defaults."""
+        moved = self.state
+        for node in self.step.options():
+            moved = self.step.toggled(moved, node.id)
+        moved = self.step.with_focus(moved, 4)
+        tree_rows(self.step, moved)
+        self.assertNotEqual(moved.values, self.state.values)
+        self.assertNotEqual(moved.focus, self.state.focus)
+        back = self.step.reset(moved)
+        self.assertEqual(back, self.step.initial())
+        enabled, static = self.step.graph.answer(back.values)
+        self.assertEqual(enabled, dict(pc.DEFAULT_ENABLED))
+        self.assertEqual(static, dict(pc.STATIC_DEFAULT))
 
-    def test_an_unknown_command_is_harmless(self) -> None:
-        after, done = pp.apply_command("zzz", self.enabled)
-        self.assertFalse(done)
-        self.assertEqual(after, self.enabled)
 
-    def test_commands_are_case_insensitive(self) -> None:
+class StaticSwitchTests(unittest.TestCase):
+    """The tri-state switch: what each shape of disk deserves, and what an untouched row stores.
+
+    ``auto``/``on``/``off`` are three words, but a workspace does not always hold three different
+    answers, and a third position that composes the bytes the first one already did is a keypress
+    that changes nothing. These tests pin the collapsing rule rather than the wording of a row.
+    """
+
+    def root(self, files: dict[str, str]) -> Path:
+        """A throwaway workspace holding exactly these files, reaped with the test that made it."""
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        return stage_files(Path(holder.name), files)
+
+    def document(self, root: Path, block: str, mode: str) -> str:
+        """What this block's state alone puts in front of the model, the other left at ``auto``."""
+        enabled = dict(pc.DEFAULT_ENABLED)
+        static = dict.fromkeys(pc.STATIC_IDS, pc.AUTO)
+        static[block] = mode
+        if block == pc.STATIC_SYSTEM:
+            return pc.compose_system_document(root, PLAN, enabled, static=static)
+        return pc.compose_agents_document(root, PLAN, "m", enabled, static=static)
+
+    def test_the_switch_offers_only_states_that_compose_differently(self) -> None:
+        cases: dict[str, tuple[dict[str, str], dict[str, tuple[str, ...]]]] = {
+            "nothing on disk": ({}, {"system": (pc.AUTO, pc.OFF), "context": (pc.AUTO,)}),
+            "both files empty": (
+                {pc.SYSTEM_FILE: "", pc.CONTEXT_FILE: ""},
+                {"system": (pc.ON, pc.OFF), "context": (pc.OFF,)},
+            ),
+            "both empty over the contract": (
+                {pc.SYSTEM_FILE: "", pc.CONTEXT_FILE: "", CONTRACT: "# c\n"},
+                {"system": (pc.ON, pc.OFF), "context": (pc.ON, pc.OFF)},
+            ),
+            "both files filled": (
+                {pc.SYSTEM_FILE: "# v\n", pc.CONTEXT_FILE: "# k\n"},
+                {"system": (pc.AUTO, pc.OFF), "context": (pc.AUTO, pc.OFF)},
+            ),
+            "an empty voice over a real contract": (
+                {pc.SYSTEM_FILE: "", CONTRACT: "# c\n"},
+                {"system": (pc.ON, pc.OFF), "context": (pc.AUTO, pc.OFF)},
+            ),
+        }
+        for name, (files, expected) in cases.items():
+            root = self.root(files)
+            for block, states in expected.items():
+                switch = pp._block_switch(root, block, pc.AUTO)
+                with self.subTest(case=name, block=block):
+                    self.assertEqual(switch.states, states)
+                    self.assertIn(switch.opening, switch.states)
+                    # Every state the row does *not* offer composes what one it does composes, and
+                    # the ones it offers compose different bytes from each other. Those two
+                    # sentences are the whole difference between a collapsed switch and a broken
+                    # one, and the table above only says which side of it each case is on.
+                    for spelling, members in switch.members.items():
+                        texts = {self.document(root, block, mode) for mode in members}
+                        self.assertEqual(len(texts), 1, f"{block} {spelling} groups states apart")
+                    apart = {
+                        self.document(root, block, members[0])
+                        for members in switch.members.values()
+                    }
+                    self.assertEqual(len(apart), len(switch.members), f"{block} offers a dead key")
+
+    def test_an_empty_file_opens_the_block_switched_off(self) -> None:
+        """The brief's own rule: an empty file on disk *is* the block being off."""
+        for block, own in (
+            (pc.STATIC_SYSTEM, pc.SYSTEM_FILE),
+            (pc.STATIC_CONTEXT, pc.CONTEXT_FILE),
+        ):
+            root = self.root({own: "", CONTRACT: "# c\n"})
+            switch = pp._block_switch(root, block, pc.AUTO)
+            with self.subTest(block=block):
+                self.assertEqual(switch.opening, pc.OFF)
+                self.assertEqual(pc.static_state(root, block), pc.OFF)
+                self.assertIn(pc.ON, switch.states, "the state that ignores the file must exist")
+
+    def test_a_switch_with_nothing_to_switch_says_so(self) -> None:
+        """One state left standing is not a switch, and the row has to admit it rather than stall.
+
+        An empty ``CONTEXT.md`` over no harness contract composes blank whichever way it is pushed,
+        so the honest screen shows the answer and refuses the key.
+        """
+        root = self.root({pc.CONTEXT_FILE: ""})
+        step = tree(root)
+        self.assertEqual(pp._block_switch(root, pc.STATIC_CONTEXT, pc.AUTO).states, (pc.OFF,))
+        rows = {node.id: node for node, _, _, _ in step.rows_in_order()}
+        self.assertFalse(rows[pc.STATIC_CONTEXT].editable)
+        self.assertIn("nothing to switch", prose(step))
+
+    def test_an_untouched_row_stores_the_word_that_was_saved(self) -> None:
+        """The screen may call an empty file ``off``; the file still remembers ``auto``.
+
+        Both spellings compose the same document, so the stored word is the one that says what the
+        operator chose, and only the diagram has to speak in effects.
+        """
+        root = self.root({pc.SYSTEM_FILE: "", CONTRACT: "# c\n"})
+        graph = tree(root).graph
+        opening = graph.opening()
+        self.assertEqual(opening[pc.STATIC_SYSTEM], pc.OFF)
+        _, stored = graph.answer(opening)
+        self.assertEqual(stored[pc.STATIC_SYSTEM], pc.AUTO)
+        self.assertEqual(graph.modes(opening)[pc.STATIC_SYSTEM], pc.OFF)
+        moved = dict(opening, **{pc.STATIC_SYSTEM: pc.ON})
+        self.assertEqual(graph.answer(moved)[1][pc.STATIC_SYSTEM], pc.ON)
+
+    def test_the_drawn_word_and_the_stored_word_compose_the_same_prompt(self) -> None:
+        """Collapsing is only honest while both halves agree about the bytes.
+
+        :meth:`ContextGraph.answer` and :meth:`ContextGraph.modes` differ by design - one names
+        provenance for the file, one for the picture - and the one thing they may never differ
+        about is the document they describe.
+        """
+        shapes = (
+            {},
+            {pc.SYSTEM_FILE: ""},
+            {pc.SYSTEM_FILE: "", pc.CONTEXT_FILE: ""},
+            {pc.SYSTEM_FILE: "# v\n", pc.CONTEXT_FILE: ""},
+        )
+        for files in shapes:
+            root = self.root({**files, CONTRACT: "# c\n"})
+            graph = tree(root).graph
+            opening = graph.opening()
+            _, stored = graph.answer(opening)
+            drawn = graph.modes(opening)
+            for block in pc.STATIC_IDS:
+                with self.subTest(files=tuple(sorted(files)), block=block):
+                    self.assertEqual(
+                        self.document(root, block, stored[block]),
+                        self.document(root, block, drawn[block]),
+                    )
+
+    def test_a_context_file_of_only_whitespace_is_empty_where_that_is_decided(self) -> None:
+        """The one shape the collapse bends on, named rather than smoothed over.
+
+        :func:`prompt_context.static_state` calls a blank-on-trim file empty - which is what the
+        sentence on the tree promises - so the row opens ``off`` while the file still remembers
+        ``auto``. Composing under the latter keeps that file's whitespace: the agents document has
+        always appended its tier's text as it stands, where the system document asks for
+        :meth:`str.strip` first. So the two spellings differ by two spaces the model would trim
+        before it decided anything, which is the seam this test exists to keep visible.
+        """
+        root = self.root({pc.CONTEXT_FILE: "  \n", CONTRACT: "# c\n"})
+        graph = tree(root).graph
+        opening = graph.opening()
+        _, stored = graph.answer(opening)
+        drawn = graph.modes(opening)
+        self.assertEqual(opening[pc.STATIC_CONTEXT], pc.OFF)
+        self.assertEqual(stored[pc.STATIC_CONTEXT], pc.AUTO)
+        self.assertEqual(drawn[pc.STATIC_CONTEXT], pc.OFF)
         self.assertEqual(
-            pp.apply_command("N", self.enabled)[0],
-            pp.apply_command("n", self.enabled)[0],
+            self.document(root, pc.STATIC_CONTEXT, stored[pc.STATIC_CONTEXT]).strip(),
+            self.document(root, pc.STATIC_CONTEXT, drawn[pc.STATIC_CONTEXT]).strip(),
         )
-
-
-class ExplainTests(unittest.TestCase):
-    def test_generated_blocks_name_the_function_that_writes_them(self) -> None:
-        text = pp.explain("1", PLAN, "m")
-        self.assertIn("tools/policy.py", text)
-
-    def test_a_switch_says_so_instead_of_claiming_text(self) -> None:
-        index = next(
-            i for i, o in enumerate(pc.OPTIONS, start=1)
-            if not pp.option_text(o, PLAN, "m")
-        )
-        self.assertIn("no text", pp.explain(str(index), PLAN, "m"))
-
-    def test_an_unparsable_answer_asks_rather_than_guessing(self) -> None:
-        self.assertIn("Type i", pp.explain("", PLAN, "m"))
+        self.assertIn("counts as empty", pp.STATIC_NOTE)
 
 
 class PrefsRoundTripTests(unittest.TestCase):
@@ -424,10 +724,10 @@ class PrefsRoundTripTests(unittest.TestCase):
         code, screen = self.capture(["--plain"])
         self.assertEqual(code, 0)
         self.assertIn("remembered from your last launch", screen)
-        plan, enabled, remembered = pp.load_context(self.runtime)
-        self.assertFalse(enabled[policy.OPTION_PARALLELISM])
-        self.assertTrue(remembered)
-        self.assertIn("lanes", plan)
+        context = pp.load_context(self.runtime)
+        self.assertFalse(context.enabled[policy.OPTION_PARALLELISM])
+        self.assertTrue(context.remembered)
+        self.assertIn("lanes", context.plan)
 
     def test_an_unattended_launch_applies_remembered_choices_without_prompting(self) -> None:
         self.capture([])  # no tty under the test runner: must draw, not hang, and not overwrite
@@ -461,12 +761,49 @@ class PrefsRoundTripTests(unittest.TestCase):
         self.capture(["--configure", "--all-off"])
         self.assertFalse(any(pc.load_prefs(self.runtime / pc.PREFS_FILE).values()))
 
+    def test_forcing_a_document_lands_in_the_same_file_as_a_box(self) -> None:
+        """The scripted half of the tri-state, which is what a CI job has instead of arrow keys."""
+        code, out = self.capture(["--configure", "--static", f"{pc.STATIC_CONTEXT}=off"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            pc.load_static(self.runtime / pc.PREFS_FILE),
+            dict(pc.STATIC_DEFAULT) | {pc.STATIC_CONTEXT: pc.OFF},
+        )
+        self.assertIn(pc.STATIC_CONTEXT, out)
+
+    def test_resetting_the_boxes_leaves_the_documents_the_operator_set_alone(self) -> None:
+        pc.save_prefs(self.runtime / pc.PREFS_FILE, dict(pc.DEFAULT_ENABLED),
+                      {pc.STATIC_SYSTEM: pc.OFF})
+        self.capture(["--configure", "--all-off"])
+        self.assertFalse(any(pc.load_prefs(self.runtime / pc.PREFS_FILE).values()))
+        self.assertEqual(
+            pc.load_static(self.runtime / pc.PREFS_FILE)[pc.STATIC_SYSTEM], pc.OFF
+        )
+
+    def test_an_unknown_document_or_state_is_refused_before_anything_is_written(self) -> None:
+        for argument in ("system=sometimes", "kimi=on", "system"):
+            with self.subTest(argument=argument):
+                code, _ = self.capture(["--configure", "--static", argument])
+                self.assertEqual(code, 2)
+                self.assertFalse((self.runtime / pc.PREFS_FILE).exists())
+
+    def test_the_scripted_report_prints_both_halves_of_the_selection(self) -> None:
+        code, out = self.capture(["--configure", "--show"])
+        self.assertEqual(code, 0)
+        for option in pc.OPTIONS:
+            self.assertIn(option.id, out)
+        for block in pc.STATIC_IDS:
+            self.assertIn(block, out)
+
     def test_the_prefs_file_never_leaves_the_options_it_knows(self) -> None:
         pc.save_prefs(self.runtime / pc.PREFS_FILE, dict(pc.DEFAULT_ENABLED))
         mode = self.runtime / pc.PREFS_FILE
         self.assertEqual(mode.stat().st_mode & 0o777, 0o600)
         stored = json.loads(mode.read_text())
-        self.assertEqual(set(stored), set(pc.OPTION_IDS))
+        # Two halves now: the flat option ids, and one nested map of the static block ids. Anything
+        # else in the file would be a key no reader owns.
+        self.assertEqual(set(stored) - {"static"}, set(pc.OPTION_IDS))
+        self.assertEqual(set(stored["static"]), set(pc.STATIC_IDS))
 
     def test_a_pref_file_with_stray_keys_does_not_become_stray_text(self) -> None:
         (self.runtime / pc.PREFS_FILE).write_text('{"parallelism": true, "grape": true}')
@@ -556,55 +893,146 @@ class TabulaRasaTests(unittest.TestCase):
         self.assertEqual(staged_system, pc.EMPTY_PROMPT_SENTINEL + "\n")
         self.assertEqual(staged_agents, "")
 
-    def test_the_recipe_on_the_help_screen_matches_the_code(self) -> None:
-        for name in ("SYSTEM.md", "CONTEXT.md"):
-            self.assertIn(name, pp.HELP)
-        self.assertIn(pc.EMPTY_PROMPT_SENTINEL, pp.HELP)
+    def test_every_fact_the_help_screen_carried_now_lives_on_the_tree(self) -> None:
+        """The deleted overlay had four facts in it, and a screen cannot lose a fact by moving.
 
-    def test_the_help_screen_states_the_fallback_it_prevents(self) -> None:
-        self.assertIn("built-in", pp.HELP)
-
-    def test_the_help_screen_reaches_the_terminal_from_a_command(self) -> None:
-        """`?` is advertised on the prompt line, so it has to bring the recipe with it.
-
-        Checked through the loop that answers the keystroke, and against a sentence that exists
-        nowhere on the drawn panel: the panel already prints a bare ``?`` for every figure it
-        cannot price, which is what the earlier version of this test was matching.
+        It had them because the flat list had nowhere else to put them. The tree has the room, so
+        each one belongs beside the row it explains - which is what this checks, rather than the
+        wording of a help page nobody has to leave the diagram to read.
         """
-        stdin, sys.stdin = sys.stdin, io.StringIO("?\n")
-        out = io.StringIO()
-        try:
-            with redirect_stdout(out):
-                selection = pp.interactive_loop(
-                    PLAN, self.root, "m", self.enabled, {},
-                    colour_on=False, remembered=False,
-                )
-        finally:
-            sys.stdin = stdin
-        self.assertIn("An empty file is a decision", out.getvalue())
-        self.assertEqual(selection, self.enabled, "asking for help changes no choice")
+        stage_files(self.root, {
+            pc.SYSTEM_FILE: "", pc.CONTEXT_FILE: "", CONTRACT: "# the harness contract\n",
+        })
+        flat = prose(tree(self.root))
+        for fact in (
+            pc.SYSTEM_FILE,
+            pc.CONTEXT_FILE,
+            CONTRACT,
+            "An empty file is a decision",
+            "counts as empty",
+            "writes nothing to your files",
+            "built-in",
+            pp.UNUSED,
+        ):
+            self.assertIn(fact, flat)
+        self.assertIn(repr(pc.EMPTY_PROMPT_SENTINEL), flat)
+
+    def test_the_tree_states_the_fallback_a_blank_document_prevents(self) -> None:
+        """``.`` looks like a typo, so the row that stages it has to say what it is for."""
+        stage_files(self.root, {pc.SYSTEM_FILE: "", CONTRACT: "# the harness contract\n"})
+        step = tree(self.root)
+        rows = tree_rows(step)
+        self.assertIn(pp.BLANK_NOTE, prose(step))
+        self.assertIn(pc.EMPTY_PROMPT_SENTINEL, pp.BLANK_NOTE)
+        # The sentence hangs off the built-in row, and that row also says plainly that it is not
+        # running: a reader who missed the note still cannot conclude Kimi's own prompt is in play.
+        marks = [row for row in rows if "built-in prompt" in row]
+        self.assertEqual(len(marks), 1)
+        self.assertIn(pp.UNUSED, marks[0])
+
+    def test_the_context_step_invents_no_keys_of_its_own(self) -> None:
+        """``a``/``n``/``r``/``i`` died here: a step may answer only what its footer advertises.
+
+        The tree inherits the engine's generated table, so this fails the moment the panel
+        special-cases a letter nobody printed - which is the exact shape of the old grammar.
+        """
+        step = tree(self.root)
+        table = step.keys(step.initial(), View(can_go_back=True))
+        base = navigation()
+        expected = [
+            *(item.action for item in base[:1]),
+            BACK_BINDING.action,
+            *(item.action for item in base[1:]),
+        ]
+        self.assertEqual([item.action for item in table], expected)
+        spelled = {name for item in table for name in item.keys}
+        for letter in ("a", "n", "r", "i"):
+            self.assertNotIn(letter, spelled, f"{letter} would be a magic keystroke again")
+        for name in ("?", "Space", "Enter", "Ctrl-R", "Backspace", "Up", "Down"):
+            self.assertIn(name, spelled, f"{name} does something and must be printed")
 
 
 class TerminalAssumptionTests(unittest.TestCase):
-    def test_read_line_returns_none_at_eof(self) -> None:
-        stdin, sys.stdin = sys.stdin, io.StringIO("")
-        try:
-            self.assertIsNone(pp.read_line("go: "))
-        finally:
-            sys.stdin = stdin
+    """What the interface claims about the terminal, checked against a real one.
 
-    def test_read_line_takes_one_command(self) -> None:
-        stdin, sys.stdin = sys.stdin, io.StringIO("3\n")
-        try:
-            self.assertEqual(pp.read_line("go: "), "3")
-        finally:
-            sys.stdin = stdin
+    The line editor used to stand or fall by three assumptions - that a command arrives only after
+    a newline, that EOF is an answerable state, and that the screen admitted the buffering. All
+    three went with the line editor. What replaces them is the single claim the modal does make,
+    which is that a keypress is an answer by itself, and that is only observable through a tty
+    driver rather than a pipe.
+    """
 
-    def test_the_screen_says_that_a_key_needs_enter(self) -> None:
-        # A line-buffered terminal that pretends otherwise trains the user to distrust the
-        # screen, so the claim is checked against the text on it rather than against a comment.
-        self.assertIn("line-buffered", pp.HELP)
-        self.assertIn("press Enter", pp.HELP)
+    DRIVER = '''
+import json, sys
+from pathlib import Path
+
+harness, workspace = (Path(arg) for arg in sys.argv[1:3])
+sys.path[:0] = [str(harness), str(harness / "tools")]
+
+import prompt_context as pc
+import prompt_panel as pp
+from tests.helpers import shipped_plan
+from tui.app import View, run
+
+graph = pp.ContextGraph(
+    shipped_plan(),
+    workspace,
+    "module guidance text",
+    {},
+    dict(pc.DEFAULT_ENABLED),
+    dict(pc.STATIC_DEFAULT),
+)
+step = pp.ContextStep(graph)
+result = run(step, View(position=7, total=8, label="Context", can_go_back=True))
+opening = graph.opening()
+moved = {k: v for k, v in dict(result.value).items() if k in opening and opening[k] != v}
+print("MOVED=" + json.dumps(moved, sort_keys=True))
+sys.exit(result.status)
+'''
+
+    def setUp(self) -> None:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        # Both documents empty, over a harness contract that is not: this is the shape where the
+        # two static switches are the first two rows the cursor meets.
+        self.workspace = Path(holder.name)
+        stage_files(self.workspace, {
+            pc.SYSTEM_FILE: "", pc.CONTEXT_FILE: "", CONTRACT: "# the harness contract\n",
+        })
+        driver = self.workspace / "drive.py"
+        driver.write_text(self.DRIVER, encoding="utf-8")
+        self.driver = driver
+        self.env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in ("COLUMNS", "LINES", "NO_COLOR", "TERM")
+        }
+
+    def answer(self, session) -> dict:
+        return json.loads(session.screen.split("MOVED=")[1].splitlines()[0])
+
+    def test_a_keypress_answers_without_a_newline(self) -> None:
+        """Space moves a row, an arrow moves the cursor, and only Enter ends the step.
+
+        Under the old line discipline none of this would have happened: the driver buffers until a
+        newline, so the two switches would still read ``off`` and the answer would be the map the
+        screen opened with. The key reference is opened and closed first, so the answer also has to
+        survive a detour through the overlay.
+        """
+        session = run_in_pty(
+            [sys.executable, str(self.driver), str(ROOT), str(self.workspace)],
+            keys=[b"?", b"?", b" ", b"\x1b[B", b" ", b"\r"],
+            expect=b"static context",
+            env=self.env,
+        )
+        self.assertEqual(session.status, flow.CONTINUE)
+        # The key reference is the only place the overlay's title and the ``k`` alias are ever
+        # painted, so their presence proves the ``?`` opened it - and that the two switches below
+        # it still landed proves closing it cost the answer nothing.
+        self.assertIn("Keys", session.screen, "the key reference never opened")
+        self.assertIn("/k", session.screen, "the overlay listed no aliases")
+        self.assertEqual(self.answer(session), {pc.STATIC_CONTEXT: pc.ON, pc.STATIC_SYSTEM: pc.ON})
+        self.assertTrue(session.restored, "the terminal came back as it was found")
 
     def test_the_panel_installs_no_signal_handler(self) -> None:
         """Ctrl-C has to reach start.sh's cleanup trap, so nothing here may claim it.
@@ -661,12 +1089,21 @@ class OptionSetCompletenessTests(unittest.TestCase):
         self.assertEqual(set(pc.CONFIG_TOGGLES) | set(pc.ENV_TOGGLES),
                          set(pc.OPTION_IDS) - generated - {pc.OPTION_MODULE_GUIDANCE})
 
-    def test_every_option_is_reachable_by_the_number_the_screen_advertises(self) -> None:
-        """Both the prompt line and the help screen offer digits 1-9, and no further."""
-        self.assertLessEqual(len(pc.OPTIONS), 9, "the screen advertises single-digit selection")
-        for index in range(1, len(pc.OPTIONS) + 1):
-            self.assertNotEqual(pp.apply_command(str(index), dict(pc.DEFAULT_ENABLED))[0],
-                                pc.DEFAULT_ENABLED, f"option {index} does not respond")
+    def test_every_option_is_a_tree_row_in_the_order_the_panel_governs_them(self) -> None:
+        """Neither renderer may hold a set of its own, and neither may need numbers to reach it.
+
+        The old screen could offer nine options because nine is what a single digit labels; a row
+        the cursor walks to has no such ceiling, so what is pinned here is the coverage and the
+        order, with nothing in the way of either.
+        """
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        root = Path(holder.name)
+        stage_files(root, {pc.SYSTEM_FILE: "# voice\n", CONTRACT: "# contract\n"})
+        step = tree(root)
+        boxes = [node for node, _, _, _ in step.rows_in_order() if node.kind == pp.CHECK]
+        self.assertEqual([node.id for node in boxes], list(pc.OPTION_IDS))
+        self.assertTrue(all(node.editable for node in boxes), "a box the cursor cannot reach")
 
     def test_no_option_is_its_own_companion(self) -> None:
         for option in pc.OPTIONS:

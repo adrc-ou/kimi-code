@@ -214,6 +214,25 @@ OPTION_BY_ID = {option.id: option for option in OPTIONS}
 #: operator had accepted the panel.
 DEFAULT_ENABLED: dict[str, bool] = dict.fromkeys(OPTION_IDS, True)
 
+#: The panel's name for each of the two file halves of a staged document - the half it does not
+#: generate. The add-ons above are switched individually; these are the operator's own text, plus
+#: the harness contract that stands behind it, and they are what "static" means here.
+STATIC_CONTEXT = "context"
+STATIC_SYSTEM = "system"
+STATIC_IDS = (STATIC_CONTEXT, STATIC_SYSTEM)
+#: ``auto`` leaves the chain to the disk, which is every launch before the first panel. ``on``
+#: forces the block active, so an empty file on disk is ignored as though it were absent. ``off``
+#: forces the block blank for this session, superseding the whole chain - and writes nothing in the
+#: workspace, because the override is a staged file, not an edit of the operator's.
+AUTO = "auto"
+ON = "on"
+OFF = "off"
+STATIC_STATES = (AUTO, ON, OFF)
+STATIC_DEFAULT: dict[str, str] = dict.fromkeys(STATIC_IDS, AUTO)
+#: Where the tri-state lives inside :data:`PREFS_FILE`: a nested key rather than more top-level
+#: entries, so a reader from before it existed finds only booleans where it expects them.
+STATIC_KEY = "static"
+
 
 def resolve_enabled(enabled: Mapping[str, bool] | None) -> dict[str, bool]:
     """Normalise a caller's choices against the shipped defaults.
@@ -226,13 +245,36 @@ def resolve_enabled(enabled: Mapping[str, bool] | None) -> dict[str, bool]:
     return {option: bool(enabled.get(option, DEFAULT_ENABLED[option])) for option in OPTION_IDS}
 
 
-def load_prefs(path: Path) -> dict[str, bool]:
-    """Read remembered choices, tolerating a file that has never been written."""
+def resolve_static(static: Mapping[str, str] | None) -> dict[str, str]:
+    """Normalise a caller's static-block states against the shipped defaults.
+
+    A state that is not one of the three words becomes :data:`AUTO` rather than being trusted, for
+    the same reason :func:`resolve_enabled` drops unknown names: a preference file written by a
+    newer panel, or edited by hand into something unrecognisable, must not blank a document nobody
+    asked it to blank.
+    """
+    if static is None:
+        return dict(STATIC_DEFAULT)
+    states = {}
+    for block in STATIC_IDS:
+        value = str(static.get(block, AUTO)).strip().lower()
+        states[block] = value if value in STATIC_STATES else AUTO
+    return states
+
+
+def _prefs_document(path: Path) -> dict[str, Any]:
+    """The whole preference file, or an empty dict for one that cannot be read or understood."""
     try:
         stored = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return dict(DEFAULT_ENABLED)
-    if not isinstance(stored, dict):
+        return {}
+    return stored if isinstance(stored, dict) else {}
+
+
+def load_prefs(path: Path) -> dict[str, bool]:
+    """Read remembered choices, tolerating a file that has never been written."""
+    stored = _prefs_document(path)
+    if not stored:
         return dict(DEFAULT_ENABLED)
     prefs = dict(DEFAULT_ENABLED)
     for option in OPTION_IDS:
@@ -241,10 +283,26 @@ def load_prefs(path: Path) -> dict[str, bool]:
     return prefs
 
 
-def save_prefs(path: Path, enabled: Mapping[str, bool]) -> None:
-    """Write choices keyed by option id, never by label, so renaming a label resets nobody."""
+def load_static(path: Path) -> dict[str, str]:
+    """Read remembered static-block states, tolerating a file written before there were any."""
+    raw = _prefs_document(path).get(STATIC_KEY)
+    return resolve_static(raw if isinstance(raw, dict) else None)
+
+
+def save_prefs(
+    path: Path, enabled: Mapping[str, bool], static: Mapping[str, str] | None = None
+) -> None:
+    """Write choices keyed by option id and block id, never by label, so renaming one resets nobody.
+
+    ``static=None`` means "leave whatever the file already says", which is what stops a caller that
+    only knows about the dynamic options from silently re-enabling a document the operator switched
+    off. Both halves are written in full, so the file is always a complete statement of the session.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    ordered = {option: bool(enabled[option]) for option in OPTION_IDS}
+    if static is None:
+        static = load_static(path)
+    ordered: dict[str, Any] = {option: bool(enabled[option]) for option in OPTION_IDS}
+    ordered[STATIC_KEY] = resolve_static(static)
     text = json.dumps(ordered, indent=2, sort_keys=False) + "\n"
     temporary = path.with_suffix(".tmp")
     temporary.write_text(text, encoding="utf-8")
@@ -399,26 +457,37 @@ def over_instruction_limit(total_bytes: int) -> str:
     )
 
 
-def document_sources(root: Path) -> dict[str, dict[str, str | None]]:
+def document_sources(
+    root: Path, static: Mapping[str, str] | None = None
+) -> dict[str, dict[str, str | None]]:
     """What each staged document was read from, keyed by ``agents`` and ``system``.
 
     The digest is of the comment-stripped text rather than the file, which is what makes the
     staleness report worth reading: editing help text genuinely does not need a restart, because
     the bytes that ship are unchanged.
+
+    The record is of what a composition under ``static`` would actually use, together with the mode
+    it used, so that a document switched off for the session reports no source at all rather than
+    one it never read. That is also what makes :func:`stale_sources` able to re-decide the same
+    question later instead of comparing a forced composition against the bare disk.
     """
+    modes = resolve_static(static)
     recorded: dict[str, dict[str, str | None]] = {}
-    for role, path in (("agents", context_source(root)), ("system", system_source(root))):
+    for role, block in (("agents", STATIC_CONTEXT), ("system", STATIC_SYSTEM)):
+        mode = modes[block]
+        path = static_source(root, block, mode)
         if path is None:
-            recorded[role] = {"source": None, "digest": None}
+            recorded[role] = {"source": None, "digest": None, "mode": mode}
             continue
         try:
             text = strip_html_comments(path.read_text(encoding="utf-8"))
         except OSError:
-            recorded[role] = {"source": str(path), "digest": None}
+            recorded[role] = {"source": str(path), "digest": None, "mode": mode}
             continue
         recorded[role] = {
             "source": str(path.relative_to(root)) if path.is_relative_to(root) else str(path),
             "digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "mode": mode,
         }
     return recorded
 
@@ -435,14 +504,19 @@ def stale_sources(root: Path, runtime_dir: Path) -> list[str]:
         return []
     if not isinstance(recorded, dict):
         return []
-    now = document_sources(root)
     stale = []
     for role, before in recorded.items():
-        after = now.get(role)
-        if not isinstance(before, dict) or after is None:
+        if not isinstance(before, dict):
             continue
-        if before.get("digest") != after.get("digest"):
-            label = after.get("source") or before.get("source") or role
+        # Re-ask the disk under the mode that was staged, so an edit to a file this session is not
+        # reading is not reported as something a restart would apply. A record from before the
+        # tri-state existed has no mode, and auto is what it was staged under.
+        block = STATIC_SYSTEM if role == "system" else STATIC_CONTEXT
+        now = document_sources(root, {block: str(before.get("mode") or AUTO)}).get(role)
+        if now is None:
+            continue
+        if before.get("digest") != now.get("digest"):
+            label = now.get("source") or before.get("source") or role
             stale.append(f"{label} changed since it was staged - restart to apply it")
     return stale
 
@@ -468,6 +542,66 @@ def context_source(root: Path) -> Path | None:
         return operator
     default = root.joinpath(*CONTRACT_SOURCE)
     return default if default.is_file() else None
+
+
+def static_tiers(root: Path, block: str) -> tuple[Path, ...]:
+    """Every file that could supply this block, most authoritative first.
+
+    Whether each one exists is the caller's question, because the answer differs: :func:`_read_tier`
+    has to know that an operator file which is present but empty is a decision rather than a gap.
+    """
+    if block == STATIC_SYSTEM:
+        return (root / SYSTEM_FILE,)
+    return (root / CONTEXT_FILE, root.joinpath(*CONTRACT_SOURCE))
+
+
+def _read_tier(path: Path) -> str | None:
+    """A tier's text, or ``None`` when there is no such file. Empty text is a real answer."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        # Present but unreadable is present but empty, never absent: "absent" would send the main
+        # agent's prompt to Kimi's built-in one, which is a different decision than the file made.
+        return ""
+
+
+def static_source(root: Path, block: str, mode: str = AUTO) -> Path | None:
+    """The file this block reads from under a tri-state :data:`STATIC_STATES` mode.
+
+    ``off`` has no file, which is how a session blanks a document without editing it. ``on`` walks
+    the chain past any tier that is present but empty - the panel's way of saying "ignore that empty
+    file as if it were not there" - and can therefore only ever choose among files that exist.
+    ``auto`` is exactly the two-tier rule :func:`system_source` and :func:`context_source` state.
+    """
+    if mode == OFF:
+        return None
+    if mode != ON:
+        return system_source(root) if block == STATIC_SYSTEM else context_source(root)
+    for path in static_tiers(root, block):
+        text = _read_tier(path)
+        if text is not None and text.strip():
+            return path
+    return None
+
+
+def static_state(root: Path, block: str, static: Mapping[str, str] | None = None) -> str:
+    """The state to show for a block, which is not always the state that was saved.
+
+    An empty file on disk *is* a blank prompt, so a block left on ``auto`` whose chosen tier is
+    empty is reported as ``off``: what the operator sees is the effect, and they can then move it.
+    A block with no file at all stays ``auto``, because for the main agent's prompt there is a
+    third answer - Kimi's own built-in - and calling that "off" would be wrong.
+    """
+    mode = resolve_static(static)[block]
+    if mode != AUTO:
+        return mode
+    source = static_source(root, block)
+    if source is None:
+        return AUTO
+    text = _read_tier(source)
+    return OFF if not (text or "").strip() else AUTO
 
 
 def _prepare(text: str, source: Path | str, values: Mapping[str, str] | None = None) -> str:
@@ -506,15 +640,21 @@ def compose_agents_document(
     module_guidance: str,
     enabled: Mapping[str, bool] | None = None,
     values: Mapping[str, str] | None = None,
+    static: Mapping[str, str] | None = None,
 ) -> str:
     """The all-lane contract: tier one or tier two, then every enabled all-lane add-on.
 
     The result is always written, even when it is empty, because Docker creates a missing bind
     source as a directory and that failure surfaces at container start rather than at render.
+
+    ``static`` is the panel's tri-state map. Switching this block off removes the file tier and
+    leaves the add-ons, which are priced and governed separately; it cannot leave the operator with
+    a document they did not ask for, because every add-on in it is one they left switched on.
     """
     choices = resolve_enabled(enabled)
+    modes = resolve_static(static)
     parts: list[str] = []
-    source = context_source(root)
+    source = static_source(root, STATIC_CONTEXT, modes[STATIC_CONTEXT])
     if source is not None:
         parts.append(_prepare(source.read_text(encoding="utf-8"), source, values))
     parts.extend(enabled_guidance(plan, policy.AUDIENCE_LANE, choices))
@@ -531,6 +671,7 @@ def compose_system_document(
     plan: dict[str, Any],
     enabled: Mapping[str, bool] | None = None,
     values: Mapping[str, str] | None = None,
+    static: Mapping[str, str] | None = None,
 ) -> str:
     """The main agent's voice plus the main-only add-ons, following the four-row rule.
 
@@ -551,11 +692,23 @@ def compose_system_document(
     Row three is the one worth stating rather than inferring. Wrapping a deliberately emptied file
     would reintroduce the prompt the operator just declined, so its emptiness is honoured even
     though the consequence is that the add-ons become a complete prompt.
+
+    ``static`` selects a row of that table; it never adds one. Switching the block off is the bottom
+    two rows - the file is treated as present and empty, so its emptiness is still honoured over
+    Kimi's own prompt - while switching it on is the top row, because "on" means an empty file is a
+    gap to walk past rather than a decision to keep. That asymmetry is what the panel's two words
+    have to mean for the pair to be usable.
     """
     choices = resolve_enabled(enabled)
+    mode = resolve_static(static)[STATIC_SYSTEM]
     additions = enabled_guidance(plan, policy.AUDIENCE_MAIN, choices)
-    path = system_source(root)
-    text = path.read_text(encoding="utf-8") if path is not None else None
+    path = static_source(root, STATIC_SYSTEM, mode)
+    if mode == OFF:
+        # Blank, not absent: absent is the row that reaches Kimi's own prompt, and a block the
+        # operator switched off is a decision about this prompt, not a request for someone else's.
+        text: str | None = ""
+    else:
+        text = path.read_text(encoding="utf-8") if path is not None else None
     body = _prepare(text, path, values) if text is not None and text.strip() else ""
     parts = [part for part in [body, *additions] if part]
     if text is None:

@@ -16,9 +16,12 @@ The harness stages two documents, not one. ``CONTEXT.md`` composes into the all-
 subagent's alike; ``SYSTEM.md`` composes into the main agent's own prompt and reaches nobody else.
 Both are assembled by ``tools/prompt_context.py`` from the operator's files, the selected modules'
 guidance, and the generated envelope sections the startup panel left switched on - the panel's
-choices are the only way to omit any of it, and nothing is ever written inside the workspace. An
-empty ``SYSTEM.md`` with every main-only add-on switched off stages as a lone period, because Kimi
-Code reads a blank file as "no file" and substitutes its own prompt.
+choices are the only way to omit any of it, and nothing is ever written inside the workspace. Each
+of the two file halves is the operator's own, and each is a tri-state rather than a box: switched
+off, the session stages the document with that half blank; switched on, the session reads the half
+as though an empty file on disk were no file at all. Neither writes in the workspace. An empty
+``SYSTEM.md`` with every main-only add-on switched off stages as a lone period, because Kimi Code
+reads a blank file as "no file" and substitutes its own prompt.
 """
 
 from __future__ import annotations
@@ -117,6 +120,10 @@ def main() -> None:
     # operator approved and the bytes the container mounts from disagreeing.
     prefs_path = args.prompt_context or args.runtime_dir / prompt_context.PREFS_FILE
     enabled = prompt_context.load_prefs(prefs_path)
+    # The two file halves of the documents are switched as a tri-state rather than as boxes,
+    # and they come from the same file for the same reason: a diagram that priced one
+    # composition while this one staged another would be the exact drift the panel prevents.
+    static = prompt_context.load_static(prefs_path)
     ephemeral = {
         "proxy-token": secrets.token_urlsafe(32),
         "search-token": secrets.token_urlsafe(32),
@@ -149,12 +156,14 @@ def main() -> None:
     write_secret(
         agents_markdown,
         prompt_context.compose_agents_document(
-            args.root, plan, module_guidance(args.runtime_dir), enabled, template_values
+            args.root, plan, module_guidance(args.runtime_dir), enabled, template_values, static
         ),
     )
     write_secret(
         system_markdown,
-        prompt_context.compose_system_document(args.root, plan, enabled, template_values),
+        prompt_context.compose_system_document(
+            args.root, plan, enabled, template_values, static
+        ),
     )
     runtime_env = {
         "SEARCH_ADAPTER_TOKEN": ephemeral["search-token"],
@@ -176,7 +185,8 @@ def main() -> None:
     # to guess why nothing changed.
     sources = args.runtime_dir / prompt_context.SOURCES_FILE
     sources.unlink(missing_ok=True)
-    write_secret(sources, json.dumps(prompt_context.document_sources(args.root), indent=1) + "\n")
+    payload = json.dumps(prompt_context.document_sources(args.root, static), indent=1) + "\n"
+    write_secret(sources, payload)
     print(f"cache_salt_chars={len(cache_salt)}")
 
 

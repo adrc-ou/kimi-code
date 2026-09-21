@@ -76,12 +76,14 @@ noninteractive, bounded, and must not install software. Detect host GPU/platform
 requirements here. The core only detects architecture for the Kimi Linux asset.
 
 Compatible modules are shown by label, alphabetically within two groups: last
-successful setup's enabled modules (checked), then all others (unchecked).
-Up/Down changes focus, Space toggles, Enter accepts, and Ctrl-C cancels with the
-terminal restored. An empty list skips the menu. State is scoped to the harness,
-workspace and host platform. `HARNESS_MODULES=a,b` overrides the menu;
-`HARNESS_MODULES=` selects none. `--non-interactive` otherwise reuses the prior
-compatible selection.
+successful setup's enabled modules (checked), then all others (unchecked). The step
+is the shared launch modal — ↑/↓ focus, Space toggles, Enter accepts, `Backspace`
+returns to the earlier step, and the footer lists the keys that step answers — so a
+module author has nothing to know beyond the row list. Ctrl-C
+cancels with the terminal restored. An empty list skips the menu. State is scoped
+to the harness, workspace and host platform. `HARNESS_MODULES=a,b` overrides the
+menu; `HARNESS_MODULES=` selects none. `--non-interactive` otherwise reuses the
+prior compatible selection.
 
 ## Lifecycle hooks
 
