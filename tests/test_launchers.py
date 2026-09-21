@@ -279,6 +279,7 @@ PY
         self.command(
             "docker",
             """
+if [[ "$*" == "compose version --format json" ]]; then echo '{"version":"v5.0.2+fixture"}'; exit 0; fi
 if [[ "$*" == *"config --environment" ]]; then cat "$TEST_BOOTSTRAP"; exit 0; fi
 if [[ "$*" == *"config --format json" ]]; then "${RESOLVED_STUB:-resolved-config-clean}"; exit 0; fi
 if [[ "$*" == *"kimi --version" ]]; then echo 0.42.0; exit 0; fi
@@ -467,6 +468,70 @@ harness_modules {phase}
         session = self.run_phase("demo\n", phase="configure")
         self.assertEqual(session.status, 0, session.screen)
         self.assertEqual(session.screen.split(), [])
+
+
+class ComposeVersionFloorTests(unittest.TestCase):
+    """``harness_validate_compose`` refuses a Compose whose config output it cannot read.
+
+    Releases before v5.0.2 drop an explicit ``create_host_path: false`` from
+    ``config --format json``, so the hygiene gate would report a confined launch as a bind
+    violation. The floor fails earlier and names the version it found, because "may create a
+    host path" is the wrong sentence to say about a config that said otherwise.
+    """
+
+    command = LauncherTests.command
+    require_executable_fixtures = LauncherTests.require_executable_fixtures
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.bin = self.base / "bin"
+        self.bin.mkdir()
+        (self.bin / "python3").symlink_to(sys.executable)
+        self.env = {"PATH": f"{self.bin}:{os.defpath}", "HOME": str(self.base)}
+        self.require_executable_fixtures()
+
+    def probe(self, docker_body: str) -> subprocess.CompletedProcess:
+        self.command("docker", docker_body)
+        return subprocess.run(
+            ["/bin/bash", "-c", 'source "$0" && harness_require_compose_version',
+             str(ROOT / "tools" / "runtime.sh")],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+    def test_a_supported_compose_is_accepted(self):
+        result = self.probe("""
+[[ "$*" == "compose version --format json" ]] && echo '{"version":"v5.0.2+desktop-1"}' && exit 0
+exit 1
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_older_compose_is_refused_by_name(self):
+        result = self.probe("""
+[[ "$*" == "compose version --format json" ]] && echo '{"version":"v2.40.3"}' && exit 0
+exit 1
+""")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("v2.40.3 is too old", result.stderr)
+        self.assertIn("5.0.2", result.stderr)
+        self.assertNotIn("host path", result.stderr)
+
+    def test_a_plain_version_line_is_parsed_when_json_is_unsupported(self):
+        result = self.probe("""
+[[ "$*" == *"--format json"* ]] && exit 1
+echo "Docker Compose version v5.1.0"
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_unreadable_version_fails_closed(self):
+        result = self.probe("echo 'Docker Compose version unknown-build'\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cannot determine", result.stderr)
 
 
 class PromptsScriptTests(unittest.TestCase):

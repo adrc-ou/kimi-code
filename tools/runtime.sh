@@ -146,7 +146,47 @@ harness_prompt_image_id() {
   docker image inspect "adrc-kimi-agent:${HARNESS_IMAGE_SUFFIX}" --format '{{.Id}}' 2>/dev/null || true
 }
 
+# The floor below is the minimum Docker Compose whose `config --format json` output the
+# confinement gate can read honestly. Releases before v5.0.2 serialise an explicit
+# `create_host_path: false` as a missing key (the field was a Go bool carrying `omitempty`),
+# so compose_hygiene.py cannot see the option it exists to enforce and refuses a confined
+# launch as a bind violation. v5.0.0 renders the value; v5.0.2 also re-materialises the
+# default on load, which is what makes an empty `bind` section mean `true` unambiguously.
+# Fail here, naming the version found, rather than letting the gate report someone else's
+# config for a Compose that cannot state this one.
+HARNESS_MIN_COMPOSE_VERSION=5.0.2
+
+harness_require_compose_version() {
+  local raw version
+  raw=$(docker compose version --format json 2>/dev/null) || raw=""
+  [[ -n "${raw}" ]] || raw=$(docker compose version 2>/dev/null || true)
+  version=$(printf '%s' "${raw}" | python3 -c '
+import re
+import sys
+
+match = re.search(r"v?(\d+\.\d+\.\d+)", sys.stdin.read())
+print(match.group(1) if match else "")
+') || version=""
+  if [[ -z "${version}" ]]; then
+    harness_die "Cannot determine the Docker Compose version; v${HARNESS_MIN_COMPOSE_VERSION} or newer is required." || return
+  fi
+  if ! python3 - "${version}" "${HARNESS_MIN_COMPOSE_VERSION}" <<'PY'
+import sys
+
+
+def parts(value):
+    return [int(part) for part in value.split("-")[0].split(".")]
+
+
+raise SystemExit(0 if parts(sys.argv[1]) >= parts(sys.argv[2]) else 1)
+PY
+  then
+    harness_die "Docker Compose v${version} is too old: it omits an explicit create_host_path: false from the resolved configuration, so launch hygiene cannot read it. Upgrade Docker Compose to v${HARNESS_MIN_COMPOSE_VERSION} or newer." || return
+  fi
+}
+
 harness_validate_compose() {
+  harness_require_compose_version || return
   harness_compose config --format json >"${HARNESS_COMPOSE_DIR}/resolved.json"
   chmod 600 "${HARNESS_COMPOSE_DIR}/resolved.json"
   # Check the launch as resolved rather than the files in the checkout: this is the only

@@ -92,7 +92,17 @@ def check_agent_mounts(
         assert isinstance(mount, dict)
         source = os.path.realpath(str(mount.get("source", "")))
         target = str(mount.get("target", ""))
-        if (mount.get("bind") or {}).get("create_host_path") is not False:
+        bind_options = mount.get("bind")
+        if not isinstance(bind_options, dict) or "create_host_path" not in bind_options:
+            # Compose before v5.0.2 drops an explicit `false` from this output, so a missing key
+            # says nothing about the mount. Fail closed and name the likeliest cause; the
+            # launcher's own version floor should make this path rare.
+            raise SystemExit(
+                f"kimi-agent bind does not state create_host_path: {source}. Docker Compose "
+                "older than v5.0.2 omits an explicit false from its configuration output; "
+                "upgrade Compose rather than editing this mount."
+            )
+        if bind_options["create_host_path"] is not False:
             raise SystemExit(f"kimi-agent bind may create a host path: {source}")
         if source == workspace:
             # The workspace is the agent's writable world by design, and it is the only one.

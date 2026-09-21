@@ -123,6 +123,15 @@ class ComposeHygieneTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "create a host path"):
             self.check_mounts()
 
+    def test_agent_bind_omitting_create_host_path_is_refused_with_a_compose_hint(self):
+        # Compose before v5.0.2 serialises an explicit false as a missing key. The gate still
+        # fails closed, but the message must name that cause rather than accuse the mount.
+        mount = bind(self.root / "other", "/other")
+        del mount["bind"]["create_host_path"]
+        self.agent_volumes().append(mount)
+        with self.assertRaisesRegex(SystemExit, "does not state create_host_path"):
+            self.check_mounts()
+
     def test_missing_state_volume_is_refused(self):
         self.agent_volumes()[:] = [
             mount

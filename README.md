@@ -36,7 +36,10 @@ without restarting.
 
 Hosts need:
 
-- Docker with Docker Compose (Docker Desktop on macOS/Windows);
+- Docker with Docker Compose v5.0.2 or newer (Docker Desktop on macOS/Windows);
+  older releases omit an explicit `create_host_path: false` from their resolved
+  configuration, so the launch hygiene gate cannot read it and the launcher
+  refuses the launch rather than misreport it;
 - Git;
 - Python 3 for the host setup scripts;
 - enough free disk space for container images and models;
