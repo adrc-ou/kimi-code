@@ -1,20 +1,21 @@
 """The shared run loop every step is rendered by, and the protocol a step implements.
 
 The division of labour is the point of the redesign. The loop owns *navigation* — focus, paging,
-scrolling, the help overlay, reset, the footer legend, resize — because that is the same on all nine
-surfaces, and a step that re-implements it is a step that will do it slightly differently. A step
+scrolling, the help overlay, reset, the footer legend, resize — because that is the same on every
+surface, and a step that re-implements it is a step that will do it slightly differently. A step
 owns *meaning*: which rows exist, which one is focused, what an action does to it, and what
 committing produces.
 
-That split is also why the surfaces read as one application instead of nine programs that happen to
-share a colour scheme. Nothing in this module knows what a module, a model, or a context block is.
+That split is also why the surfaces read as one application instead of several programs that happen
+to share a colour scheme. Nothing in this module knows what a module, a model, or a context block
+is.
 
 Mouse reporting is deliberately **not** enabled. The engine decodes wheel and click events and
-``Terminal`` will switch them on if ``Caps.mouse`` is set, but every list in this launcher is
-between two and nine rows, so the gain is negligible — while enabling reporting suppresses the
+``Terminal`` will switch them on if ``Caps.mouse`` is set, but enabling reporting suppresses the
 terminal's own click-and-drag text selection, and a configuration screen is exactly where someone
-copies a model identifier out of it. A surface with genuinely long content can turn it on without
-the engine changing.
+copies a model identifier out of it. Everything the mouse would do already has a keyboard binding
+that the footer names, including scrolling content taller than the window; see ``layout``'s
+viewport. A surface with genuinely long content can still turn it on without the engine changing.
 """
 
 from __future__ import annotations
@@ -171,9 +172,45 @@ class Session:
 
     state: object = None
     scroll: int = 0
+    #: The body row the window was last fitted around, or ``-1`` before the first fit.
+    anchor: int = -1
     help_open: bool = False
     help_scroll: int = 0
     note: str = ""
+
+    def settle(self, at: int, total: int, height: int) -> None:
+        """Keep the cursor on screen without taking the window away from the page keys.
+
+        The fit is a *constraint* on the offset rather than the author of it, and it is applied only
+        when the cursor actually moves: a scroll that re-derived its own top from the cursor on
+        every paint could never show a row below the last one the cursor may rest on, which is
+        exactly the content a long explanation or a trailing legend is made of.
+        """
+        top = max(0, min(self.scroll, max(0, total - height)))
+        if at != self.anchor:
+            top = L.scroll_for(total, height, at, top)
+            self.anchor = at
+        self.scroll = top
+
+    def glide(self, at: int, total: int, height: int, offset: int) -> None:
+        """Move the window and take the cursor with it, so the two never disagree.
+
+        Used by the keys whose whole job is the window — ``PgUp``, ``PgDn``, ``Home``, ``End``. The
+        caller has already worked out where the cursor must land inside the new offset, so the fit
+        above must not run a second time and undo it.
+        """
+        self.scroll = max(0, min(offset, max(0, total - height)))
+        self.anchor = at
+
+    def nudge(self, total: int, height: int, delta: int) -> None:
+        """One row of content for one keystroke, once the cursor has nowhere left to go.
+
+        The arrows move the selection, and when the selection is already on the edge row of the
+        list there is nothing left for them to select — but the key was pressed, and a keypress with
+        no visible consequence is how a user decides the screen has hung. So the content moves one
+        row instead, and the overflow note says where the cursor stayed.
+        """
+        self.scroll = max(0, min(self.scroll + delta, max(0, total - height)))
 
 
 @dataclass(frozen=True)
@@ -223,6 +260,14 @@ class Step:
     #: the first whenever the launcher pipes progress to a log — so it is ``None`` until then, and
     #: :meth:`tone` and :meth:`cells` answer for a step used outside a loop.
     caps: Caps | None = None
+    #: The frame this step is being painted into, set by the :class:`Modal` beside :attr:`caps`. A
+    #: step that puts prose *beside* its rows rather than under them has to know how wide the column
+    #: it was actually given is, and only the frame knows that.
+    frame: L.Frame | None = None
+    #: Sentences that are true of the whole step rather than of one row — how to read a figure, what
+    #: an empty file means. They go in the key overlay, which is the one place with room for a
+    #: paragraph: a rule that spends body rows is a rule that shrinks the answer to pay for it.
+    rules: tuple[str, ...] = ()
 
     def tone(self, role: str) -> str:
         """The SGR for one semantic colour role, or ``""`` where colour is off.
@@ -255,6 +300,33 @@ class Step:
     def rows(self, state: object) -> list[Row]:
         """The whole body — headings, gaps and selectable items alike, focusable or not."""
         raise NotImplementedError
+
+    def detail(self, state: object) -> list[Line]:
+        """Prose about the row under the cursor, for the pane beside the list or the bar under it.
+
+        Empty by default, because a step whose rows already say everything has nothing to add. A
+        tree of marks is the counter-example: it is deliberately *not* self-describing, which is
+        what lets it hold thirty rows where the old screen needed prose beside every one of them.
+        The price is that the meaning of the row the cursor is on has to be said somewhere, and the
+        place for it is here rather than in the row.
+        """
+        del state
+        return []
+
+    def detail_source(self, state: object) -> tuple[str, ...]:
+        """:meth:`detail`'s prose as plain text, for the overlay to wrap in its own width."""
+        del state
+        return ()
+
+    def alerts(self, state: object) -> tuple[str, ...]:
+        """Sentences about this answer that the operator should not have to scroll to find.
+
+        A bill, a half-selected pair, a file that went stale since the last launch. They are drawn
+        above the list rather than below it, because anything below the fold on a screen whose
+        whole point is that it does not fit is invisible to exactly the people it was written for.
+        """
+        del state
+        return ()
 
     def focus(self, state: object) -> int:
         """Index into the *focusable* rows, not into ``rows()``."""
@@ -391,8 +463,13 @@ class Modal:
         self._rail = rail_text(self.view, step)
         self.frame = L.layout(self.caps.columns, self.caps.rows, rail=bool(self._rail))
         self._legend: list[str] = []
+        #: The focused row's prose, measured for whatever width the frame actually offered. Derives
+        #: from the frame, so it is recomputed with it on every paint, and read by the pane beside
+        #: the list, by the bar under it when there is no pane, and by the key overlay.
+        self._detail: list[Line] = []
         # Ahead of ``initial()``, so a step may measure text while working out where to open.
         step.caps = self.caps
+        step.frame = self.frame
         self.session = Session(state=step.initial())
 
     # -- the loop ---------------------------------------------------------------------------
@@ -448,16 +525,25 @@ class Modal:
         rows, order = self._body()
         focused = self.step.focus(state)
         target = _target(rows, order, focused)
+        height = self._viewport(rows)
         if action in (FOCUS_UP, FOCUS_DOWN):
             delta = -1 if action == FOCUS_UP else 1
-            session.state = self.step.with_focus(state, _advance(focused, delta, len(order)))
+            moved = _advance(focused, delta, len(order))
+            if moved == focused:
+                # The cursor is already on the edge row of the list. The key still has an answer:
+                # the content moves one row, and the overflow note marks where the cursor stayed.
+                session.nudge(len(rows), height, delta)
+            else:
+                session.state = self.step.with_focus(state, moved)
         elif action in (PAGE_UP, PAGE_DOWN):
             direction = -1 if action == PAGE_UP else 1
-            index = L.page(len(order), self._viewport(rows), direction, focused)
-            session.state = self.step.with_focus(state, index)
+            self._pan(rows, order, L.page(len(rows), height, session.scroll, direction), direction)
         elif action in (FIRST, LAST):
-            index = 0 if action == FIRST else max(0, len(order) - 1)
-            session.state = self.step.with_focus(state, index)
+            # ``Home`` wants the first selectable row of the top page, ``End`` the last of the
+            # bottom one, so each scans in from the edge the window stopped at.
+            direction = 1 if action == FIRST else -1
+            offset = 0 if action == FIRST else max(0, len(rows) - height)
+            self._pan(rows, order, offset, direction)
         elif action == TOGGLE:
             session.state = self.step.toggled(state, target)
         elif action == ACCEPT:
@@ -475,6 +561,7 @@ class Modal:
         elif action == RESET:
             session.state = self.step.reset(state)
             session.scroll = 0
+            session.anchor = -1
             session.note = self.step.reset_note
             return None
         elif action == HELP:
@@ -495,6 +582,24 @@ class Modal:
                 return None
         session.note = ""
         return None
+
+    def _pan(self, rows: list[Row], order: list[int], offset: int, direction: int) -> None:
+        """Slide the window to ``offset`` and take the cursor to the nearest row it may rest on.
+
+        The two move together because either one alone is a bug: a window that pans under a cursor
+        left behind shows a screen with no focus indicator, and a cursor that jumps with nothing
+        above it to move looks like a list that lost its head. A page of pure prose has nowhere to
+        land the cursor, so it stays where it is and the window simply shows what it shows.
+        """
+        height = self._viewport(rows)
+        top = max(0, min(offset, max(0, len(rows) - height)))
+        window = L.visible_window(len(rows), height, top)
+        focus = L.edge(order, window.first, window.last, direction)
+        if focus is None:
+            self.session.scroll = window.first
+            return
+        self.session.state = self.step.with_focus(self.session.state, focus)
+        self.session.glide(order[focus], len(rows), height, window.first)
 
     def _help_key(self, key: Key) -> Result | None:
         """Keys inside the overlay: it scrolls and closes, and nothing else.
@@ -537,12 +642,7 @@ class Modal:
             table, self.view, self.caps, width=self.caps.columns, rows=MAX_FOOTER_ROWS
         )
         self._rail = rail_text(self.view, self.step)
-        self.frame = L.layout(
-            self.caps.columns,
-            self.caps.rows,
-            footer_rows=max(1, len(wanted)),
-            rail=bool(self._rail),
-        )
+        self._fit(max(1, len(wanted)))
         # A continuation row is painted indented, so the wrap has to happen in the narrower box it
         # will actually get: measured at the full width, the last row comes out two columns too wide
         # and the frame clips it mid-word instead of the wrapper dropping a whole hint.
@@ -562,6 +662,35 @@ class Modal:
         self._paint_chrome()
         self.terminal.write(self.screen.paint())
 
+    def _fit(self, footer_rows: int) -> None:
+        """Lay the frame out, then let the bar under the list grow into the prose it has to hold.
+
+        Two passes at most, in this order, because the two questions depend on each other: how many
+        rows the prose needs is a question about the width it wraps at, and that width is a
+        question about the frame. Asking for one row first costs nothing when the pane exists — the
+        prose lives beside the list then, and the bar has nothing to add — and only spends body rows
+        on a window too narrow to split, which is the same trade ``menuconfig`` makes with its help
+        layer.
+        """
+        self.frame = L.layout(
+            self.caps.columns,
+            self.caps.rows,
+            footer_rows=footer_rows,
+            rail=bool(self._rail),
+        )
+        self.step.frame = self.frame
+        self._detail = self.step.detail(self.session.state)
+        if not self._detail or not self.frame.detail.blank:
+            return
+        self.frame = L.layout(
+            self.caps.columns,
+            self.caps.rows,
+            footer_rows=footer_rows,
+            rail=bool(self._rail),
+            status_rows=1 + len(self._detail),
+        )
+        self.step.frame = self.frame
+
     def _paint_chrome(self) -> None:
         frame = self.frame
         L.paint_rule(self.screen, frame.rule_top, self.caps)
@@ -577,9 +706,34 @@ class Modal:
             )
         if frame.has("rail"):
             self._paint_rail()
+        if not frame.detail.blank:
+            self._paint_detail()
         if frame.has("status"):
             self._paint_status()
         self._paint_footer()
+
+    def _paint_detail(self) -> None:
+        """The reading column: what the row under the cursor means, set beside the list that has it.
+
+        Anchored to the body's rows, so it holds still while the list scrolls inside them. Prose
+        longer than the column is clipped with a marker rather than dropped quietly, because the
+        overlay repeats the whole of it and the user can only be told to go there if they can see
+        that something was left behind here.
+        """
+        pane = self.frame.detail
+        L.paint_column(self.screen, L.detail_rule(pane), self.caps)
+        lines = self._detail
+        if len(lines) > pane.height:
+            hidden = len(lines) - (pane.height - 1)
+            lines = [
+                *lines[: pane.height - 1],
+                Line(Segment(f"… +{hidden}  ·  ? all keys", self.caps.color_pair("dim"))),
+            ]
+        for offset, value in enumerate(lines):
+            row = pane.top + offset
+            if row >= pane.bottom:
+                break
+            L.paint_line(self.screen, row, L.Rect(row, pane.left, 1, pane.width), value, self.caps)
 
     def _paint_rail(self) -> None:
         """Position and label, plus a fill bar.
@@ -618,6 +772,14 @@ class Modal:
             Line(*(part.segments for part in parts)),
             self.caps,
         )
+        # What is left of the bar, when the window was too narrow for a pane and ``_fit`` bought
+        # these rows instead. Bounded by the bar's own height, so a step that asked for more prose
+        # than the frame would give simply says less here, and the whole of it in the overlay.
+        for offset, value in enumerate(self._detail, start=1):
+            row = self.frame.status.top + offset
+            if row >= self.frame.status.bottom:
+                break
+            L.paint_line(self.screen, row, self._span(row), value, self.caps)
 
     def _paint_footer(self) -> None:
         """The legend, generated from the same table the loop dispatched through.
@@ -646,7 +808,7 @@ class Modal:
         body = self.frame.body
         height = self._viewport(rows)
         at = _target_row(order, self.step.focus(self.session.state))
-        self.session.scroll = L.scroll_for(len(rows), height, at, self.session.scroll)
+        self.session.settle(at, len(rows), height)
         window = L.visible_window(len(rows), height, self.session.scroll)
         L.paint_rows(
             self.screen,
@@ -658,24 +820,27 @@ class Modal:
             focus_attr=self.caps.color_pair("focus"),
         )
         L.scrollbar(self.screen, body, window, len(rows), self.caps)
-        self._paint_overflow(window, height)
+        self._paint_overflow(window, height, at)
 
-    def _paint_overflow(self, window: Window, height: int) -> None:
+    def _paint_overflow(self, window: Window, height: int, at: int) -> None:
         """One reserved row under the viewport, naming what is hidden on each side.
 
         A scrollbar shows *that* content continues; a count shows *how much*, which is what makes a
         user decide to press the key again instead of assuming they had reached the end. Both
         directions share a row so a long list costs one row of content, not two.
+
+        The pointer joins the count when the cursor is the thing over that edge, which is how a page
+        movement past the last selectable row still tells the user where their next ``Space`` lands.
         """
         if not window.scrolling:
             return
         note = Line()
         if window.above:
-            note += L.overflow_note(window.above, "above", self.caps)
+            note += L.overflow_note(window.above, "above", self.caps, cursor=at < window.first)
         if window.above and window.below:
             note += Line(Segment("   ", self.caps.color_pair("rule")))
         if window.below:
-            note += L.overflow_note(window.below, "below", self.caps)
+            note += L.overflow_note(window.below, "below", self.caps, cursor=at >= window.last)
         row = self.frame.body.top + height
         L.paint_line(self.screen, row, self._span(row), note, self.caps)
 
@@ -737,8 +902,33 @@ class Modal:
                     Segment(tail, self.caps.color_pair("focus") if available else dim),
                 )
             )
+        rules = list(self.step.rules)
+        if rules:
+            out.append(BLANK)
+            out.append(Line(Segment("Notes", self.caps.color_pair("title"))))
+            out.extend(self._wrapped_notes(rules, dim))
+        about = list(self.step.detail_source(self.session.state))
+        if about:
+            out.append(BLANK)
+            out.append(
+                Line(Segment("About the row under the cursor", self.caps.color_pair("title")))
+            )
+            out.extend(self._wrapped_notes(about, dim))
         out.append(BLANK)
         out.append(Line(Segment("  ↑ ↓ PgUp PgDn scroll this list · any other key closes it", dim)))
+        return out
+
+    def _wrapped_notes(self, texts: list[str], attr: str) -> list[Line]:
+        """Prose for the overlay, wrapped once against the width the overlay actually has.
+
+        The overlay is the one surface in a step that scrolls on purpose, so it is where a sentence
+        too long for the bar under the list goes rather than being left out of the screen entirely.
+        """
+        room = max(20, self.caps.columns - 4)
+        out: list[Line] = []
+        for text in texts:
+            for piece in L.wrap(text, room, self.caps):
+                out.append(Line(Segment(f"  {piece}", attr)))
         return out
 
     # -- geometry ---------------------------------------------------------------------------

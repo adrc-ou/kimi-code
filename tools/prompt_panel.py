@@ -45,19 +45,19 @@ if __package__:
     from . import kimi_prompts, policy
     from . import prompt_context as pc
     from . import prompt_measure as pm
-    from .tui import flow
+    from .tui import flow, screen
     from .tui.app import View, run
-    from .tui.forest import CHECK, WORD, ForestState, ForestStep, Node
-    from .tui.layout import Line, Row, Segment
+    from .tui.forest import CHECK, FIXED, ForestState, ForestStep, Node
+    from .tui.layout import Row
 else:
     import kimi_prompts
     import policy
     import prompt_context as pc
     import prompt_measure as pm
-    from tui import flow
+    from tui import flow, screen
     from tui.app import View, run
-    from tui.forest import CHECK, WORD, ForestState, ForestStep, Node
-    from tui.layout import Line, Row, Segment
+    from tui.forest import CHECK, FIXED, ForestState, ForestStep, Node
+    from tui.layout import Row
 
 WIDTH = 78
 #: The reference table's name column, its gutter, and therefore where its notes have to start.
@@ -85,9 +85,16 @@ STYLE_CODES = {"dim": DIM, "bold": BOLD, "warn": WARN, "on": GREEN}
 
 #: The two states a checkbox answers with, spelled as :mod:`~.tui.forest` spells a marked row.
 ON_OFF = ("on", "off")
-#: The word on a source that is on disk and not being read. One word, always the same, because a
-#: superseded block has to be recognisable without reading a sentence about it.
-UNUSED = "unused"
+#: The four things this harness can put in front of a model, in the order the map reads them: two
+#: documents that become prompt text, then two kinds of setting that change what the agent may do
+#: rather than what it reads. Every row of the tree lives under exactly one of them, which is what
+#: replaced the old screen's sentence per row about where an add-on goes.
+DESTINATIONS = (pc.TARGET_SYSTEM, pc.TARGET_AGENTS, pc.TARGET_CONFIG, pc.TARGET_ENV)
+#: Which static block switches which destination. The other two destinations are settings, so they
+#: have no file behind them, no tier, and no switch of their own.
+BLOCK_FOR = {pc.TARGET_SYSTEM: pc.STATIC_SYSTEM, pc.TARGET_AGENTS: pc.STATIC_CONTEXT}
+#: The same relation read the other way, for the times a block has to be named by its destination.
+BLOCK_TARGET = {block: target for target, block in BLOCK_FOR.items()}
 #: Why a switched-off document is not simply *nothing*: Kimi throws away a prompt that trims to
 #: blank, so the harness sends the one token that survives. This sentence used to live in the old
 #: help screen, which the modal has no reason to hide.
@@ -103,6 +110,18 @@ STATIC_NOTE = (
     "staged document and writes nothing to your files."
 )
 
+#: How a figure is to be read. True of every row in the map, and so a rule rather than a detail:
+#: it belongs with the keys, where a reader who is unsure of a number can go find out what it is.
+PRICE_NOTE = (
+    "Each price is that block alone, never a measurement of a rendered prompt. The only figures "
+    "that are totals are the ones under 'what the model receives'."
+)
+#: The promise the screen makes about its own effect, which a reader needs before they are willing
+#: to move anything.
+PROMISE_NOTE = (
+    "Nothing is written and nothing is started until you accept the screen, and what you accept "
+    "applies to this session: a block you switch here is staged differently, not edited on disk."
+)
 #: What the last line of a row means, and why the boxes above it add up to it.
 KEY = """\
 The boxes in each row are the whole prompt that row names, cut into who wrote it: this harness,
@@ -112,6 +131,14 @@ request that this workspace actually made. An estimate is marked ~ and is the ha
 priced before Kimi has rendered anything; Kimi's framing cannot be estimated without having been
 seen, so a first launch shows ? and the whole figure with it.
 """
+
+
+#: The sentences about the whole step rather than about one row, listed in the key overlay beside
+#: the keys they explain. The map used to carry all of this inline, which is how it came to be a
+#: wall of prose with a few checkboxes in it: a rule is true of every row, so printing it against
+#: every row printed it nine times, and printing it once above the tree put it where nobody was
+#: looking for it.
+RULES = (STATIC_NOTE, BLANK_NOTE, PRICE_NOTE, PROMISE_NOTE, KEY)
 
 
 class Cost(NamedTuple):
@@ -164,7 +191,6 @@ class Context(NamedTuple):
     enabled: dict[str, bool]
     static: dict[str, str]
     remembered: bool
-
 
 
 def colour(text: str, code: str, on: bool) -> str:
@@ -596,10 +622,26 @@ def draw(
     static: dict[str, str] | None = None,
 ) -> str:
     """One screen, both halves, one alignment pass. Every path through the panel prints this."""
-    main = pieces(plan, root, module_guidance, enabled,
-                  latest.get(pm.AUDIENCE_MAIN), "primary", values, static=static)
-    sub = pieces(plan, root, module_guidance, enabled,
-                 latest.get(pm.AUDIENCE_SUBAGENT), "subagent", values, static=static)
+    main = pieces(
+        plan,
+        root,
+        module_guidance,
+        enabled,
+        latest.get(pm.AUDIENCE_MAIN),
+        "primary",
+        values,
+        static=static,
+    )
+    sub = pieces(
+        plan,
+        root,
+        module_guidance,
+        enabled,
+        latest.get(pm.AUDIENCE_SUBAGENT),
+        "subagent",
+        values,
+        static=static,
+    )
     screen = Screen(colour_on)
     screen.rows(static_rows(main, sub, plan, root, static))
     screen.rows(checklist(enabled, plan, module_guidance))
@@ -766,16 +808,15 @@ class ContextGraph:
     def deviated(self, node: Node, value: str) -> str:
         """Colour for a row the operator has moved, which is the one thing the tree must not hide.
 
-        Only a static block earns it: a checkbox off is a normal choice, while a switched document
-        is a session override that will not be there next launch unless it is remembered too.
+        Only a static block earns it, and only where the switch is asked for: an unchecked add-on
+        is a normal choice the operator is free to make, while a document they have overridden from
+        what its own file says is an exception this launch is making. The two must never arrive in
+        the same colour, or the colour stops answering the question it was drawn to answer.
         """
-        if node.kind == WORD and value and value != self.switches.get(node.id, self._any()).opening:
+        switch = self.switches.get(node.id)
+        if node.kind == CHECK and switch and value and value != switch.opening:
             return "over"
         return ""
-
-    @staticmethod
-    def _any() -> Switch:
-        return Switch(states=(), members={}, opening="")
 
     # -- figures ---------------------------------------------------------------------------
 
@@ -794,12 +835,24 @@ class ContextGraph:
         static = self.modes(live)
         pair = (
             pieces(
-                self.plan, self.root, self.module_guidance, enabled,
-                self.latest.get(pm.AUDIENCE_MAIN), "primary", self.values, static=static,
+                self.plan,
+                self.root,
+                self.module_guidance,
+                enabled,
+                self.latest.get(pm.AUDIENCE_MAIN),
+                "primary",
+                self.values,
+                static=static,
             ),
             pieces(
-                self.plan, self.root, self.module_guidance, enabled,
-                self.latest.get(pm.AUDIENCE_SUBAGENT), "subagent", self.values, static=static,
+                self.plan,
+                self.root,
+                self.module_guidance,
+                enabled,
+                self.latest.get(pm.AUDIENCE_SUBAGENT),
+                "subagent",
+                self.values,
+                static=static,
             ),
         )
         self._priced[key] = pair
@@ -815,97 +868,128 @@ class ContextGraph:
         """
         enabled, _ = self.answer(live)
         main, _ = self.priced(live)
-        notes = [note for note in (warning(enabled), *over_limit(main), *self.stale) if note]
+        # A row drawn ``- -`` is already telling the truth about itself, but not the whole truth:
+        # only the files on disk explain why no state of that block composes anything different.
+        stuck = (
+            f"{BLOCK_TARGET[block]} has nothing on disk to supply it, so no state of it composes a "
+            "different document"
+            for block in pc.STATIC_IDS
+            if len(self.switches[block].states) < 2
+        )
+        notes = [
+            note for note in (warning(enabled), *over_limit(main), *stuck, *self.stale) if note
+        ]
         return tuple(notes)
 
     # -- the tree --------------------------------------------------------------------------
 
     def nodes(self, live: Mapping[str, str]) -> tuple[Node, ...]:
-        """The whole diagram: the files, the add-ons, the two prompts, and the denominator."""
+        """The whole diagram: four destinations, the two prompts they add up to, the denominator.
+
+        The map is read top-down as *where text goes*, not as *what kind of thing we called it*, so
+        a file block and the add-ons that append to the same document are neighbours and share one
+        mark column. Two prices and a total sit underneath as their own group because they are the
+        only rows that are about a rendered prompt rather than about a source.
+        """
         enabled, _ = self.answer(live)
         static = self.modes(live)
         main, sub = self.priced(live)
         return (
-            self._static_root(static),
-            self._dynamic_root(enabled),
+            *(self._destination_row(target, enabled, static) for target in DESTINATIONS),
             self._prompt_root(main, sub, static),
             self._caps_root(),
         )
 
-    def _static_root(self, static: Mapping[str, str]) -> Node:
-        return Node(
-            id="static",
-            label="static context - the files these prompts are read from",
-            note=STATIC_NOTE,
-            children=tuple(self._block_row(block, static) for block in pc.STATIC_IDS[::-1])
-            + (self._addons_row(),),
-        )
+    def _destination_row(
+        self, target: str, enabled: Mapping[str, bool], static: Mapping[str, str]
+    ) -> Node:
+        """One destination: its switch where a switch exists, then everything that feeds it.
+
+        Four groups, because four kinds of text reach the model at all — the main agent's prompt,
+        the contract every lane reads, Kimi's own configuration, and the agent's environment. That
+        is the question a reader of this screen is actually asking, and grouping by the answer is
+        what lets a row's *place* say what the old screen paid a sentence per row to say. The
+        ``into Kimi configuration:`` prefix, the ``the dynamic add-ons`` pointer standing between
+        two halves that had otherwise nothing in common, and a price column nobody was reading all
+        went away the moment each add-on started underneath the document it edits.
+        """
+        children: list[Node] = []
+        block = BLOCK_FOR.get(target)
+        if block:
+            children.extend(self._source_rows(block, static))
+        children.extend(self._addon_rows(target, enabled))
+        if block is None:
+            return Node(id=f"to:{target}", label=target, children=tuple(children))
+        return self._block_row(block, target, static, children)
 
     def _name(self, path: Path) -> str:
         """How a file is referred to in the tree: relative when it is ours, absolute when not.
 
-        The same spelling :func:`_source` uses, so a row and the sentence under it never name one
+        The same spelling :func:`_source` uses, so a row and the sentence beside it never name one
         file two different ways — ``runtime/AGENTS.md`` and ``AGENTS.md`` are different files here.
         """
         return str(path.relative_to(self.root)) if path.is_relative_to(self.root) else str(path)
 
-    def _block_row(self, block: str, static: Mapping[str, str]) -> Node:
-        """One block: its switch, then every file that could supply it, in authority order."""
-        switch = self.switches[block]
+    def _source_rows(self, block: str, static: Mapping[str, str]) -> list[Node]:
+        """Every document that could be behind this block, most authoritative first."""
         mode = static[block]
         source = pc.static_source(self.root, block, mode)
-        children = [
+        rows = [
             self._tier_row(block, path, source)
             for path in pc.static_tiers(self.root, block)
             if path.is_file()
         ]
         if block == pc.STATIC_SYSTEM:
-            children.append(self._built_in_row(mode, source))
-        label = pc.TARGET_SYSTEM if block == pc.STATIC_SYSTEM else pc.TARGET_AGENTS
+            rows.append(self._built_in_row(mode, source))
+        return rows
+
+    def _block_row(
+        self, block: str, target: str, static: Mapping[str, str], children: list[Node]
+    ) -> Node:
+        """One static block, drawn as the row it belongs to.
+
+        The destination and the switch are one row because they are one thing: the document called
+        ``main system prompt`` *is* whatever the operator's file composes to. Two rows saying it is
+        how the old screen ended up with a heading, a switch, and a third row apologising that the
+        switch was somewhere else.
+        """
+        switch = self.switches[block]
+        mode = static[block]
+        live = len(switch.states) > 1
+        # A block whose states all compose the same document has nothing for ``Space`` to do, so it
+        # is drawn as the fact it is — the same ``- -`` a superseded file earns — and
+        # :meth:`notices` says why, because a row the cursor cannot reach has no pane to speak for
+        # it and a switch that silently refuses ``Space`` is the bug this screen was told to fix.
+        holds = _effect(self.root, block, switch.opening) != "blank"
         return Node(
             id=block,
-            label=label,
-            kind=WORD,
-            states=switch.states,
-            default=switch.opening,
-            enabled=len(switch.states) > 1,
-            note=self._block_note(block, mode, source, switch),
+            label=target,
+            kind=CHECK if live else FIXED,
+            states=switch.states if live else (),
+            default=switch.opening if live else "",
+            enabled=live or holds,
+            branch=block == pc.STATIC_CONTEXT,
+            detail=_where(_source(self.root, block, {block: mode})),
             children=tuple(children),
         )
 
-    def _block_note(self, block: str, mode: str, source: Path | None, switch: Switch) -> str:
-        """Why this row says what it says, including when there is nothing to switch."""
-        if len(switch.states) > 1:
-            return _where(_source(self.root, block, {block: mode}))
-        if source is None:
-            return (
-                "nothing to switch: no file supplies this block, and every state would leave it "
-                "exactly as empty as it is"
-            )
-        return _where(_source(self.root, block, {block: mode}))
-
     def _tier_row(self, block: str, path: Path, source: Path | None) -> Node:
-        """A file that could supply this block, marked used or superseded.
+        """A file that could supply this block, marked held or superseded.
 
-        A superseded file stays in the tree: the operator put it there, and a diagram that deleted
-        it would make the directory and the picture disagree.
+        A superseded file keeps its row: the operator put it there, and a diagram that deleted it
+        would make the directory and the picture disagree. ``- -`` says both halves of that at once
+        — empty right now, and no key here empties it — which is what the bare ``unused`` word this
+        row used to trail could not.
         """
         used = path == source
         name = self._name(path)
         if used:
-            note = ""
+            detail = ""
         elif source is None:
-            note = "not read: this block is switched off, so no file of yours supplies it"
+            detail = "not read: this block is switched off, so no file of yours supplies it"
         else:
-            note = f"not read: {self._name(source)} is the more authoritative tier of the two"
-        return Node(
-            id=f"{block}:{name}",
-            label=name,
-            enabled=used,
-            branch=used and block == pc.STATIC_CONTEXT,
-            badge="" if used else UNUSED,
-            note=note,
-        )
+            detail = f"not read: {self._name(source)} is the more authoritative tier of the two"
+        return Node(id=f"{block}:{name}", label=name, kind=FIXED, enabled=used, detail=detail)
 
     def _built_in_row(self, mode: str, source: Path | None) -> Node:
         """Kimi's own prompt, which is in use until one of yours replaces it or wraps it.
@@ -915,31 +999,49 @@ class ContextGraph:
         and the tree says composition with a coloured edge.
         """
         if mode == pc.OFF:
-            return Node(id="builtin", label="Kimi's own built-in prompt", badge=UNUSED,
-                        enabled=False, note=BLANK_NOTE)
+            return Node(
+                id="builtin",
+                label="Kimi's own built-in prompt",
+                kind=FIXED,
+                enabled=False,
+                detail=BLANK_NOTE,
+            )
         if source is None:
-            return Node(id="builtin", label="Kimi's own built-in prompt",
-                        note="no file of yours, so Kimi's own words open the prompt")
+            return Node(
+                id="builtin",
+                label="Kimi's own built-in prompt",
+                kind=FIXED,
+                detail="no file of yours, so Kimi's own words open the prompt",
+            )
         if pc.BASE_PROMPT_WRAPPER in pc.strip_html_comments(_tier_text(source)):
-            return Node(id="builtin", label="Kimi's own built-in prompt", link=True,
-                        note=f"substituted into {self._name(source)} by {pc.BASE_PROMPT_WRAPPER}")
-        return Node(id="builtin", label="Kimi's own built-in prompt", badge=UNUSED, enabled=False,
-                    note=f"replaced: {self._name(source)} is the whole prompt")
-
-    def _addons_row(self) -> Node:
-        """The pointer that makes the two halves one diagram: what follows the files."""
+            return Node(
+                id="builtin",
+                label="Kimi's own built-in prompt",
+                kind=FIXED,
+                link=True,
+                detail=f"substituted into {self._name(source)} by {pc.BASE_PROMPT_WRAPPER}",
+            )
         return Node(
-            id="addons",
-            label="the dynamic add-ons",
-            note="appended after whichever file supplies each block above, and priced one by "
-            "one in the section below",
+            id="builtin",
+            label="Kimi's own built-in prompt",
+            kind=FIXED,
+            enabled=False,
+            detail=f"replaced: {self._name(source)} is the whole prompt",
         )
 
-    def _dynamic_root(self, enabled: Mapping[str, bool]) -> Node:
-        children = []
+    def _addon_rows(self, target: str, enabled: Mapping[str, bool]) -> list[Node]:
+        """The add-ons that write into one destination, in panel order.
+
+        Their price is the price of that one block, which is why :data:`PRICE_NOTE` has to say so
+        somewhere: nothing in this tree adds a row's number up, and the figures underneath
+        ``what the model receives`` are the only place that does.
+        """
+        out = []
         for option in pc.OPTIONS:
+            if option.target != target:
+                continue
             cost = option_cost(option, self.plan, self.module_guidance)
-            children.append(
+            out.append(
                 Node(
                     id=option.id,
                     label=option.label,
@@ -947,15 +1049,10 @@ class ContextGraph:
                     states=ON_OFF,
                     default=ON_OFF[0] if enabled[option.id] else ON_OFF[1],
                     value="no prompt cost" if cost.measured and not cost.tokens else cost.text(),
-                    note=f"into {option.target}: {option.summary}",
+                    detail=option.summary,
                 )
             )
-        return Node(
-            id="dynamic",
-            label="dynamic context this harness adds",
-            note="Each price is that block alone, not a measurement of a rendered prompt.",
-            children=tuple(children),
-        )
+        return out
 
     def _prompt_root(self, main: Pieces, sub: Pieces, static: Mapping[str, str]) -> Node:
         """The two totals, priced from the answer on screen and labelled from the modes it draws."""
@@ -963,12 +1060,12 @@ class ContextGraph:
         return Node(
             id="figures",
             label="what the model receives",
-            note=KEY,
             children=(
                 # A subagent is handed no system prompt at all, so `None` below is a fact about the
                 # audience rather than about the operator's files: see `_regions`.
-                self._audience_row("main", "MAIN AGENT", main,
-                                   _source(self.root, "system", static), context_from),
+                self._audience_row(
+                    "main", "MAIN AGENT", main, _source(self.root, "system", static), context_from
+                ),
                 self._audience_row("sub", "SUBAGENT", sub, None, context_from),
             ),
         )
@@ -984,9 +1081,7 @@ class ContextGraph:
         children = []
         for name, cost, note in _regions(used, system_from, context_from):
             total, pct = figure(cost, used.cap).split("|")
-            children.append(
-                Node(id=f"{key}:{name}", label=name, value=total, pct=pct, note=note)
-            )
+            children.append(Node(id=f"{key}:{name}", label=name, value=total, pct=pct, detail=note))
         if used.measured:
             total, pct = figure(used.total, used.cap).split("|")
             return Node(
@@ -994,13 +1089,13 @@ class ContextGraph:
                 label=f"{title} - the whole prompt, on every request",
                 value=total,
                 pct=pct,
-                note=f"measured from your last real request, {used.age} ago",
+                detail=f"measured from your last real request, {used.age} ago",
                 children=tuple(children),
             )
         return Node(
             id=key,
             label=f"{title} - the whole prompt cannot be totalled",
-            note="the box priced ? has no honest figure; launch once and this row becomes exact",
+            detail="the box priced ? has no honest figure; launch once and this row becomes exact",
             children=tuple(children),
         )
 
@@ -1014,7 +1109,7 @@ class ContextGraph:
                     id=f"cap:{name}",
                     label=f"{name} lane ({audience})",
                     value=f"cap {cap:,}",
-                    note=f"window {window:,}",
+                    detail=f"window {window:,}",
                 )
             )
         return Node(
@@ -1043,6 +1138,7 @@ class ContextStep(ForestStep):
             head=head,
             opening=opening,
             tone_of=graph.deviated,
+            rules=RULES,
         )
         self._live: Mapping[str, str] | None = None
 
@@ -1053,11 +1149,17 @@ class ContextStep(ForestStep):
     def rows(self, state: object) -> list[Row]:
         assert isinstance(state, ForestState)
         self._bind(state.values)
-        out = super().rows(state)
-        for notice in self.graph.notices(state.values):
-            for piece in self._wrapped(notice, self.room):
-                out.append(Row.heading(Line(Segment(piece, self.tone("warn")))))
-        return out
+        return super().rows(state)
+
+    def alerts(self, state: object) -> tuple[str, ...]:
+        """What this answer costs, or fails to do — the sentences that change as the user toggles.
+
+        They sit above the map instead of trailing it. A bill below thirty rows of tree is a bill
+        read only by whoever already knew to scroll, and the stale-file warning is worth even less
+        down there: it is the one notice that has to be seen *before* the row it names is toggled.
+        """
+        assert isinstance(state, ForestState)
+        return self.graph.notices(state.values)
 
     def _bind(self, values: Mapping[str, str]) -> None:
         """Re-derive the tree unless the answer is the one it was built from."""
@@ -1065,7 +1167,6 @@ class ContextStep(ForestStep):
             return
         self._live = dict(values)
         self.nodes = tuple(self.graph.nodes(self._live))
-        self._roots_are_checkable = any(node.kind == CHECK for node in self.nodes)
 
 
 def recap(enabled: Mapping[str, bool], static: Mapping[str, str]) -> str:
@@ -1099,10 +1200,18 @@ def choose_context(
     if not rendering:
         # An unattended launch, or a replay of an answer this pass already has: either way the
         # printout is the record, and nothing here may write a preference nobody was asked for.
-        print(
+        # On a screen the launcher borrowed, that record has to wait its turn like any other line.
+        screen.note(
             draw(
-                context.plan, root, module_guidance, context.enabled, latest,
-                values=values, colour_on=False, remembered=context.remembered, stale=stale,
+                context.plan,
+                root,
+                module_guidance,
+                context.enabled,
+                latest,
+                values=values,
+                colour_on=False,
+                remembered=context.remembered,
+                stale=stale,
                 static=context.static,
             )
         )
@@ -1111,13 +1220,18 @@ def choose_context(
         "remembered from your last launch" if context.remembered else "this build's defaults"
     )
     graph = ContextGraph(
-        context.plan, root, module_guidance, latest, context.enabled, context.static,
-        values=values, stale=stale,
+        context.plan,
+        root,
+        module_guidance,
+        latest,
+        context.enabled,
+        context.static,
+        values=values,
+        stale=stale,
     )
     position, total = state.rail(flow.CONTEXT) if state else (1, 1)
     result = run(
-        ContextStep(graph, (f"Showing {state_name}. Enter accepts; nothing is written or "
-                            "started until you do.",)),
+        ContextStep(graph, (f"showing {state_name}",)),
         View(
             position=position,
             total=total,
@@ -1202,9 +1316,7 @@ def _note(label: str, body: str) -> list[str]:
     # Both indents go to textwrap, or the first line runs to twice the width of the rest: wrap()
     # counts the indent it is given as part of the line, and the label is that indent.
     pad = " " * NOTE_FIELD
-    wrapped = textwrap.wrap(
-        body, width=WIDTH, initial_indent=pad, subsequent_indent=pad
-    ) or [""]
+    wrapped = textwrap.wrap(body, width=WIDTH, initial_indent=pad, subsequent_indent=pad) or [""]
     return [("  " + label).ljust(NOTE_FIELD) + wrapped[0][NOTE_FIELD:], *wrapped[1:]]
 
 
@@ -1261,9 +1373,7 @@ def vars_report(runtime_dir: Path, root: Path) -> str:
         # the base, and it can never mention a name the harness invented. A "no" here would claim
         # the question was asked and answered.
         in_prompt = "-"
-        lines.append(
-            f"  {label:<{NAME_FIELD}}{who:<12}{in_prompt:<11}{_yes(_used(yours, name))}"
-        )
+        lines.append(f"  {label:<{NAME_FIELD}}{who:<12}{in_prompt:<11}{_yes(_used(yours, name))}")
     lines += ["", "What each of Kimi's own variables carries, in this build:"]
     for name, body in kimi_prompts.PLACEHOLDER_CONDITIONS.items():
         lines += _note("${" + name + "}", body)
@@ -1284,7 +1394,7 @@ def vars_report(runtime_dir: Path, root: Path) -> str:
             "read out of the running build"
             if name in literals
             else "pending: not cached for this image yet, so naming it stops the launch instead "
-                 "of shipping the name itself",
+            "of shipping the name itself",
         )
     for name in pc.DOCUMENTED_BUT_UNDEFINED:
         lines += _note(
@@ -1293,7 +1403,6 @@ def vars_report(runtime_dir: Path, root: Path) -> str:
         )
     lines += ["", "Settings the harness reads and never rewrites:", *owned_tables(root)]
     return "\n".join(lines)
-
 
 
 #: The static blocks in words, for the two places that have to name one without drawing the
@@ -1394,8 +1503,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--plain", action="store_true", help="Never emit colour, never prompt.")
     parser.add_argument("--show", action="store_true", help="Draw once and exit.")
     parser.add_argument("--configure", action="store_true", help="Set choices without a screen.")
-    parser.add_argument("--vars", action="store_true",
-                        help="list every placeholder a prompt file may hold, and who resolves it")
+    parser.add_argument(
+        "--vars",
+        action="store_true",
+        help="list every placeholder a prompt file may hold, and who resolves it",
+    )
     args, rest = parser.parse_known_args(list(sys.argv[1:] if argv is None else argv))
     if args.configure:
         return run_configure(args.runtime_dir, rest)
@@ -1416,7 +1528,13 @@ def main(argv: list[str] | None = None) -> int:
     # other, but this entry point's contract is a status code: the files it decides are staged by
     # render_runtime.py from the preference file choose_context just wrote.
     choose_context(
-        args.runtime_dir, args.root, context, module_guidance, latest, values, stale,
+        args.runtime_dir,
+        args.root,
+        context,
+        module_guidance,
+        latest,
+        values,
+        stale,
         asking=sys.stdin.isatty() and sys.stdout.isatty() and not (args.plain or args.show),
     )
     return 0

@@ -90,10 +90,14 @@ Run:
 ```
 
 The questions come one per screen in a fullscreen modal that owns the terminal
-while it is open. Each step's human label is the top-left line of the window, with a
-rail under it reading `N of M` so you can see how much launch is left, content that
-scrolls inside its own region when it does not fit, and a footer of the keys that
-step answers — in the order that matters when a narrow window makes it drop some.
+while it is open. The modal is held for the whole interactive run rather than
+raised per question, so the launch printout never shows between steps. Each step's
+human label is the top-left line of the window, with a rail under it reading
+`N of M` so you can see how much launch is left — `M` is fixed for the run and
+counts only the screens you will actually be shown, so a skipped step is never
+enumerated and the first screen you see is always step 1. Content scrolls inside
+its own region when it does not fit, and a footer lists the keys that step answers
+— in the order that matters when a narrow window makes it drop some.
 ↑/↓ move the focus marker and Enter continues; `Space` toggles the row under focus,
 `Backspace` returns to the previous step, and `Ctrl-R` puts the currently visible
 choices back to their starting state. Nothing is answered by typing a menu number,
@@ -132,6 +136,14 @@ shares it across every model of that provider. The launcher then snapshots modul
 assets and approved project extensions, and starts the segmented stack. Ctrl-C
 stops the containers and registered native module processes. Persistent
 workspace data is never removed when a module is unchecked or deleted.
+
+Because the modal is still covering the terminal while that work runs, anything it
+would have printed is spooled to `launch-notes.log` in the instance runtime
+directory and read out the moment the window closes, in order, before the launch
+says anything else. A step that fails mid-pass is reported the same way: the modal
+is released first, since leaving the alternate screen discards whatever was painted
+on it, so the diagnostic and the notes that precede it both land on the normal
+screen.
 
 Before announcing readiness, the launcher registers `/workspace` with Kimi's
 authenticated local API. This persists in Kimi's state volume and makes it the
@@ -232,6 +244,24 @@ long run is bounded instead by `MODEL_PROXY_SOCK_READ_TIMEOUT` per stalled
 upstream read and `MODEL_PROXY_MAX_REQUEST_SECONDS` per client request, so a wedged
 stream cannot hold a scarce fair-use permit. Neither is a task-length limit.
 `docs/verification.md` shows how to read the policy currently in force.
+
+The proxy also archives the prompts it forwards, always on. A request qualifies only
+when the newest user message in it is the operator speaking: a user message carrying a
+`<system-reminder>` tag, or no new user message at all, adds nothing, so the many calls
+one turn makes cost one file between them rather than one each. That file holds the
+outbound request - request line, headers, and the body pretty-printed - with the provider
+key, the internal bearer, and the cache salt redacted, and its path on the host is printed
+on one stdout line beside a timestamp and the first 65 characters of the prompt:
+
+```
+prompt_log lane=primary time=2026-09-21T03:07:21.964055+00:00 chars=53 file=/…/.local/runtime/<instance>/prompt-log/prompt-20260921T030721-964055-bede5997.txt prompt='Fix the flaky date test in tests/test_runtime_lock.py'
+```
+
+The archive lives in `.local/runtime/<instance>/prompt-log`, so the files are readable on
+the host while the stdout lines that name them arrive in `docker compose logs model-proxy`.
+The archive holds conversation text, so its contents are purged when the proxy stops and
+any leftovers are cleared again when it starts. It is the one writable
+host bind the proxy has, and it is mounted into no other container.
 
 ## Persistent workspace contract
 
@@ -480,15 +510,16 @@ mid-session edit does nothing until the next launch.
 
 ### What the startup panel adds
 
-`./start.sh` opens a context panel before it renders anything: one tree holding
-both the documents above and every block the harness can add, each row with its
-resolved size. Branches are the composition — a source that appears inside more
-than one parent gets a `▶` at the joint, and a source some other file fully
-supersedes is labelled `unused` and dimmed rather than deleted, so you can see
-what you are not getting. The two documents carry a tri-state word, `auto`, `on`
-or `off`; the add-ons are checkboxes. Both answer to the same keys as the rest of
-the modal, and everything starts on `auto` or on. Your changes are remembered for
-the next launch.
+`./start.sh` shows the composition as one map inside its modal: both the documents
+above and every block the harness can add, each row with its resolved size. The
+guides are the composition — a source that appears inside more than one parent gets
+a `▶` at the joint, and a source some other file fully supersedes keeps its row but
+goes dim with a hollow mark, so you can see what you are not getting. Both halves
+answer to the same marks: a row you hold is a `[x]` or a `[ ]`, and a row that only
+reports is `-x-` or `- -`. The sentence explaining a row is not stacked under it —
+it appears beside the map in a detail pane while the window is wide enough for one,
+and in the band under the status line when it is not — so the map itself stays short
+enough to read as a map. Your changes are remembered for the next launch.
 
 Run `./prompts.sh --configure --enable ID --disable ID --static ID=STATE` to
 change them without starting a session (`--configure` alone only prints the current
@@ -596,6 +627,8 @@ checkout location if it must stay private.
 Everything else is now behind named volumes: the harness checkout layout, the
 instance directory name, the rendered configuration, and the generated secret
 filenames under `.local/runtime/` no longer appear in the agent's mount table.
+The prompt archive is one of those instance-directory paths, and it is a host bind of
+`model-proxy` rather than of the agent, so the agent cannot read it or learn its name.
 Set `COMPOSE_PROJECT_NAME` to something neutral if the default
 `kimi_code_<instance-id>` name is not one you want published inside the
 sandbox.

@@ -30,8 +30,18 @@ import tty
 from types import TracebackType
 
 from .caps import TRUECOLOR, Caps, detect, truecolor_query, upgrade
-from .cells import ALT_OFF, ALT_ON, HIDE_CURSOR, MOUSE_OFF, MOUSE_ON, RESET, SHOW_CURSOR
+from .cells import (
+    ALT_OFF,
+    ALT_ON,
+    CLEAR,
+    HIDE_CURSOR,
+    MOUSE_OFF,
+    MOUSE_ON,
+    RESET,
+    SHOW_CURSOR,
+)
 from .keys import Decoder, Key
+from .screen import held as screen_held
 
 #: How long to wait for the terminal to answer the queries in :meth:`Terminal.probe`, in seconds.
 #: It is deliberately short: an unresponsive terminal must not cost a perceptible pause, and every
@@ -114,10 +124,14 @@ class Terminal:
         stream=None,
         title: str = "",
         probe: bool = True,
+        held: bool | None = None,
     ) -> None:
         self.fd = sys.stdin.fileno() if hasattr(sys.stdin, "fileno") else -1
         self.out = stream if stream is not None else sys.stdout
         self.caps = caps if caps is not None else detect(self.out, probe=probe)
+        #: Whether the alternate screen was borrowed by someone else -- see
+        #: :mod:`tui.screen`. A held terminal draws into a window it must not hand back.
+        self.held = screen_held() if held is None else held
         #: Mouse reporting is a separate capability from colour and must not be inferred from it:
         #: a monochrome terminal still has a mouse, and a colour terminal may have none.
         self.mouse = self.caps.mouse
@@ -174,6 +188,13 @@ class Terminal:
         if self._title_allowed():
             self._write(self._title_escape(self.title))
             self._title_set = True
+        if self.held:
+            # The launcher already owns the alternate screen, so all that is owed here is a blank
+            # one. ``paint()`` emits a diff against the buffer this process believes is on screen,
+            # and a fresh process believes nothing is on screen, so without this the previous
+            # step's frame would show straight through the gaps in the new one.
+            self._write(CLEAR + HIDE_CURSOR + (MOUSE_ON if self.mouse else ""))
+            return
         self._write(ALT_ON + HIDE_CURSOR + (MOUSE_ON if self.mouse else ""))
 
     def leave(self) -> None:
@@ -186,6 +207,13 @@ class Terminal:
             if self._title_set:
                 # Only ever set when the previous title is known, so this cannot blank a title.
                 restore = self._title_escape(self._previous_title or "")
+            if self.held:
+                # Only this process's own doing is undone. The alternate screen belongs to the
+                # launcher, which leaves it once the whole interactive sequence is over; handing it
+                # back here is exactly the flicker this mode exists to remove, and so is the
+                # trailing newline, which would scroll the frame the next step is about to redraw.
+                self._write(RESET + (MOUSE_OFF if self.mouse else "") + restore)
+                return
             self._write(
                 RESET + (MOUSE_OFF if self.mouse else "") + ALT_OFF + SHOW_CURSOR + restore + "\r\n"
             )

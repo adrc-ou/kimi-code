@@ -191,14 +191,43 @@ def _unlink(name: str) -> None:
 
 def _screens(raw: object) -> dict[str, int]:
     """Coerce a stored screen map, because a rail cannot afford a non-integer."""
+    return _counts(raw, floor=1)
+
+
+def _counts(raw: object, *, floor: int = 0) -> dict[str, int]:
+    """Coerce a stored name-to-screen map.
+
+    ``floor`` is the whole difference between the two maps this reads. A *declared* count is one the
+    surface gave while rendering, so a zero there is a corruption rather than an answer, and it is
+    rounded up. A *surveyed* count is a forecast of what a step has not reached yet, and zero is its
+    most useful value: it is how the launcher says "this step will not be on screen" before the step
+    itself ever runs, which is what keeps the rail's total from changing under the user.
+    """
     out: dict[str, int] = {}
     if isinstance(raw, dict):
         for name, count in raw.items():
             try:
-                out[str(name)] = max(1, int(count))
+                out[str(name)] = max(floor, int(count))
             except (TypeError, ValueError):
                 continue
     return out
+
+
+def parse_counts(text: str) -> dict[str, int]:
+    """Read a ``name=screens`` list, which is how the shell hands the pass's forecast over.
+
+    Anything unparseable is dropped rather than raised: the launcher's own ``|| true`` on this call
+    says a forecast nobody could read is a rail with no forecast, and the step's own count is always
+    still there to correct it. A launch must not fail because a progress bar was guessed at.
+    """
+    out: dict[str, int] = {}
+    for piece in text.split(","):
+        name, _, raw = piece.partition("=")
+        try:
+            out[name.strip()] = max(0, int(raw))
+        except ValueError:
+            continue
+    return {name: count for name, count in out.items() if name}
 
 
 class Flow:
@@ -218,6 +247,8 @@ class Flow:
         self.steps: tuple[str, ...] = tuple(declared)
         self.committed: dict[str, str] = dict(state.get("committed") or {})
         self.screens: dict[str, int] = _screens(state.get("screens"))
+        #: The launcher's forecast, one count per step, taken once per pass before any step runs.
+        self.forecast: dict[str, int] = _counts(state.get("forecast"))
         self.skipped: frozenset[str] = frozenset(str(name) for name in (state.get("skipped") or ()))
         self.target: str = str(state.get("target") or "")
         self.live: bool = bool(state.get("live"))
@@ -265,8 +296,30 @@ class Flow:
         return ""
 
     def screens_for(self, step: str) -> int:
-        """How many screens ``step`` said it would render, defaulting to one."""
-        return max(1, self.screens.get(step, DEFAULT_SCREENS))
+        """How many screens ``step`` contributes to the rail, which is none for an unseen step.
+
+        Two sources answer, in order of authority. A step that has already drawn its screen counted
+        itself while doing so, and nothing may overrule that — least of all a forecast made before
+        it knew. A step the user has not reached is known only from this pass's forecast, and that
+        is the only reason the rail can say "of 2" on the first screen of a two-screen launch: the
+        alternative is to assume every declared step will be seen, which is what made the total
+        fall as the user advanced and the bar ran backwards.
+        """
+        if step in self.skipped:
+            return 0
+        declared = self.screens.get(step)
+        if declared is not None:
+            return max(1, declared)
+        return max(0, self.forecast.get(step, DEFAULT_SCREENS))
+
+    def visible(self) -> tuple[str, ...]:
+        """The steps the user will be shown this pass, in order.
+
+        :meth:`sequence` answers a different question — which steps have not *yet* declined — and so
+        still names every step that is going to refuse later in the pass. The rail numbers screens,
+        not intentions, and a progress bar whose denominator moves is not a progress bar.
+        """
+        return tuple(name for name in self.steps if self.screens_for(name) > 0)
 
     def rail(self, step: str, index: int = 0) -> tuple[int, int]:
         """The ``N of M`` to show for the ``index``-th screen of ``step``.
@@ -279,23 +332,48 @@ class Flow:
         A step that is replayed instead of rendered still holds its numbers, which is the point —
         the rail describes the sequence, not the screens drawn so far. When a surface has more to
         ask than it declared, the position clamps to the total rather than printing "9 of 8", and a
-        name the sequence does not contain lands at its end.
+        name the sequence does not contain lands at its end. A launch with nothing on screen at all
+        says "1 of 1", because a rail that reads "0 of 0" answers no question anyone asked.
         """
-        order = self.sequence()
+        order = self.visible()
         total = sum(self.screens_for(name) for name in order)
+        if total <= 0:
+            return (1, 1)
         before = 0
         for name in order:
             if name == step:
                 break
             before += self.screens_for(name)
-        position = min(before + max(0, int(index)) + 1, max(total, 1))
-        return position, max(total, 1)
+        position = min(before + max(0, int(index)) + 1, total)
+        return position, total
 
     # -- changes ----------------------------------------------------------------------------
 
     def begin(self) -> None:
         """Mark the flow live, which is what makes destructive steps refuse to run."""
         self.live = True
+        self._save()
+
+    def survey(self, counts: dict[str, int]) -> None:
+        """Record, before the first step runs, how many screens each step is going to show.
+
+        The rail's total is the one number on the screen the user cannot recompute, so it has to be
+        settled once rather than revised at every step. It cannot be got from the declared sequence
+        either, because most of that sequence usually has no question to ask — an environment that
+        names its own model, or a launch with no modules — and a user who is shown "2 of 5" for the
+        last screen of a two-screen launch has been told a lie about their own machine.
+
+        So the launcher asks each surface, in one process and without side effects, whether it would
+        prompt right now, and writes down the answer for the whole pass. A step that later counts
+        itself differently has simply corrected the forecast with better information: its own number
+        wins from then on, which is why the surveyed count is written only for a step that has not
+        yet rendered anything. A step surveyed at zero is not on the rail at all — :meth:`skip` is
+        still the step's own answer, and this is only the launcher's guess at it.
+        """
+        for name, count in counts.items():
+            if name in self.screens:
+                continue
+            self.forecast[name] = max(0, int(count))
         self._save()
 
     def declare(self, step: str, screens: int = DEFAULT_SCREENS) -> None:
@@ -357,6 +435,7 @@ class Flow:
         """
         self.skipped = self.skipped | {step}
         self.committed.pop(step, None)
+        self.screens.pop(step, None)
         if self.target == step:
             self.target = ""
         self._save()
@@ -392,9 +471,13 @@ class Flow:
         """Drop a step's answer, used when a change upstream invalidates it.
 
         Deleting the record is what makes the step prompt again on the next pass; nothing else has
-        to know that it happened.
+        to know that it happened. Its screen count goes too, because a step that will render again
+        will say how many screens it has when it gets there, and until then the pass's forecast is
+        the only number anyone has — keeping the last pass's figure would number the rail with an
+        answer that no longer belongs to anything on screen.
         """
         self.committed.pop(step, None)
+        self.screens.pop(step, None)
         if self.target == step:
             self.target = ""
         self._save()
@@ -410,6 +493,7 @@ class Flow:
                 "steps": list(self.steps),
                 "committed": self.committed,
                 "screens": self.screens,
+                "forecast": self.forecast,
                 "skipped": sorted(self.skipped),
                 "target": self.target,
                 "live": self.live,
@@ -425,7 +509,9 @@ def main(argv: list[str] | None = None) -> int:
     file where the flow actually is.
 
     ``rail`` is the one that returns two numbers, since "N of M" is one question; ``declare`` and
-    ``skip`` let the shell adjust the counts once a surface knows how many screens it has.
+    ``skip`` let the shell adjust the counts once a surface knows how many screens it has; and
+    ``survey`` takes the whole pass's forecast in one line, which is what the launcher calls before
+    the first step runs so the rail's total never has a reason to move.
     """
     parser = argparse.ArgumentParser(prog="flow.py", description=__doc__.splitlines()[0])
     parser.add_argument("--runtime-dir", required=True)
@@ -443,11 +529,17 @@ def main(argv: list[str] | None = None) -> int:
             "rail",
             "declare",
             "skip",
+            "survey",
         ),
     )
     parser.add_argument("step", nargs="?", default="")
     parser.add_argument("--summary", default="")
     parser.add_argument("--screens", type=int, default=DEFAULT_SCREENS)
+    parser.add_argument(
+        "--counts",
+        default="",
+        help="Comma-separated name=screens forecast, e.g. model=0,context=1",
+    )
     args = parser.parse_args(argv)
 
     steps = tuple(name for name in args.steps.split(",") if name)
@@ -470,6 +562,8 @@ def main(argv: list[str] | None = None) -> int:
         flow.declare(args.step, args.screens)
     elif args.command == "skip":
         flow.skip(args.step)
+    elif args.command == "survey":
+        flow.survey(parse_counts(args.counts))
     else:
         for name, summary in flow.recap():
             print(f"{name}\t{summary}")

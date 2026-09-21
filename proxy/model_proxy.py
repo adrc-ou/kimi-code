@@ -26,22 +26,29 @@ so waiting on a provider never consumes capacity.
 Both the plan and the rendered Kimi configuration that plan was compiled into are re-read
 on the request path: drift stops the affected traffic instead of being served under stale
 assumptions.
+
+The proxy also keeps an archive of the prompts it forwards. Every new user prompt becomes one
+file under a host-visible directory, plus one stdout line pointing at it, and the directory is
+emptied when the container stops. See ``log_prompt``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import json
 import os
 import re
 import secrets
+import shutil
 import time
 import tomllib
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -52,8 +59,6 @@ from aiohttp import (
     ServerDisconnectedError,
     web,
 )
-
-DEBUG_HTTP = False
 
 RATE_WINDOW_SECONDS = 60.0
 
@@ -141,44 +146,196 @@ def debug_body(body: bytes, *, redact_cache_salt: bool = False) -> str:
         return body.decode("utf-8", errors="replace")
 
 
-def debug_http(
-    title: str,
-    *,
-    method: str | None = None,
-    url: str | None = None,
-    status: int | None = None,
-    headers=None,
-    body: bytes | None = None,
-    redact_cache_salt: bool = False,
-) -> None:
-    if not DEBUG_HTTP:
+# ============================================================
+# Outgoing prompt archive
+# ============================================================
+#
+# Every new user prompt is archived as one file holding the request the proxy is about to
+# send upstream, and one stdout line naming where it went. The archive is always on: what
+# keeps it readable is that a request only qualifies when it *introduces* a prompt, so the
+# many calls a single turn makes - each of which re-sends the whole conversation - cost one
+# file between them instead of one file each.
+#
+# The directory is a host bind, so the operator can open the path stdout names without
+# going through Docker. It holds conversation text, which is why its contents are purged on
+# shutdown, and why it is mounted into this container alone.
+#
+# A dump is a request, not a secret store: the provider key, the internal bearer, and the
+# cache salt are replaced by their redaction markers on the way to disk, exactly as they
+# were on the way to stdout.
+
+#: Where the archive lives inside this container, and the same directory's path on the host,
+#: which is the one worth printing. Unset, the host path is the container path, which is
+#: correct only when nothing was bind-mounted.
+PROMPT_LOG_DIR = Path(os.environ.get("MODEL_PROXY_PROMPT_LOG_DIR", "/prompt-log"))
+PROMPT_LOG_HOST_DIR = Path(
+    os.environ.get("MODEL_PROXY_PROMPT_LOG_HOST_DIR") or str(PROMPT_LOG_DIR)
+)
+
+#: How much of the prompt the stdout line carries. Enough to recognise the turn, short
+#: enough that the line stays one line.
+PROMPT_SUMMARY_CHARS = 65
+
+#: The harness injects its own notes as user-role messages, so a user message built like
+#: that is not the operator speaking and does not open a file.
+REMINDER_TAG = "<system-reminder>"
+
+#: Keys of the prompts already archived, oldest first. The bound is generous rather than
+#: tight: it exists so a long-lived proxy cannot accumulate one string per prompt forever,
+#: and any window wider than the number of turns in a session keeps retries and multi-step
+#: turns collapsed.
+ARCHIVED_PROMPTS = 64
+
+_archived: OrderedDict[str, None] = OrderedDict()
+
+
+def message_text(message) -> str:
+    """The plain text of one chat message, whether its content is a string or content parts."""
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part["text"]
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def prompt_of(body: bytes) -> tuple[str, int] | None:
+    """The user prompt this request introduces, with that message's position beside it.
+
+    ``None`` means the request introduces nothing: the newest user message is a harness
+    reminder, or there is no user message at all, or the body is not a chat request.
+    Looking only at the *newest* user message is what makes this a new-prompt detector;
+    scanning the whole array would qualify every call of every turn, because every call
+    re-sends the prompts that turn already contains.
+    """
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+        return None
+
+    messages = payload["messages"]
+    for position, message in enumerate(reversed(messages), start=1):
+        if not (isinstance(message, dict) and message.get("role") == "user"):
+            continue
+        text = message_text(message)
+        if not text or REMINDER_TAG in text:
+            return None
+        return (text, len(messages) - position + 1)
+
+    return None
+
+
+def prompt_summary(text: str) -> str:
+    """One greppable line carrying the opening of the prompt."""
+    flat = " ".join(text.split())
+    if len(flat) > PROMPT_SUMMARY_CHARS:
+        return flat[:PROMPT_SUMMARY_CHARS] + "…"
+    return flat
+
+
+def request_dump(method: str, url: str, headers, body: bytes) -> str:
+    """The outbound request as text: request line, headers, then the body pretty-printed."""
+    lines = [f"{method} {url} HTTP/1.1"]
+    lines += [f"{name}: {value}" for name, value in debug_headers(headers).items()]
+    lines += ["", debug_body(body, redact_cache_salt=True), ""]
+    return "\n".join(lines)
+
+
+def new_prompt(key: str) -> bool:
+    """Whether this prompt has not been archived yet, remembering it if it has not."""
+    if key in _archived:
+        _archived.move_to_end(key)
+        return False
+    _archived[key] = None
+    while len(_archived) > ARCHIVED_PROMPTS:
+        _archived.popitem(last=False)
+    return True
+
+
+def write_dump(method: str, url: str, headers: dict[str, str], body: bytes, name: str) -> None:
+    """Render and store one request; the caller decides what a failure is worth."""
+    PROMPT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (PROMPT_LOG_DIR / name).write_text(
+        request_dump(method, url, headers, body), encoding="utf-8"
+    )
+
+
+async def log_prompt(request: web.Request, lane: LanePolicy, body: bytes) -> None:
+    """Archive one qualifying outgoing prompt; never let the archive cost a request."""
+    found = prompt_of(body)
+    if found is None:
         return
 
-    print("\n" + "=" * 80, flush=True)
-    print(title, flush=True)
+    text, depth = found
+    key = hashlib.sha256(f"{depth}\n{text}".encode()).hexdigest()
+    if not new_prompt(key):
+        return
 
-    if method is not None:
-        print(f"METHOD: {method}", flush=True)
+    # The request line and headers describe a call that carries no credential of ours, so
+    # they are rebuilt from the inbound request the same way the attempt builds them, with
+    # the provider key standing in as its own redaction marker.
+    headers = filtered_request_headers(request, "<REDACTED>")
+    now = datetime.now().astimezone()
+    name = f"prompt-{now.strftime('%Y%m%dT%H%M%S')}-{now.microsecond:06d}-{key[:8]}.txt"
 
-    if url is not None:
-        print(f"URL: {url}", flush=True)
-
-    if status is not None:
-        print(f"STATUS: {status}", flush=True)
-
-    if headers is not None:
-        print("HEADERS:", flush=True)
-        for name, value in debug_headers(headers).items():
-            print(f"  {name}: {value}", flush=True)
-
-    if body is not None:
-        print("BODY:", flush=True)
+    try:
+        # A multimodal body can be hundreds of megabytes, and pretty-printing it before
+        # writing it out is far too much work to attempt on the loop that paces every lane.
+        await asyncio.to_thread(
+            write_dump,
+            request.method,
+            f"{lane.base_url}/v1/chat/completions",
+            headers,
+            body,
+            name,
+        )
+    except (OSError, ValueError) as exc:
+        # A ValueError here can only come from encoding text the provider accepted and the
+        # local filesystem would not take; either way the prompt is worth a log line and
+        # nothing more.
         print(
-            debug_body(body, redact_cache_salt=redact_cache_salt),
+            f"prompt_log lane={lane.name} error={exc.__class__.__name__}: {exc}",
             flush=True,
         )
+        return
 
-    print("=" * 80 + "\n", flush=True)
+    print(
+        f"prompt_log lane={lane.name} time={now.isoformat(timespec='microseconds')} "
+        f"chars={len(text)} file={PROMPT_LOG_HOST_DIR / name} prompt={prompt_summary(text)!r}",
+        flush=True,
+    )
+
+
+def purge_prompt_log() -> int:
+    """Empty the archive directory, leaving the mount point itself in place."""
+    try:
+        entries = sorted(PROMPT_LOG_DIR.iterdir())
+    except OSError:
+        # No directory at all is the normal state of a stack that never archived anything.
+        return 0
+
+    removed = 0
+    for entry in entries:
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            removed += 1
+        except OSError as exc:
+            print(
+                f"prompt_log_purge path={entry} error={exc.__class__.__name__}: {exc}",
+                flush=True,
+            )
+
+    return removed
 
 
 # ============================================================
@@ -1308,14 +1465,6 @@ async def chat(request: web.Request) -> web.StreamResponse:
     async with ingress.slot():
         inbound_body = await request.read()
 
-        debug_http(
-            "INBOUND REQUEST TO PROXY",
-            method=request.method,
-            url=str(request.rel_url),
-            headers=request.headers,
-            body=inbound_body,
-        )
-
         guard = lane.max_input * INPUT_GUARD_PERCENT // 100
         estimate, media = estimate_input_tokens(inbound_body)
         if estimate > guard:
@@ -1334,6 +1483,8 @@ async def chat(request: web.Request) -> web.StreamResponse:
             )
 
         outbound_body = rewrite_model(inbound_body, request, lane)
+
+        await log_prompt(request, lane, outbound_body)
 
         return await forward_chat(
             request,
@@ -1391,15 +1542,6 @@ async def stream_attempt(
             request, upstream_credential(lane.secret_name)
         )
 
-        debug_http(
-            f"OUTBOUND REQUEST TO UPSTREAM - ATTEMPT {attempt}",
-            method="POST",
-            url=url,
-            headers=outbound_headers,
-            body=body,
-            redact_cache_salt=True,
-        )
-
         response = await session.post(
             url,
             data=body,
@@ -1415,12 +1557,6 @@ async def stream_attempt(
                 error_body = await response.content.read(MAX_ERROR_BYTES + 1)
 
                 if response.status in RETRYABLE:
-                    debug_http(
-                        f"UPSTREAM RESPONSE - ATTEMPT {attempt}",
-                        status=response.status,
-                        headers=response.headers,
-                        body=error_body,
-                    )
                     response.close()
                     return Attempt(retry_after=retry_delay(response, attempt))
 
@@ -1443,15 +1579,11 @@ async def stream_attempt(
             await downstream.prepare(request)
 
             output_bytes = 0
-            debug_response_body = bytearray() if DEBUG_HTTP else None
 
             try:
                 async for chunk in response.content.iter_any():
                     output_bytes += len(chunk)
                     scanner.feed(chunk)
-
-                    if debug_response_body is not None:
-                        debug_response_body.extend(chunk)
 
                     if output_bytes > MAX_RESPONSE_BYTES:
                         response.close()
@@ -1490,14 +1622,6 @@ async def stream_attempt(
 
             scanner.finish()
             await downstream.write_eof()
-
-            if debug_response_body is not None:
-                debug_http(
-                    f"UPSTREAM RESPONSE - ATTEMPT {attempt}",
-                    status=response.status,
-                    headers=response.headers,
-                    body=bytes(debug_response_body),
-                )
 
             return _attempt_result(downstream, scanner)
 
@@ -1632,10 +1756,27 @@ async def close_client(app: web.Application) -> None:
     await app["client"].close()
 
 
+async def open_prompt_archive(app: web.Application) -> None:
+    """Start from an empty archive: a container that was killed never got the chance."""
+    stale = purge_prompt_log()
+    print(
+        f"prompt_log directory={PROMPT_LOG_HOST_DIR} "
+        f"summary_chars={PROMPT_SUMMARY_CHARS} stale_entries={stale}",
+        flush=True,
+    )
+
+
+async def close_prompt_archive(app: web.Application) -> None:
+    """Prompt text does not outlive the stack that produced it."""
+    print(f"prompt_log_purged entries={purge_prompt_log()}", flush=True)
+
+
 def create_app() -> web.Application:
     app = web.Application(client_max_size=MAX_REQUEST_BYTES)
     app.on_startup.append(create_client)
+    app.on_startup.append(open_prompt_archive)
     app.on_cleanup.append(close_client)
+    app.on_cleanup.append(close_prompt_archive)
 
     # Only lanes the operator's definitions produced are routable; a lane the plan does
     # not publish answers 404 rather than being admitted and failing policy validation.

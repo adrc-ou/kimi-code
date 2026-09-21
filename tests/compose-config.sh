@@ -25,7 +25,8 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -p "${fixture}/workspace" "${fixture}/empty" "${fixture}/assets/skills" \
-  "${fixture}/assets/agents" "${fixture}/assets/tools" "${fixture}/credentials"
+  "${fixture}/assets/agents" "${fixture}/assets/tools" "${fixture}/credentials" \
+  "${fixture}/prompt-log"
 touch "${fixture}/config.toml" "${fixture}/SYSTEM.md" "${fixture}/AGENTS.md" "${fixture}/secret" \
   "${fixture}/cert.crt" \
   "${fixture}/assets/mcp.json" "${fixture}/model-policy.json" \

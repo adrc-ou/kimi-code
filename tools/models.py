@@ -33,7 +33,7 @@ if __package__:
     from .definitions import LANES, DefinitionError, load_definitions
     from .env_values import read_env_values
     from .private_file import write_private, write_private_json
-    from .tui import flow
+    from .tui import flow, screen
     from .tui.app import View, run
     from .tui.input import FieldStep
     from .tui.menu import SINGLE, Choice, ListStep
@@ -42,7 +42,7 @@ else:
     from definitions import LANES, DefinitionError, load_definitions
     from env_values import read_env_values
     from private_file import write_private, write_private_json
-    from tui import flow
+    from tui import flow, screen
     from tui.app import View, run
     from tui.input import FieldStep
     from tui.menu import SINGLE, Choice, ListStep
@@ -386,8 +386,7 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
         # two lines that cannot both be true.
         lines[lane] = f"{PROMPTS[lane]}: {model['label']} [{model['provider']}]{suffix}"
         index += 1
-    for lane in lanes:
-        print(lines[lane])
+    screen.note(*(lines[lane] for lane in lanes))
     # In lane order, not answer order: backing up and re-answering would otherwise reorder the
     # document that the resolver and the proxy read.
     write_json(runtime / SELECTION, {lane: selection[lane] for lane in lanes})
@@ -472,7 +471,11 @@ def ask_credential(item: dict[str, str], view: View) -> str:
         )
     origin = credential_origin(item)
     persistence = credential_persistence(item)
-    print(f"{origin} {persistence}")
+    if not screen.held():
+        # The field prints both sentences itself, as its own head. On a screen the launcher borrowed
+        # for the whole run, a line written here belongs to a frame the user has already lost, so it
+        # is the copy a piped log still gets and nothing more.
+        print(f"{origin} {persistence}")
     step = FieldStep(
         title=f"{item['provider_label']} key",
         prompt=f"{item['prompt']} ({item['env']})",

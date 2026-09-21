@@ -68,8 +68,12 @@ harness_instance() {
   HARNESS_STATE_FILE="${HARNESS_RUNTIME_DIR}/state.env"
   HARNESS_SESSION_FILE="${HARNESS_RUNTIME_DIR}/session.env"
   HARNESS_IMAGE_SUFFIX=${HARNESS_INSTANCE_ID}
-  mkdir -p "${HARNESS_COMPOSE_DIR}"
+  mkdir -p "${HARNESS_COMPOSE_DIR}" "${HARNESS_RUNTIME_DIR}/prompt-log"
   chmod 700 "${HARNESS_RUNTIME_DIR}" "${HARNESS_COMPOSE_DIR}"
+  # The proxy is the only writer here and it runs unprivileged, so this is the one directory
+  # under the instance directory that other accounts may write to. Its parent stays 0700, so
+  # reaching it already requires being the operator or root.
+  chmod 777 "${HARNESS_RUNTIME_DIR}/prompt-log"
   : "${COMPOSE_PROJECT_NAME:=kimi_code_${HARNESS_INSTANCE_ID}}"
   [[ "${COMPOSE_PROJECT_NAME}" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || harness_die "Invalid COMPOSE_PROJECT_NAME" || return
   export HARNESS_INSTANCE_ID HARNESS_RUNTIME_DIR HARNESS_COMPOSE_DIR

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """The modal engine that drives ``./start.sh``'s interactive section.
 
-Six groups, ordered the way the engine is layered: capabilities (what the terminal may be given),
+Groups, ordered the way the engine is layered: the package's own surface (what a surface may reach
+for), capabilities (what the terminal may be given), measurement (how wide a string really is),
 decoding (what the terminal sent), geometry (what fits where), the generated footer (what the user
-is told), flow state (what has been answered), and finally one run through a real pty. The first
-five groups are pure and fast; the last is slow, and is the only one that proves the sequences
-actually reach a terminal and that the terminal comes back undamaged.
+is told), flow state (what has been answered), then the three step shapes run against a scripted
+terminal, and finally one run through a real pty. Everything before the pty group is pure and fast;
+the pty group is slow, and is the only one that proves the sequences actually reach a terminal and
+that the terminal comes back undamaged.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -29,8 +32,10 @@ for _directory in (ROOT, ROOT / "tools"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
+import tools.tui as tui  # noqa: E402
 from tests.helpers import run_in_pty  # noqa: E402
 from tools.tui import flow  # noqa: E402
+from tools.tui import screen as launch_screen  # noqa: E402
 from tools.tui.app import (  # noqa: E402
     ACCEPT,
     FOCUS_UP,
@@ -47,7 +52,7 @@ from tools.tui.app import (  # noqa: E402
 )
 from tools.tui.caps import ANSI256, NONE, TRUECOLOR, Caps, char_width, detect, width  # noqa: E402
 from tools.tui.cells import ALT_OFF, ALT_ON  # noqa: E402
-from tools.tui.forest import CHECK, PLAIN, WORD, ForestStep, Node  # noqa: E402
+from tools.tui.forest import CHECK, FIXED, PLAIN, ForestStep, Node  # noqa: E402
 from tools.tui.input import CARET, DELETE, FIELD, FieldState, FieldStep  # noqa: E402
 from tools.tui.keys import Decoder, Key, bind, display, legend_lines, lookup  # noqa: E402
 from tools.tui.layout import (  # noqa: E402
@@ -58,6 +63,7 @@ from tools.tui.layout import (  # noqa: E402
     Line,
     Row,
     Segment,
+    edge,
     focusable_rows,
     layout,
     page,
@@ -183,6 +189,20 @@ class Picker(Step):
 
     def commit(self, state):
         return Result(value=list(state.chosen), summary=", ".join(state.chosen))
+
+
+class Package(unittest.TestCase):
+    """What ``import tui`` promises its surfaces.
+
+    A launcher step reaches for names through the package rather than through submodules, so the
+    re-export list is an interface: a name that is advertised but never bound breaks the one
+    statement every surface starts from, and it breaks it silently, because merely importing the
+    package never reads ``__all__``.
+    """
+
+    def test_every_advertised_name_is_bound(self):
+        missing = [name for name in tui.__all__ if not hasattr(tui, name)]
+        self.assertEqual([], missing)
 
 
 class Environment(unittest.TestCase):
@@ -459,12 +479,25 @@ class Geometry(unittest.TestCase):
         self.assertEqual(thumb(visible_window(6, 8, 0), 6, 8), (0, 8))
         self.assertEqual(thumb(visible_window(0, 8, 0), 0, 8), (0, 0))
 
-    def test_a_page_leaves_a_row_of_context_behind(self):
-        self.assertEqual(page(30, 8, 1, 0), 7)
-        self.assertEqual(page(30, 8, 1, 7), 14)
-        self.assertEqual(page(30, 8, -1, 3), 0)
-        self.assertEqual(page(30, 8, 1, 29), 29)
-        self.assertEqual(page(0, 8, 1, 0), 0)
+    def test_a_page_moves_the_window_and_leaves_a_row_of_context_behind(self):
+        self.assertEqual(page(30, 8, 0, 1), 7)
+        self.assertEqual(page(30, 8, 7, 1), 14)
+        self.assertEqual(page(30, 8, 3, -1), 0)
+        # Paging stops at the last whole page rather than bottom-aligning a short tail.
+        self.assertEqual(page(30, 8, 20, 1), 22)
+        self.assertEqual(page(0, 8, 0, 1), 0)
+        self.assertEqual(page(6, 8, 0, 1), 0)
+
+    def test_the_cursor_lands_on_the_nearest_selectable_row_of_a_new_page(self):
+        # Rows 4 and 5 are prose; the window slid to 8..16, so the cursor goes to the first thing in
+        # it it may rest on, and not to 4, which is off the top.
+        order = [0, 1, 2, 3, 6, 9]
+        self.assertEqual(edge(order, 8, 16, 1), 5)
+        self.assertEqual(edge(order, 8, 16, -1), 5)
+        self.assertEqual(edge(order, 0, 4, 1), 0)
+        # A window of pure prose takes the cursor nowhere, and says so.
+        self.assertIsNone(edge(order, 4, 6, 1))
+        self.assertIsNone(edge([], 0, 8, 1))
 
     def test_the_window_counts_what_it_hides_on_each_side(self):
         window = visible_window(30, 8, 10)
@@ -797,6 +830,53 @@ class FlowState(unittest.TestCase):
         state.report("modules", 3)
         self.assertEqual(state.rail("modules"), (2, 5))
 
+    def test_a_surveyed_step_with_no_screen_never_reaches_the_rail(self):
+        # The rail's total is the one figure on the screen the user cannot recompute, so a launch
+        # that turns out to have one question cannot announce eight. A forecast taken before the
+        # first screen is drawn is what lets that launch say "1 of 1", and a step answered at zero
+        # is not on it at all.
+        state = self.flow()
+        state.survey({"models": 0, "modules": 1, "context": 0})
+        self.assertEqual(state.visible(), ("modules",))
+        self.assertEqual(state.rail("modules"), (1, 1))
+
+    def test_a_forecast_survives_the_process_boundary(self):
+        # The survey is one process and every step is another, so the guess has to be readable
+        # from the screen it is there to number.
+        self.flow().survey({"models": 0})
+        self.assertEqual(self.flow().rail("context"), (2, 2))
+
+    def test_a_step_counts_itself_once_it_has_reached_the_screen(self):
+        # A forecast is a guess about a step the user has not met and a fact about one they have.
+        # The step's own number wins from then on, and the rest of the guesswork stays in charge of
+        # every screen still to come.
+        state = self.flow()
+        state.survey({"models": 1, "modules": 1, "context": 1})
+        state.declare("modules", 3)
+        self.assertEqual(state.rail("modules", 0), (2, 5))
+        self.assertEqual(state.rail("modules", 2), (4, 5))
+        self.assertEqual(state.screens_for("context"), 1)
+
+    def test_a_forecast_cannot_undo_a_count_a_step_already_gave(self):
+        # The launcher takes its survey once, before the pass. Steps that rendered on an earlier
+        # pass of the same launch have counted themselves already and have no reason to be second-
+        # guessed by a forecast that could not see them.
+        state = self.flow()
+        state.declare("modules", 2)
+        state.survey({"modules": 0})
+        self.assertEqual(state.screens_for("modules"), 2)
+        self.assertIn("modules", state.visible())
+
+    def test_a_step_forecast_at_zero_still_gets_its_screen_if_it_finds_one(self):
+        # Zero is the launcher's guess and never the step's answer. A step that reaches a screen
+        # after being forecast out of one has to be able to rejoin the sequence, or a wrong guess
+        # would silently swallow a prompt the user needed.
+        state = self.flow()
+        state.survey({"modules": 0})
+        self.assertEqual(state.rail("context"), (2, 2))
+        self.assertTrue(state.plan("modules", 1))
+        self.assertEqual(state.rail("modules"), (2, 3))
+
     def test_the_shell_asks_for_the_same_numbers_the_python_does(self):
         argv = ["--runtime-dir", str(self.dir), "--steps", "models,modules"]
 
@@ -812,6 +892,29 @@ class FlowState(unittest.TestCase):
         self.assertEqual(call("skip", "models")[0], 0)
         self.assertEqual(call("rail", "modules"), (0, "1 3\n"))
         self.assertEqual(call("status", "models"), (0, "new\n"))
+
+    def test_the_launcher_hands_its_forecast_over_in_one_line(self):
+        argv = ["--runtime-dir", str(self.dir), "--steps", "models,modules,context"]
+
+        def call(*rest):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                status = flow.main([*argv, *rest])
+            return status, buffer.getvalue()
+
+        self.assertEqual(call("survey", "--counts", "models=0,notacount,context=2")[0], 0)
+        self.assertEqual(call("rail", "modules"), (0, "1 3\n"))
+        self.assertEqual(call("rail", "context"), (0, "2 3\n"))
+
+    def test_a_count_nobody_can_read_is_dropped_rather_than_guessed(self):
+        # A launch must not fail because a progress bar was guessed at, so an unparseable pair is
+        # no answer rather than a zero one - while zero, which is the answer the launcher most
+        # wants, stays perfectly legal to pass.
+        self.assertEqual(
+            flow.parse_counts("models=1,modules=,junk,context=-3"),
+            {"models": 1, "context": 0},
+        )
+        self.assertEqual(flow.parse_counts(""), {})
 
 
 class _Script(_Idle):
@@ -829,6 +932,21 @@ class _Script(_Idle):
         if not self.pending:
             raise AssertionError("the step is still open after its keys ran out")
         return [self.pending.pop(0)]
+
+
+class _Tail(Picker):
+    """A short list whose prose continues below the last row the cursor can rest on.
+
+    The step exists to pin the one bug it is easiest to ship: when the viewport is *derived* from
+    the cursor each paint, content that no row can focus is content nobody can ever bring on screen,
+    however loudly the overflow line says it is down there.
+    """
+
+    def rows(self, state):
+        out = super().rows(state)
+        out.append(Row.gap())
+        out.extend(Row.heading(Line(Segment(f"note {index}"))) for index in range(20))
+        return out
 
 
 class ModalTests(unittest.TestCase):
@@ -933,6 +1051,51 @@ class ModalTests(unittest.TestCase):
         other = self.modal(view=View())
         self.assertIsNone(other.handle(Key("Backspace")))
         self.assertIn("does nothing here", self.shown(other))
+
+    def test_a_body_the_cursor_cannot_cross_still_scrolls_to_its_last_row(self):
+        # The overflow line promises the tail exists; the viewport owes the user a way to reach it.
+        modal = self.modal(_Tail(items=("alpha", "beta")))
+        opening = self.shown(modal)
+        self.assertIn("more below", opening)
+        self.assertNotIn("note 19", opening)
+        modal.handle(Key("End"))
+        bottom = self.shown(modal)
+        self.assertIn("note 19", bottom)
+        # ...and the count goes away once there is nothing left to count.
+        self.assertNotIn("more below", bottom)
+        # The cursor came with the window rather than being stranded off the top of it.
+        self.assertIn("▌", bottom)
+        modal.handle(Key("Home"))
+        self.assertIn("▌ [ ] alpha", self.shown(modal))
+
+    def test_page_down_walks_the_whole_body_row_by_visible_row(self):
+        modal = self.modal(_Tail(items=("alpha", "beta")))
+        seen: set[int] = set()
+        for _ in range(12):
+            for line in self.shown(modal).splitlines():
+                words = line.split()
+                if len(words) >= 2 and words[0] == "note" and words[1].isdigit():
+                    seen.add(int(words[1]))
+            modal.handle(Key("PgDn"))
+        self.assertIn(19, seen, "the last row never came on screen")
+        self.assertEqual(seen, set(range(20)), "a row was skipped over by the page")
+
+    def test_down_at_the_last_row_moves_the_content_instead_of_going_inert(self):
+        modal = self.modal(_Tail(items=("alpha", "beta")))
+        self.shown(modal)
+        modal.handle(Key("Down"))
+        modal.handle(Key("Down"))
+        # The cursor is now on the last selectable row and cannot go further, but the key still has
+        # an answer: the content slides one row, and the cursor stays on screen while it does.
+        first = modal.session.scroll
+        modal.handle(Key("Down"))
+        self.assertGreater(modal.session.scroll, first)
+        self.assertIn("▌ [ ] beta", self.shown(modal))
+        # Up does the same thing from the other end.
+        modal.handle(Key("Up"))
+        modal.handle(Key("Up"))
+        modal.handle(Key("Up"))
+        self.assertIn("▌ [ ] alpha", self.shown(modal))
 
     def test_the_help_overlay_answers_only_itself(self):
         modal = self.modal(Picker(items=tuple(f"item{i}" for i in range(40))))
@@ -1850,11 +2013,310 @@ sys.exit(result.status)
         self.assertTrue(session.restored)
 
 
+class SpooledSentences(unittest.TestCase):
+    """``screen.note``, which is how a step says something while the launcher has the window.
+
+    A plain ``print`` under a held screen scrolls the questions away and the next frame paints over
+    only part of it, so every sentence the launcher owes the operator between two screens waits in
+    ``screen.NOTES`` instead. Waiting is the whole risk: a spool that silently swallowed a warning,
+    or truncated the line before it, would be a worse bug than the overlap it prevents, so each
+    case here is about the sentence arriving exactly once, somewhere.
+    """
+
+    #: The two variables the surface reads, cleared so that a developer's own launch cannot leak
+    #: a held screen or a runtime directory into the suite.
+    _ENV = (launch_screen.HELD, "HARNESS_RUNTIME_DIR")
+
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.runtime = Path(holder.name)
+
+    def say(self, *lines, held=False, runtime=None):
+        """Say ``lines`` in a controlled environment and return what reached stdout."""
+        saved = {name: os.environ.get(name) for name in self._ENV}
+        self.addCleanup(lambda: self._restore(saved))
+        for name in self._ENV:
+            os.environ.pop(name, None)
+        if held:
+            os.environ[launch_screen.HELD] = launch_screen.HELD_VALUE
+        if runtime is not None:
+            os.environ["HARNESS_RUNTIME_DIR"] = str(runtime)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            launch_screen.note(*lines)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _restore(saved):
+        for name, value in saved.items():
+            os.environ.pop(name, None)
+            if value is not None:
+                os.environ[name] = value
+
+    def spooled(self):
+        path = self.runtime / launch_screen.NOTES
+        return path.read_text(encoding="utf-8") if path.exists() else None
+
+    def test_a_sentence_said_under_a_held_screen_waits_for_the_window(self):
+        # The point of the spool: nothing reaches the terminal while the modal owns it.
+        self.assertEqual(self.say("resolved", "plan", held=True, runtime=self.runtime), "")
+        self.assertEqual(self.spooled(), "resolved\nplan\n")
+
+    def test_a_sentence_said_with_an_ordinary_screen_prints_straight_out(self):
+        # A launcher that could not borrow the screen leaves every step to print as it always
+        # did, so the spool must not become a requirement for the sentence to be said at all.
+        self.assertEqual(self.say("resolved", held=False, runtime=self.runtime), "resolved\n")
+        self.assertIsNone(self.spooled())
+
+    def test_a_sentence_said_with_nowhere_to_wait_prints(self):
+        # Held with no runtime directory is a launcher that set one variable and not the other.
+        # Falling through to stdout is the only answer that does not lose the line.
+        self.assertEqual(self.say("resolved", held=True), "resolved\n")
+
+    def test_a_spool_that_cannot_be_written_does_not_swallow_the_sentence(self):
+        missing = self.runtime / "not-a-directory"
+        missing.write_text("a file is not a directory", encoding="utf-8")
+        self.assertEqual(
+            self.say("resolved", held=True, runtime=missing / "deeper"),
+            "resolved\n",
+        )
+
+    def test_each_sentence_appends_rather_than_replacing_the_last(self):
+        # The pass says several things between screens, and a recap that kept only the last one
+        # would be a subtler way of losing a warning than printing it over the questions.
+        self.say("first", held=True, runtime=self.runtime)
+        self.say("second", held=True, runtime=self.runtime)
+        self.assertEqual(self.spooled(), "first\nsecond\n")
+
+    def test_the_spool_is_the_file_the_launcher_promises_to_read(self):
+        # Two languages name this path and neither can import the other, so the constant is the
+        # single statement of it and the launcher's own declaration has to match, name and all --
+        # including the copy in the list of session material deleted on exit.
+        launcher = (ROOT / "start.sh").read_text()
+        self.assertIn(
+            f"flow_notes=${{HARNESS_RUNTIME_DIR}}/{launch_screen.NOTES}",
+            launcher,
+            "start.sh no longer spools where screen.NOTES points",
+        )
+        deleted = launcher[
+            launcher.index("  for file in proxy-token") : launcher.index("harness_unlock")
+        ]
+        self.assertIn(launch_screen.NOTES, deleted, "the spool outlives the session")
+
+
+class PtyHeldScreen(unittest.TestCase):
+    """The modal stays put across the boundary between two steps.
+
+    Each step is its own process, which is what lets Backspace walk backwards, and it is also what
+    used to break the screen: a process that borrows the alternate screen necessarily returns it on
+    the way out, so the terminal dropped to the launcher's printout between every pair of questions.
+    The user read that as a crash. The fix moves the borrow out to the launcher and puts the steps
+    in held mode, and the only honest proof is a byte count on a real terminal — the *number* of
+    times the alternate screen is released across a run of several steps is the defect.
+    """
+
+    #: Two steps back to back in one interpreter, which is the byte-level contract the launcher's
+    #: loop produces: each call to ``run()`` enters and leaves a Terminal, so this is exactly the
+    #: sequence that used to drop to the printout between questions. Chaining two *processes*
+    #: instead would race on when the second one receives the keypress, and a test that measures
+    #: keystroke timing cannot assert on escape-sequence counts.
+    SCRIPT = """
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.environ["HARNESS_ROOT"], "tools"))
+
+from tui import screen
+from tui.app import run as run_step
+
+count = int(sys.argv[1]) if len(sys.argv) > 1 else 2
+for index in range(count):
+    run_step(__import__("surface_two").Picker(("alpha", "beta", "gamma")))
+    if len(sys.argv) > 2:
+        # The launcher says one of these between every pair of screens.
+        screen.note(f"{sys.argv[2]} {index}")
+"""
+
+    #: The step the driver above runs, in its own module so the driver stays short.
+    PICKER = """
+from tui.app import Result, Step
+from tui.layout import Line, Row, Segment
+
+
+class Picker(Step):
+    title = "Pick"
+
+    def __init__(self, items):
+        self.items = items
+
+    def initial(self):
+        return (0, ())
+
+    def rows(self, state):
+        _, chosen = state
+        out = []
+        for name in self.items:
+            mark = "x" if name in chosen else " "
+            out.append(Row.item(Line(Segment(f"[{mark}] {name}")), name))
+        return out
+
+    def focus(self, state):
+        return state[0]
+
+    def with_focus(self, state, index):
+        return (index, state[1])
+
+    def toggled(self, state, target):
+        chosen = set(state[1])
+        chosen ^= {target}
+        return (state[0], tuple(sorted(chosen)))
+
+    def commit(self, state):
+        return Result(value=list(state[1]))
+"""
+
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.runtime = Path(holder.name)
+        (self.runtime / "surface_two.py").write_text(self.PICKER, encoding="utf-8")
+        script = self.runtime / "driver.py"
+        script.write_text(self.SCRIPT, encoding="utf-8")
+        self.script = script
+        self.env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in ("COLUMNS", "LINES", "NO_COLOR", "TERM", "HARNESS_TUI_SCREEN")
+        }
+        self.env["HARNESS_ROOT"] = str(ROOT)
+        # The driver imports its step from alongside itself, as any launched surface would.
+        self.env["PYTHONPATH"] = str(self.runtime)
+
+    def session(self, steps: int, *, held: bool, note: str = "", read_back: bool = False):
+        """Run ``steps`` surfaces inside one launcher-shaped terminal session.
+
+        ``note`` has every surface say a sentence between its screens, which is what the launcher's
+        own printout between two steps does, and ``read_back`` then replays the spool the way
+        ``start.sh``'s ``harness_flow_unhold`` does. Both together reproduce the byte order of a
+        real launch, and that order is the thing under test: a sentence painted into the modal is
+        defect 2 with different words.
+        """
+        borrow = f"{sys.executable} {ROOT / 'tools/tui/screen.py'}"
+        body = f"{sys.executable} {self.script} {steps}"
+        if note:
+            body += f" {note}"
+        if held:
+            program = (
+                f"{borrow} --runtime-dir {self.runtime} enter"
+                f" && export HARNESS_TUI_SCREEN=held HARNESS_RUNTIME_DIR={self.runtime}"
+                f" && {body};"
+                f" {borrow} --runtime-dir {self.runtime} leave"
+            )
+            if read_back:
+                program += f"; cat {self.runtime / launch_screen.NOTES}"
+        else:
+            program = body
+        return run_in_pty(
+            ["bash", "-c", program],
+            # One Enter per surface, chunked so every step gets its own frame rather than having
+            # the whole answer consumed by the first one to poll.
+            keys=[b"\r"] * steps,
+            expect=b"alpha",
+            env=self.env,
+            cwd=ROOT,
+        )
+
+    def test_a_held_run_borrows_the_screen_once_for_the_whole_sequence(self):
+        session = self.session(3, held=True)
+        self.assertEqual(session.output.count(b"\x1b[?1049l"), 1, "the modal was left mid-run")
+        self.assertEqual(session.output.count(b"\x1b[?1049h"), 1, "the modal was entered twice")
+        self.assertTrue(session.restored)
+
+    def test_an_unheld_run_still_borrows_and_returns_per_step(self):
+        # Held mode must not become the only mode: a launcher that could not take the screen leaves
+        # every step to manage its own, exactly as it did before, and this is what that looks like.
+        session = self.session(2, held=False)
+        self.assertEqual(session.output.count(b"\x1b[?1049h"), 2)
+        self.assertEqual(session.output.count(b"\x1b[?1049l"), 2)
+        self.assertTrue(session.restored)
+
+    def test_a_held_step_clears_before_it_paints(self):
+        # The previous process left its frame on the glass and the new one diffs against a buffer
+        # it believes is empty, so without a clear the two steps' content shows through each other.
+        session = self.session(2, held=True)
+        # One clear per step, plus the launcher's own on entry.
+        self.assertGreaterEqual(session.output.count(b"\x1b[2J"), 2)
+
+    def test_a_sentence_said_under_the_modal_arrives_after_it(self):
+        # The second half of the flicker defect. Holding the screen kept the questions up, which
+        # left the launcher's own printout with nowhere to go but *through* them: the operator
+        # answered a screen with the previous step's summary painted across it. So the words wait
+        # in the spool and are read out once the window is ordinary scrollback again, and the byte
+        # order here is that promise -- the sentence must land after ALT_OFF, and once only.
+        session = self.session(2, held=True, note="policy", read_back=True)
+        left = session.output.index(b"\x1b[?1049l")
+        self.assertNotIn(b"policy", session.output[:left], "printed into the modal")
+        self.assertEqual(
+            session.output.count(b"policy"), 2, "one sentence per step, said once each"
+        )
+        self.assertIn(b"policy 0", session.output[left:])
+        self.assertIn(b"policy 1", session.output[left:])
+        self.assertTrue(session.restored)
+
+    def test_a_spooled_sentence_still_arrives_when_nobody_reads_it_back(self):
+        # The spool is not a promise that the launcher shows up: a step that dies before the leave
+        # must not have taken its warning with it, which is why the trap reads the file too. Here
+        # the driver leaves nothing behind on the terminal, so the file is the surviving evidence.
+        session = self.session(1, held=True, note="policy")
+        self.assertIn(b"policy 0", (self.runtime / launch_screen.NOTES).read_bytes())
+        self.assertNotIn(b"policy 0", session.output)
+        self.assertTrue(session.restored)
+
+    def test_leaving_twice_hands_the_screen_back_once(self):
+        # The launcher's own leave and its EXIT trap are the same call, and a trap that re-emitted
+        # the release would scroll the user's real terminal a second time after the run.
+        screen = f"{sys.executable} {ROOT / 'tools/tui/screen.py'}"
+        session = run_in_pty(
+            [
+                "bash",
+                "-c",
+                f"{screen} --runtime-dir {self.runtime} enter;"
+                f" {screen} --runtime-dir {self.runtime} leave;"
+                f" {screen} --runtime-dir {self.runtime} leave",
+            ],
+            env=self.env,
+            cwd=ROOT,
+        )
+        self.assertEqual(session.output.count(b"\x1b[?1049l"), 1)
+
+    def test_a_piped_launcher_borrows_nothing(self):
+        # Redirected output is the launcher's log, and control codes written into it are damage
+        # that outlives the run. This is the check behind start.sh's `|| true` on enter.
+        result = subprocess.run(
+            [
+                sys.executable,
+                f"{ROOT}/tools/tui/screen.py",
+                "--runtime-dir",
+                str(self.runtime),
+                "enter",
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            cwd=ROOT,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("\x1b", result.stdout)
+
+
 #: The diagram's own column arithmetic, spelled out as numbers rather than as the surface's
 #: constants: a test that imports MARK_WIDTH moves its expectation whenever the surface moves, and
 #: the whole point of the label edge is that it does not move.
 _MARK = 4
 _RAIL = 3
+_GUIDE = 2
 
 
 def _tree() -> tuple:
@@ -1868,20 +2330,28 @@ def _tree() -> tuple:
         Node(
             "sys",
             "SYSTEM.md",
-            states=("auto", "on", "off"),
-            kind=WORD,
+            states=("auto", "off"),
+            kind=CHECK,
             default="auto",
             value="4,000",
             pct="2%",
+            detail="what Kimi is told before the first message",
             children=(
-                Node("sys.op", "operator file", badge="in use"),
-                Node("sys.old", "staged tier", enabled=False, badge="unused"),
+                Node(
+                    "sys.op",
+                    "operator file",
+                    kind=FIXED,
+                    detail="staged from the repository, so the built-in prompt is not used",
+                    children=(Node("sys.line", "included text", kind=FIXED),),
+                ),
+                Node("sys.old", "staged tier", kind=FIXED, enabled=False),
                 Node(
                     "sys.base",
                     "built-in prompt",
+                    kind=PLAIN,
                     branch=True,
                     link=True,
-                    note="reaches the main agent and every subagent",
+                    detail="reaches the main agent and every subagent",
                 ),
             ),
         ),
@@ -1943,31 +2413,111 @@ class ForestTests(unittest.TestCase):
         self.assertIs(step.toggled(state, "no-such-row"), state)
 
     def test_a_switch_with_no_honest_mark_is_refused_while_the_tree_is_built(self):
-        # A checkbox means two states and a spelled word means as many as there are. Inventing a
-        # third mark, or leaving a switch unmarked, is the undocumented signal this redesign exists
-        # to remove — so it is a construction error rather than a screen nobody can read.
+        # A checkbox means exactly two states and a hollow delimiter means nobody's to move.
+        # Inventing a third mark, or leaving a switch unmarked, is the undocumented signal this
+        # redesign exists to remove — so it is a construction error rather than a screen nobody
+        # can read.
         with self.assertRaises(ValueError):
             Node("bad", "a switch with no mark", states=("on", "off"), kind=PLAIN)
         with self.assertRaises(ValueError):
             Node("bad", "a box with three states", states=("a", "b", "c"), kind=CHECK)
         with self.assertRaises(ValueError):
-            Node("bad", "a word column with nothing to spell", kind=WORD)
+            Node("bad", "a fact with a switch on it", states=("a", "b"), kind=FIXED)
+
+    def test_the_mark_vocabulary_says_the_value_and_the_changeability_at_once(self):
+        # One column, two axes: the character inside says the value and the characters around it
+        # say whether a key can move it. Nothing else may appear here, and no row may be the only
+        # place a mark is spelled — a reader learns the grammar once or not at all.
+        step = self.step(
+            nodes=(
+                Node("a", "a switch that is on", states=("on", "off"), kind=CHECK, default="on"),
+                Node("b", "a switch that is off", states=("on", "off"), kind=CHECK, default="off"),
+                Node(
+                    "c",
+                    "a switch nothing can switch",
+                    states=("on", "off"),
+                    kind=CHECK,
+                    enabled=False,
+                ),
+                Node("d", "a file that holds", kind=FIXED),
+                Node("e", "a file that is superseded", kind=FIXED, enabled=False),
+                Node("f", "A HEADING"),
+            )
+        )
+        self.assertEqual(
+            [row.line.text()[:3] for row in step.rows(step.initial()) if row.line.text().strip()],
+            ["[x]", "[ ]", "[-]", "-x-", "- -", "   "],
+        )
 
     # -- geometry ---------------------------------------------------------------------------
 
     def test_every_section_shares_one_label_edge_and_each_level_steps_right(self):
         lines = self.text(self.step())
         heading = next(line for line in lines if "STATIC CONTEXT" in line)
-        word = next(line for line in lines if line.strip().startswith("SYSTEM.md"))
-        box = next(line for line in lines if "usage limits" in line)
+        box = next(line for line in lines if "SYSTEM.md" in line)
+        tail = next(line for line in lines if "usage limits" in line)
         child = next(line for line in lines if "operator file" in line)
-        note = next(line for line in lines if "every subagent" in line)
+        joint = next(line for line in lines if "built-in prompt" in line)
+        grandchild = next(line for line in lines if "included text" in line)
+        # A heading, a switch and a fixed source in one tree all start their label here: the mark
+        # column is bought by the tree, not row by row.
         self.assertEqual(heading.index("STATIC"), _MARK)
-        self.assertEqual(word.index("SYSTEM.md"), _MARK)
-        self.assertEqual(box.index("usage limits"), _MARK)
+        self.assertEqual(box.index("SYSTEM.md"), _MARK)
+        self.assertEqual(tail.index("usage limits"), _MARK)
         self.assertEqual(child.index("operator file"), _RAIL + _MARK)
-        # A note belongs to its row's text, not to its row's columns.
-        self.assertEqual(note.index("reaches"), 2 * _MARK + _RAIL)
+        self.assertEqual(joint.index("built-in prompt"), _RAIL + _MARK)
+        # The third level steps right again, and the rail of the level above it keeps running
+        # through the blank column a branch leaves.
+        self.assertEqual(grandchild.index("included text"), 2 * _RAIL + _MARK)
+
+    def test_a_section_is_separated_from_the_one_above_it_by_a_blank_row(self):
+        # Sections drawn in one grammar read as one long list, and a glyph in the mark column would
+        # be a fifth spelling in a vocabulary whose whole job is saying "this is a switch". The
+        # separator is therefore the row itself: nothing above the first root, and a blank between
+        # every pair that follows.
+        rows = self.step().rows(self.step().initial())
+        edges = [
+            index
+            for index, row in enumerate(rows)
+            if any(word in row.line.text() for word in ("STATIC CONTEXT", "SYSTEM.md", "usage"))
+        ]
+        self.assertEqual(len(edges), 3)
+        self.assertEqual(edges[0], 0)
+        for index in edges[1:]:
+            self.assertEqual(rows[index - 1].line.text(), "")
+
+    def test_a_root_is_weighted_and_a_row_inside_it_is_not(self):
+        # The blank row says where a section begins; the weight says which row owns it. Both are
+        # readable without colour, which is why the root also keeps its own column rather than a
+        # marker that would have to compete with the four marks the switch vocabulary already has.
+        colour = Caps(color=ANSI256, columns=80, rows=24, probe=False)
+        rows = self.step(caps=colour).rows(self.step(caps=colour).initial())
+
+        def tone(needle: str) -> str:
+            line = next(row.line for row in rows if needle in row.line.text())
+            return next(part.attr for part in line.segments if needle in part.text)
+
+        title = colour.color_pair("title")
+        self.assertEqual(tone("usage limits"), title)
+        self.assertEqual(tone("STATIC CONTEXT"), title)
+        self.assertEqual(tone("operator file"), "")
+
+    def test_a_root_that_fans_out_buys_its_marker_column_for_the_whole_tree(self):
+        # Two roots starting at different columns read as two unrelated lists rather than as one
+        # map with a branch in it, so the marker is reserved on every row whether a row uses it or
+        # not. This is the only arrangement that leaves the label edge still standing.
+        step = self.step(
+            nodes=(
+                Node("base", "shared source", kind=FIXED, branch=True),
+                Node("one", "first block", states=("on", "off"), kind=CHECK),
+            )
+        )
+        lines = self.text(step)
+        branching = next(line for line in lines if "shared source" in line)
+        checkable = next(line for line in lines if "first block" in line)
+        self.assertIn("▶", branching)
+        self.assertEqual(branching.index("shared source"), _GUIDE + _MARK)
+        self.assertEqual(checkable.index("first block"), _GUIDE + _MARK)
 
     def test_a_source_feeding_two_parents_opens_its_joint_in_either_glyph_register(self):
         unicode = self.step()
@@ -1982,8 +2532,8 @@ class ForestTests(unittest.TestCase):
         self.assertEqual(unicode.cells(heavy), ascii.cells(plain))
 
     def test_no_row_costs_more_columns_than_the_window_has(self):
-        # The regression this pins: a badge and a note are both content, and each one, measured
-        # wrongly, pushed a row past the frame edge at some width.
+        # The regression this pins: a figure, a percentage and a wrapped heading are all content,
+        # and each one, measured wrongly, pushed a row past the frame edge at some width.
         for columns in range(8, 200):
             step = self.step(
                 caps=self.sized(columns),
@@ -1992,7 +2542,7 @@ class ForestTests(unittest.TestCase):
             for line in self.text(step):
                 self.assertLessEqual(step.cells(line), step.room, f"{columns}: {line!r}")
 
-    def test_a_word_longer_than_its_column_is_cut_rather_than_run_over(self):
+    def test_a_prose_row_that_overflows_wraps_rather_than_running_past_the_edge(self):
         step = self.step(
             nodes=(
                 Node(
@@ -2000,43 +2550,67 @@ class ForestTests(unittest.TestCase):
                     "LABEL",
                     states=("on", "off"),
                     kind=CHECK,
-                    note="supercalifragilisticexpialidocious-then-some trailing words",
+                    detail="supercalifragilisticexpialidocious-then-some trailing words",
                 ),
             ),
             caps=self.sized(20),
         )
         lines = self.text(step)
         self.assertTrue(all(step.cells(line) <= step.room for line in lines), lines)
+        # The sentence is what the pane is for; the tree's job is only never to overrun.
         self.assertNotIn("supercalifragilistic", "\n".join(lines))
+        state = step.with_focus(step.initial(), 0)
+        pane = [line.text() for line in step.detail(state)]
+        self.assertTrue(pane, "the row's own prose went nowhere at all")
+        self.assertTrue(all(step.cells(line) <= step.detail_room for line in pane), pane)
+        # A word longer than the column is cut rather than given a column of its own, so the whole
+        # of a sentence is what the overlay prints from ``detail_source``, not the pane.
+        self.assertEqual(
+            step.detail_source(state),
+            ("supercalifragilisticexpialidocious-then-some trailing words",),
+        )
 
-    def test_a_note_with_no_room_left_beside_its_indent_falls_to_column_zero(self):
-        step = self.step(caps=self.sized(20))
-        lines = self.text(step)
-        note = [line for line in lines if "reaches" in line or "main" in line]
-        self.assertTrue(note)
-        for line in note:
-            self.assertLessEqual(step.cells(line), step.room)
-        # Either every note line carries the indent or none does — a sentence half-indented is a
-        # sentence that looks like two.
-        self.assertEqual(len({line[: 2 * _MARK + _RAIL].strip() == "" for line in note}), 1)
+    def test_the_pane_holds_the_sentence_the_tree_refused_to_stack(self):
+        # Every row's prose is reachable from the row and nowhere else, which is what lets the map
+        # stay a map. A row with nothing to add says nothing, rather than repeating its own name.
+        step = self.step()
+        self.assertNotIn("what Kimi is told", "\n".join(self.text(step)))
+        on_block = step.with_focus(step.initial(), 0)
+        self.assertEqual(
+            [line.text() for line in step.detail(on_block)],
+            ["what Kimi is told before the first message"],
+        )
+        # The unwrapped sentence travels with it, because the overlay re-breaks it across its own
+        # width — a reader who went looking for the whole of a description should not get the
+        # pane's line endings with it.
+        self.assertEqual(
+            step.detail_source(on_block),
+            ("what Kimi is told before the first message",),
+        )
+        on_limits = step.with_focus(step.initial(), 1)
+        self.assertEqual(step.detail(on_limits), [])
+        self.assertEqual(step.detail_source(on_limits), ())
 
-    def test_the_tail_gives_up_the_percentage_then_the_figure_then_the_word(self):
+    def test_the_tail_gives_up_the_percentage_then_the_figure(self):
+        # Two columns of figures, and the rightmost is the one that says the least per cell. The
+        # breakpoints are the surface's own arithmetic: MIN_LABEL is what the label gets to keep.
         def tail(columns):
             step = self.step(caps=self.sized(columns))
             return step.fit_tail(step.tail_widths())
 
-        self.assertEqual(tail(47), (4, 5, 2))
-        self.assertEqual(tail(45), (4, 5, 0))
-        self.assertEqual(tail(41), (4, 0, 0))
-        self.assertEqual(tail(34), (0, 0, 0))
+        self.assertEqual(tail(37), (5, 2))
+        self.assertEqual(tail(36), (5, 0))
+        self.assertEqual(tail(33), (5, 0))
+        self.assertEqual(tail(32), (0, 0))
 
-    def test_a_badge_gives_way_before_a_label_does(self):
-        wide = self.step()
+    def test_a_label_survives_every_tail_the_window_cannot_hold(self):
         narrow = self.step(caps=self.sized(30))
-        self.assertIn("unused", "\n".join(self.text(wide)))
-        self.assertNotIn("unused", "\n".join(self.text(narrow)))
+        lines = "\n".join(self.text(narrow))
+        self.assertNotIn("4,000", lines)
+        self.assertNotIn("2%", lines)
         # The name is the row's identity, so it is the last thing to go.
-        self.assertIn("staged tier", "\n".join(self.text(narrow)))
+        self.assertIn("staged tier", lines)
+        self.assertIn("usage limits", lines)
 
     def test_the_columns_hold_still_while_a_state_cycles(self):
         step = self.step()
@@ -2079,21 +2653,61 @@ class ForestTests(unittest.TestCase):
         for node_id, seen in places.items():
             self.assertEqual(len(seen), 1, f"{node_id} moved: {sorted(seen)}")
 
+    def test_a_page_past_the_last_switch_moves_the_window_and_keeps_an_answer(self):
+        # The invariant behind "12 more below" being reachable. A diagram's tail is often rows that
+        # describe an outcome rather than offer a switch -- the price block on the real context step
+        # is all of them -- so a window that could only ever follow the cursor would strand those
+        # rows out of view for good. Paging moves the window, and the cursor lands on the nearest
+        # row that can still answer, so Space keeps meaning what the footer says it means.
+        nodes = (
+            (Node("head", "SECTION"),)
+            + tuple(
+                Node(f"n{i}", f"switch {i}", states=("on", "off"), kind=CHECK, default="on")
+                for i in range(3)
+            )
+            + tuple(Node("", f"unreachable fact {i}", kind=PLAIN) for i in range(12))
+        )
+        step = self.step(nodes)
+        modal = self.modal(step, caps=self.sized(60))
+        self.assertNotIn("unreachable fact 11", self.shown(modal))
+        for _ in range(8):
+            modal.handle(Key("PgDn"))
+        self.assertIn("unreachable fact 11", self.shown(modal), "the tail stayed out of view")
+        # And the cursor is still somewhere a switch lives.
+        held = step.options()[step.focus(modal.session.state)]
+        self.assertTrue(held.states, "the cursor ended on a row that cannot answer")
+        modal.handle(Key("Space"))
+        self.assertEqual(modal.session.state.values[held.id], "off")
+
     # -- answering --------------------------------------------------------------------------
 
-    def test_a_three_state_row_spells_its_state_rather_than_inventing_a_mark(self):
-        line = next(text for text in self.text(self.step()) if "SYSTEM.md" in text)
-        self.assertIn("auto", line)
-        self.assertNotIn("[", line)
+    def test_a_switch_marks_its_first_state_whatever_that_state_is_called(self):
+        # The mark column says the value, not a vocabulary: ``auto`` is the box's checked position
+        # here exactly as ``on`` is on the add-on rows, and no row spends a column spelling either
+        # word. What the cursor is on and what it says are the status line's job, and the sentence
+        # explaining why belongs to the pane.
+        step = self.step()
+        line = next(text for text in self.text(step) if "SYSTEM.md" in text)
+        self.assertTrue(line.startswith("[x] SYSTEM.md"), line)
+        self.assertNotIn("auto", line)
+        self.assertNotIn("off", line)
+        self.assertIn("auto", step.status(step.initial()).text())
+        off = step.toggled(step.initial(), "sys")
+        held = next(text for text in self.text(step, off) if "SYSTEM.md" in text)
+        self.assertTrue(held.startswith("[ ] SYSTEM.md"), held)
+        self.assertIn("off", step.status(off).text())
 
     def test_space_cycles_a_state_and_wraps_at_the_end(self):
+        # Wrapping is the whole of a two-state row's usability: a switch that clamped at its last
+        # state could be moved once and never moved back. The names here are deliberately not
+        # ``on``/``off``, which is the other half of what the row has to get right.
         step = self.step()
         state = step.initial()
         seen = []
         for _ in range(4):
             state = step.toggled(state, "sys")
             seen.append(state.values["sys"])
-        self.assertEqual(seen, ["on", "off", "auto", "on"])
+        self.assertEqual(seen, ["off", "auto", "off", "auto"])
 
     def test_space_toggles_a_checkbox(self):
         step = self.step()
@@ -2105,21 +2719,23 @@ class ForestTests(unittest.TestCase):
         self.assertEqual([value for value, _ in seen], ["off", "on", "off"])
         self.assertEqual([row.line.text()[:3] for _, row in seen], ["[ ]", "[x]", "[ ]"])
 
-    def test_a_superseded_source_is_dimmed_and_labelled_rather_than_marked(self):
+    def test_a_superseded_source_is_hollow_and_dim_rather_than_explained_in_place(self):
         # Only a row that could have carried a switch carries a hollow one. A source has no switch
         # of its own — its answer belongs to the block above it — so drawing a box there would claim
-        # a control that no key can reach. Dim plus the word is the whole signal, and it survives
-        # ``NO_COLOR``, which is why the word is not merely a restatement of the grey.
+        # a control that no key can reach. ``- -`` is that statement, and unlike the grey it is
+        # still there under ``NO_COLOR`` and on a monochrome terminal, so the fact a row contributes
+        # nothing survives the colour going away. *Why* it contributes nothing is a sentence, and
+        # sentences live in the pane.
         colour = Caps(color=ANSI256, columns=80, rows=24, probe=False)
         step = self.step(caps=colour)
         row = next(r for r in step.rows(step.initial()) if "staged tier" in r.line.text())
-        self.assertIn("unused", row.line.text())
+        self.assertIn("- - staged tier", row.line.text())
         self.assertNotIn("]", row.line.text())
         self.assertEqual(row.attr, colour.color_pair("dim"))
         self.assertFalse(row.focusable)
         mono = self.step()
         plain = next(r for r in mono.rows(mono.initial()) if "staged tier" in r.line.text())
-        self.assertIn("unused", plain.line.text())
+        self.assertIn("- - staged tier", plain.line.text())
         self.assertNotIn("\x1b", plain.line.text())
 
     def test_a_switch_no_key_can_reach_is_hollow(self):
@@ -2130,8 +2746,10 @@ class ForestTests(unittest.TestCase):
             )
         )
         lines = self.text(step)
-        self.assertIn("[x] reachable", lines[0])
-        self.assertIn("[-] unreachable", lines[1])
+        reachable = next(line for line in lines if " reachable" in line)
+        unreachable = next(line for line in lines if "unreachable" in line)
+        self.assertIn("[x] reachable", reachable)
+        self.assertIn("[-] unreachable", unreachable)
         self.assertNotIn("off", [node.id for node in step.options()])
 
     def test_reset_restores_the_opening_answer_and_the_opening_cursor(self):
@@ -2220,20 +2838,21 @@ import sys
 sys.path.insert(0, os.path.join(os.environ["HARNESS_ROOT"], "tools"))
 
 from tui.app import View, run
-from tui.forest import CHECK, WORD, Node, ForestStep
+from tui.forest import CHECK, FIXED, PLAIN, Node, ForestStep
 
 deep = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 static = Node(
     "system",
     "SYSTEM.md",
-    states=("auto", "on", "off"),
-    kind=WORD,
+    states=("auto", "off"),
+    kind=CHECK,
     default="auto",
     value="4,000",
     pct="2%",
+    detail="what the main agent is told before the first message",
     children=(
-        Node("system.staged", "staged tier", enabled=False, badge="unused"),
-        Node("system.base", "built-in prompt", branch=True, link=True),
+        Node("system.staged", "staged tier", kind=FIXED, enabled=False),
+        Node("system.base", "built-in prompt", kind=PLAIN, branch=True, link=True),
     ),
 )
 rows = [Node("head", "STATIC CONTEXT"), static]
@@ -2246,6 +2865,17 @@ for index in range(deep):
             kind=CHECK,
             default="on" if index % 2 == 0 else "off",
             value="%d" % (100 * index),
+        )
+    )
+# The real context step ends with a price section whose rows describe an outcome rather than
+# offer a switch, so the last thing on the screen is not the last thing the cursor can hold.
+for index in range(int(sys.argv[2]) if len(sys.argv) > 2 else 0):
+    rows.append(
+        Node(
+            "",
+            "unreachable fact %d" % index,
+            kind=PLAIN,
+            value="%d" % (7 * index),
         )
     )
 result = run(
@@ -2269,9 +2899,9 @@ sys.exit(result.status)
         }
         self.env["HARNESS_ROOT"] = str(ROOT)
 
-    def run_forest(self, keys, *, deep=3, **kwargs):
+    def run_forest(self, keys, *, deep=3, tail=0, **kwargs):
         return run_in_pty(
-            [sys.executable, str(self.path), str(deep)],
+            [sys.executable, str(self.path), str(deep), str(tail)],
             keys=keys,
             env=self.env,
             cwd=ROOT,
@@ -2289,8 +2919,8 @@ sys.exit(result.status)
         self.assertEqual(answer["add-on-0"], "off")
         self.assertEqual(answer["add-on-1"], "off")
         self.assertIn("▌", session.screen)
-        # The superseded source reads as a word and in colour, and the fan-out joint renders.
-        self.assertIn("unused", session.screen)
+        # A superseded source reads as a hollow mark, and the fan-out joint renders.
+        self.assertIn("- -", session.screen)
         self.assertIn("▶", session.screen)
         self.assertIn("auto", session.screen)
         self.assertIn("<Enter> continue", session.screen)
@@ -2300,10 +2930,10 @@ sys.exit(result.status)
     def test_the_cursor_opens_on_the_first_switch_and_up_cannot_leave_it(self):
         session = self.run_forest(b"\x1b[A \r", expect=b"STATIC CONTEXT", rows=24, columns=80)
         answer = self.answer(session)
-        # Up at the top of the tree goes nowhere, and the row above the tri-state one is a heading
-        # and the one below it a source no key can reach, so the only thing Space could move here is
-        # the switch the cursor started on.
-        self.assertEqual(answer["system"], "on")
+        # Up at the top of the tree goes nowhere, and the row above the switch is a heading while
+        # the ones below it are sources no key can reach, so the only thing Space could move here
+        # is the switch the cursor started on, and the only state it can move to is the other one.
+        self.assertEqual(answer["system"], "off")
         self.assertTrue(session.restored)
 
     def test_backspace_asks_for_the_previous_step_from_inside_the_tree(self):
@@ -2322,6 +2952,45 @@ sys.exit(result.status)
         self.assertIn("more below", session.screen)
         self.assertIn("add-on-13", session.screen)
         self.assertEqual(self.answer(session)["add-on-13"], "on")
+        self.assertTrue(session.restored)
+
+    def test_page_down_reaches_rows_the_cursor_cannot_hold(self):
+        # The second half of the flicker defect's sibling complaint: on the real context step the
+        # price rows at the bottom of the diagram describe an outcome and take no input, so a
+        # viewport fitted around the *cursor* could never move past the last switch and the screen
+        # advertised a tail nobody could bring on view. Here the bytes are the question -- PgDn is
+        # CSI 6~, and only a real terminal driver says whether that reaches the window at all.
+        session = self.run_forest(
+            [b"\x1b[6~"] * 8 + [b"\r"],
+            expect=b"more below",
+            deep=2,
+            tail=12,
+            rows=20,
+            columns=76,
+        )
+        self.assertIn("unreachable fact 11", session.screen, "the tail stayed out of view")
+        # Paging is not answering, so the commit that follows it still reports the tree's own
+        # opening state and every switch the operator never touched.
+        self.assertEqual(self.answer(session)["system"], "auto")
+        self.assertTrue(session.restored)
+
+    def test_page_down_past_the_end_leaves_the_answer_untouched(self):
+        # Scrolling is not selecting: paging to the bottom and back has to answer what the operator
+        # actually toggled, not whatever row the window happened to stop on. Here nothing was
+        # toggled at all, and the whole opening map comes back.
+        session = self.run_forest(
+            [b"\x1b[6~"] * 4 + [b"\x1b[5~"] * 4 + [b"\r"],
+            expect=b"more below",
+            deep=2,
+            tail=12,
+            rows=20,
+            columns=76,
+        )
+        self.assertEqual(session.status, flow.CONTINUE)
+        answer = self.answer(session)
+        self.assertEqual(answer["system"], "auto")
+        self.assertEqual(answer["add-on-0"], "on")
+        self.assertEqual(answer["add-on-1"], "off")
         self.assertTrue(session.restored)
 
 

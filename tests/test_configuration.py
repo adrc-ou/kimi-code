@@ -190,6 +190,73 @@ class ConfigurationTests(unittest.TestCase):
         models = (ROOT / "tools" / "models.py").read_text()
         self.assertIn("last used", models)
 
+    def test_a_command_that_can_render_is_never_routed_through_the_notes_spool(self):
+        # Half of defect 2 is that the launcher printed over its own modal; the other half is the
+        # trap the fix could walk into. A step's interface *is* its stdout, so spooling one would
+        # hide the one question the operator is supposed to be able to see -- a silent failure
+        # where the launch waits for an input nobody was asked for. The split is therefore worth
+        # pinning per command rather than by comment, and both lists are checked so that a new
+        # step added to the pass cannot land on the wrong side of it.
+        launcher = (ROOT / "start.sh").read_text()
+        body = launcher[launcher.index("harness_flow_pass() {") :]
+        body = body[: body.index("\n}\n")]
+        # Commands that draw a screen: they must run live, with their stdout on the terminal.
+        rendering = (
+            "tools/models.py select",
+            "tools/modules.py select",
+            "harness_modules select_version",
+            "tools/modules.py environment",
+            '"${selector[@]}"',
+            '"${panel[@]}"',
+            "tools/render_runtime.py",
+        )
+        # Commands that only print: their output waits in the notes and is read out after.
+        quiet = (
+            "tools/models.py resolve",
+            "harness_modules configure",
+            "tools/safe_workspace_init.py",
+            "tools/resource_check.py",
+            "tools/modules.py assemble",
+        )
+        for needle in rendering:
+            line = next(line for line in body.splitlines() if needle in line)
+            self.assertTrue(
+                line.strip().startswith("harness_flow_step "),
+                f"{needle} can put up a screen and must not be spooled",
+            )
+        for needle in quiet:
+            line = next(line for line in body.splitlines() if needle in line)
+            self.assertTrue(
+                line.strip().startswith("harness_flow_work "),
+                f"{needle} prints without asking and should wait for the window",
+            )
+        # And the work function is the one that redirects, so a pass line cannot be reworded into
+        # a live print by accident.
+        work = launcher[launcher.index("harness_flow_work() {") :]
+        work = work[: work.index("\n}\n")]
+        self.assertIn('>>"${flow_notes}" 2>&1', work)
+        self.assertIn('if [[ "${screen_held:-false}" == true ]]; then', work)
+
+    def test_the_notes_are_read_out_before_the_launch_says_anything_else(self):
+        # Leaving the alternate screen discards what was painted on it, so a diagnostic written
+        # while the modal was still up would be gone before anyone could read it -- the failure
+        # path is exactly where the operator most needs the sentence that waited.
+        launcher = (ROOT / "start.sh").read_text()
+        report = launcher[launcher.index("harness_flow_report() {") :]
+        report = report[: report.index("\n}\n")]
+        self.assertLess(report.index("harness_flow_unhold"), report.index("printf"))
+        unhold = launcher[launcher.index("harness_flow_unhold() {") :]
+        unhold = unhold[: unhold.index("\n}\n")]
+        self.assertLess(unhold.index("leave"), unhold.index("harness_flow_notes"))
+        self.assertIn('unset HARNESS_TUI_SCREEN', unhold)
+        # The trap is the other way out of a launch, and it owes the same two things.
+        cleanup = launcher[launcher.index("cleanup() {") : launcher.index("trap cleanup EXIT")]
+        self.assertIn('python3 tools/tui/screen.py', cleanup)
+        self.assertIn('cat "${flow_notes', cleanup)
+        self.assertLess(cleanup.index("screen.py"), cleanup.index("MODULE_PIDS"))
+        # A killed launch's notes are not this launch's news.
+        self.assertIn(': >"${flow_notes}"', launcher)
+
     def test_the_measurement_job_waits_for_a_real_prompt_then_leaves_nothing_behind(self):
         # A profile.bind record only exists after the operator's first request, so the job is
         # deferred; and the tree it copies holds conversation text, so the order of its two

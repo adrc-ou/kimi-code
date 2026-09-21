@@ -96,7 +96,8 @@ class Caps:
 
 #: Semantic roles over the sixteen ANSI slots. Magenta carries the second kind of link so that
 #: separating them never depends on telling red from green, and warnings are yellow for the same
-#: reason. Superseded text is dim *and* hollow *and* labelled; see ``layout``.
+#: reason. Supersession never rides on colour alone: a superseded row is dim *and* its mark is
+#: hollow; see ``forest``.
 _ROLES = {
     "focus": "\033[1;36m",  # bold cyan
     "title": "\033[1;97m",  # bold bright white
@@ -104,7 +105,7 @@ _ROLES = {
     "link": "\033[35m",  # magenta: template substitution, composed from several sources
     "warn": "\033[33m",  # yellow: needs attention, but is not an error
     "info": "\033[34m",  # blue: incidental information
-    "dim": "\033[2m",  # dim: superseded, and always paired with a word
+    "dim": "\033[2m",  # dim: superseded, and always paired with a hollow mark
     "rule": "\033[90m",  # bright black: chrome that should recede
     "over": "\033[1;35m",  # bold magenta: a session override, which is unusual by design
     "error": "\033[1;31m",

@@ -100,6 +100,20 @@ def prose(step: pp.ContextStep, state: object | None = None) -> str:
     return re.sub(r"\s+", " ", " ".join(tree_rows(step, state)))
 
 
+def speaking(step: pp.ContextStep, state: object | None = None) -> str:
+    """Everything the screen is able to say: the map, every row's pane text, and the rules.
+
+    The map holds no sentences and the pane holds only the row under the cursor at a time, so a
+    fact may live in either and still be on the screen for anyone who goes looking for it. That is
+    the whole argument for moving the old inline notes off the rows, and it is what a test about a
+    fact not being *lost* has to measure — not the body alone.
+    """
+    parts = tree_rows(step, state)
+    parts += [node.detail for node, _, _, _ in step.rows_in_order() if node.detail]
+    parts += list(step.rules)
+    return re.sub(r"\s+", " ", " ".join(parts))
+
+
 def stage_files(root: Path, files: dict[str, str]) -> Path:
     """Write exactly these files under ``root``, making whatever directories they name."""
     for name, text in files.items():
@@ -635,7 +649,7 @@ class StaticSwitchTests(unittest.TestCase):
         self.assertEqual(pp._block_switch(root, pc.STATIC_CONTEXT, pc.AUTO).states, (pc.OFF,))
         rows = {node.id: node for node, _, _, _ in step.rows_in_order()}
         self.assertFalse(rows[pc.STATIC_CONTEXT].editable)
-        self.assertIn("nothing to switch", prose(step))
+        self.assertIn("no state of it composes a different document", prose(step))
 
     def test_an_untouched_row_stores_the_word_that_was_saved(self) -> None:
         """The screen may call an empty file ``off``; the file still remembers ``auto``.
@@ -903,7 +917,8 @@ class TabulaRasaTests(unittest.TestCase):
         stage_files(self.root, {
             pc.SYSTEM_FILE: "", pc.CONTEXT_FILE: "", CONTRACT: "# the harness contract\n",
         })
-        flat = prose(tree(self.root))
+        step = tree(self.root)
+        flat = speaking(step)
         for fact in (
             pc.SYSTEM_FILE,
             pc.CONTEXT_FILE,
@@ -912,23 +927,27 @@ class TabulaRasaTests(unittest.TestCase):
             "counts as empty",
             "writes nothing to your files",
             "built-in",
-            pp.UNUSED,
         ):
             self.assertIn(fact, flat)
         self.assertIn(repr(pc.EMPTY_PROMPT_SENTINEL), flat)
+        # What used to be the word for an overridden source is a glyph now. A glyph is not a fact
+        # that can be lost by moving prose off the rows, but it can be lost by never drawing it, so
+        # it is pinned here rather than left to the render tests.
+        self.assertIn("- -", prose(step))
 
     def test_the_tree_states_the_fallback_a_blank_document_prevents(self) -> None:
         """``.`` looks like a typo, so the row that stages it has to say what it is for."""
         stage_files(self.root, {pc.SYSTEM_FILE: "", CONTRACT: "# the harness contract\n"})
         step = tree(self.root)
         rows = tree_rows(step)
-        self.assertIn(pp.BLANK_NOTE, prose(step))
+        self.assertIn(pp.BLANK_NOTE, speaking(step))
         self.assertIn(pc.EMPTY_PROMPT_SENTINEL, pp.BLANK_NOTE)
-        # The sentence hangs off the built-in row, and that row also says plainly that it is not
-        # running: a reader who missed the note still cannot conclude Kimi's own prompt is in play.
+        # The sentence hangs off the built-in row, and that row also says with a hollow mark that it
+        # is not running: a reader who never opened the pane still cannot conclude Kimi's own prompt
+        # is in play.
         marks = [row for row in rows if "built-in prompt" in row]
         self.assertEqual(len(marks), 1)
-        self.assertIn(pp.UNUSED, marks[0])
+        self.assertIn("- -", marks[0])
 
     def test_the_context_step_invents_no_keys_of_its_own(self) -> None:
         """``a``/``n``/``r``/``i`` died here: a step may answer only what its footer advertises.
@@ -1021,8 +1040,10 @@ sys.exit(result.status)
         """
         session = run_in_pty(
             [sys.executable, str(self.driver), str(ROOT), str(self.workspace)],
-            keys=[b"?", b"?", b" ", b"\x1b[B", b" ", b"\r"],
-            expect=b"static context",
+            # The map interleaves the add-ons between its two blocks, so the second switch is three
+            # rows down. Arrows are the only thing used to get there, which is the point.
+            keys=[b"?", b"?", b" ", b"\x1b[B", b"\x1b[B", b"\x1b[B", b" ", b"\r"],
+            expect=b"main system prompt",
             env=self.env,
         )
         self.assertEqual(session.status, flow.CONTINUE)
@@ -1102,8 +1123,18 @@ class OptionSetCompletenessTests(unittest.TestCase):
         stage_files(root, {pc.SYSTEM_FILE: "# voice\n", CONTRACT: "# contract\n"})
         step = tree(root)
         boxes = [node for node, _, _, _ in step.rows_in_order() if node.kind == pp.CHECK]
-        self.assertEqual([node.id for node in boxes], list(pc.OPTION_IDS))
         self.assertTrue(all(node.editable for node in boxes), "a box the cursor cannot reach")
+        # The map groups by destination, so an option's row is not free to sit anywhere: the groups
+        # read in destination order, a block heads the group whose document it is, and the add-ons
+        # follow it in the order the panel declares them. Built from those declarations rather than
+        # spelled out, because the point is that the tree holds no list of its own either.
+        expected: list[str] = []
+        for target in pp.DESTINATIONS:
+            block = pp.BLOCK_FOR.get(target)
+            if block:
+                expected.append(block)
+            expected += [option.id for option in pc.OPTIONS if option.target == target]
+        self.assertEqual([node.id for node in boxes], expected)
 
     def test_no_option_is_its_own_companion(self) -> None:
         for option in pc.OPTIONS:

@@ -1,12 +1,13 @@
 """The launch sequence's fullscreen modal interface.
 
-One engine, eight steps. ``caps`` decides what the terminal can do, ``keys`` turns bytes into
-keypresses and owns the binding table the footer is generated from, ``cells`` holds the buffer the
-diff writes from, ``layout`` divides a window into regions and scrolls what does not fit, ``term``
-owns the terminal itself, ``app`` runs one step until it answers, ``menu`` is the list-of-options
-step that most of the launcher's steps are, ``forest`` is the tree-of-switches step, ``input`` is
-the one-field step for the two questions that take typed text instead of a choice, and ``flow``
-remembers which steps have answered and where a back-navigation should land.
+One engine for every step of the launch flow. ``caps`` decides what the terminal can do, ``keys``
+turns bytes into keypresses and owns the binding table the footer is generated from, ``cells`` holds
+the buffer the diff writes from, ``layout`` divides a window into regions and scrolls what does not
+fit, ``term`` owns the terminal itself, ``screen`` holds that terminal across a whole run so the
+modal is never torn down between questions, ``app`` runs one step until it answers, ``menu`` is the
+list-of-options step that most of the launcher's steps are, ``forest`` is the tree-of-switches step,
+``input`` is the one-field step for the two questions that take typed text instead of a choice, and
+``flow`` remembers which steps have answered and where a back-navigation should land.
 
 A surface imports ``Step``, ``View``, ``Result`` and ``run``, describes its rows, and gets the rest:
 the title, the step rail, the focus ring, the scrollbar, the overflow counts, the help overlay,
@@ -44,7 +45,7 @@ from .app import (
 from .caps import Caps, detect
 from .cells import Screen
 from .flow import ABORTED, COMMITTED, CONTINUE, GO_BACK, MISSING, TARGET, Flow, is_live
-from .forest import CHECK, PLAIN, WORD, ForestState, ForestStep, Node, next_state, walk
+from .forest import CHECK, FIXED, PLAIN, ForestState, ForestStep, Node, next_state, walk
 from .input import DELETE, FIELD, FieldState, FieldStep
 from .keys import Binding, Key, Wheel, bind, legend, lookup
 
@@ -71,6 +72,7 @@ __all__ = [
     "DELETE",
     "FIELD",
     "FIRST",
+    "FIXED",
     "FOCUS_DOWN",
     "FOCUS_UP",
     "FieldState",
@@ -104,7 +106,6 @@ __all__ = [
     "TARGET",
     "TOGGLE",
     "Terminal",
-    "WORD",
     "View",
     "Wheel",
     "Window",

@@ -42,12 +42,14 @@ if __package__:
     from .model_config import render as render_model_tables
     from .models import POLICY_FILE, load_plan, materialise_credentials
     from .private_file import write_private
+    from .tui import screen
 else:
     import prompt_context
     from env_values import read_env_values
     from kimi_prompts import substitutions as kimi_substitutions
     from model_config import render as render_model_tables
     from private_file import write_private
+    from tui import screen
 
     from models import POLICY_FILE, load_plan, materialise_credentials
 
@@ -187,7 +189,7 @@ def main() -> None:
     sources.unlink(missing_ok=True)
     payload = json.dumps(prompt_context.document_sources(args.root, static), indent=1) + "\n"
     write_secret(sources, payload)
-    print(f"cache_salt_chars={len(cache_salt)}")
+    screen.note(f"cache_salt_chars={len(cache_salt)}")
 
 
 if __name__ == "__main__":

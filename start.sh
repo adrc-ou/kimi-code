@@ -37,6 +37,15 @@ COMPOSE_PID=""
 PROMPT_MEASURE_PID=""
 DEEP_CHECK_PID=""
 stack_started=false
+# Declared up here rather than beside the flow that sets it, because cleanup is trapped for the
+# whole script and `set -u` would turn an early failure into a second one: a trap that errors
+# leaves the user holding a borrowed alternate screen with nothing left to hand it back.
+screen_held=false
+# Sentences the launch has to say but not while the modal owns the window. Printing into a borrowed
+# alternate screen scrolls the questions away, and the frame that follows paints over only part of
+# what was left behind, so the text waits here and harness_flow_notes reads it out once the window
+# is ordinary scrollback again. tools/tui/screen.py's NOTES is this same path from the Python side.
+flow_notes=${HARNESS_RUNTIME_DIR}/launch-notes.log
 
 # The agent container keeps a read-only root filesystem, so the checker writes its machine-readable
 # report to the container's tmpfs and the launcher carries it out afterwards. The report holds only
@@ -52,6 +61,19 @@ cleanup() {
   status=$?
   trap - EXIT INT TERM ERR
   set +e
+  # First, and before this function prints anything of its own: a launch that dies mid-question
+  # must hand the terminal back so the diagnosis is readable in normal scrollback rather than
+  # painted into an alternate screen the user has to guess their way out of. `leave` is silent
+  # unless the borrow is still recorded, so the happy path's leave above costs nothing here.
+  if [[ "${screen_held:-false}" == true ]]; then
+    python3 tools/tui/screen.py --runtime-dir "${HARNESS_RUNTIME_DIR}" leave || true
+    screen_held=false
+  fi
+  # The lines the modal was sitting on, in the case where nothing reached harness_flow_unhold --
+  # a signal, or a failure in a step that reports its own trouble and exits through this trap.
+  if [[ -s "${flow_notes:-/nonexistent}" ]]; then
+    cat "${flow_notes}"
+  fi
   for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}"; do
     if [[ -n "${pid}" ]]; then
       kill "${pid}" 2>/dev/null || true
@@ -88,7 +110,7 @@ cleanup() {
   # for the next launch to mistake for progress. modules.json is deliberately not in this list, since
   # it is also the record of the last successful selection, which is exactly why the flow that reads
   # it as a replay has to go. module-values.json is the module environment answers, secrets included.
-  for file in proxy-token search-token kimi-config.toml runtime.env session.env module.env model-selection.json model-policy.json model.env module-guidance.md flow-state.json module-values.json prompt-measure.log service-check.log compose/models.json compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
+  for file in proxy-token search-token kimi-config.toml runtime.env session.env module.env model-selection.json model-policy.json model.env module-guidance.md flow-state.json module-values.json prompt-measure.log service-check.log launch-notes.log compose/models.json compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
     [[ -f "${HARNESS_RUNTIME_DIR}/${file}" ]] && find "${HARNESS_RUNTIME_DIR}/${file}" -delete
   done
   [[ -d "${HARNESS_RUNTIME_DIR}/extension-snapshot" ]] && rm -rf -- "${HARNESS_RUNTIME_DIR}/extension-snapshot"
@@ -144,6 +166,28 @@ state_value() {
   fi
 }
 
+# Everything the launch held back while the modal had the window, said now that it does not.
+harness_flow_notes() {
+  if [[ -s "${flow_notes}" ]]; then
+    cat "${flow_notes}"
+    : >"${flow_notes}"
+  fi
+}
+
+# Hand the window back, then read out whatever waited for it.
+#
+# The order is the whole point, and it is the reason a failure report cannot simply be printed from
+# wherever it was noticed: leaving the alternate screen discards everything painted on it, so a
+# sentence written while the modal was still up would be gone by the time anyone could read it.
+# Idempotent, because the pass calls this on the way out of a failure and `cleanup` calls it again.
+harness_flow_unhold() {
+  [[ "${screen_held:-false}" == true ]] || return 0
+  unset HARNESS_TUI_SCREEN
+  "${screen[@]}" leave || true
+  screen_held=false
+  harness_flow_notes
+}
+
 # One command of a pass, plus the launcher's own diagnostic.
 #
 # A command whose status is tested never reaches the ERR trap, and testing the status is exactly how
@@ -151,12 +195,40 @@ state_value() {
 # names the line rather than the command for the same reason the trap does: these commands can carry
 # a credential in their arguments.
 harness_flow_step() {
-  local rc=0
+  local rc=0 caller=${BASH_SOURCE[1]:-start.sh} line=${BASH_LINENO[0]}
   "$@" || rc=$?
+  harness_flow_report "${rc}" "${caller}" "${line}"
+  return "${rc}"
+}
+
+# The diagnostic itself, shared by both flavours of step so that neither can forget the half of it
+# that is not a printf.
+harness_flow_report() {
+  local rc=$1 caller=$2 line=$3
   if (( rc != 0 && rc != flow_back )); then
-    printf 'Harness failed at %s:%s (exit %s).\n' "${BASH_SOURCE[1]:-start.sh}" "${BASH_LINENO[0]}" \
-      "${rc}" >&2
+    harness_flow_unhold
+    printf 'Harness failed at %s:%s (exit %s).\n' "${caller}" "${line}" "${rc}" >&2
   fi
+}
+
+# One command of a pass that asks nothing of the user, and so has no screen of its own.
+#
+# A pass is not only questions. The resolver, the module configure hook, the workspace initializer
+# and the capacity check all run between the screens and all of them print, and while the modal holds
+# the window ordinary text scrolls the questions away -- the operator then answers a screen with the
+# previous step's summary painted through it. So this output waits in the launch notes and is read
+# out when the window comes back, which is where a line like it already appeared.
+#
+# Never route a command that can put a screen up through here. Its interface is stdout, and spooling
+# that hides the one question the operator is supposed to be able to see.
+harness_flow_work() {
+  local rc=0 caller=${BASH_SOURCE[1]:-start.sh} line=${BASH_LINENO[0]}
+  if [[ "${screen_held:-false}" == true ]]; then
+    "$@" >>"${flow_notes}" 2>&1 || rc=$?
+  else
+    "$@" || rc=$?
+  fi
+  harness_flow_report "${rc}" "${caller}" "${line}"
   return "${rc}"
 }
 
@@ -178,11 +250,11 @@ harness_flow_source() {
 harness_flow_pass() {
   # Both model lanes are answered in one process, so Backspace between them never has to leave it.
   harness_flow_step python3 tools/models.py select ${module_args[@]+"${module_args[@]}"} || return
-  harness_flow_step python3 tools/models.py resolve || return
+  harness_flow_work python3 tools/models.py resolve || return
   harness_flow_source "${HARNESS_RUNTIME_DIR}/model.env" || return
 
   harness_flow_step python3 tools/modules.py select ${module_args[@]+"${module_args[@]}"} || return
-  harness_flow_step harness_modules configure || return
+  harness_flow_work harness_modules configure || return
 
   # Probed on every pass rather than remembered: which version is installed is a fact about the disk
   # now, and the row the menu marks installed is only honest if it was read now.
@@ -204,9 +276,9 @@ harness_flow_pass() {
   # Generated by scripts/select_versions.py from validated values.
   harness_flow_source "${session_file}" || return
 
-  harness_flow_step python3 tools/safe_workspace_init.py "${workspace}" || return
-  harness_flow_step python3 tools/resource_check.py "${workspace}" || return
-  harness_flow_step python3 tools/modules.py assemble || return
+  harness_flow_work python3 tools/safe_workspace_init.py "${workspace}" || return
+  harness_flow_work python3 tools/resource_check.py "${workspace}" || return
+  harness_flow_work python3 tools/modules.py assemble || return
 
   # Both halves of the context decision happen here, after the modules are known and before anything
   # is rendered: the panel is the only place the resolved prompt graph is ever visible, and the file
@@ -230,6 +302,32 @@ flow_live=false
 if [[ "${non_interactive}" != true ]]; then
   "${flow[@]}" --steps "${flow_steps}" begin
   flow_live=true
+  # The rail counts screens and only a step knows how many of them it has, which is after the
+  # first one is already drawn. So the launcher asks every step that question up front, read-only,
+  # in one process: tools/flow_survey.py answers with the same short-circuits the steps use, and a
+  # launch with two questions on it says "1 of 2" on the first screen instead of numbering a step
+  # nobody will ever see. A step it cannot answer is left off the line and keeps the default of
+  # one screen, and a survey that fails outright is simply a rail with no forecast - hence the
+  # suppressed output and the `|| true`, since nothing that only draws a progress bar may be able
+  # to stop a launch.
+  flow_counts=$(python3 tools/flow_survey.py --root "${root}" --runtime-dir "${HARNESS_RUNTIME_DIR}" \
+    --steps "${flow_steps}" 2>/dev/null || true)
+  [[ -n "${flow_counts}" ]] && "${flow[@]}" survey --counts "${flow_counts}" || true
+fi
+
+# The alternate screen is borrowed once for the whole interactive sequence rather than once per
+# step, so the questions read as one modal rather than as a flicker around the launcher's own
+# printout. `enter` declines - status 1, nothing written - when stdout is not a terminal, which
+# leaves the steps to borrow and return the screen individually exactly as they always did.
+# HARNESS_TUI_SCREEN is what tells a step's terminal that the window is already borrowed; see
+# tools/tui/screen.py. The leave is owed on every way out of here, so cleanup() runs the same
+# command and `screen.py` records the borrow to keep the second one silent.
+screen=(python3 tools/tui/screen.py --runtime-dir "${HARNESS_RUNTIME_DIR}")
+if [[ "${flow_live}" == true ]] && "${screen[@]}" enter; then
+  export HARNESS_TUI_SCREEN=held
+  screen_held=true
+  # Whatever a killed launch left unsaid is not this launch's news, so the notes start empty.
+  : >"${flow_notes}"
 fi
 
 pass_status=0
@@ -241,6 +339,11 @@ while :; do
   # failure, and harness_flow_step has already said which.
   [[ "${flow_live}" == true && "${pass_status}" == "${flow_back}" ]] || exit "${pass_status}"
 done
+
+# The questions are over, so the terminal is handed back before anything is printed: the modules
+# prepare, the image build and the version smoke test all speak in ordinary scrollback lines, and
+# the recap belongs beside them rather than inside a screen that no longer has a key to leave it.
+harness_flow_unhold
 
 approval_manifest="${HARNESS_RUNTIME_DIR}/extension-approval.json"
 python3 tools/approve_extensions.py prepare --workspace "${workspace}" --manifest "${approval_manifest}" --state-dir "${HARNESS_RUNTIME_DIR}" --output "${HARNESS_COMPOSE_DIR}/approved-extensions.yaml"

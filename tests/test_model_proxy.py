@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -1721,6 +1722,184 @@ class PlanIsTheSourceOfTruthTests(unittest.TestCase):
         enforcement.sync(policy)
         self.assertEqual(enforcement.gates[CONTEXT_ID].subagent_limit, bigger)
         self.assertGreater(bigger, FAN_OUT)
+
+
+class PromptArchiveTests(unittest.IsolatedAsyncioTestCase):
+    """One file and one stdout line per new user prompt, through the real chat handler."""
+
+    HOST_DIR = "/host/prompt-log"
+
+    def setUp(self):
+        reset_policy_state()
+        clean_counters()
+        self.addCleanup(clean_counters)
+
+        storage = tempfile.TemporaryDirectory()
+        self.addCleanup(storage.cleanup)
+        self.directory = Path(storage.name) / "prompt-log"
+
+        for name, value in (
+            ("PROMPT_LOG_DIR", self.directory),
+            ("PROMPT_LOG_HOST_DIR", Path(self.HOST_DIR)),
+        ):
+            patcher = patch.object(PROXY, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        # The archive remembers what it has already written, and that memory is the
+        # module's, not the test's.
+        PROXY._archived.clear()
+        self.addCleanup(PROXY._archived.clear)
+
+        self.captured = io.StringIO()
+        patcher = patch.object(sys, "stdout", self.captured)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        async def deliver(_request, _lane, _body, _started, _inbound, _cost):
+            return PROXY.web.Response(text="ok")
+
+        patcher = patch.object(PROXY, "forward_chat", deliver)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def request(self, messages) -> SimpleNamespace:
+        body = json.dumps({"model": "anything", "messages": messages}).encode()
+        return SimpleNamespace(
+            method="POST",
+            content_type="application/json",
+            headers={"Authorization": f"Bearer {INTERNAL_TOKEN}"},
+            match_info={"lane": "subagent"},
+            query_string="",
+            rel_url="/subagent/v1/chat/completions",
+            transport=SimpleNamespace(is_closing=lambda: False),
+            app={},
+            read=lambda: asyncio.sleep(0, result=body),
+        )
+
+    async def send(self, messages) -> list[Path]:
+        """Serve one chat request and report what the archive holds afterwards."""
+        await PROXY.chat(self.request(messages))
+        return sorted(self.directory.iterdir()) if self.directory.exists() else []
+
+    @property
+    def output(self) -> str:
+        return self.captured.getvalue()
+
+    async def test_a_new_user_prompt_becomes_one_file_and_one_line(self):
+        prompt = "Add a caching layer to the session lookup"
+        files = await self.send(
+            [
+                {"role": "system", "content": "You are an agent."},
+                {"role": "user", "content": prompt},
+            ]
+        )
+
+        self.assertEqual(len(files), 1)
+        dump = files[0].read_text()
+        self.assertTrue(dump.startswith("POST "))
+        self.assertIn("/v1/chat/completions", dump)
+        self.assertIn(prompt, dump)
+        self.assertIn('\n  "messages": [', dump, "the body is pretty-printed, not compact")
+
+        line = self.output.strip()
+        self.assertIn("prompt_log lane=subagent", line)
+        self.assertRegex(line, r"time=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+        self.assertIn(f"file={self.HOST_DIR}/{files[0].name}", line, "the host path is printed")
+        self.assertIn(prompt, line)
+
+    async def test_the_stdout_summary_is_truncated_and_stays_on_one_line(self):
+        prompt = "the first line\n" + "x" * 200
+        await self.send([{"role": "user", "content": prompt}])
+
+        summary = self.output.strip().split("prompt='", 1)[1].removesuffix("'")
+        self.assertEqual(
+            len(summary),
+            PROXY.PROMPT_SUMMARY_CHARS + 1,
+            "65 characters of prompt, then an ellipsis",
+        )
+        self.assertTrue(summary.endswith("…"))
+        self.assertNotIn("\n", summary, "a prompt with newlines cannot break the line")
+
+    async def test_a_harness_reminder_is_not_a_prompt(self):
+        files = await self.send(
+            [
+                {"role": "user", "content": "Fix the flaky test"},
+                {"role": "assistant", "content": "Reading the failure now."},
+                {
+                    "role": "user",
+                    "content": "<system-reminder>Today's date is 2026-09-21.</system-reminder>",
+                },
+            ]
+        )
+
+        self.assertEqual(files, [])
+        self.assertEqual(self.output.strip(), "")
+
+    async def test_the_rest_of_a_turn_adds_nothing_and_the_next_prompt_does(self):
+        prompt = "Refactor the auth module"
+        opening = [{"role": "user", "content": prompt}]
+        self.assertEqual(len(await self.send(opening)), 1)
+
+        # Later steps of the same turn re-send the whole conversation, tool traffic included.
+        grown = opening + [
+            {"role": "assistant", "content": "Reading."},
+            {"role": "tool", "tool_call_id": "1", "content": "the file's contents"},
+        ]
+        self.assertEqual(len(await self.send(grown)), 1, "a step is not a new prompt")
+
+        next_prompt = grown + [{"role": "user", "content": "Now add tests"}]
+        self.assertEqual(len(await self.send(next_prompt)), 2)
+
+    async def test_a_content_parts_prompt_is_archived_by_its_text(self):
+        files = await self.send(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                        {"type": "text", "text": "What is in this screenshot?"},
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(len(files), 1)
+        self.assertIn("What is in this screenshot?", self.output)
+        self.assertIn("data:image/png;base64,AAAA", files[0].read_text(), "the file holds the body")
+
+    async def test_the_archive_holds_neither_credential_nor_cache_salt(self):
+        files = await self.send([{"role": "user", "content": "Any prompt at all"}])
+
+        dump = files[0].read_text()
+        self.assertNotIn(CACHE_SALT, dump)
+        self.assertNotIn(INTERNAL_TOKEN, dump)
+        self.assertNotIn(PROVIDER_KEY, dump)
+        self.assertIn("Authorization: <REDACTED>", dump)
+        self.assertIn('"cache_salt": "<REDACTED>"', dump)
+
+    async def test_the_archive_is_empty_at_both_ends_of_a_run(self):
+        await self.send([{"role": "user", "content": "First prompt"}])
+        self.assertEqual(len(list(self.directory.iterdir())), 1)
+
+        await PROXY.close_prompt_archive(None)
+        self.assertTrue(self.directory.is_dir(), "the mount point outlives its contents")
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+        # A container that was killed never got to purge, so the next one does.
+        (self.directory / "prompt-stale.txt").write_text("stale")
+        await PROXY.open_prompt_archive(None)
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    async def test_a_failing_archive_still_serves_the_request(self):
+        obstruction = self.directory.parent / "not-a-directory"
+        obstruction.write_text("a file where a parent directory should be")
+
+        with patch.object(PROXY, "PROMPT_LOG_DIR", obstruction / "prompt-log"):
+            response = await PROXY.chat(self.request([{"role": "user", "content": "Serve me"}]))
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("prompt_log lane=subagent error=", self.output)
 
 
 if __name__ == "__main__":

@@ -520,14 +520,32 @@ prepares before the agent starts. Check both halves after any change to
    `Space` cycles the row under focus, `Enter` accepts the step, `Backspace` returns
    to the previous step, `Ctrl-R` resets the visible choices, and `?` opens the full
    key reference. The footer prints only the keys this step answers, so there is
-   nothing to guess. The two documents read `auto`, `on` or `off` rather than a mark,
-   because there are three answers and no surveyed terminal interface ships a
-   tri-state glyph. A block whose file is present but empty opens on `off`, which is
-   that emptiness being honoured, and moving it to `on` is what makes the check above
+   nothing to guess. Every row — a document, an add-on, a file on disk — spells its
+   answer in the same mark column: `[x]` and `[ ]` are switches you hold, and `-x-`
+   and `- -` are the same facts about a row no key here moves. The two documents open
+   on a third answer as well, `auto`, which is why the status line under the map
+   spells the focused row's state out in words rather than leaving it to the glyph.
+   A block whose file is present but empty opens off, which is
+   that emptiness being honoured, and moving it on is what makes the check above
    behave as though the file were absent. Neither move edits `SYSTEM.md` or
    `CONTEXT.md`, and the answer is written to `prompt-context.json` only when the
    step is accepted, so a launch you cancel with `Ctrl-C` leaves nothing behind to
    undo.
+
+   Two properties of that modal are worth checking after any change to the flow, and
+   both are visible without instrumenting anything. The window never closes between
+   steps: `less` the raw transcript of a launch run on a pty and you should find
+   exactly one enter and one leave for the whole interactive run, no matter how many
+   screens it answered. And the rail total is forecast once, so every screen reads
+   `1 of M` through `M of M` and a skipped step is never enumerated. The one honest
+   exception is a total that drops by one *after* you make it drop: untick every
+   module and the per-module version menu really does vanish. A total that moves for
+   any other reason means the forecaster stopped reusing a real predicate and guessed
+   instead.
+   Everything the launch would have printed while the window held the terminal waits
+   in `launch-notes.log` under the instance runtime directory, and the check that it
+   arrived is simply that those lines appear after the `leave`, in order, on the
+   normal screen.
 
 ## 6. Optional module verification
 

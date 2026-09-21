@@ -6,22 +6,32 @@ tree, and was being shown as two flat columns of text joined by nothing. ``menu`
 and ``input`` does not want to, so this module holds the third shape, and the drawing work that goes
 with it stays here rather than in the step that knows what a context block is.
 
-Two kinds of answer live in one tree and the surface keeps them apart the way a settings screen
-does. A two-state row is a checkbox, because everyone knows what ``[x]`` means. A row with more than
-two states shows the state's own **word** in a column of its own: no surveyed terminal interface
-ships a tri-state glyph, so an invented third mark would be precisely the undocumented signal this
-redesign was commissioned to remove, whereas ``auto`` / ``on`` / ``off`` needs no legend, survives a
-monochrome terminal, and cannot be mistaken for a checkbox in a state nobody explained.
+Every row answers two independent questions and the mark column says both at once, the way the
+kernel's configuration browser does: the character *inside* the mark is the value, and the
+characters *around* it are whether anyone can change it. ``scripts/kconfig/mconf.c`` says it
+in one line — ``if (sym_is_changeable(sym)) item_make("[%c]", ...); else
+item_make("-%c-", ...)`` — and this file follows it, so a person who has ever configured a
+kernel already knows how to read this screen. ``[x]`` and ``[ ]`` are yours to move with
+``Space``; ``-x-`` and ``- -`` are facts about the workspace that no key here alters. One
+column, one grammar, and no right-hand word pretending to be a control.
 
-Structure and state are separate axes and are drawn by separate means. Structure is the branch
-guide, ``▶`` in the joint where one source feeds more than one parent, and a magenta connector where
-a document is substituted into another by template rather than appended after it. State is the mark,
-the word and the colour: a superseded row is dim **and** labelled, and hollow wherever it had a
-switch to hollow, so it reads as inactive without anyone being asked to trust hue alone, which
-neither ``NO_COLOR`` nor a colour-blind operator can be required to discount.
+Structure and state stay separate axes drawn by separate means. Structure is the guide, the
+``▶`` in the joint where one source feeds more than one parent, and a magenta connector where
+a document is substituted into another by template rather than appended after it. State is the
+mark and the colour: a superseded row is dim *and* has a hollow value, so nothing rides on hue
+alone, which neither ``NO_COLOR`` nor a colour-blind operator can be required to discount.
+
+The sentence that explains a row does not live under it. A diagram the operator has to wade through
+is a paragraph with indentation, so each row carries one :attr:`Node.detail` string instead,
+drawn by :meth:`ForestStep.detail` in the pane beside the tree, and only the row under the cursor
+is spelled out at a time. That is the ``menuconfig`` arrangement and it is why the tree can hold
+nine add-ons, two file blocks and three price groups without leaving the screen: the map is for
+orientation and the pane is for reading. Where the window is too narrow for a pane, the frame puts
+the same lines in the band under the status row, so the prose is never *only* behind a keypress and
+never stacked under every row at once either.
 
 The tail columns are measured over the whole tree rather than over the visible slice, so neither
-scrolling nor cycling a state can slide a number sideways, and a figure the operator was comparing
+scrolling nor cycling a switch can slide a number sideways, and a figure the operator was comparing
 two rows ago is still in the same column.
 """
 
@@ -34,17 +44,27 @@ from . import layout as L
 from .app import Result, Step
 from .layout import BLANK, Line, Row, Segment
 
-#: Nothing to change here: a heading, a branch, or a source whose answer belongs to its parent.
+#: Nothing to change here and nothing to report: a heading, or a source its parent answers for.
 PLAIN = "plain"
 #: Two states, drawn as a checkbox. The first state in ``states`` is the marked one.
 CHECK = "check"
-#: Any number of states, drawn as the state's own word, in a column of its own.
-WORD = "word"
+#: A row whose value is real but is not the operator's to move: ``-x-`` when it holds, ``- -``
+#: when it does not, whether because the file is absent or because another source supersedes it.
+#: The delimiter is the whole statement about changeability, so a file that is present and
+#: superseded still appears in the map — deleting it would make the directory and the picture
+#: disagree — without competing for the cursor, and why it contributes nothing rides on the row's
+#: :attr:`Node.detail` rather than on a second glyph nobody has to learn.
+FIXED = "fixed"
 
-#: Cells a checkbox and its gutter occupy, so every label in a branch starts in one column.
+#: Cells a mark and its gutter occupy, so every label in a branch starts in one column.
 MARK_WIDTH = 4
 #: Columns one guide level occupies: the tee or the rail, the dash, and its space.
 RAIL_WIDTH = 3
+#: Columns the fan-out marker occupies beside a root that composes into more than one parent. A
+#: root has no joint to set a glyph in, so unlike every deeper row it buys its own column — and
+#: pays for it on every row in the tree, because two roots starting at different columns read as
+#: two unrelated lists rather than as one map with a branch in it.
+GUIDE_WIDTH = 2
 #: The fewest label columns worth keeping before the numeric tail starts giving way. Below this a
 #: figure attached to half a name identifies nothing, so the tail is dropped instead of the label.
 MIN_LABEL = 12
@@ -53,9 +73,10 @@ MIN_LABEL = 12
 COLUMN_GAP = 3
 #: The gap between two tail columns.
 FIELD_GAP = 2
-#: The fewest columns a sentence needs before it is worth setting at an indent at all. Below this a
-#: wrapped note becomes one word per line, which is not a sentence any more.
-NOTE_ROOM = 4
+#: The two characters the mark column puts between delimiters. ``x`` is the value every vocabulary
+#: here agrees means "in use", because ``[x]`` is the one mark nobody has to learn.
+ON_MARK = "x"
+OFF_MARK = " "
 
 #: A state's colour when the caller has no opinion: in use, not in use, undecided.
 TONE_FOR = {"on": "active", "off": "dim", "auto": "info"}
@@ -73,22 +94,21 @@ class Node:
     label: str
     #: The states ``Space`` moves through, wrapping. Empty means the row takes no input at all.
     states: tuple[str, ...] = ()
-    #: :data:`CHECK` or :data:`WORD` — how ``states`` is drawn.
+    #: :data:`CHECK`, :data:`FIXED` or :data:`PLAIN` — how the mark column is spelled.
     kind: str = PLAIN
     #: The state this row opens with, for as long as nobody has answered it.
     default: str = ""
     #: The right-hand figures: tokens, and the share of the lane's cap they spend.
     value: str = ""
     pct: str = ""
-    #: Prose under the row, wrapped to the room the label had. The generated help overlay has no
-    #: slot for a step's own sentences, so a fact the operator needs on screen lives here, beside
-    #: the thing it describes, rather than behind a keypress.
-    note: str = ""
-    #: One word after the label — ``unused``, ``shared``, ``staged``. Words, because a glyph that
-    #: exists only in this one program is the thing this redesign is not allowed to invent.
-    badge: str = ""
-    #: False draws a hollow mark, dims the row, and keeps the cursor off it. For a source that is
-    #: present but overridden: it belongs in the picture and must not look selectable.
+    #: The one sentence that says why this row reads the way it does. Drawn in the pane beside the
+    #: tree while there is one, and under the row while there is not; never both, and never for a
+    #: row nobody is looking at. This is where every paragraph the old screen stacked in the body
+    #: went, and moving them here is what let the map become a map.
+    detail: str = ""
+    #: For a mark, this is its value: ``False`` hollows it and dims the row. For a row that asks
+    #: for input it also keeps the cursor off it, so a source that is present but overridden
+    #: belongs to the picture without looking selectable.
     enabled: bool = True
     #: This source is composed into more than one parent, so the joint opens into a branch.
     branch: bool = False
@@ -101,17 +121,20 @@ class Node:
     def __post_init__(self) -> None:
         """Refuse a row whose answer has no honest mark.
 
-        A checkbox says two states and a spelled word says as many as there are; a row that asks for
-        one while carrying the other would put a switch on screen whose position nobody can read —
-        the exact class of thing this redesign exists to remove. Cheaper to raise while the tree is
-        being built than to explain in a legend afterwards.
+        A checkbox says two states, and a row that is nobody's to move says one thing: whether it
+        holds. A row that asked for a state while carrying the other would put a switch on screen
+        whose position nobody can read — the exact class of thing this redesign exists to remove —
+        so the pairing is checked while the tree is being built rather than explained in a legend
+        afterwards.
         """
         if self.states and self.kind == PLAIN:
             raise ValueError(f"{self.id}: {PLAIN!r} draws no mark, so it cannot carry a switch")
         if self.kind == CHECK and len(self.states) != 2:
             raise ValueError(f"{self.id}: a checkbox has exactly two states, got {self.states}")
-        if self.kind == WORD and not self.states:
-            raise ValueError(f"{self.id}: a word column needs states to spell")
+        if self.kind == FIXED and self.states:
+            raise ValueError(
+                f"{self.id}: {FIXED!r} draws a value no key moves, so it takes no states"
+            )
 
     @property
     def editable(self) -> bool:
@@ -186,26 +209,82 @@ class ForestStep(Step):
         opening: dict[str, str] | None = None,
         tone_of: Callable[[Node, str], str] = lambda node, value: "",
         reset_note: str = "options reset",
+        rules: Sequence[str] = (),
     ) -> None:
         """
-        ``head`` is prose above the tree — the sentences a generated legend cannot carry, because
-        the legend is built from the binding table and knows nothing about prompts.
+        ``head`` is the one line above the tree that a reader needs before the tree means anything —
+        which of the answers on screen are the operator's own and which are defaults nobody has
+        agreed to yet. Everything longer than a line belongs in :attr:`Node.detail` or in ``rules``.
 
         ``opening`` is the answer the user is revisiting. A row it does not name falls back to its
         own :attr:`Node.default`, the same precedence :class:`~.menu.ListStep` uses, so the two
         surfaces cannot disagree about what "remembered" means.
 
-        ``tone_of`` colours a row's state. The surface knows that there are three states and the
+        ``tone_of`` colours a row's state. The surface knows that there are two marks and the
         launcher knows what they mean, and this is where those two knowledges have to meet.
+
+        ``rules`` are the sentences that are true of every row rather than of one — the reading of a
+        figure, the definition of an empty file. They go to the key overlay, which is the one place
+        a sentence about the whole step has room, and they are listed there beside the keys because
+        a rule nobody can find is a rule nobody follows.
         """
         self.title = title
         self.rail = rail or title
         self.nodes = tuple(nodes)
         self.head = tuple(head)
+        self.rules = tuple(rules)
         self.reset_note = reset_note
         self._opening = dict(opening or {})
         self._tone_of = tone_of
-        self._roots_are_checkable = any(node.kind == CHECK for node in self.nodes)
+
+    # The two shape questions a tree asks of its own roots are derived rather than cached, because a
+    # step that rebuilds its nodes from the operator's answer (:class:`~.prompt_panel.ContextStep`)
+    # would otherwise be measured against the tree it displayed a keystroke ago.
+
+    @property
+    def _roots_are_checkable(self) -> bool:
+        """Whether any root is a control, which is what makes every root pay for the mark column."""
+        return any(node.kind in (CHECK, FIXED) for node in self.nodes)
+
+    @property
+    def _roots_are_branching(self) -> bool:
+        """Whether any root fans out, which is what makes every row pay for the marker column."""
+        return any(node.branch for node in self.nodes)
+
+    # -- geometry ---------------------------------------------------------------------------
+
+    @property
+    def pane_room(self) -> int:
+        """Columns the detail pane gives to text, or zero when the frame has no pane."""
+        if self.frame is None or self.frame.detail.blank:
+            return 0
+        return self.frame.detail.width
+
+    @property
+    def detail_room(self) -> int:
+        """Columns to wrap the focused row's prose in: the pane's, or the screen's.
+
+        A frame with no pane still has somewhere to say what a row means — the help bar under the
+        list, which is full width and is :mod:`menuconfig`'s own answer at a width where a
+        side-by-side pane would starve the tree. Prose is never *only* behind a keypress, and it is
+        never stacked under every row at once either; this is the one place that choice is made.
+        """
+        if self.frame is None:
+            return self.room
+        return self.pane_room or self.frame.columns
+
+    @property
+    def room(self) -> int:
+        """Columns a body row has, with the pane's share taken off the right edge.
+
+        A tree measured against the full body width while a pane covers part of it does not fail
+        loudly — it paints its numbers underneath the prose, which reads as a rendering bug in the
+        prose. The subtraction happens here, once, so every measurement downstream is honest.
+        """
+        base = super().room
+        if self.frame is None or self.pane_room <= 0:
+            return base
+        return max(MIN_LABEL, base - self.pane_room - COLUMN_GAP)
 
     # -- measuring --------------------------------------------------------------------------
 
@@ -222,26 +301,18 @@ class ForestStep(Step):
             return None
         return options[min(max(state.focus, 0), len(options) - 1)]
 
-    def tail_widths(self) -> tuple[int, int, int]:
-        """Widths of the state-word, figure and percentage columns.
+    def tail_widths(self) -> tuple[int, int]:
+        """Widths of the figure and percentage columns.
 
-        Measured over the whole tree, and over every *spelling* of a state rather than only its
-        current one, so cycling a row from ``auto`` to ``off`` cannot move the number beside it.
+        Measured over the whole tree rather than over the visible slice, so switching a block off —
+        which recomposes the prices under it — cannot move a number that was two rows ago.
         """
         rows = self.rows_in_order()
-        word = max(
-            (
-                max((self.cells(spelling) for spelling in node.states), default=0)
-                for node, _, _, _ in rows
-                if node.kind == WORD
-            ),
-            default=0,
-        )
         value = max((self.cells(node.value) for node, _, _, _ in rows), default=0)
         pct = max((self.cells(node.pct) for node, _, _, _ in rows), default=0)
-        return (word, value, pct)
+        return (value, pct)
 
-    def fit_tail(self, widths: tuple[int, int, int]) -> tuple[int, int, int]:
+    def fit_tail(self, widths: tuple[int, int]) -> tuple[int, int]:
         """Shrink the tail until even the deepest row has a label worth reading.
 
         The decision is made once against the deepest row rather than per row: a tail that appeared
@@ -249,18 +320,14 @@ class ForestStep(Step):
         column two rows apart, which is the one thing a column of numbers is on screen for.
         """
         widest = max(
-            (
-                self.left(node, depth) + self._badge_cells(node.badge)
-                for node, _, depth, _ in self.rows_in_order()
-            ),
-            default=0,
+            (self.left(node, depth) for node, _, depth, _ in self.rows_in_order()), default=0
         )
-        word, value, pct = widths
-        while self._tail_cells(word, value, pct) and (
-            self.room - widest - COLUMN_GAP - self._tail_cells(word, value, pct) < MIN_LABEL
+        value, pct = widths
+        while self._tail_cells(value, pct) and (
+            self.room - widest - COLUMN_GAP - self._tail_cells(value, pct) < MIN_LABEL
         ):
-            word, value, pct = _drop(word, value, pct)
-        return (word, value, pct)
+            value, pct = _drop(value, pct)
+        return (value, pct)
 
     def left(self, node: Node, depth: int) -> int:
         """Columns the guide and the mark spend before a label may start.
@@ -268,43 +335,30 @@ class ForestStep(Step):
         Every row below a root pays for the mark even when it has no checkbox, so a source, a
         switch and a heading in one branch share a single label edge. A root pays for it too as soon
         as any root has one, because a tree whose sections start at two different columns reads as
-        two trees.
+        two trees. The same argument covers the root-level fan-out marker, which is why its column
+        is reserved whether or not this particular root branches.
         """
-        return depth * RAIL_WIDTH + self.mark_room(node, depth)
+        return depth * RAIL_WIDTH + self.guide_room + self.mark_room(node, depth)
+
+    @property
+    def guide_room(self) -> int:
+        """Columns the root-level branch marker spends, or none when no root branches."""
+        return GUIDE_WIDTH if self._roots_are_branching else 0
 
     def mark_room(self, node: Node, depth: int) -> int:
         """Whether this row's label sits behind a mark column, and how wide that column is."""
-        if depth or node.kind == CHECK or self._roots_are_checkable:
+        if depth or node.kind in (CHECK, FIXED) or self._roots_are_checkable:
             return MARK_WIDTH
         return 0
 
-    def _tail_cells(self, word: int, value: int, pct: int) -> int:
+    def _tail_cells(self, value: int, pct: int) -> int:
         """Columns the tail spends, gaps included, with no leading gap on the first live column."""
         out = 0
-        if word:
-            out += word
         if value:
-            out += value + (FIELD_GAP if word else 0)
+            out += value
         if pct:
-            out += pct + (FIELD_GAP if word or value else 0)
+            out += pct + (FIELD_GAP if value else 0)
         return out
-
-    def _badge_cells(self, badge: str) -> int:
-        """A badge sits between the label and the tail, so it is neither free nor forgettable."""
-        return 1 + self.cells(badge) if badge else 0
-
-    def badge_shown(self, node: Node, depth: int, *tail: int) -> bool:
-        """Whether this row can still afford its badge, which it gives up before its label does.
-
-        The word is the secondary signal for what the hollow mark already says, whereas the label is
-        the row's identity: at a width where both cannot live, the number went first, the word goes
-        next, and the name survives. Which rows lose theirs is a per-row question, so it is answered
-        per row rather than with a flag that would drop every ``unused`` to spare one crowded row.
-        """
-        if not node.badge:
-            return False
-        give = self.left(node, depth) + self._badge_cells(node.badge) + self._tail_cells(*tail)
-        return self.room - give - COLUMN_GAP >= MIN_LABEL
 
     def _cut(self, text: str, room: int) -> str:
         if self.caps is not None:
@@ -316,7 +370,7 @@ class ForestStep(Step):
 
         ``main system promp`` reads as a shorter name than ``main system prompt``, and the two are
         different rows to a user scanning the tree. The mark costs a column and says the rest is
-        somewhere else — which it is, in the status line, where the focused row is spelled out.
+        somewhere else — which it is, twice over: in the status line, and in the pane.
         """
         if self.caps is None or self.cells(text) <= room:
             return self._cut(text, room)
@@ -368,14 +422,24 @@ class ForestStep(Step):
     def rows(self, state: object) -> list[Row]:
         assert isinstance(state, ForestState)
         out: list[Row] = []
-        for text in self.head:
+        lines: list[tuple[str, str]] = [(text, "dim") for text in self.head]
+        lines += [(text, "warn") for text in self.alerts(state)]
+        for text, role in lines:
             for piece in self._wrapped(text, self.room):
-                out.append(Row.heading(Line(Segment(piece, self.tone("dim")))))
-        if self.head:
+                out.append(Row.heading(Line(Segment(piece, self.tone(role)))))
+        if lines:
             out.append(Row.gap())
-        word, value, pct = self.fit_tail(self.tail_widths())
+        widths = self.fit_tail(self.tail_widths())
+        # A root is a section, and four sections drawn in one grammar read as one long list. The
+        # blank row and the weight are what tell them apart: a glyph in the mark column would be a
+        # fifth spelling in a vocabulary whose whole job is saying "this is a switch".
+        roots = 0
         for node, rails, depth, last in self.rows_in_order():
-            out.extend(self._rows(node, rails, depth, last, state, word, value, pct))
+            if depth == 0:
+                roots += 1
+                if roots > 1:
+                    out.append(Row.gap())
+            out.extend(self._rows(node, rails, depth, last, state, *widths))
         return out
 
     def _rows(
@@ -385,30 +449,25 @@ class ForestStep(Step):
         depth: int,
         last: bool,
         state: ForestState,
-        word: int,
         value: int,
         pct: int,
     ) -> list[Row]:
-        columns = self._columns(node, word, value, pct)
+        columns = self._columns(node, value, pct)
         if self._is_prose(node, columns):
-            out = self._prose(node, rails, depth, last, state)
-        else:
-            out = [self._row(node, self._line(node, rails, depth, last, state, word, value, pct))]
-        if node.note:
-            out.extend(self._note(node, depth))
-        return out
+            return self._prose(node, rails, depth, last, state)
+        return [self._row(node, self._line(node, rails, depth, last, state, value, pct))]
 
-    def _is_prose(self, node: Node, columns: tuple[int, int, int]) -> bool:
+    def _is_prose(self, node: Node, columns: tuple[int, int]) -> bool:
         """Whether a row is a sentence rather than a control.
 
-        Only a plain row with no figure to align may take the whole width: a switch, a state word,
+        Only a plain row with no figure to align may take the whole width: a switch, a fixed mark,
         and even a disabled checkbox all print a mark that the label edge is measured against, and
         wrapping a row that has one moves the mark off the column every other row shares. Prose is
         the heading and the source name — the rows that carry nothing but words.
         """
         return node.kind == PLAIN and not any(columns)
 
-    def _columns(self, node: Node, word: int, value: int, pct: int) -> tuple[int, int, int]:
+    def _columns(self, node: Node, value: int, pct: int) -> tuple[int, int]:
         """The tail this row really has, out of the columns the tree fitted.
 
         The columns are shared so figures line up, and they stay shared among the rows that carry
@@ -416,10 +475,9 @@ class ForestStep(Step):
         exists to avoid. What is *not* reserved is tail a row can never print: reserving it anyway
         is what cut a section title off mid-word in a window with room for the whole of it.
         """
-        shown = word if node.kind == WORD else 0
         if not node.value and not node.pct:
-            return (shown, 0, 0)
-        return (shown, value, pct)
+            return (0, 0)
+        return (value, pct)
 
     def _prose(
         self, node: Node, rails: tuple[bool, ...], depth: int, last: bool, state: ForestState
@@ -433,45 +491,38 @@ class ForestStep(Step):
         guide = self._guide(rails, depth, last, node.branch)
         mark = " " * MARK_WIDTH if self.mark_room(node, depth) else ""
         edge = self.cells(guide) + len(mark)
-        badge = node.badge if self.badge_shown(node, depth, 0, 0, 0) else ""
-        room = max(1, self.room - edge - self._badge_cells(badge))
+        room = max(1, self.room - edge)
         pieces = self._wrapped(node.label, room)
-        tone = self._label_tone(node, state)
+        tone = self._label_tone(node, state, depth)
         parts: list[Segment] = []
         if guide:
             parts.append(Segment(guide, self.tone("link") if node.link else self.tone("rule")))
         if mark:
             parts.append(Segment(mark))
         parts.append(Segment(pieces[0], tone))
-        if badge:
-            parts.append(self._badge(badge))
         out = [self._row(node, Line(*parts))]
         out.extend(
             self._row(node, Line(Segment(f"{' ' * edge}{piece}", tone))) for piece in pieces[1:]
         )
         return out
 
-    def _note(self, node: Node, depth: int) -> list[Row]:
-        """The sentence under a row, at the row's own indent until that leaves nothing to write in.
-
-        The indent is a nicety and the sentence is not, so a deep row in a shallow window puts its
-        note at column zero rather than losing it. Everything the tree says has to reach the
-        screen — that is the whole argument for scrolling inside the frame instead of clipping.
-        """
-        indent = self.left(node, depth) + MARK_WIDTH
-        room = self.room - indent
-        if room < NOTE_ROOM:
-            indent, room = 0, self.room
-        pad = " " * indent
-        return [
-            Row.heading(Line(Segment(f"{pad}{piece}", self.tone("dim"))))
-            for piece in self._wrapped(node.note, room)
-        ]
-
     def _row(self, node: Node, line: Line) -> Row:
+        line = self._bounded(line)
         if not node.editable:
             return Row.heading(line, self.tone("dim") if not node.enabled else "")
         return Row.item(line, node.id, wash=False)
+
+    def _bounded(self, line: Line) -> Line:
+        """No row costs more columns than the body has, however deep its guide runs.
+
+        Below about a dozen columns the rails and the mark column of a third-level row are wider on
+        their own than the room they are drawn in. The frame would clip that at the edge anyway,
+        which cuts the row mid-glyph and tells the reader nothing, so the cut happens here instead,
+        where it carries the same marker every other clip in this surface pays for.
+        """
+        if self.caps is None:
+            return line
+        return L.fit(line, self.room, self.caps)
 
     def _line(
         self,
@@ -480,7 +531,6 @@ class ForestStep(Step):
         depth: int,
         last: bool,
         state: ForestState,
-        word: int,
         value: int,
         pct: int,
     ) -> Line:
@@ -488,22 +538,16 @@ class ForestStep(Step):
         guide = self._guide(rails, depth, last, node.branch)
         if guide:
             parts.append(Segment(guide, self.tone("link") if node.link else self.tone("rule")))
-        if node.kind == CHECK:
-            parts.append(Segment(f"{self._box(node, state)} ", self._mark_tone(node, state)))
-        elif self.mark_room(node, depth):
-            parts.append(Segment(" " * MARK_WIDTH))
-        columns = self._columns(node, word, value, pct)
-        badge = node.badge if self.badge_shown(node, depth, *columns) else ""
-        spare = self._badge_cells(badge)
-        label = self._clip_label(node.label, self._label_room(node, depth, spare, *columns))
-        parts.append(Segment(label, self._label_tone(node, state)))
-        if badge:
-            parts.append(self._badge(badge))
-        parts.extend(self._tail(node, depth, state, spare, *columns, label))
+        box = self._box(node, state)
+        parts.append(Segment(f"{box} " if box else " " * MARK_WIDTH, self._mark_tone(node, state)))
+        columns = self._columns(node, value, pct)
+        label = self._clip_label(node.label, self._label_room(node, depth, *columns))
+        parts.append(Segment(label, self._label_tone(node, state, depth)))
+        parts.extend(self._tail(node, depth, state, *columns, label))
         return Line(*parts)
 
-    def _label_room(self, node: Node, depth: int, spare: int, *tail: int) -> int:
-        give = self.left(node, depth) + spare + self._tail_cells(*tail)
+    def _label_room(self, node: Node, depth: int, *tail: int) -> int:
+        give = self.left(node, depth) + self._tail_cells(*tail)
         return max(1, self.room - give - COLUMN_GAP)
 
     def _guide(self, rails: tuple[bool, ...], depth: int, last: bool, branch: bool) -> str:
@@ -511,53 +555,68 @@ class ForestStep(Step):
 
         ``▶`` is set *in* the joint rather than beside it, so a fan-out costs no extra column and
         still reads at a glance; the ASCII tier gets ``>`` for the same reason it gets ``+`` for a
-        tee. A root draws nothing, because there is no joint above it to connect to.
+        tee. A root has no joint to carry it, so a branching root gets a column of its own and every
+        other row in the tree gets that column blank — :meth:`left` charges for it either way, which
+        is the only way the labels stay in one edge.
         """
-        if not depth:
-            return ""
         glyph = L.box_glyphs(self.caps) if self.caps is not None else L.BOX_LIGHT
-        out = "".join(f"{glyph['v']}  " if keep else "   " for keep in rails)
+        dash = ">" if glyph is L.BOX_ASCII else "▶" if branch else glyph["h"]
+        if not depth:
+            if not self._roots_are_branching:
+                return ""
+            return f"{dash} " if branch else " " * GUIDE_WIDTH
+        rail = "".join(f"{glyph['v']}  " if keep else "   " for keep in rails)
         joint = glyph["bl"] if last else glyph["tee_l"]
-        if branch:
-            dash = ">" if glyph is L.BOX_ASCII else "▶"
-        else:
-            dash = glyph["h"]
-        return f"{out}{joint}{dash} "
-
-    def _badge(self, badge: str) -> Segment:
-        """A superseded block is labelled with a word, and the word is the same one every time."""
-        role = "dim" if badge == "unused" else "info"
-        return Segment(f" {badge}", self.tone(role))
+        return f"{' ' * self.guide_room}{rail}{joint}{dash} "
 
     def _box(self, node: Node, state: ForestState) -> str:
-        """The checkbox, always three cells.
+        """The mark column: the value inside, the changeability around it. Always three cells.
 
-        Hollow ``[-]`` is the mark :mod:`~.menu` already spends on a row the cursor cannot reach, so
-        a superseded source reads as disabled rather than merely unchecked — the difference between
-        "this is off" and "this is off and no key here changes it".
+        ``[-]`` is the mark :mod:`~.menu` already spends on a row the cursor cannot reach, so a
+        switch with nothing to switch reads as *inert* rather than merely unchecked — the difference
+        between "this is off" and "this is off and no key here changes it". ``-x-`` and ``- -`` are
+        the same fact about a row that was never a switch: a file on disk, priced or superseded.
         """
+        if node.kind == FIXED:
+            return f"-{ON_MARK if node.enabled else OFF_MARK}-"
         if not node.enabled:
             return "[-]"
-        return "[x]" if state.values.get(node.id, "") == node.states[0] else "[ ]"
+        return (
+            f"[{ON_MARK if state.values.get(node.id, '') == node.states[0] else OFF_MARK}]"
+            if node.kind == CHECK
+            else "   "
+        )
 
     def _mark_tone(self, node: Node, state: ForestState) -> str:
+        """The colour of a mark, which follows its value and never a hue of its own.
+
+        Green for a row that holds — the file that is being read, the add-on that is on — and dim
+        for one that does not. A fixed row's ``-x-`` is the same claim as a checkbox's ``[x]``, so
+        it is the same colour, and the two spellings stay distinguishable by their delimiters
+        rather than by being coloured differently for different reasons.
+        """
         if not node.enabled:
             return self.tone("dim")
-        return self.tone("active") if state.values.get(node.id, "") == node.states[0] else ""
+        holds = state.values.get(node.id, "") == node.states[0] if node.states else True
+        return self.tone("active") if holds else ""
 
-    def _label_tone(self, node: Node, state: ForestState) -> str:
+    def _label_tone(self, node: Node, state: ForestState, depth: int = 0) -> str:
         """The label's colour, which is how a superseded chain goes grey before a word is read.
 
         Only a state heavy enough to matter carries onto the label, and a forced override takes the
         override colour rather than green, so two different reasons for "not the default" never
-        arrive in the same glyph.
+        arrive in the same glyph. A root is weighted even when it carries no state at all, because
+        the six sections of this map are drawn in one grammar and the reader still has to find their
+        edges while scrolling.
         """
         if node.tone:
             return self.tone(node.tone)
         if not node.enabled:
             return self.tone("dim")
         role = self._state_role(node, state)
-        return self.tone(role) if role in _HEAVY else ""
+        if role in _HEAVY:
+            return self.tone(role)
+        return self.tone("title") if not depth else ""
 
     def _state_role(self, node: Node, state: ForestState) -> str:
         value = state.values.get(node.id, "")
@@ -568,37 +627,25 @@ class ForestStep(Step):
         node: Node,
         depth: int,
         state: ForestState,
-        spare: int,
-        word: int,
         value: int,
         pct: int,
         label: str,
     ) -> list[Segment]:
-        used = (
-            self.left(node, depth) + spare + self.cells(label) + self._tail_cells(word, value, pct)
-        )
+        used = self.left(node, depth) + self.cells(label) + self._tail_cells(value, pct)
         # The gap belongs to the columns, not to the row: padding the edge of an empty tail would
         # widen the row for nothing, and a row the frame has to clip is a row that looks broken.
-        if not any((word, value, pct)):
+        if not any((value, pct)):
             return []
         out = [Segment(" " * max(COLUMN_GAP, self.room - used))]
-        if word:
-            shown = state.values.get(node.id, "") if node.kind == WORD else ""
-            out.append(Segment(self._cut(shown, word).rjust(word), self._state_attr(node, state)))
         if value:
-            if word:
-                out.append(Segment(" " * FIELD_GAP))
             out.append(Segment(self._cut(node.value, value).rjust(value)))
         if pct:
-            if word or value:
+            if value:
                 out.append(Segment(" " * FIELD_GAP))
             out.append(Segment(self._cut(node.pct, pct).rjust(pct), self.tone("dim")))
         return out
 
-    def _state_attr(self, node: Node, state: ForestState) -> str:
-        return self.tone(self._state_role(node, state))
-
-    # -- status -----------------------------------------------------------------------------
+    # -- status and pane --------------------------------------------------------------------
 
     def status(self, state: object) -> Line:
         """The focused row in full, because its label is the first thing a narrow window clips.
@@ -613,8 +660,38 @@ class ForestStep(Step):
         value = state.values.get(node.id, "")
         return Line(
             Segment(node.label, self.tone("focus")),
-            Segment(f"  {value}" if value else "", self._state_attr(node, state)),
+            Segment(f"  {value}" if value else "", self.tone(self._state_role(node, state))),
         )
+
+    def detail(self, state: object) -> list[Line]:
+        """The prose describing the row under the cursor, wrapped for wherever it will be shown.
+
+        Rebuilt per paint rather than cached, because the tree itself is re-derived from the answer
+        on every keystroke — a pane that outlived the row it described would say something about a
+        file the operator has just switched off.
+
+        The row's own name is not repeated here: the cursor is on it and the status line spells it
+        out, so a header would be one more line of the screen spent saying nothing.
+        """
+        assert isinstance(state, ForestState)
+        node = self.option(state)
+        if node is None or not node.detail:
+            return []
+        return [
+            Line(Segment(piece, self.tone("dim")))
+            for piece in self._wrapped(node.detail, self.detail_room)
+        ]
+
+    def detail_source(self, state: object) -> tuple[str, ...]:
+        """The same prose before it was wrapped.
+
+        The overlay re-measures it: a sentence broken for a pane twenty-eight columns wide breaks in
+        the wrong place across the full width of the overlay, and a reader who went looking for the
+        whole of a description should not get the pane's line endings with it.
+        """
+        assert isinstance(state, ForestState)
+        node = self.option(state)
+        return (node.detail,) if node is not None and node.detail else ()
 
     # -- answering --------------------------------------------------------------------------
 
@@ -658,10 +735,8 @@ class ForestStep(Step):
         return Result(value=dict(state.values))
 
 
-def _drop(word: int, value: int, pct: int) -> tuple[int, int, int]:
+def _drop(value: int, pct: int) -> tuple[int, int]:
     """Give up the rightmost non-empty column, which is the one that says the least per cell."""
     if pct:
-        return (word, value, 0)
-    if value:
-        return (word, 0, 0)
-    return (0, 0, 0)
+        return (value, 0)
+    return (0, 0)

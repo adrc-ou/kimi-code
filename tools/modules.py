@@ -16,7 +16,7 @@ if __package__:
     from .definitions import ENV_VAR, ID
     from .private_file import write_private_json
     from .safe_workspace_init import UnsafeWorkspace, components, initialize
-    from .tui import flow
+    from .tui import flow, screen
     from .tui.app import View, run
     from .tui.input import FieldStep
     from .tui.menu import Choice, ListStep
@@ -24,7 +24,7 @@ else:
     from definitions import ENV_VAR, ID
     from private_file import write_private_json
     from safe_workspace_init import UnsafeWorkspace, components, initialize
-    from tui import flow
+    from tui import flow, screen
     from tui.app import View, run
     from tui.input import FieldStep
     from tui.menu import Choice, ListStep
@@ -161,9 +161,11 @@ def ask_module_value(module, item, view):
     ``whitespace_is_value`` is for.
     """
     name = item["name"]
-    print(
-        f"{module['label']}: add {name} to .env to persist it; this value is for this session only."
-    )
+    persist = f"{module['label']}: add {name} to .env to persist it"
+    if not screen.held():
+        # The field prints this itself, as its own head. On a screen the launcher borrowed for the
+        # whole run, a line written here belongs to a frame the user has already lost.
+        print(f"{persist}; this value is for this session only.")
     step = FieldStep(
         title=module_field_title(module, item),
         prompt=f"{item['prompt']} ({name})",

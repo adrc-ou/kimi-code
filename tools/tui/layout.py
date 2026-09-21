@@ -431,16 +431,40 @@ def thumb(window: Window, total: int, height: int) -> tuple[int, int]:
     return (start, start + size)
 
 
-def page(total: int, height: int, direction: int, selected: int) -> int:
-    """The index to focus after a page movement.
+def page(total: int, height: int, previous: int, direction: int) -> int:
+    """The viewport top after a page movement, given it was at ``previous``.
 
-    A page leaves one row of context behind so the user can see where they came from, which is what
-    makes ``PgDn`` on a long list feel like turning a page rather than being teleported.
+    Paging moves the *window* and not the cursor, which is why the two are separate numbers here.
+    A page that could only move the cursor strands any content below the last row the cursor may
+    rest on — prose under a short list, a legend under a tree — and leaves the overflow count
+    promising a tail nobody can ever bring on screen.
+
+    One row of the old page is left visible so the move reads as turning a page rather than being
+    teleported.
     """
-    if total <= 0:
+    if total <= 0 or height <= 0:
         return 0
     step = max(1, height - 1)
-    return max(0, min(selected + direction * step, total - 1))
+    return max(0, min(previous + direction * step, max(0, total - height)))
+
+
+def edge(order: list[int], first: int, last: int, direction: int) -> int | None:
+    """Where the cursor belongs after the window moved past it, as a position in ``order``.
+
+    The cursor rides the edge it is closest to: a page down lands it on the first selectable row of
+    the new page, a page up on the last. That keeps ``Space`` and ``Enter`` aimed at something the
+    user can see, which is the property a config screen cannot afford to lose — an off-screen cursor
+    toggles an answer nobody is looking at.
+
+    ``None`` says the window holds no selectable row at all, so the cursor had best stay put.
+    """
+    if not order:
+        return None
+    positions = range(len(order)) if direction > 0 else range(len(order) - 1, -1, -1)
+    for position in positions:
+        if first <= order[position] < last:
+            return position
+    return None
 
 
 # --------------------------------------------------------------------------------------------
@@ -466,6 +490,10 @@ class Frame:
     title: Rect = Rect()
     rail: Rect = Rect()
     body: Rect = Rect()
+    #: The reading column beside the body, or blank when the window cannot afford one. It is a
+    #: region rather than an overlay because a pane the list can paint under is a pane that
+    #: silently loses its numbers.
+    detail: Rect = Rect()
     status: Rect = Rect()
     footer: Rect = Rect()
     rule_top: Rect = Rect()
@@ -495,8 +523,77 @@ _GIVE_UP = ("status", "rail", "title")
 #: table — so it is given up before the rail and before the status line, and never out of the body.
 COMFORT_BODY = 8
 
+#: The tallest the bar under the list is ever allowed to get: one line naming what the cursor is on,
+#: plus as much of that row's description as a fixed band should hold. The frame clamps to this so a
+#: surface cannot ask for a paragraph and take the list's rows with it.
+MAX_STATUS_ROWS = 4
 
-def layout(columns: int, rows: int, *, footer_rows: int = 1, rail: bool = True) -> Frame:
+# --------------------------------------------------------------------------------------------
+# the reading pane
+# --------------------------------------------------------------------------------------------
+
+#: The narrowest body worth splitting in two. Below this the tree loses more to the pane than the
+#: pane gives back, and the help bar under the list carries the prose instead. It is set against
+#: what a clipped label still costs: the pane is worth two to four body rows, and a 120-column
+#: window — a normal laptop terminal — is where paying that back starts to win.
+DETAIL_MIN_BODY = 72
+#: The fewest columns of prose that read as a column rather than as a ribbon.
+DETAIL_MIN_WIDTH = 28
+#: The most. A sentence set across eighty columns is the reason people lost their place in the
+#: old screen; a pane is a measure, not a spare room.
+DETAIL_MAX_WIDTH = 52
+#: Columns the divider between the two spends: its rule and one space either side.
+DETAIL_SPEND = 3
+
+
+def detail_rect(body: Rect) -> Rect:
+    """The pane beside ``body``, or a blank rect when the window is too narrow to split.
+
+    A third of the width, clamped both ways: the tree needs enough of what is left to hold a label
+    and a column of figures, and prose past a comfortable measure stops being faster to read. The
+    pane is anchored to the body's own rows and to the screen's right edge, so it holds still while
+    the list scrolls and never lands on the footer.
+    """
+    if body.width < DETAIL_MIN_BODY:
+        return Rect()
+    width = min(DETAIL_MAX_WIDTH, max(DETAIL_MIN_WIDTH, (body.width - DETAIL_SPEND) // 3))
+    if body.width - DETAIL_SPEND - width < DETAIL_MIN_BODY:
+        return Rect()
+    return Rect(body.top, body.right - width, body.height, width)
+
+
+def detail_rule(pane: Rect) -> Rect:
+    """The divider column that belongs to a pane, in the gap between the two.
+
+    Spelled from the pane rather than stored beside it so the gap stays one number
+    (:data:`DETAIL_SPEND`) with one centre, and the tree's right edge, the rule, and the prose's
+    left margin cannot drift apart as that number is retuned.
+    """
+    if pane.blank:
+        return Rect()
+    return Rect(pane.top, pane.left - 2, pane.height, 1)
+
+
+def paint_column(screen: Screen, area: Rect, caps: Caps, attr: str = "") -> None:
+    """A vertical separator down ``area``'s column, for as many rows as ``area`` covers.
+
+    The pane's rule stops with the body instead of running on through the help bar and the footer:
+    a divider down the whole screen would box the legend in with the prose and make the footer look
+    like part of the description rather than part of the chrome.
+    """
+    glyph = box_glyphs(caps)["v"]
+    for row in range(area.top, min(area.bottom, screen.rows)):
+        screen.text(row, area.left, glyph, attr or caps.color_pair("rule"))
+
+
+def layout(
+    columns: int,
+    rows: int,
+    *,
+    footer_rows: int = 1,
+    rail: bool = True,
+    status_rows: int = 1,
+) -> Frame:
     """Divide a ``columns`` x ``rows`` window into its regions.
 
     ``footer_rows`` is how many rows the legend needs, which only the caller knows, because it
@@ -505,9 +602,17 @@ def layout(columns: int, rows: int, *, footer_rows: int = 1, rail: bool = True) 
 
     ``rail`` is whether the step rail has anything to say, which is likewise the caller's question.
     A row that would be blank is not chrome, and the body is short enough without it.
+
+    ``status_rows`` is how many lines the bar under the list needs: one for a step that only names
+    the row under the cursor, more for a tree that has prose to say about it and no room beside the
+    list to say it in. The body shortens by exactly that much, and the bar is given up a row at a
+    time — before any chrome is given up — so a short window loses the description and not the list.
+    Three lines of description is the ceiling: past that the bar is an essay, and an essay belongs
+    in the key overlay, which scrolls.
     """
     columns = max(20, columns)
     rows = max(4, rows)
+    status_rows = max(1, min(status_rows, MAX_STATUS_ROWS))
     footer_rows = max(1, min(footer_rows, rows - 3))
     shown = set(CHROME)
     if not rail:
@@ -518,7 +623,9 @@ def layout(columns: int, rows: int, *, footer_rows: int = 1, rail: bool = True) 
         if kept & {"title", "rail"}:
             total += 1  # the rule under the header block
         if "status" in kept:
-            total += 1  # the rule above it
+            # ``len(kept)`` already counted the bar's first row, so this is its extra rows plus the
+            # rule above it — two, for a step with nothing to say beyond the cursor's own line.
+            total += status_rows
         return total
 
     # The extra legend row is given up before any chrome is, because a wrapped hint is the one
@@ -548,19 +655,25 @@ def layout(columns: int, rows: int, *, footer_rows: int = 1, rail: bool = True) 
     footer = Rect(rows - footer_rows, 0, footer_rows, columns)
     rule_bottom = Rect()
     if "status" in shown:
-        status = Rect(footer.top - 1, 0, 1, columns)
-        rule_bottom = Rect(footer.top - 2, 0, 1, columns)
+        status = Rect(footer.top - status_rows, 0, status_rows, columns)
+        rule_bottom = Rect(footer.top - status_rows - 1, 0, 1, columns)
         body_end = rule_bottom.top
     else:
         body_end = footer.top
     body = Rect(cursor, 0, max(1, body_end - cursor), columns).shrink(
         left=GUTTER_WIDTH, right=SCROLLBAR_WIDTH
     )
+    # Splitting is the last thing done to the body and the first thing a short window gives back:
+    # the loop asks for one status row again when the list can no longer hold both regions.
+    detail = detail_rect(body)
+    if not detail.blank:
+        body = body.shrink(right=detail.width + DETAIL_SPEND)
     return Frame(
         screen=Rect(0, 0, rows, columns),
         title=title,
         rail=rail,
         body=body,
+        detail=detail,
         status=status,
         footer=footer,
         rule_top=rule_top,
@@ -669,17 +782,30 @@ def scrollbar(screen: Screen, area: Rect, window: Window, total: int, caps: Caps
         screen.text(row, column, mark, rule)
 
 
-def overflow_note(count: int, direction: str, caps: Caps, attr: str = "") -> Line:
+def overflow_note(
+    count: int,
+    direction: str,
+    caps: Caps,
+    attr: str = "",
+    *,
+    cursor: bool = False,
+) -> Line:
     """``2 more below`` — the discoverability half of scrolling.
 
     The count is the point. A scrollbar shows *that* there is more, and a half-visible row shows
     *that* it continues, but neither says how much is left, and how much is what decides whether to
     keep pressing the key.
+
+    With ``cursor`` the pointer glyph joins the arrow, which is how a selection left off-screen by a
+    deliberate page movement still says where it went. The window and the cursor are separately
+    owned, so a body whose last selectable row sits above its own tail can show the tail without
+    pretending the cursor came with it.
     """
     if direction == "above":
         word, mark = "above", ("↑" if caps.unicode else "^")
     else:
         word, mark = "below", ("↓" if caps.unicode else "v")
+    where = pointer(caps) + mark if cursor else mark
     # ``more`` is not the counted noun — the rows are — so it never takes a plural. ``2 more
     # below`` reads as a direction; ``2 mores below`` reads as a typo.
-    return Line(Segment(f" {mark} {count} more {word}", attr or caps.color_pair("rule")))
+    return Line(Segment(f" {where} {count} more {word}", attr or caps.color_pair("rule")))

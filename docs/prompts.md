@@ -621,8 +621,9 @@ The ratio worth acting on is unchanged: the harness's own contract is the larges
 thing every agent carries and the only large surface the harness fully controls,
 and the subagent pays for it without receiving the main prompt at all.
 
-The panel itself costs the model nothing: 75 lines and 4,343 characters
-of terminal output that the launcher prints and discards, none of which
+The panel itself costs the model nothing: the 75 lines and roughly 4.4 KB of
+screen it draws — in the modal, or as the plain printout an unattended launch
+gets — are never written into a file the agent reads, none of it
 reaches a prompt. Worth saying, because the panel is otherwise the only
 place these figures are added up, and an instrument that measures a
 budget should not quietly spend one of its own.
