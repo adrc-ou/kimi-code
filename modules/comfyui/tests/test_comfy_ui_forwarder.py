@@ -50,7 +50,9 @@ class TLSEchoServer:
         self.listener.listen(8)
         self.port = self.listener.getsockname()[1]
         self.stopping = threading.Event()
-        self.thread = threading.Thread(target=self.accept_forever, name="stand-in-accept", daemon=True)
+        self.thread = threading.Thread(
+            target=self.accept_forever, name="stand-in-accept", daemon=True
+        )
         self.thread.start()
 
     def accept_forever(self):
@@ -93,7 +95,7 @@ class TLSEchoServer:
 
 
 def read_until(sock: socket.socket, predicate, timeout: float = 15.0) -> bytes:
-    """Accumulate whatever arrives until ``predicate`` is satisfied, the peer hangs up, or time is."""
+    """Accumulate whatever arrives until ``predicate`` holds, the peer hangs up, or time out."""
     sock.settimeout(timeout)
     collected = b""
     try:
@@ -233,7 +235,8 @@ class ForwarderPumpTests(unittest.TestCase):
                     break
                 arrived += chunk
             why.append(f"attempt {attempt} of 3")
-            why.append(f"upstream echoed {sum(len(c) for c in self.upstream.received)} bytes so far")
+            echoed = sum(len(c) for c in self.upstream.received)
+            why.append(f"upstream echoed {echoed} bytes so far")
             why.append(f"forwarder notes={self.server.notes}")
             diagnostic = "; ".join(why)
             self.assertEqual(len(arrived), len(expected), diagnostic)

@@ -17,6 +17,7 @@ for _directory in (ROOT, ROOT / "tools"):
         sys.path.insert(0, str(_directory))
 
 import prompt_context  # noqa: E402
+
 from tests.helpers import run_in_pty  # noqa: E402
 
 
@@ -279,7 +280,9 @@ PY
         self.command(
             "docker",
             """
-if [[ "$*" == "compose version --format json" ]]; then echo '{"version":"v5.0.2+fixture"}'; exit 0; fi
+if [[ "$*" == "compose version --format json" ]]; then
+  echo '{"version":"v5.0.2+fixture"}'; exit 0
+fi
 if [[ "$*" == *"config --environment" ]]; then cat "$TEST_BOOTSTRAP"; exit 0; fi
 if [[ "$*" == *"config --format json" ]]; then "${RESOLVED_STUB:-resolved-config-clean}"; exit 0; fi
 if [[ "$*" == *"kimi --version" ]]; then echo 0.42.0; exit 0; fi

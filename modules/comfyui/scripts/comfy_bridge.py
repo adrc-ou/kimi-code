@@ -61,7 +61,8 @@ async function enter() {
   // fragment was never transmitted to the bridge, and it does not stay in the address bar either.
   history.replaceState(null, "", location.pathname);
   if (!grant) {
-    status.textContent = "This page is not a frontend login. Open a freshly requested ComfyUI link.";
+    status.textContent =
+      "This page is not a frontend login. Open a freshly requested ComfyUI link.";
     return;
   }
   try {

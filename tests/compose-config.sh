@@ -9,6 +9,13 @@ fi
 # Ignore operator configuration, even when this check runs in a configured clone.
 export COMPOSE_ENV_FILES=/dev/null
 export COMPOSE_DISABLE_ENV_FILE=1
+# Same floor the launcher applies: below it `config --format json` omits an explicit
+# create_host_path: false, so the hygiene gate below cannot read the option it enforces and
+# refuses a confined launch. Ask for the upgrade here, where the cause is named, rather than
+# leaving it as an unexplained bind violation two thirds of the way through this script.
+# shellcheck disable=SC1091
+source "${root}/tools/runtime.sh"
+harness_require_compose_version || exit 1
 export SEARXNG_SECRET=compose-fixture-only
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/kimi compose.XXXXXX")
 test_project="kimi-cache-test-$(basename "${fixture}" | tr '[:upper:] .' '[:lower:]--')"

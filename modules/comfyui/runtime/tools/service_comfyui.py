@@ -29,7 +29,9 @@ def frontend_probe(comfyctl):
         except urllib.error.HTTPError as exc:
             raise ValueError(f"the ComfyUI frontend refused a request ({exc.code})") from None
         except (OSError, urllib.error.URLError) as exc:
-            raise ValueError(f"the ComfyUI frontend is unreachable ({type(exc).__name__})") from None
+            raise ValueError(
+                f"the ComfyUI frontend is unreachable ({type(exc).__name__})"
+            ) from None
         try:
             return json.loads(body)
         except ValueError:

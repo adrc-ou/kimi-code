@@ -20,7 +20,7 @@ import subprocess
 import sys
 from collections import Counter
 from contextlib import AsyncExitStack
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 CONFIG = Path("/home/agent/.kimi-code/mcp.json")
@@ -327,7 +327,7 @@ def write_report(path, mode, results, code):
     else:
         from private_file import write_private_json
     write_private_json(path, {
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "mode": mode,
         "exit_code": code,
         "counts": dict(Counter(result["status"] for result in results)),
