@@ -341,7 +341,9 @@ if [[ "${non_interactive}" != true ]]; then
   # to stop a launch.
   flow_counts=$(python3 tools/flow_survey.py --root "${root}" --runtime-dir "${HARNESS_RUNTIME_DIR}" \
     --steps "${flow_steps}" 2>/dev/null || true)
-  [[ -n "${flow_counts}" ]] && "${flow[@]}" survey --counts "${flow_counts}" || true
+  if [[ -n "${flow_counts}" ]]; then
+    "${flow[@]}" survey --counts "${flow_counts}" || true
+  fi
 fi
 
 # The alternate screen is borrowed once for the whole interactive sequence rather than once per

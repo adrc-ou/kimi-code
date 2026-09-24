@@ -28,7 +28,45 @@ jobs:
       - run: python -m compileall -q proxy scripts search-adapter tests tools modules container
       - run: ruff check .
       - run: python scripts/check_locks.py
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # apt's shellcheck on the runner image is two major releases behind, and the linters differ
+      # between them, so this gate would report a different set of defects depending on which image
+      # the job landed on -- and change again when ubuntu-latest moves. Pin the published release
+      # and verify its digest rather than depending on whichever version the image carries.
+      - name: Install pinned shellcheck
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+        run: |
+          case "$(uname -m)" in
+            x86_64)
+              asset="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+              digest=b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+              ;;
+            aarch64)
+              asset="shellcheck-${SHELLCHECK_VERSION}.linux.aarch64.tar.gz"
+              digest=68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc
+              ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${asset}" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${asset}"
+          printf '%s  %s\n' "${digest}" "${RUNNER_TEMP}/${asset}" | sha256sum --check --quiet
+          tar -xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}"
+          mkdir -p "${RUNNER_TEMP}/bin"
+          install -m 0755 \
+            "${RUNNER_TEMP}/shellcheck-${SHELLCHECK_VERSION}/shellcheck" "${RUNNER_TEMP}/bin/shellcheck"
+          # `$GITHUB_PATH` only reaches the steps that follow, so prepend it here too and let the
+          # guard below resolve `shellcheck` through PATH rather than by absolute path: that is the
+          # same lookup the lint step performs, and it outranks anything the runner image carries.
+          export PATH="${RUNNER_TEMP}/bin:${PATH}"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
+          shellcheck --version
+          if [ "$(shellcheck --version | sed -n 's/^version: //p')" != "${SHELLCHECK_VERSION#v}" ]; then
+            echo "shellcheck still resolves a version other than ${SHELLCHECK_VERSION}." >&2
+            exit 1
+          fi
       - run: git ls-files '*.sh' -z | xargs -0 -n1 bash -n
       - run: git ls-files '*.sh' -z | xargs -0 shellcheck
       - run: npm ci --ignore-scripts --prefix container
