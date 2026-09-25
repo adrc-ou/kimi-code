@@ -25,10 +25,25 @@ test_project="kimi-cache-test-$(basename "${fixture}" | tr '[:upper:] .' '[:lowe
 compose_files=(-f "${root}/compose.yaml" -f "${root}/compose.search.yaml" -f "${fixture}/models.json")
 runtime_test=false
 cleanup() {
+  local status=0
   if [[ "${runtime_test}" == true ]]; then
-    docker compose -p "${test_project}" "${compose_files[@]}" down --volumes --remove-orphans
+    # Release the initializer's pins before asking the daemon to destroy the volumes: the removal
+    # runs as root, but unlinking an immutable file is EPERM for root too, so kimi-state only
+    # becomes removable once a container still holding CAP_LINUX_IMMUTABLE has cleared them.
+    # Best effort, because a teardown problem must never mask the check that actually failed.
+    if [[ -f "${fixture}/state-test.json" ]]; then
+      docker compose -p "${test_project}" -f "${fixture}/state-test.json" run --rm --no-deps \
+        state-unpin-test || true
+    fi
+    docker compose -p "${test_project}" "${compose_files[@]}" down --volumes --remove-orphans ||
+      status=$?
   fi
+  # Unconditional: under errexit an EXIT trap aborted by a failing command never reached this line,
+  # so a refused volume removal also leaked the whole fixture directory.
   find "${fixture}" -depth -delete
+  # `return`, never `exit`: an EXIT trap that calls `exit` overwrites the body's status, which
+  # would turn every failed runtime check green.
+  return "${status}"
 }
 trap cleanup EXIT
 mkdir -p "${fixture}/workspace" "${fixture}/empty" "${fixture}/assets/skills" \
@@ -108,14 +123,24 @@ docker compose "${compose_files[@]}" -f "${fixture}/limits.yaml" config --quiet
 if [[ "${1:-}" == --runtime ]]; then
   runtime_test=true
   compose=(docker compose -p "${test_project}" "${compose_files[@]}")
+  # Every container started here needs the daemon, so unlike the checks above this one cannot be
+  # reproduced by reading the rendered configuration. Each announces itself before it starts: the
+  # script fails fast, so the last label on stdout names the check that died rather than leaving
+  # an unexplained exit 1 at the end of a run nobody else can replay.
+  runtime_check() {
+    local label=$1
+    shift
+    printf 'runtime %s\n' "${label}"
+    "$@"
+  }
   # Both a fresh cache and one already owned by SearXNG must initialize.
-  "${compose[@]}" run --rm --no-deps searxng-init
+  runtime_check "searxng cache initialises when empty" "${compose[@]}" run --rm --no-deps searxng-init
   # shellcheck disable=SC2016
-  "${compose[@]}" run --rm --no-deps --entrypoint /bin/sh searxng -ec \
+  runtime_check "searxng cache is owned and writable by SearXNG" "${compose[@]}" run --rm --no-deps --entrypoint /bin/sh searxng -ec \
     'stat -c "%u:%g:%a" /var/cache/searxng; test "$(stat -c "%u:%g:%a" /var/cache/searxng)" = 977:977:700; echo preserved > /var/cache/searxng/test-marker'
-  "${compose[@]}" run --rm --no-deps searxng-init
+  runtime_check "searxng cache initialises when already owned" "${compose[@]}" run --rm --no-deps searxng-init
   # shellcheck disable=SC2016
-  "${compose[@]}" run --rm --no-deps --entrypoint /bin/sh searxng -ec \
+  runtime_check "searxng cache keeps owner and contents across restarts" "${compose[@]}" run --rm --no-deps --entrypoint /bin/sh searxng -ec \
     'test "$(stat -c "%u:%g:%a" /var/cache/searxng)" = 977:977:700; test "$(cat /var/cache/searxng/test-marker)" = preserved'
 
   # Exercise the actual agent tmpfs configuration without building the agent
@@ -140,7 +165,8 @@ print(json.dumps({"services": {"cache-test": {
                 "echo ok > /home/agent/.cache/kimi-code/web/test/dist-web/assets/test"],
 }}}))
 ' >"${fixture}/cache-test.json"
-    docker compose -p "${test_project}" -f "${fixture}/cache-test.json" run --rm cache-test
+    runtime_check "agent cache tmpfs belongs to ${identity}" \
+      docker compose -p "${test_project}" -f "${fixture}/cache-test.json" run --rm cache-test
     # Exercise the real initializer on fresh volumes, then migrate 1000:1000
     # state to 1234:2345. Use the cached Python image without building Kimi.
     # shellcheck disable=SC2016
@@ -167,14 +193,40 @@ probe = {
                 "link.is_symlink() or link.symlink_to(\"/etc/passwd\"); "
                 "(roots[1]/\"writable\").write_text(\"ok\")"],
 }
-print(json.dumps({"services": {"state-init-test": initializer, "state-write-test": probe},
+# The initializer pins its managed files, and unlinking an immutable file is EPERM even for root,
+# so nothing can remove the kimi-state volume until a container that still holds CAP_LINUX_IMMUTABLE
+# has cleared those pins. Derived from the initializer service itself, and calling its own
+# clear_immutable, so the mounts and capabilities that release the pins cannot drift away from the
+# ones that set them.
+unpin = "\n".join([
+    "import importlib.util, os",
+    "from pathlib import Path",
+    "spec = importlib.util.spec_from_file_location(\"kimi_staging\", \"/initialize-agent-state.py\")",
+    "module = importlib.util.module_from_spec(spec)",
+    "spec.loader.exec_module(module)",
+    "targets = [Path(base) / name",
+    "           for root in (\"/state/kimi\", \"/state/serena\", \"/state/assets\", \"/state/managed\")",
+    "           for base, dirs, files in os.walk(root)",
+    "           for name in dirs + files]",
+    "for path in targets:",
+    "    module.clear_immutable(path)",
+    "print(\"cleared immutable pins on \" + str(len(targets)) + \" state volume entries\")",
+])
+unpin_service = dict(initializer, entrypoint=["python", "-c"], command=[unpin])
+print(json.dumps({"services": {"state-init-test": initializer, "state-write-test": probe,
+                               "state-unpin-test": unpin_service},
                   "volumes": {"kimi-state": {}, "serena-state": {}, "kimi-assets": {},
                               "kimi_user_agents": {}, "kimi_user_skills": {},
                               "kimi_user_plugins": {}}}))
 ' >"${fixture}/state-test.json"
-    for _ in 1 2; do
-      docker compose -p "${test_project}" -f "${fixture}/state-test.json" run --rm state-init-test
-      docker compose -p "${test_project}" -f "${fixture}/state-test.json" run --rm state-write-test
+    # Two passes, because the second one re-stages over the state the first left -- which is what
+    # restarting an existing workspace does, and the only way to catch a staging step that is not
+    # actually idempotent against its own output.
+    for pass in 1 2; do
+      runtime_check "agent state initialises for ${identity} (pass ${pass})" \
+        docker compose -p "${test_project}" -f "${fixture}/state-test.json" run --rm state-init-test
+      runtime_check "agent writes initialised state for ${identity} (pass ${pass})" \
+        docker compose -p "${test_project}" -f "${fixture}/state-test.json" run --rm state-write-test
     done
   done
 fi
