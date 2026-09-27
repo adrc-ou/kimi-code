@@ -48,6 +48,11 @@ else:
     from tui.menu import SINGLE, Choice, ListStep
 
 SELECTABLE = ("primary", "subagent")
+#: Suffix on a main-agent-screen row that launches the agent on the queued long lane instead of
+#: the concurrent one. It is a row id, never a model id: the model is the same either way, and
+#: the plan stores the lane separately.
+AGENT_SUFFIX = "@long"
+
 #: Which step of the launch sequence each lane is asked on, so the flow can number the two screens
 #: separately: they are one process, but the user meets them as two steps.
 LANE_STEP = {"primary": flow.MODEL, "subagent": flow.SUBAGENT}
@@ -57,7 +62,7 @@ POLICY_FILE = "model-policy.json"
 MODEL_ENV = "model.env"
 COMPOSE_FRAGMENT = "compose/models.json"
 CREDENTIALS_DIR = "credentials"
-PROMPTS = {"primary": "Primary agent model", "subagent": "Subagent model"}
+PROMPTS = {"primary": "Main agent model", "subagent": "Subagent model"}
 #: Both failure families mean "this selection cannot be served", and both must print one
 #: clean line rather than a traceback, because start.sh surfaces the launcher's stderr.
 Refusal = (DefinitionError, policy.ResolutionError, OSError, ValueError)
@@ -128,6 +133,103 @@ def selectable(models: list[dict[str, Any]], lane: str) -> list[dict[str, Any]]:
         (model for model in models if lane in model["lanes"]),
         key=lambda model: (model["label"].casefold(), model["id"]),
     )
+
+
+def token_span(tokens: int) -> str:
+    """One token count in the short form a launch screen has room for.
+
+    Windows are advertised in two traditions, a decimal million (1,000,000) and a binary one
+    (262,144, which everyone calls 256k), so both bases are tried, largest first. A count that is a
+    clean multiple of neither is written out in full rather than rounded, because a row that
+    promises a window the definition does not declare is worse than a long label. Nothing here
+    knows what any model's window is: the number always comes from the definition.
+    """
+    for base, letter in ((1_000_000, "M"), (1024 * 1024, "M"), (1_000, "k"), (1024, "k")):
+        if tokens >= base and tokens % base == 0:
+            return f"{tokens // base}{letter}"
+    return f"{tokens:,}"
+
+
+def long_window_tokens(model: dict[str, Any]) -> int | None:
+    """The window the long-lane twin offers, when this definition's shape carries one.
+
+    ``load_definitions`` hands back lanes as a table of ``[lane.*]`` entries, so the window is
+    right there. Tests and any other caller may name lanes as a bare list, which says a long lane
+    exists but not how big it is; a missing number costs the label its size, not the row.
+    """
+    lanes = model.get("lanes")
+    long_lane = lanes.get("long") if isinstance(lanes, dict) else None
+    if not isinstance(long_lane, dict):
+        return None
+    tokens = long_lane.get("context_tokens")
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
+        return None
+    return tokens
+
+
+def agent_rows(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The main-agent screen's rows: every primary model, offered on each of its two agent lanes.
+
+    The two windows the main agent can launch on are peers, not tiers: one trades context for
+    in-flight overlap and the other trades overlap for context. The queued wide-window row comes
+    first because that is the shipped default - a bigger window beats spare headroom under the
+    utilisation mandate - and the row id carries the lane, with :func:`split_agent_row` taking it
+    back out, so nothing downstream has to know the two were ever one screen.
+    """
+    rows: list[dict[str, Any]] = []
+    for model in selectable(models, "primary"):
+        if "long" in model["lanes"]:
+            twin = dict(model)
+            twin["id"] = f"{model['id']}{AGENT_SUFFIX}"
+            tokens = long_window_tokens(model)
+            span = f", {token_span(tokens)} window" if tokens is not None else ""
+            twin["label"] = f"{model['label']} - Long (queued{span})"
+            rows.append(twin)
+        if "primary" in model["lanes"]:
+            row = dict(model)
+            row["label"] = f"{model['label']} - Medium (concurrent)"
+            rows.append(row)
+    return rows
+
+
+def split_agent_row(row_id: str) -> tuple[str, str]:
+    """``(model id, agent lane)`` for a primary-screen row id."""
+    if row_id.endswith(AGENT_SUFFIX):
+        return row_id[: -len(AGENT_SUFFIX)], "long"
+    return row_id, "primary"
+
+
+def join_agent_row(model_id: str, agent_lane: str) -> str:
+    """The row id a launcher would have to answer to reproduce a stored selection."""
+    return f"{model_id}{AGENT_SUFFIX}" if agent_lane == "long" else model_id
+
+
+def remembered_row(lane: str, model_id: str, stored: dict[str, Any]) -> str:
+    """The row this lane's screen would have to offer to repeat ``stored``'s answer.
+
+    Only the main-agent screen has more than one row per model, so only there does a saved model id
+    need the window it was chosen with put back on it. A document with no usable recorded window —
+    every launch before the window became a choice, and any later one whose value has rotted — is
+    read as the narrow lane rather than as :data:`policy.DEFAULT_AGENT_LANE`: the wide row is new
+    and no historical answer can have been given on it, so the shipped default describes a launch
+    with no memory at all, not a memory that predates the question. Guessing wide here would
+    upgrade last launch's answer into a lane it never chose.
+    """
+    if lane != "primary":
+        return model_id
+    agent_lane = str(stored.get("agent_lane") or "primary")
+    if agent_lane not in policy.AGENT_LANES:
+        agent_lane = "primary"
+    return join_agent_row(model_id, agent_lane)
+
+
+def lane_rows(models: list[dict[str, Any]], lane: str) -> list[dict[str, Any]]:
+    """The rows one lane's screen offers.
+
+    Only the main-agent screen has more than its own model list: it also carries the window
+    choice, so that either agent lane is one keystroke rather than an edit to a file.
+    """
+    return agent_rows(models) if lane == "primary" else selectable(models, lane)
 
 
 def prompts(override: str, non_interactive: bool, choices: list[dict[str, Any]]) -> bool:
@@ -298,11 +400,14 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
     if not isinstance(previous, dict):
         previous = {}
     lanes = list(SELECTABLE)
-    options = {lane: selectable(models, lane) for lane in lanes}
+    options = {lane: lane_rows(models, lane) for lane in lanes}
     overrides = {
         lane: os.environ.get(f"HARNESS_{lane.upper()}_MODEL", "").strip() for lane in lanes
     }
     selection: dict[str, str] = {}
+    agent_lane = str(previous.get("agent_lane") or policy.DEFAULT_AGENT_LANE)
+    if agent_lane not in policy.AGENT_LANES:
+        agent_lane = policy.DEFAULT_AGENT_LANE
     lines: dict[str, str] = {}
     state = flow.running(runtime)
     # This launch's own answers, which are what a replayed lane re-uses. The last launch's answers
@@ -324,9 +429,14 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
             for earlier in lanes[:index]
         )
         asking = prompts(overrides[lane], non_interactive, choices)
+        # The row this screen would have pre-selected, in the window the earlier document chose.
+        # Asked of the document itself rather than of ``agent_lane``, which this launch overwrites
+        # as soon as the primary screen answers: joining that to the subagent's model id would
+        # invent a row the subagent screen has never offered.
+        remembered = remembered_row(lane, str(previous.get(lane, "")), previous)
         replayed = ""
         if state and asking and not state.should_render(step):
-            stored = str(answered.get(lane, ""))
+            stored = remembered_row(lane, str(answered.get(lane, "")), answered)
             if stored in ids:
                 replayed = stored
             else:
@@ -346,7 +456,7 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
                 chosen = choose(
                     lane,
                     choices,
-                    str(previous.get(lane, "")),
+                    remembered,
                     non_interactive=non_interactive,
                     override=overrides[lane],
                     view=(
@@ -373,14 +483,20 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
                         # again asks them rather than replaying values that were never confirmed.
                         state.forget(LANE_STEP[later])
                 continue
-        selection[lane] = chosen
+        model_id = chosen
+        if lane == "primary":
+            # The row carries the window; the selection document keeps a real model id and the
+            # lane beside it, so every consumer that reads model ids reads model ids still.
+            # ``choose`` has already refused a row it does not offer, so nothing to re-check here.
+            model_id, agent_lane = split_agent_row(chosen)
+        selection[lane] = model_id
         if state and asking:
             # Only a lane that could have been asked commits. An answer from ``HARNESS_*_MODEL`` or
             # from ``--non-interactive`` is a step with no screen in it, and committing would put it
             # back on the rail that skipping just took it off.
             state.commit(step, chosen)
         model = next(item for item in choices if item["id"] == chosen)
-        suffix = " (last used)" if previous.get(lane) == chosen else ""
+        suffix = " (last used)" if remembered and chosen == remembered else ""
         # Held until the sequence settles rather than printed as each lane closes: going back would
         # otherwise leave the superseded answer in the scrollback next to the one that replaced it,
         # two lines that cannot both be true.
@@ -388,8 +504,12 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
         index += 1
     screen.note(*(lines[lane] for lane in lanes))
     # In lane order, not answer order: backing up and re-answering would otherwise reorder the
-    # document that the resolver and the proxy read.
-    write_json(runtime / SELECTION, {lane: selection[lane] for lane in lanes})
+    # document that the resolver and the proxy read. The window rides alongside rather than inside
+    # a lane's value, because every other consumer of this file reads model ids there and a row id
+    # it cannot look up would fail the launch.
+    document = {lane: selection[lane] for lane in lanes}
+    document["agent_lane"] = agent_lane
+    write_json(runtime / SELECTION, document)
     return 0
 
 
@@ -644,12 +764,14 @@ def cmd_resolve(root: Path, runtime: Path) -> int:
     selection = read_json(runtime / SELECTION)
     if not isinstance(selection, dict):
         raise DefinitionError(f"{SELECTION} must contain an object")
+    agent_lane = str(selection.get("agent_lane") or policy.DEFAULT_AGENT_LANE)
     plan = policy.resolve(
         providers,
         models,
         {lane: str(selection.get(lane, "")) for lane in SELECTABLE},
         reserved_context_size=reserved_context_size(root),
         key_values=values,
+        agent_lane=agent_lane,
     )
     require_bootstrap_declarations(root, plan)
     write_json(runtime / POLICY_FILE, plan)
@@ -667,6 +789,7 @@ def cmd_resolve(root: Path, runtime: Path) -> int:
         + " ".join(
             f"{lane}={plan['lanes'][lane]['alias']}" for lane in LANES if lane in plan["lanes"]
         )
+        + f"; main agent on {policy.LANE_DISPLAY.get(plan['agent_lane'], plan['agent_lane'])}"
     )
     for counter in plan["counters"].values():
         if counter["family"] == "context":

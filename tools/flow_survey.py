@@ -136,16 +136,24 @@ def lane_forecast(survey: Survey, lane: str) -> tuple[bool | None, str]:
     if not definitions:
         return (None, "")
     _, model_list = definitions
-    choices = model_step.selectable(model_list, lane)
+    # The rows this lane's screen really offers, twins included: the count of screens is what the
+    # rail promises the user, and a model with a second agent window is one more row on that
+    # screen.
+    choices = model_step.lane_rows(model_list, lane)
     override = os.environ.get(f"HARNESS_{lane.upper()}_MODEL", "").strip()
     # An unattended launch is not on the other side of this call: the launcher surveys only when
     # it has started a flow, and it starts a flow only when it means to ask.
     asking = model_step.prompts(override, False, choices)
+    # The answer is a model id, not a row id: this feeds credential forecasting, and the window a
+    # lane launches on cannot change which key it needs. So the row is counted and then taken
+    # apart again, which keeps the rail total and the plan forecast honest to the same source.
+    remembered = str(survey.previous_selection.get(lane, ""))
+    remembered = model_step.remembered_row(lane, remembered, survey.previous_selection)
     if override:
-        return (asking, override)
-    by_id = {model["id"] for model in choices}
-    previous = str(survey.previous_selection.get(lane, ""))
-    return (asking, previous if previous in by_id else (choices[0]["id"] if choices else ""))
+        return (asking, model_step.split_agent_row(override)[0])
+    by_id = {item["id"] for item in choices}
+    default = remembered if remembered in by_id else (choices[0]["id"] if choices else "")
+    return (asking, model_step.split_agent_row(default)[0])
 
 
 def selected_modules(survey: Survey) -> list[dict] | None:
@@ -208,6 +216,19 @@ def unanswered_credentials(survey: Survey, selections: list[dict[str, str]]) -> 
     for selection in selections:
         if not all(selection.values()):
             return None
+        # The same window the panel would launch on, forecast the same way the launcher's
+        # default works: the shipped default lane when the model declares it, the model's
+        # own lane when it does not. A missing plan would hide a credential question, and an
+        # impossible lane designation would too.
+        try:
+            primary = models[selection["primary"]]
+        except KeyError:
+            return None
+        agent_lane = (
+            policy.DEFAULT_AGENT_LANE
+            if policy.DEFAULT_AGENT_LANE in primary["lanes"]
+            else "primary"
+        )
         try:
             plan = policy.resolve(
                 model_step.apply_endpoint_overrides(providers, values),
@@ -215,6 +236,7 @@ def unanswered_credentials(survey: Survey, selections: list[dict[str, str]]) -> 
                 selection,
                 reserved_context_size=reserved,
                 key_values=values,
+                agent_lane=agent_lane,
             )
             used = model_step.used_credentials(plan)
         except (OSError, ValueError):
@@ -309,6 +331,11 @@ def answer_credentials(survey: Survey) -> int | None:
 
 
 def _candidates(survey: Survey, lane: str) -> list[str]:
+    """Model ids worth forecasting credentials against — deliberately not :func:`lane_rows`.
+
+    The long-lane twin is the same model under a different window and needs the same key, so
+    enumerating rows would resolve the same credential twice and change nothing.
+    """
     definitions = survey.definitions
     if not definitions:
         return []

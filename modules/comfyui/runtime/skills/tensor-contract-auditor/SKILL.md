@@ -19,7 +19,8 @@ For every important boundary identify:
 - transformation performed;
 - authoritative source.
 
-Record durable contracts in `.agent-state/TENSOR_CONTRACTS.md`.
+Record the contracts you establish in `/tmp/agent-state/TENSOR_CONTRACTS.md`, and copy anything the
+project must keep into the project itself, where it survives the session.
 
 Never infer model-specific channels, patching, temporal compression, latent
 scale, context layout, or normalization from generic diffusion knowledge when

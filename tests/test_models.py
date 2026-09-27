@@ -44,7 +44,7 @@ MODELS = [
         "lanes": ["primary", "subagent"],
     },
 ]
-PRIMARY = "Primary agent model"
+PRIMARY = "Main agent model"
 SUBAGENT = "Subagent model"
 
 
@@ -446,14 +446,17 @@ class SelectTests(unittest.TestCase):
         # start.sh reads these lines in its non-interactive printout, so the modal must not be the
         # only place an answer appears.
         self.select(answer("primary", "big"), answer("subagent", "wide"))
-        self.assertIn("Primary agent model: Big Serious Model [acme]", self.written())
+        self.assertIn(
+            "Main agent model: Big Serious Model - Medium (concurrent) [acme]", self.written()
+        )
         self.assertIn("Subagent model: Wide Context Model [globex]", self.written())
 
     def test_a_remembered_answer_is_still_said_to_be_remembered(self):
         (self.runtime / models.PREVIOUS_SELECTION).write_text(json.dumps({"primary": "wide"}))
         self.select(answer("primary", "wide"), answer("subagent", "fast"))
         self.assertIn(
-            "Primary agent model: Wide Context Model [globex] (last used)", self.written()
+            "Main agent model: Wide Context Model - Medium (concurrent) [globex] (last used)",
+            self.written(),
         )
         # The other lane was never remembered, so it must not borrow the suffix.
         self.assertNotIn("(last used)", self.written().split("Subagent model:")[1])
@@ -462,7 +465,11 @@ class SelectTests(unittest.TestCase):
         (self.runtime / models.PREVIOUS_SELECTION).write_text(json.dumps(["not", "a", "mapping"]))
         code, _ = self.select(answer("primary", "big"), answer("subagent", "fast"))
         self.assertEqual(code, 0)
-        self.assertEqual(self.selection(), {"primary": "big", "subagent": "fast"})
+        # No recorded window survives a document that is not a mapping, and no window means the
+        # native one: a broken memory may lose a preference, not launch the wrong lane.
+        self.assertEqual(
+            self.selection(), {"primary": "big", "subagent": "fast", "agent_lane": "primary"}
+        )
 
     def test_back_re_asks_the_first_lane_and_the_second_answer_is_not_kept(self):
         code, script = self.select(
@@ -475,9 +482,12 @@ class SelectTests(unittest.TestCase):
         self.assertEqual(script.lanes, [PRIMARY, SUBAGENT, PRIMARY, SUBAGENT])
         self.assertEqual([view.position for view in script.views], [1, 2, 1, 2])
         selection = self.selection()
-        self.assertEqual(selection, {"primary": "wide", "subagent": "tiny"})
-        # Lane order, not answer order: the resolver and the proxy read this document.
-        self.assertEqual(list(selection), ["primary", "subagent"])
+        self.assertEqual(
+            selection, {"primary": "wide", "subagent": "tiny", "agent_lane": "primary"}
+        )
+        # Lane order, not answer order: the resolver and the proxy read this document. The window
+        # rides at the end so those readers see the two lanes first.
+        self.assertEqual(list(selection), ["primary", "subagent", "agent_lane"])
 
     def test_going_back_leaves_one_answer_line_per_lane_and_it_names_the_final_answer(self):
         # Two lines that cannot both be true is worse than a line late: the superseded answer must
@@ -488,13 +498,15 @@ class SelectTests(unittest.TestCase):
             answer("primary", "wide"),
             answer("subagent", "tiny"),
         )
-        self.assertEqual(self.written().count("Primary agent model:"), 1)
-        self.assertIn("Primary agent model: Wide Context Model [globex]", self.written())
+        self.assertEqual(self.written().count("Main agent model:"), 1)
+        self.assertIn(
+            "Main agent model: Wide Context Model - Medium (concurrent) [globex]", self.written()
+        )
         self.assertNotIn("Big Serious Model", self.written())
         self.assertEqual(
             self.written().splitlines(),
             [
-                "Primary agent model: Wide Context Model [globex]",
+                "Main agent model: Wide Context Model - Medium (concurrent) [globex]",
                 "Subagent model: Tiny Cheap Model [globex]",
             ],
         )
@@ -506,14 +518,20 @@ class SelectTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(script.lanes, [SUBAGENT])
         self.assertIs(script.views[0].can_go_back, False)
-        self.assertEqual(self.selection(), {"primary": "wide", "subagent": "fast"})
-        self.assertIn("Primary agent model: Wide Context Model [globex]", self.written())
+        self.assertEqual(
+            self.selection(), {"primary": "wide", "subagent": "fast", "agent_lane": "primary"}
+        )
+        self.assertIn(
+            "Main agent model: Wide Context Model - Medium (concurrent) [globex]", self.written()
+        )
 
     def test_an_overridden_lane_never_takes_the_screen(self):
         code, script = self.select(answer("primary", "big"), HARNESS_SUBAGENT_MODEL="tiny")
         self.assertEqual(code, 0)
         self.assertEqual(script.lanes, [PRIMARY])
-        self.assertEqual(self.selection(), {"primary": "big", "subagent": "tiny"})
+        self.assertEqual(
+            self.selection(), {"primary": "big", "subagent": "tiny", "agent_lane": "primary"}
+        )
 
     def test_back_from_the_first_lane_cannot_loop(self):
         # can_go_back is False there, so the engine cannot produce GO_BACK. If a step ever did,
@@ -534,6 +552,213 @@ class SelectTests(unittest.TestCase):
                     models.cmd_select(self.root, self.runtime, non_interactive=False)
         self.assertIn("no available model declares a primary lane", str(caught.exception))
         self.assertFalse((self.runtime / models.SELECTION).exists())
+
+
+class WindowTests(unittest.TestCase):
+    """The extended-window row: how it is offered, named, answered, and remembered.
+
+    These use a definition-shaped ``lanes`` table (``{"primary": {...}, "long": {...}}``) because
+    that is what ``load_definitions`` really returns and the window size in the row's name comes
+    out of it. One test keeps the flat list shape the other classes use, which is the case where
+    the launcher knows a long lane exists but not how big it is.
+    """
+
+    def setUp(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        self.root = directory / "project"
+        self.runtime = self.root / "runtime"
+        self.runtime.mkdir(parents=True)
+        self.screen = Screen()
+        self.models = [
+            {
+                "id": "roomy",
+                "label": "Roomy Model",
+                "provider": "acme",
+                "lanes": {
+                    "primary": {"context_tokens": 262144},
+                    "long": {"context_tokens": 1000000},
+                    "subagent": {"context_tokens": 65536},
+                },
+            },
+            {
+                "id": "modest",
+                "label": "Modest Model",
+                "provider": "globex",
+                "lanes": {
+                    "primary": {"context_tokens": 131072},
+                    "long": {"context_tokens": 524288},
+                },
+            },
+        ]
+        self.definitions = mock.patch.object(
+            models, "load_definitions", lambda root: (None, self.models)
+        )
+        self.stdin = mock.patch.object(sys, "stdin", Screen())
+        self.stdout = mock.patch.object(sys, "stdout", self.screen)
+        for patcher in (self.definitions, self.stdin, self.stdout):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("HARNESS_", "COLORTERM", "NO_COLOR"))
+        }
+
+    def pick(self, row_id):
+        """A scripted answer naming one of this fixture's rows, twins included."""
+        return Result(value=row_id, summary=row_id)
+
+    def select(self, *answers, **overrides):
+        script = ScriptedRun(*answers)
+        with mock.patch.dict(os.environ, {**self.environment, **overrides}, clear=True):
+            with mock.patch.object(models, "run", script):
+                code = models.cmd_select(self.root, self.runtime, non_interactive=False)
+        return code, script
+
+    def selection(self):
+        return json.loads((self.runtime / models.SELECTION).read_text())
+
+    def test_each_model_with_a_long_lane_gets_one_more_row_than_it_used_to_have(self):
+        # The queued wide-window row leads its pair because that is the lane a fresh launch opens
+        # on, and the two rows for one model are read together rather than sorted apart.
+        rows = models.lane_rows(self.models, "primary")
+        self.assertEqual(
+            [row["id"] for row in rows],
+            ["modest@long", "modest", "roomy@long", "roomy"],
+        )
+        self.assertEqual(
+            [row["id"] for row in models.lane_rows(self.models, "subagent")], ["roomy"]
+        )
+
+    def test_the_twin_is_named_by_the_window_its_own_definition_declares(self):
+        labels = {row["id"]: row["label"] for row in models.lane_rows(self.models, "primary")}
+        self.assertEqual(labels["roomy@long"], "Roomy Model - Long (queued, 1M window)")
+        # Not every long lane is a megabyte, and the row that says so must not be a string
+        # somebody has to remember to edit.
+        self.assertEqual(labels["modest@long"], "Modest Model - Long (queued, 512k window)")
+        # Both rows name their own trade, since the screen offers them as peers and not as a
+        # model plus a footnote.
+        self.assertEqual(labels["roomy"], "Roomy Model - Medium (concurrent)")
+
+    def test_a_lane_table_without_sizes_still_offers_the_row(self):
+        # The shape the other classes in this file use: a long lane is named but not measured, so
+        # the row loses its size and the choice itself survives.
+        flat = [
+            {
+                "id": "one",
+                "label": "One Model",
+                "provider": "acme",
+                "lanes": ["primary", "long"],
+            }
+        ]
+        self.assertEqual(
+            [row["label"] for row in models.lane_rows(flat, "primary")],
+            ["One Model - Long (queued)", "One Model - Medium (concurrent)"],
+        )
+
+    def test_answering_a_twin_row_stores_a_real_model_id_and_the_window_beside_it(self):
+        # Every other reader of this document looks a value up in the model table, so a row id
+        # written there would fail the launch rather than change the window.
+        code, _ = self.select(self.pick("roomy@long"), self.pick("roomy"))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.selection(), {"primary": "roomy", "subagent": "roomy", "agent_lane": "long"}
+        )
+
+    def test_the_window_choice_survives_into_the_next_launch_as_the_remembered_row(self):
+        (self.runtime / models.PREVIOUS_SELECTION).write_text(
+            json.dumps({"primary": "roomy", "subagent": "roomy", "agent_lane": "long"})
+        )
+        code, script = self.select(self.pick("roomy@long"), self.pick("roomy"))
+        self.assertEqual(code, 0)
+        step = script.asks[0][0]
+        self.assertEqual(step.initial().chosen, ("roomy@long",))
+        self.assertIn(
+            "Roomy Model - Long (queued, 1M window) [acme] (last used)", self.screen.getvalue()
+        )
+
+    def test_a_native_answer_is_not_reported_as_a_remembered_extended_one(self):
+        # The suffix has to mean "this is what you picked last time", so the window the last launch
+        # used is the only thing that can make the native row look like a repeat of it.
+        (self.runtime / models.PREVIOUS_SELECTION).write_text(
+            json.dumps({"primary": "roomy", "subagent": "roomy", "agent_lane": "long"})
+        )
+        self.select(self.pick("roomy"), self.pick("roomy"))
+        primary = self.screen.getvalue().splitlines()[0]
+        self.assertEqual(primary, "Main agent model: Roomy Model - Medium (concurrent) [acme]")
+
+    def test_an_extended_answer_cannot_leak_onto_the_subagents_row(self):
+        # One screen's window is not the other screen's row id: joining the two would invent a
+        # "roomy@long" row for a lane that has never had twins and lose its (last used) note.
+        (self.runtime / models.PREVIOUS_SELECTION).write_text(
+            json.dumps({"primary": "roomy", "subagent": "roomy", "agent_lane": "long"})
+        )
+        self.select(self.pick("modest@long"), self.pick("roomy"))
+        self.assertEqual(
+            self.selection(), {"primary": "modest", "subagent": "roomy", "agent_lane": "long"}
+        )
+        self.assertIn("Subagent model: Roomy Model [acme] (last used)", self.screen.getvalue())
+
+    def test_a_window_no_longer_offered_falls_back_instead_of_failing_the_launch(self):
+        # The stale preference is the interesting part: a long lane withdrawn from a model between
+        # launches must resolve to the native window, not to a row the screen cannot answer with.
+        # One primary model left means the screen is not even asked, so this is also the case where
+        # nothing on screen could have corrected the memory.
+        self.models.pop(1)
+        (self.runtime / models.PREVIOUS_SELECTION).write_text(
+            json.dumps({"primary": "roomy", "subagent": "roomy", "agent_lane": "long"})
+        )
+        for model in self.models:
+            model["lanes"].pop("long", None)
+        code, script = self.select()
+        self.assertEqual(code, 0)
+        # Neither lane has a second row left to choose between, so nothing is asked at all and the
+        # stale "long" has to correct itself without ever meeting the screen.
+        self.assertEqual([step.title for step, _ in script.asks], [])
+        self.assertEqual(
+            self.selection(), {"primary": "roomy", "subagent": "roomy", "agent_lane": "primary"}
+        )
+
+    def test_a_stale_window_preference_does_not_steal_the_default_from_the_native_row(self):
+        # The cursor opens on the row the last launch answered, and on a screen whose model lost
+        # its long lane there is no such row: defaulting to the first one is the honest answer.
+        (self.runtime / models.PREVIOUS_SELECTION).write_text(
+            json.dumps({"primary": "modest", "subagent": "roomy", "agent_lane": "long"})
+        )
+        for model in self.models:
+            if model["id"] == "modest":
+                model["lanes"].pop("long")
+        code, script = self.select(self.pick("modest"), self.pick("roomy"))
+        self.assertEqual(code, 0)
+        self.assertEqual(script.asks[0][0].initial().chosen, ("modest",))
+        self.assertEqual(self.selection()["agent_lane"], "primary")
+
+    def test_the_override_column_accepts_a_twin_row_as_well_as_a_plain_model(self):
+        # HARNESS_PRIMARY_MODEL is documented as taking whatever the screen offers, so the window
+        # has to be reachable from it for a scripted launch too.
+        code, _ = self.select(self.pick("roomy"), HARNESS_PRIMARY_MODEL="roomy@long")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.selection(), {"primary": "roomy", "subagent": "roomy", "agent_lane": "long"}
+        )
+
+    def test_a_window_that_is_no_one_round_number_is_written_out_in_full(self):
+        # Rounding 12,345 up to "12k" would advertise a window the definition does not declare,
+        # which is the one thing a row naming a context size must never do.
+        self.assertEqual(models.token_span(12345), "12,345")
+        self.assertEqual(models.token_span(262144), "256k")
+        self.assertEqual(models.token_span(1000000), "1M")
+        self.assertEqual(models.token_span(1048576), "1M")
+
+    def test_a_single_model_with_a_long_lane_still_asks_because_the_window_is_a_question(self):
+        # Without the twins this launch would answer itself and the extended lane would be
+        # unreachable except by editing a file.
+        self.models.pop(1)
+        code, script = self.select(self.pick("roomy@long"))
+        self.assertEqual(code, 0)
+        self.assertEqual([step.title for step, _ in script.asks], [PRIMARY])
+        self.assertEqual(self.selection()["agent_lane"], "long")
 
 
 if __name__ == "__main__":

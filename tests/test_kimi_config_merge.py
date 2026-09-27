@@ -29,7 +29,7 @@ api_key = "fresh-token"
 provider = "nrp-primary"
 max_context_size = 262144
 capabilities = ["thinking", "tool_use"]
-display_name = "NRP Qwen3 — Primary"
+display_name = "NRP Qwen3 - Medium (concurrent)"
 
 [secondary_model]
 default_model = "qwen3-subagent"

@@ -306,9 +306,33 @@ blocks for one audience and `compose_*_document()` appends the enabled ones:
 
 Each block is written to stand alone — a subagent that receives only the usage
 limits must not be pointed at a table it cannot see — and each costs what it
-costs: 503 tokens for the limits, 670 for the table, 474 for the parallelism
+costs: 524 tokens for the limits, 890 for the table, 474 for the parallelism
 advice, and 378 for a ComfyUI module's guidance, measured with the estimator in
 `tools/prompt_measure.py` against the shipped definitions.
+
+**The lane table opens by naming its reader.** One document names three lanes and
+exactly one of them belongs to the agent reading it, so
+`_lane_table_lines()` (`tools/policy.py`) begins the main-audience table with one
+unconditional second-person sentence: you are the main agent of this workspace,
+you launched on `qwen3-long`, the Long (queued) lane, a 1,000,000-token window,
+and the subagent rows describe the children you may delegate to. Subagents never
+see it, because they never see the lane table at all. That sentence is the only
+line in the assembled prompt that states who is being addressed; everything else
+about the subagent lane reaches both audiences, and the all-lane limits block and
+the harness contract both phrase the subagent rules as conditionals — "if you are
+reading this as a subagent…". An agent handed three conditional role cues and one
+row called `subagent` can therefore settle on the wrong audience, and having done
+so it will start finding evidence for it, including in text it wrote itself. The
+fix is the assertion, not more prose about lanes.
+
+Which leaves a rule worth stating for whoever reads a session log afterwards,
+because it is not something the prompt can enforce: the authority for which lane
+a request ran on is the resolved plan, the launcher's banner line, and the
+`modelAlias` field of each `llm.request` record in that agent's own `wire.jsonl`.
+Those three are produced by the machinery. The generated blocks are *derived*
+from the plan and are not independent evidence of anything, and an agent's own
+recollection of its prompt is weaker still — it is a reconstruction, and it can
+name sentences that were never there.
 
 **Which blocks are composed in is a launch-panel choice.** `start.sh` runs
 `tools/prompt_panel.py` before `tools/render_runtime.py`; the selection is stored
@@ -562,8 +586,9 @@ in the compaction template either: neither `WORKSPACE Memories` nor
 `memoriesContent` occurs anywhere in the bundle. "Memory" in the bundle means
 in-memory caches, and the `contextMemory` directory name is Kimi's own label for
 compaction. `mcp__serena__*` memory tools belong to the Serena server, not Kimi.
-A directory like `.agent-state/` is a project convention that only the operating
-contract in the prompt tells the agent about.
+The agent's working memory is not a Kimi feature at all: `/tmp/agent-state` is a
+convention of the operating contract in the prompt, staged inside the container by
+`tools/register_workspace.py`, and Kimi neither reads nor knows about it.
 
 ---
 
@@ -580,17 +605,20 @@ Estimated, this checkout, all blocks enabled and the ComfyUI module selected:
 
 | piece | tokens | bytes | reaches |
 | --- | --- | --- | --- |
-| `runtime/AGENTS.md`, comments stripped | 1,517 | 6,067 | both |
-| usage limits block | 503 | — | both |
-| module guidance, ComfyUI | 378 | 1,510 | both |
-| **composed all-lane contract** | **2,398** | **9,592** | both |
-| lane table block | 670 | — | main only |
+| `runtime/AGENTS.md`, comments stripped | 1,659 | 6,633 | both |
+| usage limits block | 524 | — | both |
+| module guidance, ComfyUI | 564 | 2,254 | both |
+| **composed all-lane contract** | **2,747** | **10,985** | both |
+| composed all-lane contract, no module | 2,183 | — | both |
+| lane table block | 889 | — | main only |
 | parallel-work block | 474 | — | main only |
-| **composed system prompt**, `${base_prompt}` wrapper plus both blocks | **1,149** | **4,593** | main only |
+| **composed system prompt**, `${base_prompt}` wrapper plus both blocks | **1,368** | **5,469** | main only |
 | tool schemas | priced by `--live`, never diagrammed — see surface 13 | | per profile |
 | compaction summariser prompt | 9,157 per compaction, not per step | | the agent compacted |
 
-Measured from one live session, main audience on `qwen3-primary`:
+Measured from one live session, main audience on `qwen3-primary` — a sample from
+before `long` became the default agent lane, so the lane named here is what that
+session happened to open on, not what a launch today would open on:
 
 | region | tokens | who owns it |
 | --- | --- | --- |
@@ -606,10 +634,12 @@ is why the subagent lane is the one that runs out of room first.
 Three cautions that belong with these numbers rather than in a footnote. The
 estimator is Kimi's own heuristic — one token per four ASCII characters, one per
 non-ASCII character — and **not** the provider's tokenizer, so a percentage is a
-sense of scale and not a reservation. The measured contract of 2,379 predates the
-final wording of the blocks, against 2,398 estimated today: the two disagree by
-less than one percent and are not expected to agree exactly, which is the whole
-reason both columns exist. And `${cwd_listing}` is inside the framing region, so a
+sense of scale and not a reservation. The measured contract of 2,379 is an older
+draft of the same document: since that session the contract absorbed the lane-role
+rewrite and the ComfyUI guidance grew, so the composed figure is 2,747 today. The
+two are not expected to agree exactly, which is the whole reason both columns
+exist: the estimate is what a launch from this checkout will pay, the measurement
+is what one launch actually paid. And `${cwd_listing}` is inside the framing region, so a
 prompt changes size during a session without the harness changing anything; a
 measurement is a sample, not a constant. The panel therefore re-measures every
 launch, appends to `prompt-measurements.jsonl`, and prints the age of the figure it
@@ -630,11 +660,12 @@ budget should not quietly spend one of its own.
 
 Two of these numbers are a fence rather than a note.
 `tests/test_prompt_guidance.py::SizeFenceTests` holds the harness's own
-contract text under 2,150 estimated tokens and the generated half of the
-main prompt under 1,300, both with module guidance excluded so the fence
-bounds what this repository writes and not what a module happens to
-ship. The thresholds sit above the estimated figures in the first table
-and above the measured 2,379 in the second, deliberately: a fence tight
+contract text under 2,250 estimated tokens and the generated half of the
+main prompt under 1,400, both with module guidance excluded, so what is
+bounded is the table's no-module row — 2,183 today — rather than the 2,747
+one, because the difference between them is prose this repository does not
+own. The thresholds sit above the figures they bound with deliberate
+slack: a fence tight
 enough to be a weather report fails on every reword and gets loosened
 until it means nothing. Restoring the hand-written provider-policy
 section that this harness deleted - 1,142 tokens - trips it by a mile,

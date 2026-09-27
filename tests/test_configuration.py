@@ -639,6 +639,16 @@ class ResolvedEnvelopeTests(unittest.TestCase):
         for key in ("KIMI_SUBAGENT_TIMEOUT_MS", "KIMI_CODE_SWARM_TIMEOUT_MS"):
             self.assertIsNone(re.search(rf'^\s*{key}\s*:', COMPOSE_SOURCE, re.MULTILINE))
 
+    def test_no_client_request_carries_a_wall_clock(self):
+        # The third clock of the same family: the proxy's own per-request deadline. Unlimited is
+        # this knob's own spelling of 0, so unlike the subagent timeouts it can live in
+        # compose.yaml, where an operator may still name a positive number to bound one debugging
+        # session. The provider's published advice is to retry indefinitely, and the UI already
+        # owns cancelling a request the operator no longer wants.
+        self.assertEqual(compose_value("MODEL_PROXY_MAX_REQUEST_SECONDS"), 0)
+        example = (ROOT / ".env.example").read_text()
+        self.assertIn("MODEL_PROXY_MAX_REQUEST_SECONDS=0", example)
+
     def test_guidance_publishes_the_envelope_and_tells_the_agent_to_fill_it(self):
         if str(ROOT / "tools") not in sys.path:
             sys.path.insert(0, str(ROOT / "tools"))
@@ -669,6 +679,163 @@ class ResolvedEnvelopeTests(unittest.TestCase):
         # Nothing names an opt-out variable any more: the startup panel is the only control.
         for text in (main, lane):
             self.assertNotIn("KIMI_SYSTEM_PROMPT_OMIT_ENVELOPE", text)
+
+
+COUNT_PROVIDER = """
+schema_version = 1
+label = "Count Fixture"
+policy_url = "https://fixture.invalid/policy"
+
+[endpoint]
+base_url = "https://fixture.invalid"
+base_url_env = "FIXTURE_BASE_URL"
+protocol = "openai"
+
+[[credential]]
+id = "default"
+label = "Fixture API token"
+
+[safety]
+context_margin_percent = 95
+output_rate_margin_percent = 90
+{rules}
+"""
+
+
+def count_model(wire_name: str, slug: str) -> str:
+    """One 1,000,000-token model with a 64,000-token subagent lane.
+
+    The sizes are the shipped model's, so the aggregate budget divides the subagent reservation
+    exactly five times: a resolution that reimposes a provider-wide ceiling on a model that has
+    its own shows up as a fan-out that stops being 5, which is easy to assert and hard to misread.
+    """
+    return f"""
+schema_version = 1
+label = "{wire_name}"
+provider = "counts"
+model = "{wire_name}"
+slug = "{slug}"
+credential = "default"
+
+[context]
+advertised_tokens = 1000000
+
+[lane.primary]
+context_tokens = 262144
+input_tokens = 196608
+output_clamp_tokens = 65536
+
+[lane.subagent]
+context_tokens = 64000
+input_tokens = 55808
+output_clamp_tokens = 8192
+"""
+
+
+def rule_table(*rules: str) -> str:
+    return "".join(f"\n[[rule]]\n{rule}\n" for rule in rules)
+
+
+LISTED = 'kind = "max_concurrent_requests"\nscope = "model"\nmodels = ["Listed Model"]\nlimit = 16'
+FALLBACK = 'kind = "max_concurrent_requests"\nscope = "provider"\nlimit = 2\ndefault = true'
+AGGREGATE = 'kind = "aggregate_context_fraction"\nscope = "model"\npercent = 35'
+ACCOUNT_WIDE = 'kind = "max_concurrent_requests"\nscope = "provider"\nlimit = 3'
+
+
+class CountRulePrecedenceTests(unittest.TestCase):
+    """How the resolver reconciles a provider's fallback ceiling against a model's own.
+
+    NRP publishes concurrency per model -- 16 for one, 8 for another, 2 for a third -- so the
+    tightest row is a safe floor for a model nobody transcribed yet and a false ceiling for every
+    model that was. Taking the minimum of both, which is what every other counter pair in this
+    resolver correctly does, would silently reduce a 5-deep swarm to 2 on the strength of a
+    figure the provider never stated for that model.
+    """
+
+    def resolve(self, rules: str, primary: str = "listed", subagent: str = "listed"):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            provider = root / "providers" / "counts"
+            provider.mkdir(parents=True)
+            (provider / "provider.toml").write_text(COUNT_PROVIDER.format(rules=rules))
+            for directory, wire_name, slug in (
+                ("listed", "Listed Model", "listed"),
+                ("unlisted", "Unlisted Model", "unlisted"),
+            ):
+                model = root / "models" / directory
+                model.mkdir(parents=True)
+                (model / "model.toml").write_text(count_model(wire_name, slug))
+            if str(ROOT / "tools") not in sys.path:
+                sys.path.insert(0, str(ROOT / "tools"))
+            import definitions
+            import policy
+
+            providers, models = definitions.load_definitions(root)
+            return policy.resolve(
+                providers,
+                {model["id"]: model for model in models},
+                {"primary": primary, "subagent": subagent},
+                reserved_context_size=8192,
+                # The fixture models declare no long lane, and this class is about counters.
+                agent_lane="primary",
+            )
+
+    def counters(self, plan: dict, family: str) -> list[dict]:
+        return [c for c in plan["counters"].values() if c["family"] == family]
+
+    def test_a_default_yields_to_the_model_it_would_have_capped(self):
+        plan = self.resolve(rule_table(AGGREGATE, LISTED, FALLBACK))
+        context = self.counters(plan, "context")[0]
+        self.assertEqual(context["max"], 16)
+        self.assertEqual(plan["limits"]["subagent_concurrency"], 5)
+        self.assertFalse(plan["limits"]["subagent_concurrency_basis"].startswith("harness"))
+
+    def test_a_default_applies_only_where_nothing_specific_does(self):
+        # One selection, two models: the listed one keeps 16, the unlisted one falls back to 2,
+        # so the fallback cannot leak across the table the provider actually published.
+        plan = self.resolve(rule_table(AGGREGATE, LISTED, FALLBACK), subagent="unlisted")
+        by_subject = {c["subject"]: c for c in self.counters(plan, "context")}
+        self.assertEqual(by_subject["Listed Model"]["max"], 16)
+        self.assertEqual(by_subject["Unlisted Model"]["max"], 2)
+        self.assertTrue(by_subject["Unlisted Model"]["count_basis"].startswith("harness"))
+        # The subagent lane is the unlisted model, so the tightest rule now bounds the fan-out.
+        self.assertEqual(plan["limits"]["lane_concurrency"]["subagent"], 2)
+        self.assertLessEqual(plan["limits"]["subagent_concurrency"], 2)
+
+    def test_a_default_never_borrows_a_separate_counter(self):
+        # A count counter of its own would be held beside the model's, and the min that collapses
+        # counters would reimpose exactly the cap displacing was meant to avoid.
+        plan = self.resolve(rule_table(AGGREGATE, LISTED, FALLBACK))
+        self.assertEqual(self.counters(plan, "count"), [])
+
+    def test_a_genuine_account_wide_ceiling_still_stacks(self):
+        # Not every loose-scope rule is a fallback. A provider that caps the whole account has
+        # stated a second, simultaneously true limit about a different subject, and both hold.
+        plan = self.resolve(rule_table(AGGREGATE, LISTED, ACCOUNT_WIDE))
+        counts = self.counters(plan, "count")
+        self.assertEqual([c["max"] for c in counts], [3])
+        self.assertEqual(self.counters(plan, "context")[0]["max"], 16)
+        self.assertEqual(plan["limits"]["lane_concurrency"]["primary"], 3)
+        self.assertLessEqual(plan["limits"]["subagent_concurrency"], 3)
+
+    def test_a_fallback_survives_a_provider_that_publishes_no_context_rule(self):
+        # With no aggregate rule there is no context counter to fold a ceiling into, and the
+        # fallback would vanish -- leaving an untranscribed model entirely unbounded.
+        plan = self.resolve(rule_table(LISTED, FALLBACK), subagent="unlisted")
+        self.assertEqual(self.counters(plan, "context"), [])
+        by_subject = {c["subject"]: c for c in self.counters(plan, "count")}
+        self.assertEqual(by_subject["Unlisted Model"]["max"], 2)
+        self.assertEqual(by_subject["Listed Model"]["max"], 16)
+
+    def test_the_shipped_provider_resolves_exactly_as_before_the_fallback(self):
+        # The NRP fallback must cost this selection nothing: 16 still governs, no count counter
+        # appears, and the fan-out stays at the largest the published budget allows.
+        plan = shipped_plan()
+        self.assertEqual(self.counters(plan, "count"), [])
+        context = self.counters(plan, "context")[0]
+        self.assertEqual(context["max"], 16)
+        self.assertEqual(context["count_basis"], "the provider's own rule for this model")
+        self.assertEqual(plan["limits"]["subagent_concurrency"], 5)
 
 
 if __name__ == "__main__":

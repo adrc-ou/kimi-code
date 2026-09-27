@@ -36,19 +36,33 @@ key_url = "https://litellm.lib.ou.edu/ui/?page=api-keys"
 # ------------------------------------------------------------
 # Fair-use rules
 #
-# NRP states three rules. Only the first is enforced by the gateway itself; the other two
-# are terms of use that this harness enforces on the operator's behalf.
+# NRP states four rules. Only the first is applied by the gateway itself; the rest are terms
+# of use this harness enforces on the operator's behalf. The endpoint below is the University
+# of Oklahoma's deployment of NRP's managed gateway, so rule 1 may or may not be switched on
+# there; the harness never relies on it and enforces every rule here regardless.
 #
-#   1. 200,000 output tokens per minute per API token and model.
+#   1. 200,000 output tokens per minute per API token and model, counted over fixed calendar
+#      minutes. The harness books the same allowance per rolling minute, before a request
+#      runs - stricter than the published window, and deliberately so: an estimate that has
+#      to be spent cannot be settled after the fact.
 #   2. A single request using at least 35% of the model's context length is limited to
 #      one concurrent request.
-#   3. Otherwise at most 16 concurrent requests for qwen3, and all concurrent requests
-#      combined must stay within 35% of the model's context length.
+#   3. Otherwise all concurrent requests combined must stay within 35% of the model's
+#      context length.
+#   4. A per-model concurrency table, which the gateway does not enforce at all: 16 for
+#      qwen3, gpt-oss and qwen3-embedding; 8 for minimax-m2, qwen3-small, gemma and
+#      gemma-small; 2 for kimi, glm-5 and deepseek-v4-flash.
 #
 # `scope` decides which traffic shares a counter, which is what makes selecting the same
 # model for both lanes behave differently from two models: "model" keys are the wire model
 # identifier, so both lanes hit one counter; "credential_model" keys pair the API token
 # with the model.
+#
+# Rules 1 to 3 are stated by NRP generically, so they carry no `models` list and apply to
+# every model this provider serves. Rule 4 is published per model, so it is narrowed to the
+# model it describes rather than left to be inherited by the next model anyone adds: a
+# concurrency allowance copied onto a model the provider never listed is a licence the
+# provider did not grant.
 # ------------------------------------------------------------
 
 [[rule]]
@@ -64,12 +78,25 @@ percent = 35
 [[rule]]
 kind = "max_concurrent_requests"
 scope = "model"
+models = ["Qwen3.8 Flash Next"]
 limit = 16
 
 [[rule]]
 kind = "aggregate_context_fraction"
 scope = "model"
 percent = 35
+
+# Not a published NRP rule. A model added to this provider without its own concurrency rule
+# gets the tightest figure from the table above, because guessing wide would put an
+# unlisted model straight into a terms-of-use violation, and guessing at all is what a
+# default must not be allowed to hide. `default = true` means this figure is *displaced* by
+# any model-scoped rule rather than stacked beside it, so it costs qwen3 nothing: the 16
+# above is that model's answer, and this one applies only where nothing more specific is.
+[[rule]]
+kind = "max_concurrent_requests"
+scope = "provider"
+limit = 2
+default = true
 
 # ------------------------------------------------------------
 # Deliberate under-use of the rules above.
@@ -80,8 +107,13 @@ percent = 35
 #
 #   context_margin_percent      aggregate in-flight context budget, as a share of the
 #                               35% threshold. At 95% of 350,000 the derived budget is
-#                               332,500, which admits five 64,000-token subagents and
-#                               still overlaps one subagent with the primary lane.
+#                               332,500: five 64,000-token subagents (320,000) fit inside
+#                               it, and a full-size concurrent-lane request overlaps one
+#                               of them (262,144 + 64,000 = 326,144) but never two. The
+#                               wide lane is not in that arithmetic: a request priced at
+#                               or above 350,000 is admitted only when the pool is empty,
+#                               because that is rule 2, and a lane capped at 965,536 is
+#                               the one most able to reach that price.
 #   output_rate_margin_percent  booked share of the per-minute output allowance, leaving
 #                               room for estimates that land slightly low.
 # ------------------------------------------------------------

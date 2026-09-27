@@ -40,15 +40,17 @@ default_effort = "xhigh"
 [context]
 advertised_tokens = 1000000
 
-# Native window is 262,144 tokens. The remaining advertised headroom requires YaRN
-# extrapolation upstream, so it is opt-in through the long lane instead of default.
+# Native window is 262,144 tokens, offered as the Medium (concurrent) peer: its smaller
+# reservation is what leaves the provider's in-flight pool room to overlap requests.
 [lane.primary]
 context_tokens = 262144
 input_tokens = 196608
 output_clamp_tokens = 65536
 
-# Optional lane. Declaring it creates the /long route and the qwen3-long alias, which
-# stays an exclusive primary request; omitting it removes both.
+# Optional lane. Declaring it creates the /long route and the qwen3-long alias, offered as
+# the Long (queued) peer and launched by default: the wider window is worth more than the
+# overlap it spends. A request there runs alone only when priced at or above the provider's
+# exclusive threshold; a short one still overlaps. Omitting the lane removes both.
 [lane.long]
 context_tokens = 1000000
 input_tokens = 900000

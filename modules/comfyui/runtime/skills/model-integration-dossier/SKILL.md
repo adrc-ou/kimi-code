@@ -25,4 +25,4 @@ Before implementing an unfamiliar model integration, establish:
 Prefer model configuration and canonical implementation over third-party summaries.
 
 Write significant findings and exact source locations to
-`.agent-state/UPSTREAM_SOURCES.md`.
+`/tmp/agent-state/UPSTREAM_SOURCES.md`.

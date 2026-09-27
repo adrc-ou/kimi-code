@@ -80,6 +80,104 @@ harness_instance() {
   export HARNESS_STATE_FILE HARNESS_SESSION_FILE HARNESS_IMAGE_SUFFIX COMPOSE_PROJECT_NAME
 }
 
+# Delete everything the instance directory may be holding that could carry a secret.
+#
+# A launch that is killed outright runs no cleanup at all: no EXIT trap, no unlock, nothing. So the
+# next launch has to assume the directory is dirty, and it has to say so before it renders anything,
+# or a provider key survives every reboot until someone happens to stop the stack politely.
+#
+# Three families, by how they got there:
+#
+#   credentials/       today's layout - one file per credential the selection uses (tools/models.py)
+#   <a>__<b>           the same secret names written flat. Two underscores are reserved for exactly
+#                      this by tools/definitions.py, which refuses them in a provider id or a
+#                      credential id, and no other artifact in this directory has one, so the shape
+#                      alone identifies a key without naming a provider.
+#   the ledger below   flat names older revisions wrote at the instance root. No current code
+#                      produces any of them, which is precisely why no current cleanup knows them.
+#
+# `bootstrap.?*` is the resolved bootstrap environment, which is a copy of .env with every default
+# filled in, and is the one file here that can hold a key the operator persisted rather than typed.
+#
+# Never fatal: residue that will not go is worth a warning, not a launch that cannot start.
+HARNESS_SECRET_RESIDUE=(nrp-api-key bridge-token)
+
+harness_sweep_secrets() {
+  local directory=${1:-${HARNESS_RUNTIME_DIR:-}}
+  local name
+  [[ -n "${directory}" && -d "${directory}" ]] || return 0
+  # This function deletes by name without looking; the instance directory is the only thing it is
+  # ever allowed to point at, and a path that does not say so is a bug worth shouting about.
+  if [[ "${directory}" != *"/.local/runtime/"* ]]; then
+    echo "Refusing to sweep ${directory}: not a harness instance directory." >&2
+    return 0
+  fi
+  for name in ${HARNESS_SECRET_RESIDUE[@]+"${HARNESS_SECRET_RESIDUE[@]}"}; do
+    if [[ -e "${directory}/${name}" || -L "${directory}/${name}" ]]; then
+      find "${directory}/${name}" -delete 2>/dev/null ||
+        echo "Could not remove ${name} from the instance directory." >&2
+    fi
+  done
+  find "${directory}" -maxdepth 1 -type f \( -name '*__*' -o -name 'bootstrap.?*' \) \
+    -delete 2>/dev/null ||
+    echo "Could not sweep secret-shaped residue from ${directory}." >&2
+  if [[ -d "${directory}/credentials" ]]; then
+    # The directory itself stays; materialise_credentials() owns its mode and recreates the files.
+    find "${directory}/credentials" -mindepth 1 -delete 2>/dev/null ||
+      echo "Could not empty ${directory}/credentials." >&2
+  fi
+  return 0
+}
+
+# Sweep every instance directory in this checkout *except* the one we are launching.
+#
+# The instance id digests the checkout path, the workspace path and the platform, so moving the
+# repository, retargeting its workspace, or switching platform orphans the previous instance
+# directory completely: nothing in a later launch ever names it, and a provider key inside it
+# outlives every cleanup that knows about. Orphans are also what a checkout that has been copied
+# around accumulates. Every sibling whose lock no live process holds gets the same sweep the live
+# directory gets, and one that is still held is left exactly as it is, so a second instance
+# sharing this checkout keeps its own secrets.
+#
+# Heldness comes from the lock itself rather than the pid written in it: a pid outliving its
+# process is the ordinary state of a file left by a kill -9, and after a reboot some unrelated
+# process owns that number, which would guard the leftover key forever. The kernel drops an flock
+# when its holder dies by any means, so trying the lock non-blockingly answers the real question.
+# Anything the probe cannot settle counts as held — skipping a stale directory costs one leftover,
+# sweeping a live one costs the operator their running session.
+harness_sweep_stale_instances() {
+  local root=${1:-}
+  local current=${HARNESS_RUNTIME_DIR:-}
+  [[ -n "${root}" && -d "${root}" ]] || return 0
+  local directory
+  for directory in "${root}"/*/; do
+    [[ -d "${directory}" ]] || continue
+    directory=${directory%/}
+    [[ "${directory}" == "${current}" ]] && continue
+    python3 "${HARNESS_ROOT}/tools/instance_lock.py" --free "${directory}/launcher.lock" ||
+      continue
+    harness_sweep_secrets "${directory}"
+  done
+  return 0
+}
+
+# Retire the scratch directory this harness used to keep inside the project.
+#
+# The workspace belongs to whatever project is checked out there, so harness leftovers get removed
+# at both ends of a launch rather than accumulating between them. Removal is deliberately not
+# unconditional: a project that tracks its own directory of that name owns it, and Git is the
+# arbiter. The function it calls also refuses a symlink and a directory it does not own.
+#
+# Silent by construction. This runs from the exit trap, where a complaint about a cleanup would
+# bury the reason the launch is ending.
+harness_retire_workspace_state() {
+  local workspace=${1:-${HARNESS_WORKSPACE:-}}
+  [[ -n "${workspace}" && -d "${workspace}" ]] || return 0
+  python3 "${HARNESS_ROOT}/tools/safe_workspace_init.py" --retire-only "${workspace}" \
+    >/dev/null 2>&1 || true
+  return 0
+}
+
 harness_lock() {
   HARNESS_LOCK_PATH="${HARNESS_RUNTIME_DIR}/launcher.lock"
   # FD 9 is reserved for the launcher. Python's flock works on both macOS and
@@ -215,7 +313,13 @@ harness_init() {
   harness_platform
   harness_resolve_bootstrap_env
   harness_instance
+  # Behind the lock, so this only ever clears residue: a launcher that is actually running would
+  # have refused us the lock and never got here.
   harness_lock
+  harness_sweep_secrets
+  # The lock above only proves nothing is launching *this* instance id, so the siblings need their
+  # own liveness test before the same sweep reaches them.
+  harness_sweep_stale_instances "${HARNESS_RUNTIME_DIR%/*}"
   HARNESS_RESOLVED_BOOTSTRAP=$(mktemp "${HARNESS_RUNTIME_DIR}/bootstrap.XXXXXX")
   printf '%s\n' "${HARNESS_BOOTSTRAP_ENV}" >"${HARNESS_RESOLVED_BOOTSTRAP}"
   unset HARNESS_BOOTSTRAP_ENV

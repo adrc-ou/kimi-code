@@ -9,7 +9,7 @@
 # Keys that are not listed as user-owned in runtime/config-policy.json are re-pinned on every
 # launch, so an in-session change to harness policy does not survive a restart.
 
-# Replaced with the alias of the model selected for the primary agent by ./start.sh.
+# Replaced with the alias of the model selected for the main agent by ./start.sh.
 default_model = "__KIMI_PRIMARY_ALIAS__"
 
 default_permission_mode = "manual"

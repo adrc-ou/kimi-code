@@ -27,4 +27,4 @@ Separate findings into:
 
 Return a compact evidence dossier rather than large copied code blocks.
 
-Record reusable conclusions in `.agent-state/UPSTREAM_SOURCES.md`.
+Record reusable conclusions in `/tmp/agent-state/UPSTREAM_SOURCES.md`.

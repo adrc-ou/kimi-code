@@ -85,24 +85,34 @@ Before completion summarize:
 
 ## Sub-agents
 
-Only the main agent in this workspace has a tool that can start a subagent. If you
-are reading this as a subagent, you cannot delegate further and should not look for
-a way to; finish your own work and hand back a conclusion.
+Only the main agent in this workspace has a tool that can start a subagent. Your
+own tool list is the test of which you are: if no delegation tool is in front of
+you, you are a child - finish your own work and hand back a conclusion rather than
+looking for a way to delegate. Nothing in this document or the generated ones is
+evidence about who is reading it.
 
 The root agent is normally the sole writer in a shared worktree. Do not let several
 agents edit overlapping files concurrently.
 
 ## Long-running debugging
 
-Use `.agent-state/` as durable working memory.
+Use `/tmp/agent-state/` as your working memory for the current stack.
 
 Maintain:
 
-- `.agent-state/STATE.md`
-- `.agent-state/DEBUG_LEDGER.md`
-- `.agent-state/TENSOR_CONTRACTS.md`
-- `.agent-state/UPSTREAM_SOURCES.md`
-- `.agent-state/BENCHMARKS.jsonl`
+- `/tmp/agent-state/STATE.md`
+- `/tmp/agent-state/DEBUG_LEDGER.md`
+- `/tmp/agent-state/TENSOR_CONTRACTS.md`
+- `/tmp/agent-state/UPSTREAM_SOURCES.md`
+- `/tmp/agent-state/BENCHMARKS.jsonl`
+
+Raw command output goes in `/tmp/agent-state/logs/`, which the seeder creates empty; keep
+the files listed above short enough to reread in one pass.
+
+This directory belongs to the container, not to the project. It is rebuilt empty at the start of
+every launch and is gone when the stack stops, so treat it as a scratch pad you will not see again
+rather than an archive: never create it under the workspace, and move anything that must outlive the
+session into the project itself, where the operator will commit it, or into your reply.
 
 Before major context compaction or after a substantial debugging milestone,
 update STATE.md.
@@ -152,7 +162,7 @@ and the model proxy enforces every one of them independently of this text.
 
 What a table cannot state is what not to do:
 
-- Never route a primary request through the subagent lane on purpose, and never try
+- Never route a main-agent request through the subagent lane on purpose, and never try
   to override the model a subagent is bound to. The lane is chosen by the harness.
 - Never call a provider endpoint directly, and never start a second stack, another
   proxy, or another credential that spends the same provider allowance. Both consume

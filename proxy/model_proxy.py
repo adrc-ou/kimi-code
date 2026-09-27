@@ -95,7 +95,11 @@ MAX_QUEUED = int(os.environ.get("MODEL_PROXY_MAX_QUEUED", "32"))
 
 # A stalled upstream read must release its permit rather than wedge the lane.
 SOCK_READ_TIMEOUT = float(os.environ.get("MODEL_PROXY_SOCK_READ_TIMEOUT", "300"))
-MAX_REQUEST_SECONDS = float(os.environ.get("MODEL_PROXY_MAX_REQUEST_SECONDS", "3600"))
+# Zero, the default, means no per-request wall clock at all: a request runs until it completes,
+# until its stream stalls past SOCK_READ_TIMEOUT, or until the client cancels it, and the UI owns
+# that last one. This is also what the provider advises for scripts. An operator may still name a
+# positive number to reinstate a cap; nothing else in the file treats 0 as a valid limit.
+MAX_REQUEST_SECONDS = float(os.environ.get("MODEL_PROXY_MAX_REQUEST_SECONDS", "0"))
 
 # Coarse per-lane input ceiling, as a percentage of the lane input cap. It exists
 # to catch configuration drift and abuse, not to meter legitimate traffic.
@@ -376,6 +380,10 @@ class RuntimePolicy:
     limits: dict
     reserved: int
     providers: tuple[str, ...]
+    #: The lane Kimi's ``default_model`` is expected to name. Chosen at launch, and the only
+    #: lane whose alias the drift check accepts for it. The plan always carries one; this
+    #: default only matches the harness's shipped default lane for a hand-made plan.
+    agent_lane: str = "long"
 
 
 def _positive(entry: dict, key: str, where: str) -> int:
@@ -417,6 +425,18 @@ def upstream_credential(secret_name: str) -> str:
     if not value:
         raise PolicyDrift(f"credential {secret_name} is empty")
     return value
+
+
+def verify_credentials(policy: RuntimePolicy) -> None:
+    """Read every credential the plan names once, before the proxy starts listening.
+
+    Without this, a missing or empty mount first surfaces on the request that needs that
+    lane, which makes a failed launch look like a transient upstream error mid-session.
+    Values are read and discarded: nothing here may print one, and the request path keeps
+    reading per request so a remount is picked up without a restart.
+    """
+    for secret_name in sorted({lane.secret_name for lane in policy.lanes.values()}):
+        upstream_credential(secret_name)
 
 
 def _lane_from_plan(name: str, entry: dict, providers: dict, reserved: int) -> LanePolicy:
@@ -497,10 +517,15 @@ def enforce_kimi_configuration(policy: RuntimePolicy, config_path: str | None = 
         raise PolicyDrift(
             f"forced secondary model {secondary.get('default_model')!r} is not {subagent.alias!r}"
         )
-    primary = policy.lanes.get("primary")
-    if primary is not None and config.get("default_model") != primary.alias:
+    agent = policy.lanes.get(policy.agent_lane)
+    if agent is None:
         raise PolicyDrift(
-            f"Kimi default model {config.get('default_model')!r} is not {primary.alias!r}"
+            f"model policy designates agent lane {policy.agent_lane!r}, which it does not publish"
+        )
+    if config.get("default_model") != agent.alias:
+        raise PolicyDrift(
+            f"Kimi default model {config.get('default_model')!r} is not the designated "
+            f"agent lane model {agent.alias!r}"
         )
 
 
@@ -525,19 +550,31 @@ def load_runtime_policy(config_path: str | None = None) -> RuntimePolicy:
         limits=dict(plan.get("limits") or {}),
         reserved=reserved,
         providers=tuple(sorted({lane.provider_name for lane in lanes.values()})),
+        agent_lane=str(plan.get("agent_lane") or "long"),
     )
     enforce_kimi_configuration(policy, config_path)
     return policy
 
 
-def counter_limits(counter: dict) -> tuple[int | None, int | None, int | None]:
-    """Return (context budget, exclusivity threshold, request limit) a counter imposes."""
+def counter_limits(counter: dict) -> tuple[int | None, int | None, int | None, int | None]:
+    """Return (context budget, ceiling, exclusivity threshold, request limit) a counter imposes.
+
+    The budget is the ceiling reduced by the declared margin, so it is what the gate steers
+    traffic towards; the ceiling is the provider's own published number, and it is the larger
+    figure a lone request is still allowed to occupy. Only the second bounds whether a request
+    too big to share the pool may run at all.
+    """
     family = counter.get("family")
     if family == "context":
-        return counter.get("budget"), counter.get("exclusive_at"), counter.get("max")
+        return (
+            counter.get("budget"),
+            counter.get("ceiling"),
+            counter.get("exclusive_at"),
+            counter.get("max"),
+        )
     if family == "count":
-        return None, None, counter.get("max")
-    return None, None, None
+        return None, None, None, counter.get("max")
+    return None, None, None, None
 
 
 def validate_policy(policy: RuntimePolicy | None = None) -> None:
@@ -554,13 +591,20 @@ def validate_policy(policy: RuntimePolicy | None = None) -> None:
         "MODEL_PROXY_MAX_ERROR_BYTES": MAX_ERROR_BYTES,
         "MODEL_PROXY_MAX_QUEUED": MAX_QUEUED,
         "MODEL_PROXY_SOCK_READ_TIMEOUT": SOCK_READ_TIMEOUT,
-        "MODEL_PROXY_MAX_REQUEST_SECONDS": MAX_REQUEST_SECONDS,
         "MODEL_PROXY_INPUT_GUARD_PERCENT": INPUT_GUARD_PERCENT,
         "MODEL_PROXY_MEDIA_TOKEN_ESTIMATE": MEDIA_TOKEN_ESTIMATE,
     }
     for name, value in numeric_values.items():
         if value <= 0:
             raise RuntimeError(f"{name} must be positive; got {value}")
+    # The one knob for which "no limit" is a legitimate setting, so it is validated apart from
+    # the map above rather than loosening the rule for everything in it. A negative is still a
+    # typo, and a typo here would mean every request trips its deadline the instant it starts.
+    if MAX_REQUEST_SECONDS < 0:
+        raise RuntimeError(
+            f"MODEL_PROXY_MAX_REQUEST_SECONDS must be 0 for unlimited or a positive number;"
+            f" got {MAX_REQUEST_SECONDS}"
+        )
     if INPUT_GUARD_PERCENT < 100:
         raise RuntimeError("MODEL_PROXY_INPUT_GUARD_PERCENT must be at least 100")
 
@@ -579,25 +623,44 @@ def validate_policy(policy: RuntimePolicy | None = None) -> None:
             counter = policy.counters.get(counter_id)
             if counter is None:
                 raise RuntimeError(f"{lane.alias} names unknown counter {counter_id}")
-            budget, exclusive_at, _limit = counter_limits(counter)
+            budget, ceiling, exclusive_at, _limit = counter_limits(counter)
             if budget is None:
                 continue
-            aggregate = counter.get("ceiling")
-            if isinstance(aggregate, int) and budget > aggregate:
+            if ceiling is not None and budget > ceiling:
                 raise RuntimeError(
                     f"counter {counter_id} budgets {budget} tokens above the "
-                    f"{aggregate}-token aggregate ceiling its provider publishes"
+                    f"{ceiling}-token aggregate ceiling its provider publishes"
                 )
-            # A reservation that reaches the exclusivity threshold may exceed the budget: the
-            # provider's own terms allow a request that large to run, provided nothing else
-            # runs beside it. Below that threshold, a lane that cannot fit inside the budget
-            # could never be admitted at all.
+            # No price may fall between the two. A reservation over the budget is served alone
+            # only while it fits the ceiling, and above it only once the threshold is reached,
+            # so a threshold set above its own ceiling would leave the prices between them with
+            # no admission rule at all. Providers publish one fraction for both, so agreeing is
+            # the normal case; a provider that ever split them this way is a contradiction the
+            # harness cannot serve and must refuse to start on.
+            if (
+                ceiling is not None
+                and exclusive_at is not None
+                and exclusive_at > ceiling
+            ):
+                raise RuntimeError(
+                    f"counter {counter_id} sets exclusivity at {exclusive_at} tokens, above the "
+                    f"{ceiling}-token aggregate ceiling its provider publishes"
+                )
+            # A reservation the budget cannot hold is not automatically unservable: the
+            # provider's aggregate rule bounds the requests it has *in combination*, so a
+            # reservation that fits the published ceiling on its own is served alone, and a
+            # reservation at or above the exclusivity threshold is served alone by the
+            # provider's own terms. What cannot be served at all is a reservation above the
+            # ceiling that the threshold nonetheless does not licence to run alone; the two
+            # numbers coincide for NRP, so only contradictory provider terms can produce it.
             if lane.reservation > budget and not (
-                exclusive_at is not None and lane.reservation >= exclusive_at
+                lane.reservation <= ceiling
+                or (exclusive_at is not None and lane.reservation >= exclusive_at)
             ):
                 raise RuntimeError(
                     f"{lane.alias} reserves {lane.reservation} tokens but counter {counter_id} "
-                    f"only budgets {budget}; no request on this lane could ever be admitted"
+                    f"budgets {budget} of a {ceiling}-token ceiling without a threshold that "
+                    f"large; no request on this lane could ever be admitted"
                 )
 
     subagent = policy.lanes.get("subagent")
@@ -685,6 +748,24 @@ def estimate_input_tokens(body: bytes) -> tuple[int, int]:
 
     stripped = DATA_URL.sub(_drop, body)
     return len(stripped) // 4 + media * MEDIA_TOKEN_ESTIMATE, media
+
+
+def priced_reservation(lane: LanePolicy, estimate: int) -> int:
+    """What one request is charged for its fair-use permit, from what it is actually carrying.
+
+    A lane's own reservation is the worst case its input cap and output clamp allow, which is the
+    right number for proving at startup that the lane can be served at all and the wrong one for
+    admitting a request that uses a tenth of its window. NRP's aggregate and exclusivity rules are
+    both written about the context a request utilizes, so charging the worst case makes a short
+    request on a wide lane look large enough to run alone and hold the whole allowance while it
+    does not need it.
+
+    The estimate is the same figure the input guard already measured, and the lane reservation
+    stays the ceiling: a price may be fairer than the worst case, never bigger than it. That
+    ordering is what keeps every startup check that was proved against the static reservation
+    true of the charged one.
+    """
+    return min(lane.reservation, max(estimate, 1) + lane.output_clamp)
 
 
 def authorize_client(request: web.Request) -> None:
@@ -955,16 +1036,20 @@ class RateLedger:
 class FairUseGate:
     """Admission for one provider counter.
 
-    A counter carries whichever of three constraints the provider publishes for its scope:
-    an aggregate in-flight token budget, a threshold at or above which a single request must
-    run alone, and a hard request-count ceiling. ``None`` means the provider stated nothing
-    of that kind, so the constraint is simply absent - a provider with only a concurrency
-    limit gets a counting semaphore, and one with only a token budget gets a bin.
+    A counter carries whichever of four constraints the provider publishes for its scope: an
+    aggregate in-flight token budget, the published ceiling that budget was taken from, a
+    threshold at or above which a single request must run alone, and a hard request-count
+    ceiling. ``None`` means the provider stated nothing of that kind, so the constraint is
+    simply absent - a provider with only a concurrency limit gets a counting semaphore, and one
+    with only a token budget gets a bin.
 
-    Lanes are not special-cased. A reservation that reaches the exclusivity threshold runs
-    alone because the provider says a request that large may not overlap anything; every
-    other lane is admitted while the sum of live reservations stays inside the budget. Which
-    lane yields to which is a fairness choice, not a policy rule: subagents give way to a
+    Lanes are not special-cased. A reservation that runs alone - because the provider says a
+    request that large may not overlap anything, or because it is larger than the entire budget
+    and so could not overlap anything even in principle - waits for an idle counter; everything
+    else is admitted while the sum of live reservations stays inside the budget. A reservation
+    is what one request was priced at rather than the largest its lane could ever be, so it is
+    the request that decides whether it runs alone, not the route it arrived on.
+    Which lane yields to which is a fairness choice, not a policy rule: subagents give way to a
     primary that is already queued, so an idle operator cannot be starved by a fan-out of
     children.
     """
@@ -974,6 +1059,7 @@ class FairUseGate:
         counter_id: str,
         *,
         budget: int | None = None,
+        ceiling: int | None = None,
         exclusive_at: int | None = None,
         limit: int | None = None,
         subagent_limit: int | None = None,
@@ -981,6 +1067,7 @@ class FairUseGate:
         self.counter_id = counter_id
         self.condition = asyncio.Condition()
         self.budget = budget
+        self.ceiling = ceiling
         self.exclusive_at = exclusive_at
         self.limit = limit
         self.subagent_limit = subagent_limit
@@ -993,14 +1080,40 @@ class FairUseGate:
     def is_exclusive(self, reservation: int) -> bool:
         return self.exclusive_at is not None and reservation >= self.exclusive_at
 
+    def runs_alone(self, reservation: int) -> bool:
+        """Whether a reservation this size can only ever be served with the counter empty.
+
+        Two independent reasons reach the same answer. The provider may say a request at or
+        above its own threshold runs alone, or the request may simply be larger than the whole
+        aggregate budget, in which case sharing is arithmetic rather than policy: nothing that
+        ever finishes can make room for it, so admitting it beside anything would wait forever.
+        Both cases stay compliant, because a provider's aggregate limit bounds requests held in
+        combination, and a lone request within the published ceiling breaks no such bound.
+
+        The second case is the common one in practice. The budget is the provider's fraction
+        reduced by the declared margin, so any lane wide enough to reach the threshold also
+        carries a band of requests that overshoot the margin while fitting the provider's own
+        number, and per-request pricing puts real traffic in that band. Treating it as ordinary
+        shared traffic instead of solitude strands those requests permanently, which is why
+        :func:`validate_policy` requires the threshold to sit at or below the ceiling: the two
+        rules together leave no price that can neither share nor run alone.
+        """
+        if self.is_exclusive(reservation):
+            return True
+        if self.budget is None or reservation <= self.budget:
+            return False
+        return self.ceiling is None or reservation <= self.ceiling
+
     def _admits(self, lane: str, reservation: int) -> bool:
         if self.limit is not None and self.active >= self.limit:
             return False
         if self.subagent_limit is not None and self.active_subagents >= self.subagent_limit:
             return False
-        if self.is_exclusive(reservation):
+        if self.runs_alone(reservation):
             return self.active == 0
-        if lane != "primary" and self.waiting_primary:
+        # Only children yield, and only to somebody else's turn: a primary-like request that
+        # counted its own queue entry as a reason to wait could never be admitted at all.
+        if lane == "subagent" and self.waiting_primary:
             return False
         return self.budget is None or self.reserved + reservation <= self.budget
 
@@ -1042,6 +1155,7 @@ class FairUseGate:
             "waiting_primary": self.waiting_primary,
             "reserved_context": self.reserved,
             "context_budget": self.budget,
+            "context_ceiling": self.ceiling,
             "exclusive_at": self.exclusive_at,
             "request_limit": self.limit,
             "subagent_limit": self.subagent_limit,
@@ -1100,19 +1214,21 @@ class Enforcement:
             family = counter.get("family")
             lanes = counter.get("lanes") or []
             if family in {"context", "count"}:
-                budget, exclusive_at, limit = counter_limits(counter)
+                budget, ceiling, exclusive_at, limit = counter_limits(counter)
                 subagent_limit = fan_out if "subagent" in lanes else None
                 gate = self.gates.get(counter_id)
                 if gate is None:
                     self.gates[counter_id] = FairUseGate(
                         counter_id,
                         budget=budget,
+                        ceiling=ceiling,
                         exclusive_at=exclusive_at,
                         limit=limit,
                         subagent_limit=subagent_limit,
                     )
                 else:
                     gate.budget = budget
+                    gate.ceiling = ceiling
                     gate.exclusive_at = exclusive_at
                     gate.limit = limit
                     gate.subagent_limit = subagent_limit
@@ -1206,12 +1322,19 @@ class Enforcement:
 
 
 @contextlib.asynccontextmanager
-async def admission(lane: LanePolicy, enforcement: Enforcement) -> AsyncIterator[None]:
-    """Hold every counter the plan says this lane's traffic is charged to."""
-    reservation = lane.reservation
+async def admission(
+    lane: LanePolicy, enforcement: Enforcement, reservation: int | None = None
+) -> AsyncIterator[None]:
+    """Hold every counter the plan says this lane's traffic is charged to.
+
+    ``reservation`` is what this one request costs; omitting it charges the lane's worst case.
+    Each gate adds and later releases the same figure it was handed, so the value is captured
+    once here rather than recomputed, and an unbalanced ledger is impossible by construction.
+    """
+    cost = lane.reservation if reservation is None else reservation
     async with contextlib.AsyncExitStack() as stack:
         for gate in enforcement.gates_for(lane):
-            await stack.enter_async_context(gate.slot(lane.name, reservation))
+            await stack.enter_async_context(gate.slot(lane.name, cost))
         yield
 
 
@@ -1393,6 +1516,9 @@ async def health(_request: web.Request) -> web.Response:
             "status": "ok",
             "policy_enforced": True,
             **enforcement.snapshot(),
+            # Which lane the main agent was launched on: the alias Kimi's default_model must
+            # carry, and therefore the lane a session's own traffic is metered against.
+            "agent_lane": policy.agent_lane,
             "subagent_limit": policy.limits.get("subagent_concurrency"),
             "providers": sorted(policy.providers),
             "credentials": sorted(
@@ -1416,7 +1542,9 @@ async def health(_request: web.Request) -> web.Response:
             },
             "input_guard_percent": INPUT_GUARD_PERCENT,
             "sock_read_timeout_seconds": SOCK_READ_TIMEOUT,
-            "max_request_seconds": MAX_REQUEST_SECONDS,
+            # Null, not a sentinel number: an operator reading this should be able to tell that
+            # no wall clock is configured rather than decode a made-up one.
+            "max_request_seconds": MAX_REQUEST_SECONDS or None,
             "usage_reporting_supported": USAGE_SUPPORTED,
             "stats": {
                 "rate_waits": stats.rate_waits,
@@ -1496,6 +1624,7 @@ async def chat(request: web.Request) -> web.StreamResponse:
             # runs; a ledger that meters input charges itself from it and settles to the
             # prompt tokens the response reports.
             Cost(input=estimate, output=lane.output_clamp),
+            priced_reservation(lane, estimate),
         )
 
 
@@ -1534,10 +1663,11 @@ async def stream_attempt(
     lane: LanePolicy,
     body: bytes,
     attempt: int,
+    reservation: int,
 ) -> Attempt:
     """Make one attempt, holding every fair-use permit this lane is charged to."""
     url = f"{lane.base_url}/v1/chat/completions"
-    async with admission(lane, enforcement):
+    async with admission(lane, enforcement, reservation):
         outbound_headers = filtered_request_headers(
             request, upstream_credential(lane.secret_name)
         )
@@ -1654,14 +1784,20 @@ async def forward_chat(
     started: float,
     inbound_body: bytes,
     cost: Cost,
+    reservation: int | None = None,
 ) -> web.StreamResponse:
     """Retry an upstream request until it finishes or the client goes away.
 
     Every sleep happens with no fair-use permit held and no rate booking outstanding,
     so provider backpressure never occupies capacity that other requests could use.
+
+    ``reservation`` is what the caller priced this request at, and every attempt holds exactly
+    that. Omitting it charges the lane's worst case, which is the correct reading of a caller
+    that has not measured anything.
     """
     global USAGE_SUPPORTED
 
+    cost_of_permit = lane.reservation if reservation is None else reservation
     attempt_number = 0
     session: ClientSession = request.app["client"]
 
@@ -1672,7 +1808,7 @@ async def forward_chat(
             raise asyncio.CancelledError
 
         elapsed = time.monotonic() - started
-        if elapsed > MAX_REQUEST_SECONDS:
+        if MAX_REQUEST_SECONDS and elapsed > MAX_REQUEST_SECONDS:
             stats.deadline_stops += 1
             print(
                 f"request_deadline lane={lane.name} attempts={attempt_number} "
@@ -1696,7 +1832,7 @@ async def forward_chat(
 
         try:
             outcome = await stream_attempt(
-                request, session, lane, body, attempt_number
+                request, session, lane, body, attempt_number, cost_of_permit
             )
         except (TimeoutError, ClientConnectionError, ServerDisconnectedError) as exc:
             enforcement.settle(lane, bookings, cost, None)
@@ -1714,6 +1850,11 @@ async def forward_chat(
                     f"attempts={attempt_number} prompt_tokens={outcome.prompt_tokens} "
                     f"output_tokens={outcome.output_tokens} "
                     f"estimated_output={outcome.estimated_output} "
+                    # The priced permit beside the pre-request estimate, so the gap between what
+                    # a permit cost and what the request turned out to use is readable from the
+                    # log rather than something an operator has to trust the estimator about.
+                    f"priced_reservation={cost_of_permit} lane_reservation={lane.reservation} "
+                    f"estimated_input={cost.input} "
                     f"stalled={outcome.stalled} "
                     f"elapsed_seconds={time.monotonic() - started:.3f}",
                     flush=True,
@@ -1789,6 +1930,12 @@ def create_app() -> web.Application:
 
 def main() -> None:
     validate_policy()
+    try:
+        verify_credentials(BASELINE_POLICY)
+    except PolicyDrift as exc:
+        # One clean line rather than a traceback: start.sh surfaces the container's stderr,
+        # and the fact names something the operator can mount, not a crash to debug.
+        raise SystemExit(f"model-proxy will not start: {exc}") from None
     for name, lane in sorted(BASELINE_POLICY.lanes.items()):
         print(
             f"lane={name} alias={lane.alias} provider={lane.provider_name} "

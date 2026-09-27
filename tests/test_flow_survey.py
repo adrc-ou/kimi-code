@@ -156,6 +156,23 @@ class SurveyTests(unittest.TestCase):
     def test_a_model_named_by_the_environment_never_takes_the_screen(self):
         self.assertEqual(self.asked(flow.MODEL, HARNESS_PRIMARY_MODEL="fast"), 0)
 
+    def test_an_extended_window_row_named_by_the_environment_takes_none_either(self):
+        # The override column takes whatever the screen offers, so a twin has to be as recognisable
+        # to the forecast as a plain model - and the answer it projects is still a model id.
+        self.catalog([{**MODELS[0], "lanes": ["primary", "long", "subagent"]}])
+        self.assertEqual(self.asked(flow.MODEL, HARNESS_PRIMARY_MODEL="fast@long"), 0)
+        self.assertEqual(self.selections, [{"primary": "fast", "subagent": "fast"}])
+
+    def test_one_model_with_a_window_to_choose_between_is_still_a_question(self):
+        # The twin is what makes this a screen: with the extended lane declared, a catalog of one
+        # model still has two rows, and promising zero here would under-count the rail.
+        self.catalog([{**MODELS[0], "lanes": ["primary", "long", "subagent"]}])
+        self.assertEqual(self.asked(flow.MODEL), 1)
+        # Without it, the same catalog asks nothing, which is the assertion that makes the line
+        # above about the window rather than about the fixture.
+        self.catalog([MODELS[0]])
+        self.assertEqual(self.asked(flow.MODEL), 0)
+
     def test_a_lane_answered_for_the_user_still_supplies_its_answer(self):
         # The credential forecast needs both lanes settled, so an override has to feed the
         # projection rather than only switching a screen off.

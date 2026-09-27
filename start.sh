@@ -121,9 +121,12 @@ cleanup() {
   # between the copy and its own cleanup must not leave conversation text on the host, and a job
   # that exits early takes its pid down with it, so this directory is cleared unconditionally.
   [[ -d "${HARNESS_RUNTIME_DIR}/prompt-sessions" ]] && rm -rf -- "${HARNESS_RUNTIME_DIR}/prompt-sessions"
-  # Provider keys are session material: empty the directory, including any file a
-  # renamed credential left behind.
-  [[ -d "${HARNESS_RUNTIME_DIR}/credentials" ]] && find "${HARNESS_RUNTIME_DIR}/credentials" -mindepth 1 -delete
+  # Provider keys are session material, and the next launch sweeps them too in case this one was
+  # killed before reaching here. One function holds both ends so the two lists cannot drift.
+  harness_sweep_secrets "${HARNESS_RUNTIME_DIR}"
+  # The agent's scratch directory left the workspace, so it needs nothing here: the container's
+  # own tmpfs holds it and `down` above takes the container with it.
+  harness_retire_workspace_state "${workspace:-}"
   harness_unlock
   exit "${status}"
 }

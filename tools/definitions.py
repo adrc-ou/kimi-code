@@ -79,6 +79,13 @@ PER_REQUEST_RULE_KINDS = frozenset({"max_output_tokens_per_request", "max_contex
 #: identifier, so two lanes bound to the same model contend for the same permits.
 SCOPES = frozenset({"model", "provider", "credential", "credential_model"})
 
+#: Rule kinds that may be declared with ``default = true``, and the scopes that may carry one.
+#: A default is a fallback ceiling for models the provider has not listed individually, so it
+#: belongs at a scope looser than ``model``: a model-scoped rule is already the most specific
+#: statement its kind can make, and marking it default would only obscure that.
+DEFAULTABLE_RULE_KINDS = COUNT_RULE_KINDS
+DEFAULTABLE_RULE_SCOPES = SCOPES - {"model"}
+
 #: Scopes a rule of each family may meaningfully use. A provider-scoped context fraction has
 #: no single model context to measure, so it is refused instead of guessed at.
 ALLOWED_SCOPES: dict[frozenset[str], frozenset[str]] = {
@@ -132,6 +139,15 @@ def _percent(table: dict[str, Any], key: str, where: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 100:
         raise DefinitionError(f"{where}.{key} must be an integer percentage between 1 and 100")
     return int(value)
+
+
+def _flag(table: dict[str, Any], key: str, where: str) -> bool:
+    """Read an optional boolean, absent meaning false. Only a real boolean will do: a rule
+    table that accepted ``"true"`` would make a quoting mistake read as a deliberate choice."""
+    value = table.get(key, False)
+    if not isinstance(value, bool):
+        raise DefinitionError(f"{where}.{key} must be a boolean")
+    return value
 
 
 def _text(table: dict[str, Any], key: str, where: str) -> str:
@@ -282,6 +298,14 @@ def _parse_credentials(raw: Any, where: str, provider_id: str) -> dict[str, dict
 
 
 def _parse_rules(raw: Any, where: str) -> list[dict[str, Any]]:
+    """Read one provider's ``[[rule]]`` tables into enforceable rules.
+
+    ``default = true`` marks a count rule as a fallback ceiling for models the provider has not
+    listed by name. Such a rule is resolved by *displacing*: it applies only where no
+    model-scoped rule of the same kind does, and it never adds its own counter beside one. That
+    is what lets a provider carry its tightest published row as a floor for unknown models
+    without capping the models it explicitly allowed more of.
+    """
     if not isinstance(raw, list) or not raw:
         raise DefinitionError(f"{where} must declare at least one [[rule]] table")
     result: list[dict[str, Any]] = []
@@ -316,7 +340,7 @@ def _parse_rules(raw: Any, where: str) -> list[dict[str, Any]]:
         fields = RULE_KINDS[kind]
         if not fields & set(item):
             raise DefinitionError(f"{here} must set {' or '.join(sorted(fields))}")
-        unexpected = set(item) - {"kind", "scope", "models", *fields}
+        unexpected = set(item) - {"kind", "scope", "models", "default", *fields}
         if unexpected:
             raise DefinitionError(f"{here} has unknown key(s): {', '.join(sorted(unexpected))}")
         value = (
@@ -331,12 +355,23 @@ def _parse_rules(raw: Any, where: str) -> list[dict[str, Any]]:
             or not all(isinstance(name, str) and name for name in applies_to)
         ):
             raise DefinitionError(f"{here}.models must be a non-empty list of wire model names")
+        default = _flag(item, "default", here)
+        if default and kind not in DEFAULTABLE_RULE_KINDS:
+            raise DefinitionError(
+                f"{here}.default is meaningful only for {', '.join(sorted(DEFAULTABLE_RULE_KINDS))}"
+            )
+        if default and scope not in DEFAULTABLE_RULE_SCOPES:
+            raise DefinitionError(
+                f"{here}.default needs one of {', '.join(sorted(DEFAULTABLE_RULE_SCOPES))}; "
+                "a model-scoped rule is already specific to its model and cannot be a fallback"
+            )
         result.append(
             {
                 "kind": kind,
                 "scope": scope,
                 "value": int(value),
                 "models": list(applies_to) if applies_to else None,
+                "default": default,
             }
         )
     return result

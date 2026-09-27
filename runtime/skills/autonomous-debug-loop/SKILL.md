@@ -1,11 +1,12 @@
 ---
 name: autonomous-debug-loop
-description: Disciplined long-running debugging loop with durable experiment state that survives context compaction and session restarts
+description: Disciplined long-running debugging loop with experiment state that survives context compaction
 type: prompt
 whenToUse: When debugging requires multiple experiments, long-running commands, background tasks, or substantial context consumption
 ---
 
-Use `.agent-state` as external working memory.
+Use `/tmp/agent-state` as external working memory. It is the container's own scratch space: staged
+empty when the stack starts, and gone when the stack stops. Never put it in the project.
 
 STATE.md must always contain:
 
@@ -36,8 +37,8 @@ Do not make multiple unrelated changes in one experiment.
 
 Do not repeat an experiment without identifying what changed.
 
-Redirect large logs into `.agent-state/logs/` and summarize them instead of
+Redirect large logs into `/tmp/agent-state/logs/` and summarize them instead of
 feeding entire logs repeatedly into context.
 
-Before context compaction, update STATE.md so that a fresh agent could resume
-the investigation using only repository state plus `.agent-state`.
+Before context compaction, update STATE.md so that a fresh agent in the same stack
+could resume the investigation using only repository state plus `/tmp/agent-state`.

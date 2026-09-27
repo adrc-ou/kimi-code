@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Create harness workspace state without following workspace-controlled links."""
+"""Prepare a project workspace for a session without following workspace-controlled links.
+
+Nothing harness-owned is created in the project any more. The agent's scratch memory used to live
+in ``.agent-state/`` inside the workspace, where it outlived the session that wrote it and cluttered
+a tree that belongs to somebody else; it is now ``/tmp/agent-state`` in the agent container, staged
+by ``tools/register_workspace.py`` and destroyed with the container. What this module still does is
+the two things that genuinely belong to a launch - create the directories a selected module
+declares, and keep harness droppings out of the project's ``git status`` - plus retire the scratch
+directory from workspaces an older revision left it in.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +16,7 @@ import argparse
 import errno
 import os
 import secrets
+import shutil
 import stat
 from pathlib import Path, PurePosixPath
 
@@ -15,44 +25,11 @@ if __package__:
 else:
     from git_query import git_text
 
-DIRECTORIES = (".agent-state/logs",)
-FILES = (
-    ".agent-state/STATE.md",
-    ".agent-state/DEBUG_LEDGER.md",
-    ".agent-state/TENSOR_CONTRACTS.md",
-    ".agent-state/UPSTREAM_SOURCES.md",
-    ".agent-state/BENCHMARKS.jsonl",
-)
-STATE_TEMPLATE = """# Agent State
-
-## Objective
-
-## Current failure / work item
-
-## Important requirements
-
-## Last known-good state
-
-## Minimal reproduction
-
-## Current evidence
-
-## Active hypothesis
-
-## Eliminated hypotheses
-
-## Important files
-
-## Upstream references
-
-## Commands/tests already run
-
-## Next three experiments
-1.
-2.
-3.
-"""
-EXCLUDES = (".agent-state/", ".playwright-cli/", ".serena/")
+#: The scratch directory older revisions created inside the project. Nothing writes it any more,
+#: and this is the only place its name still appears in code that runs.
+RETIRED_DIRECTORY = ".agent-state"
+#: Harness droppings that a project's own `git status` should never have to look at.
+EXCLUDES = (".playwright-cli/", ".serena/")
 OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
 
 
@@ -102,23 +79,48 @@ def open_directory(root_fd: int, relative: str, expected_uid: int, create: bool)
         raise
 
 
-def ensure_file(root_fd: int, relative: str, expected_uid: int) -> None:
-    parts = components(relative)
-    parent = open_directory(root_fd, "/".join(parts[:-1]), expected_uid, create=True)
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+def tracked_by_git(root: Path, relative: str) -> bool | None:
+    """Whether the project owns this path: yes, no, or none of our business (not a repository).
+
+    The answer decides whether deleting is safe, so the failure modes are not symmetric. Git
+    refusing the question returns None and retires nothing; only an empty successful listing is
+    evidence the directory is ours.
+    """
+    output = git_text(root, "ls-files", "--", relative)
+    if output is None:
+        return None
+    return bool(output.splitlines())
+
+
+def retire_state(root: Path) -> bool:
+    """Delete the workspace's scratch directory if this harness, and only this harness, made it.
+
+    Three things must hold: it is a real directory owned by us rather than a link we would follow,
+    the repository tracks nothing under that name, and the name is the one this harness used. A
+    project that keeps its own directory there - tracked, and therefore somebody's work - is left
+    exactly as found, and so is any workspace Git cannot speak about.
+    """
+    target = root / RETIRED_DIRECTORY
+    if not target.exists() and not target.is_symlink():
+        return False
+    if tracked_by_git(root, RETIRED_DIRECTORY) is not False:
+        return False
+    expected_uid = os.getuid()
+    root_fd = os.open(root, OPEN_DIR)
     try:
-        fd = os.open(parts[-1], flags, 0o600, dir_fd=parent)
+        require_directory(root_fd, str(root), expected_uid)
         try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_uid or info.st_nlink != 1:
-                raise UnsafeWorkspace(f"unsafe workspace file: {relative}")
-            if relative == ".agent-state/STATE.md" and info.st_size == 0:
-                os.write(fd, STATE_TEMPLATE.encode())
-                os.fsync(fd)
-        finally:
-            os.close(fd)
+            fd = open_directory(root_fd, RETIRED_DIRECTORY, expected_uid, create=False)
+        except (FileNotFoundError, NotADirectoryError, UnsafeWorkspace):
+            # A link, a file, or a directory owned by another account: not ours to remove.
+            return False
+        os.close(fd)
     finally:
-        os.close(parent)
+        os.close(root_fd)
+    # rmtree never follows a symlink it finds on the way down, so nothing inside can redirect the
+    # deletion at a path outside the workspace.
+    shutil.rmtree(target)
+    return True
 
 
 def update_git_exclude(root: Path, expected_uid: int) -> None:
@@ -183,31 +185,39 @@ def update_git_exclude(root: Path, expected_uid: int) -> None:
         os.close(root_fd)
 
 
-def initialize(root: Path, directories=()) -> None:
+def initialize(root: Path, directories=(), retire: bool = True) -> None:
     root.mkdir(parents=True, exist_ok=True)
     root = root.resolve(strict=True)
     if root == Path("/") or "\n" in str(root):
         raise UnsafeWorkspace(f"unsafe workspace root: {root}")
     expected_uid = os.getuid()
+    if retire:
+        retire_state(root)
     root_fd = os.open(root, OPEN_DIR)
     try:
         require_directory(root_fd, str(root), expected_uid)
-        for relative in (*DIRECTORIES, *directories):
+        for relative in directories:
             fd = open_directory(root_fd, relative, expected_uid, create=True)
             os.close(fd)
-        for relative in FILES:
-            ensure_file(root_fd, relative, expected_uid)
     finally:
         os.close(root_fd)
     update_git_exclude(root, expected_uid)
-    print(f"Initialized agent state in {root}")
+    print(f"Workspace ready: {root}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("workspace", type=Path)
+    parser.add_argument(
+        "--retire-only",
+        action="store_true",
+        help="remove the retired scratch directory and create nothing (the exit trap's question)",
+    )
     args = parser.parse_args()
     try:
+        if args.retire_only:
+            retire_state(args.workspace)
+            return
         initialize(args.workspace)
     except (OSError, UnicodeError, UnsafeWorkspace) as exc:
         raise SystemExit(f"workspace initialization refused: {exc}") from exc

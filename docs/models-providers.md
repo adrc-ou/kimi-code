@@ -87,9 +87,11 @@ Three numbers per lane, and what they mean:
 
 - `context_tokens` — the window Kimi is told the model has, i.e.
   `max_context_size` in Kimi's model table. This is a *slice* of the model, not
-  necessarily the whole thing: the native window here is 262,144 while the
-  provider advertises 1,000,000, and the extra headroom is opt-in through the
-  long lane.
+  necessarily the whole thing: the model here declares 262,144 on its `primary`
+  lane and 1,000,000 on its `long` lane, and `[context].advertised_tokens` says
+  the provider advertises 1,000,000 for the model as a whole. Two lanes is the
+  norm, not an exception — they are the two ways of spending one allowance, and a
+  lane is what the operator picks between.
 - `input_tokens` — Kimi's `max_input_size`, the prompt-side cap the proxy
   rejects above.
 - `output_clamp_tokens` — the generation budget the proxy clamps
@@ -102,8 +104,10 @@ that large. It may not be smaller than any declared lane window.
 
 A model declares **capabilities**, never costs or limits. `capabilities`,
 `support_efforts` and the effort default are copied into the generated Kimi
-model table; the long lane exists so a model's extended window is a deliberate
-choice rather than something every request inherits.
+model table. The `long` lane exists so the wide window is a lane with its own
+name, route, alias and accounting rather than a number every request inherits,
+and because the two agent lanes are peers it is the one the launcher opens on by
+default; a model that declares only `primary` simply offers one row.
 
 ## `providers/<id>/provider.toml`
 
@@ -167,7 +171,10 @@ downstream has to know the distinction exists. The id is synthesised as
 `<credential>__<slug>`, so the shipped model reads `QWEN3_API_KEY` into a
 credential called `default__qwen3` and the launcher writes the secret file
 `nrp__default__qwen3`. Synthesis is refused if that id already exists in the
-provider — rename the credential or the slug rather than silently reusing one.
+provider — rename the credential or the slug rather than silently reusing one —
+and also if the resulting secret file name is longer than 64 characters, which
+is the longest path the proxy will open: a slug long enough to overrun it fails
+resolution instead of staging a credential file nothing can read.
 Because the credential id is part of what `credential` and `credential_model`
 rules count against, scoping happens **before** the resolver builds any counter:
 two models on two keys share no upstream ledger, so they must share none here,
@@ -188,7 +195,7 @@ proxy. A value missing from `.env` is prompted for once, for that session only.
 
 ### Rule taxonomy
 
-A rule is `{kind, scope, limit|percent, models?}`. `kind` decides which enforcer
+A rule is `{kind, scope, limit|percent, models?, default?}`. `kind` decides which enforcer
 it becomes and which unit it is measured in; `scope` decides **which traffic
 shares one counter**, which is precisely why selecting the same model for both
 lanes behaves differently from selecting two. The nine enforceable kinds:
@@ -224,6 +231,33 @@ Scopes resolve to a counter subject:
 hold per-model terms. Multiple rules of one kind in one scope collapse to the
 **tightest** value.
 
+A count rule may additionally carry `default = true`, which marks it as the
+harness's own stand-in rather than a number the provider publishes for that
+traffic. Only a count kind may be declared default, and only at a scope looser
+than `model` — a model-scoped rule is already the most specific statement its
+kind can make, and marking that default would only obscure it. Both are refused
+at load rather than ignored. Resolution then runs in this order:
+
+1. a **model-scoped** count rule that applies to the model displaces every
+   `default`. The two must not stack: a model's own ceiling and a catch-all
+   standing in for "nothing was said" describe the same set of in-flight
+   requests, and the minimum of the two would enforce a ceiling that provider
+   never stated for that model. Several model-scoped rules collapse to their
+   `min`, since each is a separate true statement about the same traffic.
+2. otherwise a `default` count rule supplies the ceiling, and the plan records
+   the `count_basis` that says where the number came from.
+3. either way, a **non-default** count rule at a looser scope (`credential`,
+   `credential_model`, `provider`) keeps its own counter and stacks, exactly as
+   it did before defaults existed; a `default` never opens one, which is why it
+   must be able to resolve without a host counter of its own.
+
+Subjects never merge across providers: `_key_for()` prefixes every subject with
+its provider id, so two providers each holding a rule of one kind still get two
+counters, and a selection spanning providers is charged each of them separately.
+A `default` is a harness choice wearing a provider file's clothes, so the label
+it resolves under has to say which; `providers/nrp/provider.toml` carries one and
+it is not an NRP number.
+
 This taxonomy is deliberately not NRP-shaped. NRP publishes no per-token
 monetary ceiling and no hard requests-per-minute; a provider that does is
 expressed by adding a `limit` kind, not by restructuring the resolver.
@@ -233,8 +267,15 @@ Conversely, a provider with *no* concurrency rule at all is legitimate — see
 **Safety margins** are the only tunables a provider file carries, and they exist
 because request cost is estimated before it is known. Each is a percentage of
 the provider's own threshold, applied by the resolver — never a number
-subtracted by hand in `.env`. The derived budget is always `min(threshold,
-threshold × margin)`, so a margin cannot push usage above the published rule.
+subtracted by hand in `.env`. `_percent()` accepts only an integer from 1 to 100,
+so a margin cannot *be* an overcommitment; and the context budget takes
+`min(threshold, threshold × margin)` on top of that, so the derived figure is
+never above the published rule even if the bound were ever relaxed. The rate
+ledger takes `threshold × margin` directly, capped at the same 100, and clamped
+to a floor of 1 so a provider that publishes a tiny allowance still admits one
+request rather than deadlocking. At the shipped provider the two derived numbers
+are 332,500 in-flight tokens (95% of 350,000) and 180,000 booked output tokens
+per minute (90% of 200,000).
 
 ## Resolution
 
@@ -252,6 +293,20 @@ model splits ledgers, it does not enlarge any allowance.
 1. **Lane membership.** `primary` comes from the primary selection, `subagent`
    from the subagent selection, and `long` exists only if the primary model
    declares it. Dropping a lane drops its route, its alias, and its counters.
+   The selection also designates which of those lanes the *main agent* launches
+   on (`agent_lane`, one of `primary` or `long`, defaulting to `long`), which
+   decides only the alias rendered into Kimi's `default_model`; designating a
+   lane the selected model does not declare is a refusal, not a fallback,
+   because a launch that quietly got the smaller window would believe it had the
+   larger one. Every route stays open either way, so Kimi's own model picker can
+   still move the session between them mid-flight. The two agent lanes are peers
+   rather than tiers, which is why `tools/policy.py` keeps one label map —
+   `LANE_DISPLAY` — and every human-facing surface reads its entry for the lane
+   in play: the picker rows `tools/models.py` builds, the `display_name` in each
+   generated `[models.*]` table, the `--resolve` summary, and the lane table in
+   the generated workspace guidance. Labels are the only thing that map touches;
+   the ids stay `primary`/`long`/`subagent` because they name the route, the
+   alias, and the provider-scoped policy behind them.
 2. **Lane sizing.** Per-request caps shrink the declared window and clamp;
    `input_tokens` is then `min(declared, context - clamp)`. Kimi's
    `loop_control.reserved_context_size` (read from `runtime/config.toml`,
@@ -314,9 +369,9 @@ atomically) and are deleted when the launcher exits:
 
 | File | Written by | Read by | Contents |
 | --- | --- | --- | --- |
-| `model-selection.json` | `models.py select` | `models.py resolve` | `{"primary": id, "subagent": id}` |
-| `last-model-selection.json` | `start.sh` after a successful launch | `models.py select` | Prior selection, shown as `(last used)` and pre-selected |
-| `model-policy.json` | `models.py resolve` | proxy, `render_runtime.py`, `check_services.py` | The plan: lanes, counters, limits, providers, selection |
+| `model-selection.json` | `models.py select` | `models.py resolve` | `{"primary": id, "subagent": id, "agent_lane": "primary"\|"long"}` — the two lanes the user answered, and the window the primary screen's row carried |
+| `last-model-selection.json` | `start.sh` after a successful launch | `models.py select` | Prior selection, shown as `(last used)` and pre-selected, its `agent_lane` deciding which of a model's two rows was the answer |
+| `model-policy.json` | `models.py resolve` | proxy, `render_runtime.py`, `check_services.py` | The plan: lanes, counters, limits, providers, selection, designated agent lane |
 | `model.env` | `models.py resolve` | `start.sh`, then Compose interpolation | `KIMI_SUBAGENT_CONCURRENCY`, `KIMI_BACKGROUND_TASK_SLOTS` — only the values `compose.yaml` interpolates; lane aliases reach Kimi through the rendered config |
 | `credentials/<provider>__<credential>` | `render_runtime.py` | proxy (via Docker secret) | One key value each, where a model-scoped credential id is the synthesised `<credential>__<slug>`; stale files from deselected models are removed |
 | `compose/models.json` | `models.py resolve` | Compose (`-f`, appended by `tools/runtime.sh`) | Secrets declaration + the proxy service's secret list |
@@ -401,12 +456,46 @@ step.
 
 `render_runtime.py` generates `[providers.*]`, `[models.*]` and
 `[secondary_model]` from the plan, so the harness sets the default model and the
-subagent model automatically. Kimi Code itself offers `/model`,
-`/secondary-model`, `/provider` and `/settings` in-session, and there is no
-documented way to disable that surface without patching the CLI, which this
-project will not do. The mitigations are that `secondary_model.force = true`
-keeps children on the subagent lane, `default_model` is not one of the
-user-owned keys the initializer lets an in-session write keep, and the proxy
-re-reads Kimi's live config at every policy refresh and fails closed if a lane
-drifts from the plan. A wrong turn therefore loses a request, not fair-use
-compliance.
+subagent model automatically. Each `[models.*]` table carries a `display_name`
+from `LANE_DISPLAY`, and the picker row is that name with the provider appended
+— for the shipped plan, `Qwen3.8-Flash-Next - Long (queued) (NRP)`,
+`... - Medium (concurrent) (NRP)` and `... - Subagent (automatic) (NRP)`.
+
+**The subagent row cannot be hidden, and is labelled instead.** Kimi Code's
+model list is every configured alias: in the shipped bundle,
+`pickerModelsForHost()` (byte `142070433`) filters exactly one entry out —
+`SECONDARY_DERIVED_MODEL_ALIAS`, the `__secondary__` value Kimi synthesises
+itself from the `[secondary_model]` recipe — and offers the rest, with no
+`hidden` flag on a model table to honour. The `qwen3-subagent` alias has to
+exist for `secondary_model.force = true` to bind children to it, so hiding it
+from `/model` would mean deleting the lane that makes the binding work.
+Renaming the alias to `__secondary__` is worse, not better: Kimi strips that
+name from the models view, so the forced binding could fall back to the main
+model and every child would silently inherit the main window. The mitigations
+are therefore that `secondary_model.force = true` keeps children on the
+subagent lane whatever the picker offers, `default_model` is not one of the
+user-owned keys the initializer lets an in-session write keep, the label says
+"(automatic)", and the proxy re-reads the configuration the launcher staged at
+every policy refresh and fails closed if a lane drifts from the plan.
+
+Two names are therefore unavailable as aliases, both discovered in the same
+bundle: `__secondary__`, which Kimi filters as above, and `primary`, which
+`/secondary-model` refuses because it reserves that word for "bind the caller's
+own model". A model slug that produced either would break the picker rather
+than the resolver, so this harness keeps lane names in ids and personality in
+`display_name`.
+
+What that last check compares against is worth stating precisely, because it
+bounds what the harness can possibly enforce. The file it reads is the rendered
+snapshot under `/policy/`, which is read-only and outside Kimi's own home;
+`/home/agent/.kimi-code/config.toml`, where an in-session `/model` writes, is
+never opened. A model switch is therefore not policed by name — and could not
+be, since the proxy has no view of it — but it is policed by *price*: whichever
+alias the request arrives under, the proxy resolves that lane's own reservation
+and re-prices the permit from the request's measured size, so a session that
+switched itself onto a wider window still cannot spend more than that window's
+lane is permitted. A wrong turn loses a request, not fair-use compliance. The
+converse is also deliberate: the designations cannot be *enforced* to agree, so
+`agent_lane` is a launch-time statement of which window the session opened in,
+which is why the generated envelope publishes it — an agent cannot otherwise tell
+which lane it is being metered on.

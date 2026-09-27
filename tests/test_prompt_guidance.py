@@ -156,7 +156,10 @@ class IsolationTests(unittest.TestCase):
         self.assertNotIn("AgentSwarm", lane)
         self.assertNotIn("subagents concurrently", lane)
         self.assertNotIn("`qwen3", lane)
-        self.assertIn("cannot delegate further", lane)
+        # The rule a child needs is still stated, and stated about the audience rather
+        # than as a question the reader must answer about itself.
+        self.assertIn("subagent-spawning tool", lane)
+        self.assertIn("this document is not", lane)
 
     def test_the_fanout_block_carries_its_ceiling_rather_than_referring_to_the_table(self):
         text = block_for(policy.OPTION_PARALLELISM)
@@ -260,10 +263,10 @@ class SizeFenceTests(unittest.TestCase):
     """
 
     #: Tokens of harness-written contract text that every lane pays, comments stripped.
-    CONTRACT_TOKENS = 2_150
+    CONTRACT_TOKENS = 2_250
 
     #: Tokens of harness-written main-prompt text, which is the wrapper plus the main-only blocks.
-    PROMPT_TOKENS = 1_300
+    PROMPT_TOKENS = 1_400
 
     def contract(self, extra: str = "") -> str:
         """The shipped all-lane document with no module guidance, plus any bulk under test.

@@ -258,58 +258,88 @@ administrator, because this harness cannot create an institutional account for y
 
 The proxy enforces whatever rules the selected providers publish, resolved at
 launch into one plan — see
-[the definition contract](models-providers.md). For NRP that is three rules: a
-per-minute output-token allowance per API token *and* model (the only rule the
-gateway meters itself, with HTTP 429 — input tokens do not count); one concurrent
-request once a request uses at least the policy's fraction of the model context;
-and otherwise a bounded number of concurrent requests whose combined context
-stays inside that fraction. Nothing about those numbers is baked into the proxy:
-each lane's reservation is its input cap plus its output clamp from the resolved
-plan, revalidated against Kimi's live rendered configuration on every refresh.
+[the definition contract](models-providers.md). NRP publishes four terms and the
+proxy enforces all four with three mechanisms: a per-minute output-token
+allowance per API token *and* model (the only term the gateway meters itself,
+with HTTP 429 — input tokens do not count, and NRP counts fixed calendar minutes
+while this ledger books a rolling minute in advance, which is stricter); one
+concurrent request once a request uses at least the policy's fraction of the
+model context; and otherwise a bounded number of concurrent requests — NRP's own
+table, which the gateway does not enforce at all — whose combined context stays
+inside that fraction, on the same counter as the rule above it. Nothing about
+those numbers is baked into the proxy: each lane's reservation is its input cap
+plus its output clamp from the resolved plan, revalidated against the rendered
+Kimi configuration the launcher staged for this run on every refresh.
 
-Read the policy that is in force right now:
+The operator's view of that is the launch report, which condenses the whole plan
+to one line — at the shipped definitions:
+
+```
+policy enforced (3 lanes; 5 subagent permits; context budget 332500; rate 1 counter(s))
+```
+
+A bare `HTTP ready`, or a FAIL on that line, means the proxy has stopped verifying
+policy rather than merely being slow. Nothing else about the enforcement is
+visible from the web UI, and that is deliberate: a request that has to wait for a
+permit waits, and the only thing the user sees is that the turn took longer. The
+per-lane numbers behind that line are for whoever maintains the harness, not for
+the operator, and they are read from the proxy's own health endpoint — an
+internal diagnostic, reachable only from inside the container network:
 
 ```bash
 ./shell.sh
 curl -s http://model-proxy:8080/healthz | python3 -m json.tool
 ```
 
-Expect `policy_enforced: true`; `subagent_limit`; `providers` and `credentials`
-for the selection; then per lane its alias, model, endpoint, credential, context
-window, input cap, output clamp, computed reservation, whether that reservation
-runs alone, and the counter ids it holds. `counters` reports each context gate's
-`context_budget` against its provider threshold, and `rates` each rolling
-ledger's `capacity` and `unit`. The launcher's quick check condenses the same data to
-`policy enforced (3 lanes; 5 subagent permits; context budget 332500; rate 1
-counter(s))`; a bare `HTTP ready` or a FAIL means the proxy has stopped
-verifying policy, not merely that it is slow.
+Expect `policy_enforced: true`; `agent_lane`, the lane the main agent was launched
+on and the one whose alias Kimi's `default_model` must carry; `subagent_limit`;
+`providers` and `credentials` for the selection; then per lane its alias, model,
+endpoint, credential, context window, input cap, output clamp, computed
+worst-case reservation, whether a reservation that large would run alone, and
+the counter ids it holds. `counters` reports each context gate's `context_budget`
+against its provider threshold, and `rates` each rolling ledger's `capacity` and
+`unit`. A `/long` request that came in small is admitted beside other traffic
+even though `exclusive` says true for that lane, because that field is the lane
+worst case and the gate prices the live request.
 
 The same plan is composed into the two prompt documents, so what Kimi was told is
 readable without a container shell: the staged copies are
 `.local/runtime/<instance>/SYSTEM.md` and `.../AGENTS.md` on the host, and
 `/home/agent/.kimi-code/SYSTEM.md` and `.../AGENTS.md` inside the sandbox. Check
-that the numbers there match `/healthz`; both come from the one plan, so a mismatch
-means a stale launch. The launch panel can switch any add-on off and can put either
+that the numbers there match the health report above; both come from the one plan, so a
+mismatch means a stale launch. The launch panel can switch any add-on off and can put either
 document on `on` or `off`, so a missing section is a setting rather than a fault —
 the proxy still enforces the plan, and `./prompts.sh --show` prints both halves of
 what the next unattended launch will compose: the two documents with their state,
 and the nine add-ons with theirs.
 
-With the shipped definitions the model advertises 1,000,000 tokens, of which
-262,144 are native and the rest requires YaRN extension upstream. The primary lane
-reserves its whole native window and the long lane reserves 965,536, which is at
-or above the exclusivity threshold and so runs strictly alone. Only that long lane
-runs alone. A primary request plus one subagent reservation does fit the aggregate
-budget, which is what the safety margin buys; a primary request plus the full
-five-subagent fan-out does not, so the proxy queues the overflow rather than
-refusing it. That is the intended shape, not a fault.
+With the shipped definitions the model advertises 1,000,000 tokens, which is what
+the two fraction rules are measured against, and the harness slices that one model
+into three lanes of its own choosing — 262,144, 1,000,000 and 64,000 — because the
+window a request may grow to is a policy decision about how much of the allowance it
+may hold, not a fact the provider imposes on a single request. Each lane also has
+a *worst-case* reservation — primary 262,144, long 965,536, subagent 64,000 — which is
+what a permit costs when nothing has been measured. Actual permits are priced from the
+request's own estimated input plus that lane's output clamp, capped at the lane worst
+case, so exclusivity and budget admission follow the size of the request in front of the
+proxy rather than the size of the route it arrived on. A `/long` request that stays small
+overlaps with other traffic; one priced at or above the 350,000-token exclusivity
+threshold runs alone and holds every other lane in queue for its duration. No lane is
+alone by construction. A primary request plus one subagent reservation does fit the
+aggregate 332,500-token budget, which is what the 95% safety margin buys; a primary
+request plus the full five-subagent fan-out does not, so the proxy queues the overflow
+rather than refusing it. Startup feasibility, by contrast, is still proved against the
+static worst case — a lane that could never be admitted at full size is a policy error,
+not a runtime surprise. That is the intended shape, not a fault.
 
 Drift fails closed. If the mounted configuration stops describing lanes the
 proxy can admit — `secondary_model.force` flipped off, an input allowance that
 cannot fit its own window plus the output clamp, or a reservation that could
 never be admitted — `/healthz` returns 503 and chat requests get 503 with
-`Retry-After` instead of unmeasured traffic. Confirm it once from the host, with
-the stack still running:
+`Retry-After` instead of unmeasured traffic. This is the harness refusing to
+serve, not a state an operator is expected to detect: what a user sees is an
+error on the next message. The check below is for whoever changed a definition
+and wants the refusal proven once from the host, with the stack still running:
 
 ```bash
 rendered=$(sed -n "s/^KIMI_RENDERED_CONFIG=//p" .local/runtime/*/runtime.env | tr -d "'")

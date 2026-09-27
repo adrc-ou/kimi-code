@@ -24,7 +24,15 @@ class RegistrationTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         home = Path(temporary.name)
         (home / "server.token").write_text("fixture-private-token\n")
-        self.env = patch.dict(os.environ, {"KIMI_CODE_HOME": str(home)})
+        # The scratch directory is an absolute path in the container; a test that ran main()
+        # unpointed would rebuild the real one and take any in-flight session's notes with it.
+        self.env = patch.dict(
+            os.environ,
+            {
+                "KIMI_CODE_HOME": str(home),
+                "KIMI_AGENT_STATE_DIR": str(home / "agent-state"),
+            },
+        )
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -72,6 +80,60 @@ class RegistrationTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(registration.main(), 1)
             build.assert_not_called()
+
+
+class ScratchTests(unittest.TestCase):
+    """The agent's working memory is container scratch, staged empty on every launch."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name) / "agent-state"
+
+    def test_stages_the_layout_the_operating_contract_names(self):
+        prepared = registration.prepare_agent_state(self.directory)
+        self.assertEqual(prepared, str(self.directory))
+        self.assertIn("## Objective", (self.directory / "STATE.md").read_text())
+        for name in registration.LEDGER_FILES:
+            self.assertTrue((self.directory / name).is_file(), name)
+        self.assertTrue((self.directory / "logs").is_dir())
+        self.assertEqual(os.stat(self.directory).st_mode & 0o777, 0o700)
+
+    def test_a_second_launch_drops_what_the_first_left(self):
+        registration.prepare_agent_state(self.directory)
+        (self.directory / "STATE.md").write_text("last session's notion of progress\n")
+        (self.directory / "stale-run.log").write_text("evidence nobody asked for\n")
+        registration.prepare_agent_state(self.directory)
+        self.assertIn("## Objective", (self.directory / "STATE.md").read_text())
+        self.assertFalse((self.directory / "stale-run.log").exists())
+
+    def test_replaces_a_link_rather_than_following_it(self):
+        outside = self.directory.parent / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("not scratch\n")
+        self.directory.symlink_to(outside, target_is_directory=True)
+        registration.prepare_agent_state(self.directory)
+        self.assertTrue(self.directory.is_dir())
+        # The point of unlinking the link instead of descending through it: whatever is on the
+        # other side is not scratch and is not this function's to remove.
+        self.assertTrue((outside / "keep.txt").exists())
+        self.assertTrue((self.directory / "STATE.md").is_file())
+
+    def test_the_container_path_is_the_one_the_contract_tells_agents_to_use(self):
+        # The prose and the code have exactly one chance to agree, which is here. Every expected
+        # string is built from the constant the seeder actually uses, so the assertion compares
+        # the documents against the code rather than against a second copy of the same literal.
+        scratch = str(registration.AGENT_STATE_DIR)
+        contract = (ROOT / "runtime" / "AGENTS.md").read_text()
+        self.assertIn(f"{scratch}/STATE.md", contract)
+        self.assertIn(f"{scratch}/{registration.LOGS_DIR}", contract)
+        for name in registration.LEDGER_FILES:
+            self.assertIn(f"{scratch}/{name}", contract)
+        self.assertNotIn(".agent-state", contract)
+        for document in [*ROOT.rglob("SKILL.md")]:
+            if ".git" in document.parts or ".local" in document.parts:
+                continue
+            self.assertNotIn(".agent-state", document.read_text(), str(document))
 
 
 if __name__ == "__main__":

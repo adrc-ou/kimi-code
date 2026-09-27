@@ -333,6 +333,10 @@ exit 0
             '{"live":true,"steps":["model"],"committed":{"model":"stub"}}'
         )
         (runtime / "module-values.json").write_text('{"DEMO_KEY":"stub-secret"}')
+        # A key from that dead launch too. Neither name is one the exit cleanup below would
+        # recognise, which is the point of sweeping at startup rather than only at shutdown.
+        (runtime / "nrp-api-key").write_text("stub-secret\n")
+        (runtime / "bootstrap.Zzzzzz").write_text("NRP_API_KEY=stub-secret\n")
         result = self.run_script("start.sh", "--non-interactive")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -356,6 +360,10 @@ exit 0
         # actually see rather than from a dead launch's notion of how far it got.
         self.assertFalse((runtime / "flow-state.json").exists())
         self.assertFalse((runtime / "module-values.json").exists())
+        # And so is the residue a killed launch leaves behind: the legacy flat key, and the
+        # resolved .env copy that mktemp wrote before the lock was even held.
+        self.assertFalse((runtime / "nrp-api-key").exists())
+        self.assertFalse((runtime / "bootstrap.Zzzzzz").exists())
         self.assertIn("primary", (runtime / "last-model-selection.json").read_text())
         # The panel's choices are memory: they survive the launch that made them and are honoured
         # by the next, which is the only way a headless session can express a selection at all.

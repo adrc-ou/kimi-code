@@ -17,6 +17,7 @@ if str(ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(ROOT / "tools"))
 
 import definitions  # noqa: E402
+import policy  # noqa: E402
 
 PROVIDER = """
 schema_version = 1
@@ -222,7 +223,57 @@ class RuleTaxonomyTests(DefinitionFixture):
                     "scope": scope.split('"')[1],
                     "value": int(value.split("= ")[1]),
                     "models": None,
+                    "default": False,
                 })
+
+    def test_a_default_count_rule_parses_at_every_looser_scope(self):
+        for scope in ("provider", "credential", "credential_model"):
+            with self.subTest(scope=scope):
+                providers, _ = self.load(
+                    provider=self.rule(
+                        f'\n[[rule]]\nkind = "max_concurrent_requests"\nscope = "{scope}"\n'
+                        "limit = 2\ndefault = true\n"
+                    )
+                )
+                self.assertEqual(providers["fixture"]["rules"][0]["default"], True)
+
+    def test_only_a_count_rule_may_be_declared_a_default(self):
+        # A rate window or a context fraction at a loose scope is a second, genuinely
+        # simultaneous cap; displacing with one would drop a rule the provider really stated.
+        for kind, scope, value in (
+            ("output_tokens_per_minute", "provider", "limit = 100"),
+            ("aggregate_context_fraction", "model", "percent = 35"),
+            ("max_context_tokens", "provider", "limit = 200000"),
+        ):
+            with self.subTest(kind=kind):
+                message = self.assertRefused(
+                    provider=self.rule(
+                        f'\n[[rule]]\nkind = "{kind}"\nscope = "{scope}"\n{value}\n'
+                        "default = true\n"
+                    )
+                )
+                self.assertIn("default is meaningful only for", message)
+
+    def test_a_default_belongs_at_a_scope_looser_than_one_model(self):
+        message = self.assertRefused(
+            provider=self.rule(
+                '\n[[rule]]\nkind = "max_concurrent_requests"\nscope = "model"\nlimit = 4\n'
+                "default = true\n"
+            )
+        )
+        self.assertIn("cannot be a fallback", message)
+
+    def test_a_default_that_is_not_a_boolean_is_refused(self):
+        # Accepting "true" would make a quoting mistake look like a deliberate policy choice.
+        for literal in ('"true"', "1", '"1"'):
+            with self.subTest(literal=literal):
+                message = self.assertRefused(
+                    provider=self.rule(
+                        '\n[[rule]]\nkind = "max_concurrent_requests"\nscope = "provider"\n'
+                        f"limit = 2\ndefault = {literal}\n"
+                    )
+                )
+                self.assertIn("must be a boolean", message)
 
     def test_a_kind_this_harness_cannot_enforce_is_refused(self):
         message = self.assertRefused(
@@ -432,6 +483,83 @@ class ModelTests(DefinitionFixture):
         self.assertIn("key_env", message)
 
 
+class AgentLaneTests(DefinitionFixture):
+    """Which window the main agent launches in, and what refuses to supply one.
+
+    This is the only lane choice a launch makes rather than a request making, so the interesting
+    half of the contract is the refusals: a designation the model cannot serve has to stop the
+    launch instead of quietly becoming the native window.
+    """
+
+    LONG = (
+        "\n[lane.long]\ncontext_tokens = 16384\n"
+        "input_tokens = 12288\noutput_clamp_tokens = 4096\n"
+    )
+
+    def resolve(self, model_text: str = MODEL, **kwargs) -> dict:
+        # The shipped fixture budgets 35% of its window, which none of its lanes could ever fit,
+        # so the rule is widened here the way the other resolving cases widen it: this class is
+        # about which lane a launch designates, not about what an impossible budget does.
+        provider = PROVIDER.replace("percent = 35", "percent = 100")
+        providers, parsed = definitions.load_definitions(
+            self.tree(provider=provider, models={"fixture_model": model_text})
+        )
+        return policy.resolve(
+            providers,
+            {item["id"]: item for item in parsed},
+            {"primary": "fixture_model", "subagent": "fixture_model"},
+            reserved_context_size=1024,
+            **kwargs,
+        )
+
+    def test_a_plan_designates_a_lane_and_every_reader_sees_the_same_one(self):
+        for lane in ("primary", "long"):
+            with self.subTest(lane=lane):
+                plan = self.resolve(MODEL + self.LONG, agent_lane=lane)
+                self.assertEqual(plan["agent_lane"], lane)
+                self.assertIn(lane, plan["lanes"])
+
+    def test_the_designation_defaults_to_the_wide_queued_window(self):
+        # An omitted argument is what a caller that has no panel passes, and the shipped default
+        # is the wider lane: under the utilisation mandate a bigger window beats the in-flight
+        # headroom a smaller lane would have left. A caller that must not pay for the wide
+        # reservation passes agent_lane="primary" explicitly.
+        self.assertEqual(self.resolve(MODEL + self.LONG)["agent_lane"], "long")
+
+    def test_a_model_without_a_long_lane_cannot_be_launched_on_one(self):
+        # The window can be withdrawn from a definition while a saved preference still names it,
+        # and the resolver is where that stops: silently serving the native window would let a
+        # launch believe it had the bigger one.
+        with self.assertRaises(policy.ResolutionError) as caught:
+            self.resolve(agent_lane="long")
+        self.assertIn("not available", str(caught.exception))
+
+    def test_a_lane_that_is_not_a_window_a_main_agent_can_use_is_refused(self):
+        # Naming the subagent lane here would put unbounded primary traffic on a route metered for
+        # small bounded children.
+        for lane in ("subagent", "", "Primary", "nowhere"):
+            with self.subTest(lane=lane), self.assertRaises(policy.ResolutionError) as caught:
+                self.resolve(MODEL + self.LONG, agent_lane=lane)
+            self.assertIn("not selectable", str(caught.exception))
+
+    def test_the_designed_lane_carries_the_alias_and_size_the_renderer_will_publish(self):
+        plan = self.resolve(MODEL + self.LONG, agent_lane="long")
+        lane = plan["lanes"][plan["agent_lane"]]
+        self.assertEqual(lane["route"], "/long/v1")
+        self.assertGreater(lane["context_tokens"], plan["lanes"]["primary"]["context_tokens"])
+
+    def test_the_window_choice_leaves_the_routes_and_the_counters_alone(self):
+        # Designating a lane is not the same as opening one: both routes exist either way, and the
+        # provider's aggregate budget is metered across all of them regardless of the preference.
+        for lane in ("primary", "long"):
+            with self.subTest(lane=lane):
+                plan = self.resolve(MODEL + self.LONG, agent_lane=lane)
+                self.assertEqual(sorted(plan["lanes"]), ["long", "primary", "subagent"])
+                self.assertEqual(
+                    sorted(plan["selection"]), sorted(["primary", "subagent"])
+                )
+
+
 class KeyScopeCounterTests(DefinitionFixture):
     """A counter must follow the key a lane actually authenticates with.
 
@@ -469,6 +597,8 @@ class KeyScopeCounterTests(DefinitionFixture):
             {"primary": "a_model", "subagent": "b_model"},
             reserved_context_size=1024,
             key_values=values,
+            # These fixtures declare no long lane, and this class is about key scoping.
+            agent_lane="primary",
         )
 
     def ledgers(self, plan: dict) -> dict[str, list[str]]:

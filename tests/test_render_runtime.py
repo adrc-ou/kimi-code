@@ -28,8 +28,13 @@ class LaunchSteps:
     PROVIDER_ONLY = "NRP_API_KEY=provider-secret\n"
     MODEL_SCOPED = "QWEN3_API_KEY=model-secret\nNRP_API_KEY=provider-secret\n"
 
-    def fixture(self, directory: Path, values: str = PROVIDER_ONLY) -> Path:
-        """A resolved plan, plus the resolved ``.env`` the renderer is asked to read."""
+    def fixture(self, directory: Path, values: str = PROVIDER_ONLY, primary: str = "") -> Path:
+        """A resolved plan, plus the resolved ``.env`` the renderer is asked to read.
+
+        ``primary`` is what to hand ``HARNESS_PRIMARY_MODEL``, which names a row of the primary
+        screen and not only a model, so an extended-window launch is reachable end to end from
+        here without any test having to know a model id.
+        """
         state = directory / "state"
         workspace = directory / "workspace"
         workspace.mkdir()
@@ -42,6 +47,8 @@ class LaunchSteps:
             "HARNESS_WORKSPACE": str(workspace),
             "HARNESS_RESOLVED_BOOTSTRAP": str(resolved),
         }
+        if primary:
+            environment["HARNESS_PRIMARY_MODEL"] = primary
         for action in ("select", "resolve"):
             subprocess.run(
                 ["python3", str(ROOT / "tools" / "models.py"), action, "--non-interactive"],
@@ -91,9 +98,9 @@ class RenderRuntimeTests(LaunchSteps, unittest.TestCase):
             self.assertRegex(first_salt, r"^[A-Za-z0-9_-]+$")
             config = (state / "kimi-config.toml").read_text()
             self.assertNotIn("__MODEL_PROXY_TOKEN__", config)
-            # The default model is whatever the primary selection's alias is, so this asserts
-            # the shape of the generated name rather than a model this test hard-codes.
-            self.assertRegex(config, r'default_model = "[a-z0-9]+-primary"')
+            # The default model is whatever the designated agent lane's alias is, so this
+            # asserts the shape of the generated name rather than a model this test hard-codes.
+            self.assertRegex(config, r'default_model = "[a-z0-9]+-(primary|long)"')
 
     def test_credential_is_a_mode_0600_file_named_by_the_definition(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -110,6 +117,39 @@ class RenderRuntimeTests(LaunchSteps, unittest.TestCase):
             fragment = (state / "compose" / "models.json").read_text()
             self.assertIn("nrp__default", fragment)
             self.assertNotIn("provider-secret", fragment)
+
+    def test_an_extended_window_launch_renders_the_long_alias_as_the_default_model(self):
+        # The whole chain for the launch-time window choice: the row the picker offers, the model
+        # id the selection document keeps, the lane the plan designates, and the alias Kimi is
+        # actually handed. Nothing here names a model, so a definition rename moves the test.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            state = self.fixture(base, primary=f"{self.any_primary_model()}@long")
+            self.render(state, base / "resolved.env")
+            plan = json.loads((state / "model-policy.json").read_text())
+            config = tomllib.loads((state / "kimi-config.toml").read_text())
+            self.assertEqual(plan["agent_lane"], "long")
+            self.assertEqual(plan["selection"]["primary"], self.any_primary_model())
+            self.assertEqual(config["default_model"], plan["lanes"]["long"]["alias"])
+            # The window is the main agent's own; the forced subagent lane is untouched by it.
+            self.assertEqual(
+                config["secondary_model"]["default_model"], plan["lanes"]["subagent"]["alias"]
+            )
+            # The row that was not asked for is still on offer, which is what lets Kimi's own
+            # model picker move back to it mid-session without the launcher being involved.
+            self.assertIn(plan["lanes"]["primary"]["alias"], config["models"])
+
+    @staticmethod
+    def any_primary_model() -> str:
+        """The id of some shipped model that declares both a primary and a long lane."""
+        import definitions
+
+        _, model_list = definitions.load_definitions(ROOT)
+        return next(
+            model["id"]
+            for model in model_list
+            if "primary" in model["lanes"] and "long" in model["lanes"]
+        )
 
     def test_generated_tables_come_from_the_plan_not_the_baseline(self):
         with tempfile.TemporaryDirectory() as directory:

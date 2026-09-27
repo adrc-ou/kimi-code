@@ -119,7 +119,13 @@ POLICY = PROXY.BASELINE_POLICY
 LANES = POLICY.lanes
 PRIMARY, LONG, SUBAGENT = LANES["primary"], LANES["long"], LANES["subagent"]
 PRIMARY_RESERVATION = PRIMARY.reservation
+LONG_RESERVATION = LONG.reservation
 SUBAGENT_RESERVATION = SUBAGENT.reservation
+
+
+def priced_for(lane, estimate: int) -> int:
+    return PROXY.priced_reservation(lane, estimate)
+
 SECRET_NAMES = sorted({lane.secret_name for lane in LANES.values()})
 
 
@@ -296,6 +302,28 @@ class CredentialTests(unittest.TestCase):
         with self.assertRaisesRegex(PROXY.PolicyDrift, "is empty"):
             PROXY.upstream_credential("nrp__empty_fixture")
 
+    def test_startup_reads_every_credential_the_plan_names(self):
+        # A credential mounted after the proxy started is picked up per request, but one that
+        # was never mounted has to stop the launch. Otherwise the operator's first sign of it is
+        # a failure mid-conversation that looks like the upstream being unwell.
+        PROXY.verify_credentials(POLICY)
+
+        plan = mutated()
+        credential = plan["lanes"]["primary"]["credential"]
+        plan["providers"]["nrp"]["credentials"][credential]["secret_name"] = "nrp__never_mounted"
+        missing = loaded_policy(plan)
+        with self.assertRaisesRegex(PROXY.PolicyDrift, "nrp__never_mounted"):
+            PROXY.verify_credentials(missing)
+
+    def test_startup_reads_each_credential_once_however_many_lanes_share_it(self):
+        # All three shipped lanes authenticate with the one NRP key, so a per-lane read would be
+        # three opens of one file. The refusal above is the behaviour that matters; this is the
+        # shape that keeps it cheap and keeps the sorted order stable in the message.
+        seen: list[str] = []
+        with patch.object(PROXY, "upstream_credential", side_effect=seen.append):
+            PROXY.verify_credentials(POLICY)
+        self.assertEqual(seen, SECRET_NAMES)
+
 
 class RequestValidationTests(unittest.TestCase):
     def test_only_planned_lane_routes_are_registered(self):
@@ -335,6 +363,10 @@ class RequestValidationTests(unittest.TestCase):
     def test_a_lane_the_plan_does_not_publish_is_not_routable(self):
         plan = mutated()
         del plan["lanes"]["long"]
+        # The shipped plan designates the lane this test withdraws, and the renderer rightly
+        # refuses that; which routes get published is the question under test, so leave the
+        # plan servable.
+        plan["agent_lane"] = "primary"
         name = "model_proxy_without_the_long_lane"
         environment = {
             "MODEL_PROXY_POLICY": write_plan(plan),
@@ -562,11 +594,37 @@ class ConfigurationDriftTests(unittest.TestCase):
 
         self.assertIn(SUBAGENT.alias, self.drift(mutate))
 
-    def test_the_default_model_must_be_the_primary_lane_model(self):
+    def test_the_default_model_must_be_the_designated_agent_lane_model(self):
         def mutate(document):
             document["default_model"] = SUBAGENT.alias
 
-        self.assertIn(PRIMARY.alias, self.drift(mutate))
+        self.assertIn(LONG.alias, self.drift(mutate))
+
+    def test_the_agent_lane_is_what_the_default_model_is_checked_against(self):
+        # The whole point of the launch-time window choice: the check follows the designation
+        # rather than the lane named primary. The shipped designation is the queued long lane,
+        # so the test re-opens the session on the concurrent one: that plan's own rendered
+        # config must pass, and anything priced to the withdrawn lane would not.
+        plan = mutated()
+        plan["agent_lane"] = "primary"
+        with live(plan):
+            PROXY.enforce_kimi_configuration(PROXY.load_runtime_policy())
+
+        def mutate(document):
+            document["default_model"] = LONG.alias
+
+        with self.assertRaises(PROXY.PolicyDrift) as caught:
+            loaded_policy(plan, mutate)
+        self.assertIn(PRIMARY.alias, str(caught.exception))
+
+    def test_an_agent_lane_the_plan_does_not_publish_is_refused(self):
+        plan = mutated()
+        plan["agent_lane"] = "long"
+        del plan["lanes"]["long"]
+        with live_plan(plan):
+            with self.assertRaises(PROXY.PolicyDrift) as caught:
+                PROXY.load_runtime_policy()
+        self.assertIn("agent lane", str(caught.exception))
 
     def test_kimi_must_still_offer_every_planned_lane(self):
         def mutate(document):
@@ -618,14 +676,40 @@ class ValidationTests(unittest.TestCase):
     def test_a_lane_that_could_never_be_admitted_stops_startup(self):
         plan = mutated()
         lane = plan["lanes"]["primary"]
-        # Anything strictly between the aggregate budget and the exclusivity threshold is
-        # both too large to share the budget and too small to be allowed to run alone.
-        reservation = BUDGET + (EXCLUSIVE_AT - BUDGET) // 2
+        # A reservation above the budget is served alone, so it is only truly unservable when
+        # the provider offers no threshold large enough to licence that solitude - nothing that
+        # ever finishes can then make room for it, and it would wait forever on an idle counter.
+        reservation = CEILING + 1
+        lane["output_clamp_tokens"] = reservation // 2
+        lane["input_tokens"] = reservation - lane["output_clamp_tokens"]
+        lane["context_tokens"] = reservation + plan["reserved_context_size"]
+        plan["counters"][CONTEXT_ID]["exclusive_at"] = None
+        policy = loaded_policy(plan)
+        with self.assertRaisesRegex(RuntimeError, "could ever be admitted"):
+            PROXY.validate_policy(policy)
+
+    def test_a_reservation_between_the_budget_and_the_ceiling_starts(self):
+        # The band the check above used to refuse outright: too large to share the margin-
+        # reduced budget, well within the provider's own ceiling, and so served alone rather
+        # than stranded. Refusing it would turn an ordinary long session into a failed launch.
+        plan = mutated()
+        lane = plan["lanes"]["primary"]
+        reservation = BUDGET + (CEILING - BUDGET) // 2
         lane["output_clamp_tokens"] = reservation // 2
         lane["input_tokens"] = reservation - lane["output_clamp_tokens"]
         lane["context_tokens"] = reservation + plan["reserved_context_size"]
         policy = loaded_policy(plan)
-        with self.assertRaisesRegex(RuntimeError, "could ever be admitted"):
+        PROXY.validate_policy(policy)
+        gate = PROXY.FairUseGate(CONTEXT_ID, budget=BUDGET, ceiling=CEILING, exclusive_at=None)
+        self.assertTrue(gate.runs_alone(reservation))
+
+    def test_an_exclusivity_threshold_above_its_own_ceiling_stops_startup(self):
+        # Split the two numbers the wrong way and prices between them belong to no rule: too
+        # large for the budget, too small for solitude, and above the published aggregate.
+        plan = mutated()
+        plan["counters"][CONTEXT_ID]["exclusive_at"] = CEILING + 1
+        policy = loaded_policy(plan)
+        with self.assertRaisesRegex(RuntimeError, "above the"):
             PROXY.validate_policy(policy)
 
     def test_an_exclusive_reservation_may_exceed_the_budget(self):
@@ -847,6 +931,82 @@ class FairUseGateTests(unittest.IsolatedAsyncioTestCase):
         gate = self.gate(exclusive_at=EXCLUSIVE_AT)
         self.assertTrue(gate.is_exclusive(EXCLUSIVE_AT))
         self.assertFalse(gate.is_exclusive(EXCLUSIVE_AT - 1))
+
+    async def test_a_small_long_request_overlaps_other_traffic(self):
+        # The long lane's worst case is exclusive, but the gate prices the request in front
+        # of it. Two modest /long calls stay under both the threshold and the aggregate
+        # budget, so they run together — which is the point: a wider window becomes
+        # reachable without buying solitude along with it. A non-exclusive long request
+        # must also not yield to itself; only children give way to a queued primary.
+        modest = priced_for(LONG, 100_000)
+        self.assertLess(modest, EXCLUSIVE_AT)
+        self.assertLessEqual(2 * modest, BUDGET)
+        self.assertEqual(await self._peak_priced([("long", modest), ("long", modest)]), 2)
+
+    async def test_a_price_between_the_budget_and_the_threshold_is_still_served(self):
+        # Per-request pricing means a big-but-not-huge turn on the wide lane can cost more than
+        # the aggregate budget without reaching the exclusivity threshold. Nothing that ever
+        # finishes can free room for such a price, so waiting on the budget would strand it:
+        # it is served alone instead. The estimate below is one the lane actually produces, so
+        # this is the shape of a real long session, not only an arithmetic curiosity.
+        estimate = BUDGET + 1 - LONG.output_clamp
+        stranded = priced_for(LONG, estimate)
+        self.assertEqual(stranded, BUDGET + 1)
+        self.assertLess(stranded, EXCLUSIVE_AT)
+        gate = self.gate()
+        await asyncio.wait_for(self._take_slot(gate, "long", stranded), timeout=5)
+        self.assertEqual((gate.active, gate.reserved), (0, 0))
+
+    async def test_a_price_over_the_budget_does_not_share_the_pool(self):
+        # Served alone is the whole of it: the stranded price still excludes everything else,
+        # because admitting another request beside it is what the budget forbids.
+        stranded = BUDGET + 1
+        self.assertLess(stranded, EXCLUSIVE_AT)
+        self.assertEqual(
+            await self._peak_priced([("long", stranded), ("subagent", SUBAGENT_RESERVATION)]),
+            1,
+        )
+
+    async def test_a_request_priced_over_the_threshold_serialises_the_pool(self):
+        # The same route at full size does hold the pool. Exclusivity is a property of the
+        # price, so a big /long request waits for an idle child and blocks a new one.
+        self.assertGreaterEqual(LONG_RESERVATION, EXCLUSIVE_AT)
+        self.assertEqual(
+            await self._peak_priced(
+                [("subagent", SUBAGENT_RESERVATION), ("long", LONG_RESERVATION)]
+            ),
+            1,
+        )
+
+    async def test_a_priced_reservation_never_exceeds_the_lane_worst_case(self):
+        self.assertEqual(priced_for(LONG, 10**9), LONG_RESERVATION)
+        self.assertEqual(priced_for(SUBAGENT, 0), 1 + SUBAGENT.output_clamp)
+        self.assertEqual(priced_for(PRIMARY, 1000), 1000 + PRIMARY.output_clamp)
+        self.assertLess(priced_for(LONG, 0), EXCLUSIVE_AT)
+        self.assertGreaterEqual(priced_for(LONG, LONG.max_input), EXCLUSIVE_AT)
+
+    async def _peak_priced(self, priced):
+        """Run one task per (lane, reservation) pair and report peak concurrency."""
+        gate = self.gate()
+        live = 0
+        peak = 0
+        release = asyncio.Event()
+
+        async def one(lane, reservation):
+            nonlocal live, peak
+            async with gate.slot(lane, reservation):
+                live += 1
+                peak = max(peak, live)
+                await release.wait()
+                live -= 1
+
+        tasks = [asyncio.create_task(one(lane, cost)) for lane, cost in priced]
+        while gate.active == 0:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.gather(*tasks)
+        return peak
 
     async def test_model_concurrency_caps_total_requests(self):
         self.assertEqual(
@@ -1204,7 +1364,7 @@ class ChatRouteTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(clean_counters)
         self.sent = []
 
-        async def capture(_request, lane, body, _started, _inbound, _cost):
+        async def capture(_request, lane, body, _started, _inbound, _cost, _reservation):
             self.sent.append((lane, json.loads(body)))
             return PROXY.web.Response(text="ok")
 
@@ -1321,8 +1481,8 @@ class ForwardChatTests(unittest.IsolatedAsyncioTestCase):
         calls = {"count": 0}
         first_response = SimpleNamespace()
 
-        async def fake_attempt(_request, _session, lane, _body, _attempt):
-            async with PROXY.admission(lane, PROXY.enforcement):
+        async def fake_attempt(_request, _session, lane, _body, _attempt, reservation):
+            async with PROXY.admission(lane, PROXY.enforcement, reservation):
                 calls["count"] += 1
                 observations.append(("attempt", self.gate.active, self.ledger.committed))
                 if calls["count"] >= 2:
@@ -1372,15 +1532,47 @@ class ForwardChatTests(unittest.IsolatedAsyncioTestCase):
         async def never_finish(*_args, **_kwargs):
             return PROXY.Attempt(retry_after=1.0)
 
-        started = time.monotonic() - PROXY.MAX_REQUEST_SECONDS - 1
         before = PROXY.stats.deadline_stops
-        with patch.object(PROXY, "stream_attempt", never_finish):
+        with (
+            patch.object(PROXY, "MAX_REQUEST_SECONDS", 60.0),
+            patch.object(PROXY, "stream_attempt", never_finish),
+        ):
+            started = time.monotonic() - 61
             with self.assertRaises(PROXY.web.HTTPBadGateway):
                 await PROXY.forward_chat(
                     self.request(), self.lane, b"{}", started, b"{}", self.cost()
                 )
         self.assertEqual(self.ledger.committed, 0)
         self.assertEqual(PROXY.stats.deadline_stops, before + 1)
+
+    async def test_the_default_request_limit_is_unlimited(self):
+        """The wall clock is off: only a stall timeout or a gone client ends a request.
+
+        NRP's own advice is to retry indefinitely with an increasing interval, so the proxy
+        must not preempt a patient client. Cancelling in the UI is the user's prerogative and
+        arrives here as a closing transport.
+        """
+        self.assertEqual(PROXY.MAX_REQUEST_SECONDS, 0.0)
+
+        attempts = {"count": 0}
+        request = self.request()
+
+        async def keep_retrying(*_args, **_kwargs):
+            attempts["count"] += 1
+            if attempts["count"] >= 4:
+                request.transport.is_closing = lambda: True
+            return PROXY.Attempt(retry_after=0.0)
+
+        before = PROXY.stats.deadline_stops
+        with patch.object(PROXY, "stream_attempt", keep_retrying):
+            with self.assertRaises(asyncio.CancelledError):
+                await PROXY.forward_chat(
+                    request, self.lane, b"{}", time.monotonic(), b"{}", self.cost()
+                )
+
+        self.assertGreaterEqual(attempts["count"], 4)
+        self.assertEqual(PROXY.stats.deadline_stops, before)
+        self.assertEqual((self.gate.active, self.ledger.committed), (0, 0))
 
     async def test_a_gone_client_stops_without_an_attempt(self):
         async def never_called(*_args, **_kwargs):  # pragma: no cover - must not run
@@ -1439,7 +1631,7 @@ class ForwardChatTests(unittest.IsolatedAsyncioTestCase):
     async def test_gateway_rejection_of_usage_is_retried_without_injection(self):
         calls = []
 
-        async def reject_then_succeed(_request, _session, lane, body, attempt):
+        async def reject_then_succeed(_request, _session, lane, body, attempt, _reservation):
             calls.append(body)
             if len(calls) == 1:
                 return PROXY.Attempt(retry_after=0.0, rejected_usage=True)
@@ -1601,6 +1793,8 @@ class HealthTests(unittest.IsolatedAsyncioTestCase):
         status, body = await self.report()
         self.assertEqual(status, 200)
         self.assertTrue(body["policy_enforced"])
+        # The shipped plan's designation: the wide queued lane is the launch default.
+        self.assertEqual(body["agent_lane"], "long")
         self.assertEqual(body["credentials"], SECRET_NAMES)
         self.assertEqual(body["subagent_limit"], FAN_OUT)
         self.assertEqual(sorted(body["lanes"]), sorted(LANES))
@@ -1614,6 +1808,17 @@ class HealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(body["lanes"]["primary"]["exclusive"])
         self.assertTrue(body["lanes"]["long"]["exclusive"])
         self.assertFalse(body["lanes"]["subagent"]["exclusive"])
+
+    async def test_health_names_the_lane_the_main_agent_opened_on(self):
+        # An operator who chose the concurrent window needs one place to confirm the session
+        # really is on it. This is that place, and it is the same designation the drift check
+        # compares Kimi's default model against.
+        plan = mutated()
+        plan["agent_lane"] = "primary"
+        status, body = await self.report(plan)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["agent_lane"], "primary")
+        self.assertEqual(body["lanes"]["primary"]["alias"], PRIMARY.alias)
 
     async def test_health_reports_no_credential_value(self):
         # The operator sees where each lane is served from, which is the plan's own
@@ -1756,7 +1961,7 @@ class PromptArchiveTests(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        async def deliver(_request, _lane, _body, _started, _inbound, _cost):
+        async def deliver(_request, _lane, _body, _started, _inbound, _cost, _reservation):
             return PROXY.web.Response(text="ok")
 
         patcher = patch.object(PROXY, "forward_chat", deliver)

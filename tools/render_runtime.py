@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
-    from . import prompt_context
+    from . import policy, prompt_context
     from .env_values import read_env_values
     from .kimi_prompts import substitutions as kimi_substitutions
     from .model_config import render as render_model_tables
@@ -44,6 +44,7 @@ if __package__:
     from .private_file import write_private
     from .tui import screen
 else:
+    import policy
     import prompt_context
     from env_values import read_env_values
     from kimi_prompts import substitutions as kimi_substitutions
@@ -90,7 +91,13 @@ def kimi_config(root: Path, plan: dict[str, Any], token: str) -> str:
     generated = render_model_tables(plan, PLACEHOLDER_MARKER)
     if PLACEHOLDER_MARKER not in generated:
         raise SystemExit("generated model configuration lost the proxy token marker")
-    rendered = template.replace(ALIAS_MARKER, plan["lanes"]["primary"]["alias"])
+    # The main agent's own model is the plan's designated agent lane, which the launch panel
+    # picks; the marker's name predates that choice and stays, because it is the baseline
+    # template's vocabulary, not the plan's.
+    agent_lane = plan.get("agent_lane") or policy.DEFAULT_AGENT_LANE
+    if agent_lane not in plan["lanes"]:
+        raise SystemExit(f"plan designates agent lane {agent_lane!r}, which it does not publish")
+    rendered = template.replace(ALIAS_MARKER, plan["lanes"][agent_lane]["alias"])
     rendered = rendered.replace(MODEL_MARKER, generated)
     rendered = rendered.replace(PLACEHOLDER_MARKER, token)
     for marker in (MODEL_MARKER, ALIAS_MARKER, PLACEHOLDER_MARKER):

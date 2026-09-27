@@ -50,7 +50,25 @@ else:
         DefinitionError,
     )
 
-LANE_DISPLAY = {"primary": "Primary", "long": "Long Context", "subagent": "Subagent"}
+#: The human-facing name of each lane, shown wherever a person chooses or reads a model entry.
+#: The ids stay ``primary``/``long``/``subagent`` because they name the route, the alias and the
+#: provider-scoped policy, none of which a label should disturb. The two agent lanes are peers:
+#: one trades context for concurrency, the other trades concurrency for context, and the
+#: subagent entry is harness-bound, so its label says so and no one is meant to pick it.
+LANE_DISPLAY = {
+    "primary": "Medium (concurrent)",
+    "long": "Long (queued)",
+    "subagent": "Subagent (automatic)",
+}
+
+#: Which lane the main agent itself launches on. This is a window choice, not a routing one:
+#: every lane keeps its own route, alias and provider binding either way, and the plan simply
+#: says which alias Kimi's ``default_model`` is rendered from. Either lane is offerable whenever
+#: the selected primary model declares it. ``long`` is the shipped default because a wider
+#: window is worth more than spare in-flight headroom the utilisation mandate would rather see
+#: spent; the queueing that costs is bounded by the same pool either way.
+AGENT_LANES = ("primary", "long")
+DEFAULT_AGENT_LANE = "long"
 
 #: Which generated guidance a caller may ask for. ``lane`` is what every audience gets - the
 #: numbers that bound it - and ``main`` adds the blocks only the primary agent can act on.
@@ -228,10 +246,76 @@ def _model_output_cap(provider: dict[str, Any], model: dict[str, Any]) -> int | 
     return min(caps) if caps else None
 
 
+def _effective_count(
+    provider: dict[str, Any], model: dict[str, Any]
+) -> tuple[int | None, str | None]:
+    """One model's request-count ceiling, and how the resolver came to it.
+
+    A provider publishes concurrency *per model*, so a model-scoped rule is that provider's
+    specific answer about the traffic in question, and a looser-scope rule marked ``default`` is
+    its fallback for models it did not list. The two must not stack. Taking the minimum of a
+    provider's tightest published row and one model's explicit, much larger allowance would
+    enforce a ceiling that provider never stated for that model, and would quietly undo every
+    derived limit that allowance produces.
+
+    Where several specific rules do apply they collapse to their minimum, because each is a
+    separate true statement about the same set of requests. A default is consulted only when
+    nothing specific applies, and the basis says so, since an unsourced floor is a harness choice
+    an operator is entitled to see.
+    """
+    rules = [rule for rule in _provider_rules(provider, COUNT_RULE_KINDS) if _applies(rule, model)]
+    specific = [rule["value"] for rule in rules if rule["scope"] == "model"]
+    if specific:
+        return min(specific), "the provider's own rule for this model"
+    fallback = [rule["value"] for rule in rules if rule.get("default")]
+    if fallback:
+        return min(fallback), "harness default from the provider's tightest published row"
+    return None, None
+
+
+def _model_count_counter(
+    provider: dict[str, Any],
+    model: dict[str, Any],
+    lanes: list[dict[str, Any]],
+    count: int,
+    basis: str,
+) -> dict[str, Any]:
+    """A count ceiling for a model that has no context counter to live in.
+
+    Folding a model's count into its context counter is what keeps one admission to one permit,
+    but a provider may publish concurrency without any context rule at all. Dropping the
+    ceiling there would make a default evaporate for want of a host, so such a model gets a
+    counter of its own, keyed to the same model-scoped subject.
+    """
+    subject = f"{provider['id']}/{model['model']}"
+    return {
+        "id": f"count:model:{subject}",
+        "family": "count",
+        "kind": "max_concurrent_requests",
+        "scope": "model",
+        "provider": provider["id"],
+        "subject": model["model"],
+        "max": count,
+        "count_basis": basis,
+        "lanes": [lane["lane"] for lane in lanes],
+    }
+
+
 def _context_counter(
-    provider: dict[str, Any], model: dict[str, Any], lanes: list[dict[str, Any]]
+    provider: dict[str, Any],
+    model: dict[str, Any],
+    lanes: list[dict[str, Any]],
+    count: int | None,
+    count_basis: str | None,
 ) -> dict[str, Any] | None:
-    """Aggregate-context and exclusivity thresholds for one model-scoped counter."""
+    """Aggregate-context and exclusivity thresholds for one model-scoped counter.
+
+    The model's request-count ceiling rides along here when one exists, because both describe
+    the same set of in-flight requests and one admission should take one permit. A model with no
+    context rule at all gets no counter of this family rather than a budget-less one: every
+    ceiling is a number of tokens, and a caller that renders "budget" from it would have nothing
+    true to say.
+    """
     aggregate = [
         rule
         for rule in _provider_rules(provider, CONTEXT_RULE_KINDS)
@@ -242,12 +326,7 @@ def _context_counter(
         for rule in _provider_rules(provider, CONTEXT_RULE_KINDS)
         if rule["kind"] == "exclusive_above_context_fraction" and _applies(rule, model)
     ]
-    counts = [
-        rule["value"]
-        for rule in _provider_rules(provider, COUNT_RULE_KINDS)
-        if _applies(rule, model) and rule["scope"] == "model"
-    ]
-    if not aggregate and not exclusive and not counts:
+    if not aggregate and not exclusive:
         return None
     margin = provider["context_margin_percent"]
     percent = min((rule["value"] for rule in aggregate), default=None)
@@ -270,7 +349,8 @@ def _context_counter(
         "ceiling": ceiling,
         "budget": None if ceiling is None else min(ceiling, ceiling * margin // 100),
         "exclusive_at": exclusive_at,
-        "max": min(counts) if counts else None,
+        "max": count,
+        "count_basis": count_basis,
         "lanes": [lane["lane"] for lane in lanes],
     }
 
@@ -318,7 +398,14 @@ def _shared_counters(
     counts = [
         rule["value"]
         for rule in provider["rules"]
-        if rule["kind"] in COUNT_RULE_KINDS and rule["scope"] == scope and _applies(rule, model)
+        if rule["kind"] in COUNT_RULE_KINDS
+        and rule["scope"] == scope
+        and _applies(rule, model)
+        # A default has already been resolved into whichever counter bounds this model's own
+        # traffic, by _effective_count. Building a counter for it here would stack the
+        # provider's fallback on top of the model's specific allowance, which is the one
+        # resolution that would be both wrong and silently restrictive.
+        and not rule.get("default")
     ]
     if counts:
         result.append(
@@ -390,6 +477,7 @@ def resolve(
     *,
     reserved_context_size: int,
     key_values: dict[str, str] | None = None,
+    agent_lane: str = DEFAULT_AGENT_LANE,
 ) -> dict[str, Any]:
     """Build the enforcement plan for one primary model and one subagent model.
 
@@ -397,9 +485,18 @@ def resolve(
     a model authenticates with is a fact about the upstream identity being metered. Every
     derived limit is unchanged by it: scoping a key per model splits ledgers, it does not
     enlarge any allowance.
+
+    ``agent_lane`` names the lane Kimi's own main agent launches on. It changes only which
+    alias is rendered into ``default_model``; every lane keeps its route, its alias and its
+    own accounting, so the subagent binding and the other lanes are unaffected by it.
     """
     if reserved_context_size <= 0:
         raise ResolutionError("reserved_context_size must be positive")
+    if agent_lane not in AGENT_LANES:
+        raise ResolutionError(
+            f"agent lane {agent_lane!r} is not selectable; choose one of "
+            f"{', '.join(AGENT_LANES)}"
+        )
     for role in ("primary", "subagent"):
         if selection.get(role) not in models:
             available = ", ".join(sorted(models)) or "none"
@@ -439,6 +536,16 @@ def resolve(
             lane, model, provider, reserved_context_size=reserved_context_size
         )
 
+    # The agent lane is a property of the selection, so it is checked after membership: asking
+    # for the long window on a model that declares no long lane would otherwise render a
+    # default_model alias the plan never published, and the proxy would refuse its own launch.
+    if agent_lane not in selected:
+        primary = models[selection["primary"]]
+        raise ResolutionError(
+            f"agent lane {agent_lane!r} is not available from model {primary['id']}; "
+            f"it declares {', '.join(sorted(primary['lanes']))}"
+        )
+
     # Counters are built once per provider and model, with the full list of lanes bound to
     # that pair, and only then bound back to each lane by membership. That order matters: a
     # model whose provider publishes no context rule gets no context counter at all, and a
@@ -451,9 +558,13 @@ def resolve(
     for (provider_id, _model_name), lane_entries in lanes_by_model.items():
         model = next(models[entry["model_id"]] for entry in lane_entries)
         provider = providers[provider_id]
-        context = _context_counter(provider, model, lane_entries)
+        count, count_basis = _effective_count(provider, model)
+        context = _context_counter(provider, model, lane_entries, count, count_basis)
         if context is not None:
             counters[context["id"]] = context
+        elif count is not None:
+            standalone = _model_count_counter(provider, model, lane_entries, count, count_basis)
+            counters[standalone["id"]] = standalone
         for scope in COUNTER_SCOPES:
             groups = _identity_groups(models, scope, lane_entries)
             for group_model, group_lanes in groups:
@@ -487,6 +598,7 @@ def resolve(
         "schema_version": SCHEMA_VERSION,
         "reserved_context_size": reserved_context_size,
         "selection": dict(selection),
+        "agent_lane": agent_lane,
         "providers": {
             provider_id: {
                 "label": provider["label"],
@@ -537,9 +649,14 @@ def _check_budgets(
 ) -> None:
     """Refuse any configuration where a lane could never be admitted.
 
-    A lane whose reservation reaches its provider's exclusive threshold is allowed to exceed
-    the aggregate budget, because the provider itself permits exactly that request to run
-    alone; the proxy admits it only when the counter is empty.
+    Exceeding the aggregate budget does not by itself strand a lane. The budget is the
+    provider's ceiling reduced by the declared margin, and a provider's aggregate rule bounds
+    requests held *in combination*, so a reservation that overshoots the margin yet fits the
+    ceiling is served alone, exactly as one reaching the provider's own exclusivity threshold
+    is. What cannot be served is a reservation above the ceiling that no threshold licenses to
+    run alone, and a provider whose threshold sits above its own ceiling, which leaves the
+    prices between the two governed by neither rule. The proxy re-checks both at startup;
+    refusing them here means a bad definition fails at launch, with the name of the rule.
     """
     for lane in selected.values():
         for counter_id in lane["counters"]:
@@ -549,13 +666,29 @@ def _check_budgets(
             budget = counter.get("budget")
             if budget is None:
                 continue
-            if lane["reservation"] > budget and not lane["exclusive"]:
+            ceiling = counter.get("ceiling")
+            threshold = counter.get("exclusive_at")
+            if (
+                ceiling is not None
+                and threshold is not None
+                and threshold > ceiling
+            ):
+                raise ResolutionError(
+                    f"counter {counter_id} sets exclusivity at {threshold} tokens, above the "
+                    f"{ceiling}-token ceiling its provider publishes for {counter['subject']}. "
+                    "A request priced between the two could neither share the pool nor run "
+                    "alone, so no lane on this counter is servable."
+                )
+            if lane["reservation"] > budget and not (
+                lane["exclusive"]
+                or (ceiling is not None and lane["reservation"] <= ceiling)
+            ):
                 raise ResolutionError(
                     f"{lane['alias']} reserves {lane['reservation']} tokens but counter "
-                    f"{counter_id} only budgets {budget}; no request on this lane could ever "
-                    "be admitted. Shrink the lane's input cap or raise the provider margin."
+                    f"{counter_id} budgets {budget} of a {ceiling} ceiling; no request on this "
+                    "lane could ever be admitted. Shrink the lane's input cap or raise the "
+                    "provider margin."
                 )
-            ceiling = counter.get("ceiling")
             if (
                 ceiling is not None
                 and "advertised_tokens" in counter
@@ -644,6 +777,24 @@ def _context_counters(plan: dict[str, Any]):
     return (c for c in plan["counters"].values() if c["family"] == "context")
 
 
+def _count_ceiling_line(counter: dict[str, Any]) -> str:
+    """One rendered concurrency ceiling, naming where its number came from.
+
+    A ceiling resolved from the model's own provider rule and one substituted by a provider-wide
+    fallback are different kinds of knowledge, and an operator reading the envelope cannot tell
+    them apart from the number alone. Only the second is a harness choice, so only the second is
+    worth a caveat; naming it is what makes a wrong default visible instead of merely small.
+    """
+    basis = counter.get("count_basis")
+    scoped = counter["family"] == "context" or counter.get("scope") == "model"
+    where = "for" if scoped else "across"
+    caveat = "" if basis is None or not basis.startswith("harness") else f" ({basis})"
+    return (
+        f"- At most {counter['max']} concurrent requests {where} `{counter['subject']}`"
+        f"{caveat}."
+    )
+
+
 def _lane_order(plan: dict[str, Any]) -> list[str]:
     return [name for name in LANES if name in plan["lanes"]]
 
@@ -706,9 +857,10 @@ def _lane_limit_lines(plan: dict[str, Any]) -> list[str]:
         "  concurrency. Never answer them by opening extra connections, containers, credentials",
         "  or sessions, and never call a provider endpoint around the proxy: each spends",
         "  capacity the proxy cannot see.",
-        "- Only the main agent in this workspace has a subagent-spawning tool. If you are reading",
-        "  this as a subagent you cannot delegate further, and the lane serving you is bound by",
-        "  the harness - do not try to change it.",
+        "- Only the main agent in this workspace has a subagent-spawning tool; a child inherits",
+        "  both its work and the lane serving it from the harness and chooses neither. Your own",
+        "  tool list is the test of which you are - this document is not, and no sentence in it",
+        "  is evidence about who is reading it.",
         "",
     ]
     return lines
@@ -721,14 +873,29 @@ def _lane_table_lines(plan: dict[str, Any]) -> list[str]:
     The two are separate checkboxes, so a table whose "Runs alone" column meant nothing without a
     sibling would be a hole in the prompt the moment an operator unchecked one.
     """
+    agent = plan["lanes"].get(str(plan.get("agent_lane", DEFAULT_AGENT_LANE)))
     lines = [
         "## Model runtime envelope (generated at launch)",
         "",
         "The per-lane shape of this session's capacity. The proxy enforces every number below and",
         "the launcher configures Kimi's own dispatch limit to match, so the two cannot disagree.",
         "",
-        "| Lane | Model | Alias | Context | Input cap | Output clamp | In-flight cost | "
-        "Runs alone |",
+    ]
+    if agent:
+        # Which window the main agent sits in is not retrievable from inside the session, and the
+        # rest of this document names the subagent lane as often as any other. Stating the role
+        # and the lane up front, in the second person, is the only line in the prompt that says
+        # who is reading it; a model that has to infer its own audience gets it wrong sometimes.
+        lines += [
+            f"You are the main agent of this workspace. You launched on `{agent['alias']}`, "
+            f"the {LANE_DISPLAY.get(agent['lane'], agent['lane'])} lane, a "
+            f"{agent['context_tokens']:,}-token window. The subagent rows anywhere in this "
+            "document describe the children you may delegate to, never you.",
+            "",
+        ]
+    lines += [
+        "| Lane | Model | Alias | Context | Input cap | Output clamp | Worst-case cost | "
+        "Alone at full size |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for name in _lane_order(plan):
@@ -760,9 +927,11 @@ def _lane_table_lines(plan: dict[str, Any]) -> list[str]:
         )
         if counter.get("exclusive_at") is not None:
             lines.append(
-                f"- The **Runs alone** column is decided by one figure: at or above "
-                f"{counter['exclusive_at']:,} tokens a request is admitted only when the pool is "
-                "otherwise empty."
+                f"- The **Alone at full size** column is decided by one figure: a request priced "
+                f"at or above {counter['exclusive_at']:,} tokens is admitted only when the pool "
+                "is otherwise empty, so a short request on a wide lane overlaps normally and only "
+                "a large one runs alone. The proxy prices a request from its own input, capped by "
+                "its lane's worst-case cost."
             )
     for counter in plan["counters"].values():
         if counter["family"] != "rate":
@@ -775,14 +944,10 @@ def _lane_table_lines(plan: dict[str, Any]) -> list[str]:
         )
     for counter in _context_counters(plan):
         if counter.get("max") is not None:
-            lines.append(
-                f"- At most {counter['max']} concurrent requests for `{counter['subject']}`."
-            )
+            lines.append(_count_ceiling_line(counter))
     for counter in plan["counters"].values():
         if counter["family"] == "count":
-            lines.append(
-                f"- At most {counter['max']} concurrent requests across `{counter['subject']}`."
-            )
+            lines.append(_count_ceiling_line(counter))
     per_lane = plan["limits"].get("lane_concurrency") or {}
     if per_lane:
         ceilings = ", ".join(
@@ -802,17 +967,22 @@ def _lane_table_lines(plan: dict[str, Any]) -> list[str]:
             "whatever provider rules do apply."
         )
     lines += [
-        "- Keep the default model as launched. A primary request must never be deliberately routed",
-        "  through the subagent lane, and the subagent model is bound by the harness rather than",
-        "  chosen per call.",
-        "- A long-context request is a bigger primary step, not a way to obtain subagent-style",
-        "  concurrency: it is served alone precisely because it is large. Let it finish instead of",
-        "  trimming the other lanes to make room for it.",
+        "- Keep the default model as launched. A main-agent request must never be deliberately",
+        "  routed through the subagent lane, and the subagent model is bound by the harness rather",
+        "  than chosen per call.",
+        "- Kimi's model picker is the supported way to change lane mid-session, and doing so is",
+        "  legitimate: every lane is metered, and the proxy re-prices a request from its own size",
+        "  rather than from which route it arrived on.",
+        "- The two agent lanes are peers trading window against overlap: Long (queued) reserves",
+        "  so much context that a full-size request there runs alone and other work queues behind",
+        "  it, while Medium (concurrent) leaves the pool room to overlap requests. Neither is a",
+        "  way to obtain subagent-style concurrency. Let a long run finish instead of trimming",
+        "  the other lanes to make room for it.",
         "- Backgrounded agents and background Bash share one task-slot pool, separate from these",
         "  lanes, and exceeding it fails outright rather than queueing.",
-        "- Subagent and swarm wall-clock limits are unlimited, so a long run is bounded by the",
-        "  proxy and by context instead. A stalled stream is a reason to resume the work, not to",
-        "  redesign it.",
+        "- Subagent and swarm runs have no wall-clock limit, so a long run is bounded by the proxy",
+        "  and by context instead. A request the proxy is retrying is not a stuck request: there",
+        "  is no request deadline, and cancelling in the UI is the user's decision to make.",
         "- Provider terms change and model windows differ. To alter any number here, edit the",
         "  definitions in `./models` and `./providers`, then restart the stack - never `.env`.",
         "  This section states the limits and changes none.",

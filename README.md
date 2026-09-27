@@ -113,12 +113,31 @@ keeps to one spelling each to stay short — on the steps that list something; t
 steps that ask you to type a value hand `?` and `Space` to the value instead, so the
 only keys they print are the ones that still work there.
 
-The launcher first asks which model serves the primary agent and which serves
+The launcher first asks which model serves the main agent and which serves
 subagents. Each picker lists the models defined in `./models` alphabetically by
 label, marks the last-used choice, and pre-selects it; only models whose provider
-exists in `./providers` are offered. Answering non-interactively
-(`--non-interactive`, or a single available model) reuses the previous choice, and
-`HARNESS_PRIMARY_MODEL` / `HARNESS_SUBAGENT_MODEL` override one picker.
+exists in `./providers` are offered.
+
+A model with both agent lanes is listed twice on the main-agent screen, because
+how much context the main agent launches with is the operator's decision and it
+is the one decision the two lanes differ on. The two rows are peers, not a
+default and an upgrade, and each says which way it trades:
+
+- `… - Long (queued, 1M window)` — the 1,000,000-token window, and the shipped
+  default, listed first and pre-selected. Reserving that much of the provider's
+  in-flight pool means a request which actually fills most of it runs alone and
+  everything else waits for it.
+- `… - Medium (concurrent)` — the model's own 262,144-token window, whose
+  smaller reservation leaves the pool room to overlap requests.
+
+Neither row is faster in the sense that matters most: both are served by the same
+model at the same speed, and the difference is how much of one minute's capacity
+a request spends. The wider row wins whenever the work is long, which is why it
+opens first; the narrower row wins when many short requests want to be in flight
+at once. Answering non-interactively (`--non-interactive`, or a single available
+model) reuses the previous choice, and `HARNESS_PRIMARY_MODEL` /
+`HARNESS_SUBAGENT_MODEL` override one picker. `HARNESS_PRIMARY_MODEL` also accepts
+the wide row's id, which is the model id with an `@long` suffix.
 
 Both models then resolve against their providers' rules into one enforcement plan,
 and every number downstream — lane sizes, Kimi's model tables, the subagent
@@ -181,7 +200,10 @@ HARNESS_PRIMARY_MODEL=qwen3_8_flash_next HARNESS_SUBAGENT_MODEL=qwen3_8_flash_ne
 ```
 
 `HARNESS_PRIMARY_MODEL` and `HARNESS_SUBAGENT_MODEL` take model directory
-identifiers and skip the corresponding picker; an identifier that is not available
+identifiers and skip the corresponding picker; `HARNESS_PRIMARY_MODEL` additionally
+takes the `<id>@long` suffix to choose the Long (queued) window instead of the
+Medium (concurrent) one it would otherwise launch on. An identifier that is not
+available
 for that role stops startup. `HARNESS_MODULES` is a comma-separated list of module
 directory identifiers; an explicit empty value selects the core only. If omitted in
 non-interactive mode, the previous compatible selection is reused. Missing required module
@@ -197,10 +219,16 @@ Services are available at:
 - Enabled modules document their own service URLs.
 
 Generated secrets and native logs are kept under the instance-specific
-`.local/runtime/` directory and are excluded from Git. Ephemeral credentials,
-rendered provider configuration, and bridge certificates are deleted at normal
-shutdown. The private NRP cache salt persists so cached responses remain
-isolated across restarts.
+`.local/runtime/` directory and are excluded from Git. Ephemeral credentials and
+rendered provider configuration are deleted at normal shutdown — and swept again
+before a launch renders anything, because a launcher that is killed outright runs no
+shutdown at all, and a key left in that directory would otherwise outlive every
+reboot until someone stopped the stack politely. That pre-launch sweep reaches every
+instance directory in the tree, not just the one this launch will use: the id
+digests the checkout and workspace paths, so a clone that has moved leaves a
+directory nothing later ever names. The private cache salt is the
+deliberate exception: it persists so cached responses remain isolated across
+restarts, and it is never a provider credential.
 
 ## Resolved policy enforcement
 
@@ -211,21 +239,27 @@ input and refuses to serve if it cannot honour it. Adding a provider whose terms
 look nothing like NRP's — a token-per-minute ceiling, a hard context cap, no
 concurrency rule at all — is a definition change, not a proxy change.
 
-The rules NRP publishes, transcribed into `providers/nrp/provider.toml`:
+The terms NRP publishes, transcribed into `providers/nrp/provider.toml`, are four,
+and the proxy enforces all four with three mechanisms:
 
-- 200,000 output tokens per minute per API token *and* model, as a
+- 200,000 output tokens per minute per API token *and* model, as an
   `output_tokens_per_minute` rule at `credential_model` scope. This is the only
-  rule the gateway meters for you, and it returns HTTP 429. A rolling one-minute
-  ledger books each attempt's full output clamp before it starts and settles it
-  against measured usage; the gateway's own `x-ratelimit-*` header wins whenever
-  it reports less headroom.
+  term the gateway meters for you, and it returns HTTP 429. NRP counts it over
+  fixed calendar minutes; a rolling one-minute ledger here books each attempt's
+  full output clamp *before* it starts and settles it against measured usage,
+  which is stricter, because an estimate that has to be spent cannot be settled
+  after the fact. The gateway's own `x-ratelimit-*` header wins whenever it
+  reports less headroom.
 - Exactly one concurrent request once a request uses 35% or more of the model's
   context, as `exclusive_above_context_fraction` at `model` scope. The resolver
   marks such a lane exclusive and the proxy admits it only when the counter is
   empty.
-- Otherwise at most 16 concurrent requests for the model, with their combined
-  context inside 35% of the window, as `max_concurrent_requests` and
-  `aggregate_context_fraction`, both at `model` scope.
+- At most 16 concurrent requests for the model, as `max_concurrent_requests` at
+  `model` scope. NRP does not enforce its own concurrency table at all, so this
+  one is honoured here or nowhere.
+- Their combined context inside 35% of the model's window, as
+  `aggregate_context_fraction` at `model` scope — the same counter as the rule
+  above it, which is why three mechanisms carry four terms.
 
 Because both scope on the model identifier, selecting one model for both lanes
 makes them contend for the same permits, while selecting two models shares only
@@ -241,25 +275,64 @@ definition the model advertises 1,000,000 tokens, so the aggregate ceiling is
 350,000 and the in-flight budget is 332,500; the rate ledger books 180,000 output
 tokens per minute.
 
-A lane's reservation is its input cap plus its output clamp, both from
-`[lane.*]` in the model definition and both revalidated against Kimi's live
-rendered configuration on every policy refresh — a configuration the proxy cannot
+A lane's worst-case reservation is its input cap plus its output clamp, both from
+`[lane.*]` in the model definition and both revalidated against the rendered Kimi
+configuration the launcher staged for this run — a configuration the proxy cannot
 honour answers HTTP 503 instead of passing unmeasured traffic. At the shipped
-numbers `qwen3-primary` reserves its whole native 262,144-token window,
-`qwen3-long` reserves 965,536 and is therefore strictly alone, and each
-`qwen3-subagent` reserves 64,000, which is 5 at once against the 332,500
-budget: the largest fan-out the rules allow. `qwen3-long` stays opt-in because its
-extra context comes from YaRN extension of the model's native window rather than
-native attention. `./start.sh` derives Kimi's subagent concurrency from the same
-plan, so Kimi is told to run exactly as many children as the proxy will admit, and
-the generated envelope appended to its system prompt instructs it to use the whole
-envelope instead of self-limiting.
+numbers `qwen3-primary` reserves its whole 262,144-token window, `qwen3-long`
+reserves 965,536, and each `qwen3-subagent` reserves 64,000, which is 5 at once
+against the 332,500 budget: the largest fan-out the rules allow. A permit is not
+charged at that worst case. The gate prices each request from its own estimated
+input plus that lane's output clamp, capped at the lane reservation, so nothing
+runs alone by name: only a request whose price reaches 350,000 does, which for
+`qwen3-long` means one that has actually filled most of its window. Which alias
+the main agent launches on is the plan's `agent_lane`, answered on the main-agent
+picker and rendered into Kimi's `default_model`; the wide lane is the shipped
+answer, because under a mandate to use the allowance the provider granted, the
+larger window is worth more than the overlap it spends. `./start.sh` derives
+Kimi's subagent concurrency from the same plan, so Kimi is told to run exactly as
+many children as the proxy will admit, and the generated envelope appended to its
+system prompt instructs it to use the whole envelope instead of self-limiting.
+
+That is also the whole of what the harness does with your habits, and it is worth
+stating plainly, because the interesting cases are invisible:
+
+- Choosing the wide row costs you nothing until a request is actually large. A
+  short turn on `qwen3-long` is admitted beside other traffic like any other
+  request; only one that cannot fit inside the pool alongside anything takes it
+  alone. The price is the proxy's own estimate of the request's input — a
+  character-count heuristic, not the provider's tokenizer — plus that lane's
+  65,536-token output clamp, and two numbers can force solitude: the provider's
+  own rule that a request at or above 350,000 tokens runs alone, and the plainer
+  fact that a request priced above the 332,500-token pool has no room to share.
+  The second binds first, so in practice a `qwen3-long` turn starts running alone
+  somewhere past 267,000 tokens of context and overlaps freely below it. Leaving
+  the launch on the wide lane is therefore free when the work is small and
+  protective when it is not — there is no reason to pre-emptively narrow it.
+- A long session is what makes a queue. Compaction keeps a conversation inside
+  its window rather than letting it grow until a request is refused, so the
+  ordinary shape of a long chat — one very big request at a time — is exactly the
+  shape that runs alone. Starting a swarm *while* that is in flight makes the
+  children wait for it, and waiting is not failing: the permit is held for them.
+- Fan-out is a budget decision, not a preference. Five subagents at 64,000 tokens
+  each is 320,000 of the 332,500 in-flight budget, so a sixth cannot start and a
+  wide-lane request cannot start at all beside them. Running ten children in the
+  background does not get ten times the work done; it gets the same work done
+  with more of it waiting.
+- Nothing you can do in the web UI spends provider capacity the proxy has not
+  metered. `/model` can move a live session between the two agent lanes and the
+  request is then priced on the lane it arrived on; there is no route around the
+  gate, and the lane the harness bound for subagents is re-forced at every
+  refresh.
 
 Subagent and swarm wall-clock limits are unlimited: `timeout_ms = 0` in
-`runtime/config.toml`, re-pinned at every launch, never via the environment. A
-long run is bounded instead by `MODEL_PROXY_SOCK_READ_TIMEOUT` per stalled
-upstream read and `MODEL_PROXY_MAX_REQUEST_SECONDS` per client request, so a wedged
-stream cannot hold a scarce fair-use permit. Neither is a task-length limit.
+`runtime/config.toml`, re-pinned at every launch, never via the environment. There is
+no request wall clock either — `MODEL_PROXY_MAX_REQUEST_SECONDS` defaults to 0, which is
+the knob's own spelling of "never give up", matching the provider's advice to retry
+indefinitely with a growing interval. A client request therefore ends when it completes,
+when `MODEL_PROXY_SOCK_READ_TIMEOUT` fires on a stalled upstream read, or when the user
+cancels it in the UI; only the stall timeout releases a scarce fair-use permit on the
+proxy's own initiative. None of these is a task-length limit.
 `docs/verification.md` shows how to read the policy currently in force.
 
 The proxy also archives the prompts it forwards, always on. A request qualifies only
@@ -282,10 +355,19 @@ host bind the proxy has, and it is mounted into no other container.
 
 ## Persistent workspace contract
 
-`start.sh` creates `.agent-state/` and its initial state files automatically.
-Each selected module declares additional relative workspace directories.
-Existing files and directories are preserved. Initialization rejects symlinked
-children rather than following them outside the workspace.
+The workspace belongs to the project checked out in it, so the harness creates no
+state there of its own. Each selected module declares the relative workspace
+directories it needs, and `start.sh` creates those and nothing else. Existing
+files and directories are preserved. Initialization rejects symlinked children
+rather than following them outside the workspace.
+
+The agent's working memory — the `STATE.md` and experiment ledgers the operating
+contract tells it to keep — lives at `/tmp/agent-state` inside the agent container,
+on the container's own tmpfs. `start.sh` does not create it; the in-container
+`tools/register_workspace.py` rebuilds it from empty once the stack is ready, and it
+ceases to exist with the container. Older revisions kept it in the workspace as
+`.agent-state/`; a launch retires that directory when the repository does not track
+it, and leaves it alone when it does.
 
 Module `AGENTS.md` instructions are staged for the session and appended to its
 system prompt, each under a heading naming the module that owns it. The workspace's

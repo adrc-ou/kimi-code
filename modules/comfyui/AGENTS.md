@@ -44,5 +44,7 @@ Never assume model-specific:
 - scheduler/timestep convention.
 
 Derive these from current model configuration or authoritative implementation
-and record important boundaries in `.agent-state/TENSOR_CONTRACTS.md`.
+and record important boundaries in `/tmp/agent-state/TENSOR_CONTRACTS.md`. That
+file is scratch for the current stack, so copy any contract the project should
+keep into the project's own documentation before the session ends.
 
