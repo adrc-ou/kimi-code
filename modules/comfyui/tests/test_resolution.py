@@ -395,6 +395,12 @@ class ContainerMountTests(unittest.TestCase):
         argv = resolve_locks.container_argv(self.plan, {"digest": "sha256:" + "a" * 64})
         self.assertIn("ghcr.io/astral-sh/uv@sha256:" + "a" * 64, argv)
 
+    def test_the_entrypoint_names_the_binary_path_the_image_ships(self):
+        # The uv image puts the executable at /uv and keeps it off its PATH, so `--entrypoint uv`
+        # reaches runc as a PATH lookup and dies with "executable file not found in $PATH".
+        argv = resolve_locks.container_argv(self.plan, {"digest": "sha256:" + "a" * 64})
+        self.assertEqual(argv[argv.index("--entrypoint") + 1], "/uv")
+
 
 class PlanTests(unittest.TestCase):
     def setUp(self):

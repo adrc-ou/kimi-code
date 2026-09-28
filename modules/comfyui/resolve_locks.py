@@ -83,7 +83,9 @@ def container_argv(plan: dict[str, Any], pin: dict[str, str]) -> list[str]:
     outside the container and there is no second set of paths to keep in step. The instance root is
     deliberately *not* mounted: it holds the provider key and the proxy token, and resolution needs
     neither. ``--entrypoint`` is named explicitly because the uv image's own entrypoint is not part
-    of its published contract.
+    of its published contract, and it is named as ``/uv`` because that is where the image places
+    the binary: its PATH does not include it, so the bare name fails container init with
+    "executable file not found in $PATH".
     """
     mount = Path(plan["mount"])
     return [
@@ -91,7 +93,7 @@ def container_argv(plan: dict[str, Any], pin: dict[str, str]) -> list[str]:
         "run",
         "--rm",
         "--entrypoint",
-        "uv",
+        "/uv",
         "-v",
         f"{mount}:{mount}",
         "-v",
