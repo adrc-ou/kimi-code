@@ -593,6 +593,7 @@ def layout(
     footer_rows: int = 1,
     rail: bool = True,
     status_rows: int = 1,
+    detail: bool = False,
 ) -> Frame:
     """Divide a ``columns`` x ``rows`` window into its regions.
 
@@ -602,6 +603,11 @@ def layout(
 
     ``rail`` is whether the step rail has anything to say, which is likewise the caller's question.
     A row that would be blank is not chrome, and the body is short enough without it.
+
+    ``detail`` is whether the step has prose to put in the reading column, and it is opt-in for the
+    same reason ``rail`` is: a pane with nothing in it is not a column of prose, it is a vertical
+    rule that the list paid for. Only a surface that answers :meth:`~.app.Step.detail` asks for one,
+    and the width it costs the list is only ever spent by the steps that spend it well.
 
     ``status_rows`` is how many lines the bar under the list needs: one for a step that only names
     the row under the cursor, more for a tree that has prose to say about it and no room beside the
@@ -665,15 +671,15 @@ def layout(
     )
     # Splitting is the last thing done to the body and the first thing a short window gives back:
     # the loop asks for one status row again when the list can no longer hold both regions.
-    detail = detail_rect(body)
-    if not detail.blank:
-        body = body.shrink(right=detail.width + DETAIL_SPEND)
+    pane = detail_rect(body) if detail else Rect()
+    if not pane.blank:
+        body = body.shrink(right=pane.width + DETAIL_SPEND)
     return Frame(
         screen=Rect(0, 0, rows, columns),
         title=title,
         rail=rail,
         body=body,
-        detail=detail,
+        detail=pane,
         status=status,
         footer=footer,
         rule_top=rule_top,

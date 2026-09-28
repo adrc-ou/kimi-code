@@ -17,6 +17,7 @@ for _directory in (ROOT, ROOT / "tools"):
         sys.path.insert(0, str(_directory))
 
 import prompt_context  # noqa: E402
+import workspace_registry  # noqa: E402
 
 from tests.helpers import run_in_pty  # noqa: E402
 
@@ -37,6 +38,8 @@ class LauncherTests(unittest.TestCase):
             "tools/modules.py",
             "tools/private_file.py",
             "tools/safe_workspace_init.py",
+            "tools/workspace_choice.py",
+            "tools/workspace_registry.py",
             "scripts/read_env.py",
         ):
             destination = self.root / relative
@@ -90,7 +93,8 @@ exit 99
 """,
         )
         self.bootstrap = self.base / "bootstrap-fixture"
-        self.bootstrap.write_text(f"WORKSPACE_PATH={self.workspace}\n")
+        self.bootstrap.write_text("")
+        self.remember(self.workspace)
         # Keep operator configuration out of test subprocesses.
         self.env = {
             "PATH": f"{self.bin}:{os.defpath}",
@@ -124,6 +128,17 @@ exit 99
         path = self.bin / name
         path.write_text("#!/bin/bash\nset -euo pipefail\n" + body)
         path.chmod(0o700)
+
+    def remember(self, *paths):
+        """Seed the workspace the way an interactive launch would have left it.
+
+        The answer is no longer a line in :file:`.env`, so a fixture cannot name it in the resolved
+        bootstrap any more; it belongs to the remembered list, and a launcher run with
+        ``--non-interactive`` reads exactly that. Written through the real registry rather than by
+        hand, because a fixture that drifts from the document it imitates tests the fixture.
+        """
+        for path in paths:
+            workspace_registry.touch(self.root, str(path))
 
     def run_script(self, name, *args):
         return subprocess.run(
@@ -182,6 +197,7 @@ class SessionFlowTests(unittest.TestCase):
 
     setUp = LauncherTests.setUp
     command = LauncherTests.command
+    remember = LauncherTests.remember
     run_script = LauncherTests.run_script
     require_executable_fixtures = LauncherTests.require_executable_fixtures
 
@@ -211,7 +227,7 @@ module_prepare() { echo prepare >>"${TEST_EVENTS}"; }
 module_install() { echo install >>"${TEST_EVENTS}"; }
 module_start() { echo start >>"${TEST_EVENTS}"; }
 """)
-        self.bootstrap.write_text(f"WORKSPACE_PATH={self.workspace}\nNRP_API_KEY=fixture-key\n")
+        self.bootstrap.write_text("NRP_API_KEY=fixture-key\n")
         self.env["TEST_EVENTS"] = str(self.base / "events")
         self.env["HARNESS_MODULES"] = "demo"
         (self.bin / "python3").unlink()
@@ -374,7 +390,7 @@ exit 0
             runtime / prompt_context.PREFS_FILE,
             dict.fromkeys(prompt_context.OPTION_IDS, False),
         )
-        self.bootstrap.write_text(f"WORKSPACE_PATH={self.workspace}\nNRP_API_KEY=fixture-key\n")
+        self.bootstrap.write_text("NRP_API_KEY=fixture-key\n")
         result = self.run_script("start.sh", "--non-interactive")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((runtime / "SYSTEM.md").read_text(), ".\n")
@@ -403,6 +419,162 @@ print(json.dumps(configuration))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("exposes host bind", result.stderr)
         self.assertNotIn("register-workspace", (self.base / "events").read_text())
+
+
+class WorkspaceChoiceTests(unittest.TestCase):
+    """The workspace the launch works in, which is no longer a line in :file:`.env`.
+
+    Three things are worth pinning here rather than in the screen's own suite: that the question is
+    asked with a terminal attached (it is the first thing ``start.sh`` does, before the launcher
+    borrows the screen for the flow), that its answer reaches the environment the rest of the launch
+    reads, and that the answer is *checked* on the way through. The refusal of anything that holds
+    ``$HOME`` or the checkout is the one thing standing between a mistyped path and an agent that can
+    read the operator's credentials, and it is enforced here as well as on the screen: the
+    environment is a hand-written thing.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.root = self.base / "harness"
+        self.root.mkdir()
+        self.workspace = self.base / "project"
+        self.workspace.mkdir()
+        # The helpers the launcher reaches for by name under ``$HARNESS_ROOT``, staged in a tree of
+        # our own: pointing HARNESS_ROOT at the real checkout would write the remembered list into
+        # the repository it is supposed to be testing.
+        (self.root / "tools").mkdir(parents=True, exist_ok=True)
+        for name in ("workspace_registry.py", "workspace_choice.py", "private_file.py"):
+            shutil.copy2(ROOT / "tools" / name, self.root / "tools" / name)
+        shutil.copytree(
+            ROOT / "tools" / "tui",
+            self.root / "tools" / "tui",
+            ignore=shutil.ignore_patterns("__pycache__"),
+            dirs_exist_ok=True,
+        )
+        self.home = self.base / "home"
+        self.home.mkdir(parents=True, exist_ok=True)
+        self.env = {
+            "PATH": f"{os.defpath}:/bin:/usr/bin",
+            "HOME": str(self.home),
+            "TERM": "xterm-256color",
+        }
+
+    def shell(self, body: str, **extra):
+        """Run ``body`` with the launcher's own helpers sourced and nothing else inherited."""
+        script = f"""
+set -euo pipefail
+source {shlex.quote(str(ROOT / "tools" / "runtime.sh"))}
+HARNESS_ROOT={shlex.quote(str(self.root))}
+{body}
+"""
+        return subprocess.run(
+            ["/bin/bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=self.base,
+            env={**self.env, **extra},
+            check=False,
+        )
+
+    def remember(self, *paths):
+        """Seed the remembered list the way an earlier interactive launch would have."""
+        for path in paths:
+            workspace_registry.touch(self.root, str(path))
+
+    def test_the_remembered_workspace_is_the_one_an_unasked_launch_mounts(self):
+        other = self.base / "older"
+        other.mkdir()
+        self.remember(other, self.workspace)
+        result = self.shell('harness_resolve_workspace && printf "%s" "$WORKSPACE_PATH"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Newest first, and that newest is what every read-only entry point will act on.
+        self.assertEqual(result.stdout, str(self.workspace))
+
+    def test_an_answer_named_in_the_environment_outranks_the_memory(self):
+        # The launcher exports what the screen answered, so an explicitly named directory wins over
+        # whatever the last launch left behind — and a relative one is still resolved against the
+        # checkout, which is how ``../workspace`` was meant in the first place.
+        result = self.shell(
+            'harness_resolve_workspace && printf "%s" "$HARNESS_WORKSPACE"',
+            WORKSPACE_PATH=str(self.workspace),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, str(self.workspace))
+        relative = self.shell(
+            'harness_resolve_workspace && printf "%s" "$HARNESS_WORKSPACE"',
+            WORKSPACE_PATH="../project",
+        )
+        self.assertEqual(relative.stdout, str(self.workspace))
+
+    def test_nothing_chosen_and_nothing_asked_is_a_refusal_with_a_remedy(self):
+        result = self.shell("harness_resolve_workspace")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("./start.sh", result.stderr)
+
+    def test_the_roots_that_would_expose_the_host_are_refused(self):
+        for name, value in (
+            ("filesystem root", "/"),
+            ("the account home", str(self.home)),
+            ("the harness checkout", str(self.root)),
+        ):
+            with self.subTest(root=name):
+                result = self.shell(
+                    "harness_resolve_workspace && printf %s \"$WORKSPACE_PATH\"",
+                    WORKSPACE_PATH=value,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("Refusing unsafe workspace", result.stderr)
+
+    def test_an_ancestor_of_the_checkout_is_refused_like_the_checkout(self):
+        # The trap this closes: a workspace at the account's home mounts the directory that holds
+        # .env and every generated key, and it is one keystroke from being typed.
+        for value in (str(self.base.parent), str(self.base), str(self.home.parent)):
+            with self.subTest(value=value):
+                result = self.shell(
+                    "harness_resolve_workspace && printf %s \"$WORKSPACE_PATH\"",
+                    WORKSPACE_PATH=value,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("Refusing unsafe workspace", result.stderr)
+                if value != "/":
+                    # Naming what the workspace would have held is the point of the sentence: the
+                    # operator has to be able to see which directory they nearly mounted.
+                    self.assertIn("holds", result.stderr)
+
+    def test_a_sibling_of_the_checkout_is_still_a_normal_workspace(self):
+        # Guard the guard: containment is not "shares a prefix", and a project beside the harness is
+        # the ordinary layout this repository documents.
+        sibling = self.base / "harness-with-spaces-project"
+        sibling.mkdir()
+        result = self.shell(
+            "harness_resolve_workspace && printf %s \"$WORKSPACE_PATH\"",
+            WORKSPACE_PATH=str(sibling),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, str(sibling))
+
+    def test_a_workspace_asked_on_a_terminal_reaches_the_environment_and_the_memory(self):
+        # The screen takes its keystrokes from the launcher's own stdin, exactly like a module's
+        # version menu does, and Enter on the newest row is the whole interaction.
+        self.remember(self.workspace)
+        script = f"""
+set -euo pipefail
+source {shlex.quote(str(ROOT / "tools" / "runtime.sh"))}
+HARNESS_ROOT={shlex.quote(str(self.root))}
+harness_choose_workspace
+printf "CHOSEN:%s\n" "$WORKSPACE_PATH"
+"""
+        session = run_in_pty(["bash", "-c", script], keys=b"\r", cwd=self.base,
+                             env={**self.env, "COLUMNS": "80", "LINES": "24"},
+                             expect=b"workspace directory")
+        self.assertEqual(session.status, 0, session.screen[-400:])
+        self.assertIn(f"CHOSEN:{self.workspace}", session.screen)
+        self.assertTrue(session.restored)
+        # And the choice is recorded for the launches that will not be asked.
+        self.assertEqual(workspace_registry.newest(self.root), str(self.workspace))
 
 
 class ModuleHookTerminalTests(unittest.TestCase):
@@ -555,6 +727,7 @@ class PromptsScriptTests(unittest.TestCase):
     """
 
     command = LauncherTests.command
+    remember = LauncherTests.remember
     run_script = LauncherTests.run_script
     require_executable_fixtures = LauncherTests.require_executable_fixtures
 

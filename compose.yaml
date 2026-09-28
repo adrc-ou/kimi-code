@@ -188,7 +188,7 @@ services:
       # Core mounts only: the workspace bind is the single host path this container can observe.
       # Module and approved-extension overlays add their own binds and must justify each one.
       - type: bind
-        source: "${WORKSPACE_PATH:?Set WORKSPACE_PATH in .env}"
+        source: "${WORKSPACE_PATH:?Chosen by ./start.sh}"
         target: /workspace
         read_only: false
         bind:

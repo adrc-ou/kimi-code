@@ -20,6 +20,19 @@ again immediately before launch. Generated secrets and rendered configuration
 are stored with restrictive permissions below `.local/runtime/INSTANCE_ID` and
 removed when the launcher exits.
 
+The workspace is chosen on screen rather than read from a configuration file, and
+is validated before the launch continues: it must be an absolute path below the
+filesystem root, must be a directory, must be readable and writable by the
+launching account, and symlinks are resolved to their target first. The launcher
+also refuses any directory that *holds* the harness checkout or the account's
+home — not merely the two themselves, since the parent of the checkout is the
+easier mistype and mounts the same credentials. Both layers check it: the screen,
+so the operator hears it while they can still change the answer, and the launcher,
+because `WORKSPACE_PATH` in the environment is a hand-written thing. Recently used workspaces are remembered in
+`.local/workspaces.json`, outside the instance tree because it selects the
+instance; the paths in it are the same ones the agent can already read out of its
+own mount table, so the file holds nothing the sandbox does not already see.
+
 ## Agent filesystem permissions
 
 Kimi keeps its configuration, sessions, and OAuth state in its home directory

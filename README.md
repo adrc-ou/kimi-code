@@ -62,9 +62,13 @@ artifacts owned by root.
    model-scoped key wins; set only the provider-scoped one and every model of
    that provider shares it.
 3. Set `SEARXNG_SECRET` to the output of `openssl rand -hex 32`.
-4. Set `WORKSPACE_PATH` to a dedicated directory containing only material the
-   agent is allowed to inspect and change. The agent can always see this exact
-   host path, so avoid a location whose name you need to keep private.
+4. Run `./start.sh` once. Its first screen asks which directory the session
+   should work in — the workspace is chosen there rather than configured in
+   `.env`, because it is the one decision every launch has to re-make and it is
+   where the agent's whole writable world begins. Point it at a dedicated
+   directory containing only material the agent is allowed to inspect and
+   change. The agent can always see this exact host path, so avoid a location
+   whose name you need to keep private.
 5. Leave everything else blank or defaulted. `NRP_BASE_URL` redirects the NRP
    endpoint for this deployment only; `KIMI_BACKGROUND_TASK_SLOTS` blanks to a
    value derived from the resolved plan; the `MODEL_PROXY_*` names are process
@@ -111,7 +115,43 @@ and no key does anything the step has not named. `?` opens the full reference �
 every spelling of every key, including `k` and `j` for the arrows, which the footer
 keeps to one spelling each to stay short — on the steps that list something; the
 steps that ask you to type a value hand `?` and `Space` to the value instead, so the
-only keys they print are the ones that still work there.
+only keys they print are the ones that still work there. Only the step that shows
+which system prompts the session will run uses the reading column at the right of a
+wide window, so it is the only step that spends list width on one; every other step
+has the row under its cursor's own words to say what it means, and gets the full
+width.
+
+The first question is asked before that modal opens, because everything after it
+is keyed on the answer: which directory the session works in. The screen is
+headed `Choose a workspace directory` and lists up to ten directories this
+checkout has been used with, newest first, with the most recent already marked —
+so the ordinary launch is `Enter`. Each row shows the whole host path with its
+final directory name in bold, since that is the part you are scanning for. Above
+the list, `New Workspace...` becomes a text field the moment the cursor reaches
+it, opening at `/` with the insertion point after it: `Tab` completes a directory
+the way bash does (one match is filled in, several insert what they agree on and
+are listed at the bottom of the panel, files are never offered), `←`/`→` step the
+insertion point, `↑`/`↓` take it to either end, and a path too long for one row
+wraps onto the next rather than scrolling out of sight. `Esc` hands the arrow keys
+back to the list, and `Tab` takes them again.
+
+An answer is checked before the screen closes. It must be absolute, must not be a
+filesystem root, must be a directory rather than a file, must be one you can read
+and write, and must not hold this checkout or your own home directory — either
+would put the operator's credentials inside the agent's writable world. A symlink
+is replaced by what it points at. A path whose last name
+does not exist yet is allowed, since creating it is the usual intent. A remembered
+row is asked again on every launch, because the disk may have moved: if it is gone
+but could be created you are asked `That directory does not exist. Create it?`, and
+if it cannot be, `Remove it from the Recent Workspaces list?` — `←`/`→` move
+between the buttons, `Enter` takes one, and `Esc` cancels. Nothing is created and
+nothing is deleted by closing the screen.
+
+Your choice is remembered per checkout in `.local/workspaces.json`, which is the
+one file that deliberately survives an instance, and it is what `./shell.sh`,
+`./extensions.sh`, `./prompts.sh` and `--non-interactive` act on: an unattended
+launch takes the most recently chosen workspace, and refuses with this remedy if
+you have never been asked.
 
 The launcher first asks which model serves the main agent and which serves
 subagents. Each picker lists the models defined in `./models` alphabetically by
@@ -743,6 +783,11 @@ The launcher reports its instance ID. Generated runtime material for that
 instance lives below `.local/runtime/INSTANCE_ID`; replaceable native module installations live
 below `.local/runtime/INSTANCE_ID/module-data/<module>`. Stop the matching stack before removing
 either directory. Never delete the workspace as part of cache cleanup.
+
+`.local/workspaces.json` is not cache and must not be swept with it: it is the list of workspaces
+this checkout has been pointed at, and it is the only record of which directory an unattended launch
+should mount. Removing it does not free anything worth having — it costs you the recent list and
+leaves `--non-interactive` with no workspace to start.
 
 An ordinary `launcher.lock` file may remain after a crash; advisory locking
 makes an unlocked file harmless. Both macOS and WSL2 use Python's advisory

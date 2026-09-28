@@ -34,7 +34,7 @@ for _directory in (ROOT, ROOT / "tools"):
 
 import tools.tui as tui  # noqa: E402
 from tests.helpers import run_in_pty  # noqa: E402
-from tools.tui import flow  # noqa: E402
+from tools.tui import app, flow  # noqa: E402
 from tools.tui import screen as launch_screen  # noqa: E402
 from tools.tui.app import (  # noqa: E402
     ACCEPT,
@@ -3060,6 +3060,149 @@ sys.exit(result.status)
         self.assertEqual(answer["add-on-0"], "on")
         self.assertEqual(answer["add-on-1"], "off")
         self.assertTrue(session.restored)
+
+
+class OverlayStep(Picker):
+    """A list with a floating panel of its own, which is what ``Step.overlay`` is for.
+
+    The panel is one line per item the caller hands in, so a test can ask exactly how tall a panel
+    the loop will accept is, and where it lands.
+    """
+
+    def __init__(self, lines=(), **kwargs):
+        super().__init__(**kwargs)
+        self.lines = tuple(lines)
+
+    def overlay(self, state):
+        if not self.lines:
+            return None
+        return tuple(Line(Segment(text)) for text in self.lines)
+
+
+class OverlayTests(unittest.TestCase):
+    """The layer a step paints over the bottom of its body without displacing the list.
+
+    A completion panel is the reason it exists: content that answers the *value being edited* has to
+    appear without pushing the question off the top of the window, which is exactly what appending
+    it as rows would do. These are the properties that make painting over someone's region safe.
+    """
+
+    def painted(self, step, caps=QUIET, rows=24, columns=80):
+        """One frame of one step, with the frame that produced it.
+
+        The frame has to come back from the modal that painted rather than from a second modal
+        built the same way: ``paint()`` negotiates the footer's height with the window and re-fits
+        the body, so a frame read before the negotiation is a frame the screen was not drawn in.
+        """
+        modal = Modal(step, View(), terminal=_Idle(caps), caps=caps)
+        modal.paint()
+        return modal, modal.screen.snapshot()
+
+    def test_a_panel_lands_at_the_bottom_of_the_body_and_stops_there(self):
+        modal, screen = self.painted(OverlayStep(lines=("cand-a", "cand-b")))
+        body = modal.frame.body
+        self.assertIn("cand-b", screen[body.bottom - 1])
+        self.assertIn("cand-a", screen[body.bottom - 2])
+        # The rule is the panel's own edge, inside the body rather than across the window: the
+        # gutter and the scrollbar column belong to the list that is still painted underneath.
+        rule = screen[body.bottom - 3]
+        self.assertNotIn("cand", rule)
+        self.assertIn("─", rule)
+        # And the panel never reaches the chrome. The status row and the footer are how the operator
+        # knows what a key will do, and a panel that painted over them would take that away.
+        for row in range(modal.frame.status.top, modal.frame.footer.bottom):
+            self.assertNotIn("cand-", screen[row])
+
+    def test_a_panel_covers_the_list_without_moving_it(self):
+        plain, before = self.painted(OverlayStep())
+        _, after = self.painted(OverlayStep(lines=("cand-a", "cand-b")))
+        body = plain.frame.body
+        listed = range(body.top, body.bottom - 3)
+        # The declared rows are painted at the same screen rows either way: the panel floats, it
+        # does not insert. That is the whole difference between this layer and a run of rows.
+        self.assertEqual([before[row] for row in listed], [after[row] for row in listed])
+        self.assertIn("cand-a", "\n".join(after))
+
+    def test_a_panel_too_long_for_the_window_keeps_its_head_and_counts_the_rest(self):
+        lines = tuple(f"item {index}" for index in range(40))
+        modal, screen = self.painted(OverlayStep(lines=lines))
+        body = modal.frame.body
+        painted = "\n".join(screen[body.top : body.bottom])
+        self.assertIn("item 0", painted)
+        self.assertNotIn("item 39", painted)
+        self.assertIn("more", painted)
+        # Rows above the panel are untouched, so the question the panel is about stays on screen.
+        self.assertIn("alpha", screen[body.top])
+        self.assertLessEqual(sum(1 for row in screen if "item " in row), app.MAX_OVERLAY_ROWS)
+
+    def test_a_step_with_nothing_to_float_paints_exactly_what_it_painted_before(self):
+        # The hook's default is ``None``, and a step that answers ``None`` must not leave a rule, a
+        # blank row, or any other trace of a panel behind: nine of the launcher's screens are that
+        # step, and a divider none of them asked for would be a change to all of them.
+        _, plain = self.painted(Picker())
+        _, silent = self.painted(OverlayStep())
+        self.assertEqual(plain, silent)
+        self.assertIsNone(OverlayStep().overlay(None))
+
+    def test_the_help_overlay_replaces_the_panel_rather_than_sharing_the_body(self):
+        step = OverlayStep(lines=("cand-a", "cand-b"))
+        modal = Modal(step, View(), terminal=_Idle(), caps=QUIET)
+        modal.session.help_open = True
+        modal.paint()
+        screen = "\n".join(modal.screen.snapshot())
+        self.assertIn("Keys", screen)
+        self.assertNotIn("cand-a", screen)
+
+
+class ReadingColumnTests(unittest.TestCase):
+    """Who pays for the column at the right of a wide window, and who does not.
+
+    The pane is a third of the window's width, so it is only worth taking from a list that has
+    something to put beside it. A step whose rows already describe themselves gets the width back.
+    """
+
+    WIDE = Caps(color=NONE, columns=140, rows=24, probe=False)
+
+    def nodes(self):
+        return [Node("a", "Alpha", kind=CHECK, states=("on", "off"), detail="what it means")]
+
+    def painted(self, step):
+        modal = Modal(step, View(), terminal=_Idle(self.WIDE), caps=self.WIDE)
+        modal.paint()
+        return modal, modal.screen.snapshot()
+
+    def test_a_list_takes_the_whole_body_at_a_width_where_a_pane_would_fit(self):
+        menu = ListStep(
+            title="Modules", prompt="Choose", mode=SINGLE, choices=[Choice("a", "Alpha")]
+        )
+        modal, screen = self.painted(menu)
+        self.assertFalse(menu.has_detail)
+        self.assertTrue(modal.frame.detail.blank)
+        # Full body: everything but the gutter the pointer lives in and the scrollbar's column.
+        self.assertEqual(modal.frame.body.left, GUTTER_WIDTH)
+        self.assertEqual(modal.frame.body.right, self.WIDE.columns - SCROLLBAR_WIDTH)
+        # No divider is drawn down the right of a list that has nothing to say there.
+        body = modal.frame.body
+        self.assertNotIn("│", "".join(screen[body.top : body.bottom]))
+
+    def test_a_tree_keeps_the_column_it_has_prose_for(self):
+        tree = ForestStep(title="Context", nodes=self.nodes(), opening={"a": "on"})
+        modal, screen = self.painted(tree)
+        self.assertTrue(tree.has_detail)
+        self.assertFalse(modal.frame.detail.blank)
+        self.assertLess(modal.frame.body.right, modal.frame.detail.left)
+        body = modal.frame.body
+        self.assertIn("│", "".join(screen[body.top : body.bottom]))
+
+    def test_the_frame_asks_the_step_before_it_splits_the_body(self):
+        # The flag is what decides, not whether the step happens to return prose: a step that has a
+        # reading column but nothing in it this keystroke still keeps the column it paid for.
+        self.assertFalse(Step().has_detail)
+        self.assertFalse(ListStep(title="x", choices=[]).has_detail)
+        self.assertTrue(ForestStep(title="x", nodes=[]).has_detail)
+        narrow = layout(140, 24)
+        self.assertTrue(narrow.detail.blank)
+        self.assertFalse(layout(140, 24, detail=True).detail.blank)
 
 
 if __name__ == "__main__":  # pragma: no cover

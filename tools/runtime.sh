@@ -28,27 +28,69 @@ harness_platform() {
   export HARNESS_PLATFORM HARNESS_PLATFORM_LABEL HARNESS_KIMI_ASSET
 }
 
+# The directory this checkout works in, from whatever was asked of it.
+#
+# `./start.sh` puts a screen in front of the operator and exports the answer; every other entry point
+# (`./shell.sh`, `./extensions.sh`, `./prompts.sh`) and an unattended launch have no screen to ask
+# with, and take the directory the last interactive launch chose. That remembered list is the only
+# place the answer can live outside an instance, because the instance identity digests the workspace:
+# a file under `.local/runtime/<instance>/` would be orphaned by the very choice it recorded.
+#
+# The checks are the launcher's own and run on the answer however it arrived. The registry
+# canonicalises what it stores, but `WORKSPACE_PATH` in the environment is a hand-written thing, and
+# a hand-written `/` is a workspace that mounts the host.
+harness_resolve_workspace() {
+  local value=${WORKSPACE_PATH:-}
+  if [[ -z "${value}" ]]; then
+    value=$(python3 "${HARNESS_ROOT}/tools/workspace_registry.py" --root "${HARNESS_ROOT}" newest) ||
+      value=""
+  fi
+  [[ -n "${value}" ]] ||
+    harness_die "No workspace has been chosen for this checkout. Run ./start.sh to pick one." ||
+    return
+  case "${value}" in
+    /*) local candidate=${value} ;;
+    *) local candidate="${HARNESS_ROOT}/${value}" ;;
+  esac
+  mkdir -p -- "${candidate}"
+  HARNESS_WORKSPACE=$(cd "${candidate}" && pwd -P)
+  [[ "${HARNESS_WORKSPACE}" != "/" ]] ||
+    harness_die "Refusing unsafe workspace: the filesystem root" || return
+  # A workspace that *holds* the checkout also holds its .env and every generated key under
+  # .local/runtime, and one that holds the account's home holds everything the account keeps. The
+  # trailing slash is what makes this containment rather than a string prefix: /work/proj must not
+  # be refused for sitting inside a workspace at /work/thing that merely shares three characters.
+  for protected in "${HARNESS_ROOT}" "${HOME}"; do
+    if [[ "${protected}/" == "${HARNESS_WORKSPACE}/"* ]]; then
+      harness_die "Refusing unsafe workspace: ${HARNESS_WORKSPACE} holds ${protected}" || return
+    fi
+  done
+  [[ "${HARNESS_WORKSPACE}" != *$'\n'* ]] || harness_die "The workspace path contains a newline" || return
+  export WORKSPACE_PATH=${HARNESS_WORKSPACE}
+  export HARNESS_WORKSPACE
+}
+
+# Ask the operator which workspace this launch should use, and hand the answer to the rest of the
+# launcher through the environment. Only `./start.sh` calls this, and it calls it before
+# `harness_init`, because the instance identity is built from the answer: nothing that needs a runtime
+# directory, an image tag, or a Compose project can have been worked out yet.
+#
+# The screen prints the path on standard output and nothing else, which is what makes it capturable.
+# Its status is this function's, so a Ctrl-C inside it still reaches the caller's trap as 130.
+harness_choose_workspace() {
+  local chosen
+  chosen=$(python3 "${HARNESS_ROOT}/tools/workspace_choice.py" --root "${HARNESS_ROOT}") || return
+  [[ -n "${chosen}" ]] || harness_die "The workspace choice came back empty." || return
+  export WORKSPACE_PATH=${chosen}
+}
+
 harness_resolve_bootstrap_env() {
   [[ -f "${HARNESS_ROOT}/.env" ]] || harness_die "Missing .env. Copy .env.example to .env and configure it." || return
   command -v docker >/dev/null 2>&1 || harness_die "Required command not found: docker" || return
   docker compose version >/dev/null
+  harness_resolve_workspace || return
   HARNESS_BOOTSTRAP_ENV=$(docker compose --env-file "${HARNESS_ROOT}/.env" \
     -f "${HARNESS_ROOT}/compose.bootstrap.yaml" config --environment)
-  HARNESS_WORKSPACE_VALUE=$(printf '%s\n' "${HARNESS_BOOTSTRAP_ENV}" | \
-    python3 "${HARNESS_ROOT}/scripts/read_env.py" /dev/stdin WORKSPACE_PATH)
-  [[ -n "${HARNESS_WORKSPACE_VALUE}" ]] || harness_die "WORKSPACE_PATH must not be empty." || return
-  case "${HARNESS_WORKSPACE_VALUE}" in
-    /*) local candidate=${HARNESS_WORKSPACE_VALUE} ;;
-    *) local candidate="${HARNESS_ROOT}/${HARNESS_WORKSPACE_VALUE}" ;;
-  esac
-  mkdir -p -- "${candidate}"
-  HARNESS_WORKSPACE=$(cd "${candidate}" && pwd -P)
-  case "${HARNESS_WORKSPACE}" in
-    /|"${HARNESS_ROOT}"|"${HOME}") harness_die "Refusing unsafe WORKSPACE_PATH: ${HARNESS_WORKSPACE}" || return ;;
-  esac
-  [[ "${HARNESS_WORKSPACE}" != *$'\n'* ]] || harness_die "WORKSPACE_PATH contains a newline" || return
-  export WORKSPACE_PATH=${HARNESS_WORKSPACE}
-  export HARNESS_WORKSPACE
   local variable value
   for variable in COMPOSE_PROJECT_NAME LOCAL_UID LOCAL_GID; do
     value=$(printf '%s\n' "${HARNESS_BOOTSTRAP_ENV}" | \

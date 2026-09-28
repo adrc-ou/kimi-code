@@ -26,8 +26,20 @@ source "${root}/tools/runtime.sh"
 # sentence rather than with a compose error after a bind source has already been created.
 harness_require_commands || exit 1
 harness_traps
+# `harness_init` derives everything below from the workspace, and cannot run before it is known.
+HARNESS_ROOT=${root}
+export HARNESS_ROOT
+# The first question of the launch, and the one the rest of it is keyed on: the instance identity, the
+# image tags, the Compose project and the state volumes all digest this path, so it is asked ahead of
+# the modal flow rather than being a step inside it. Going back to it would mean throwing every answer
+# after it away, which is why no later step offers Backspace into it either. An unattended launch is
+# never asked, and `harness_init` takes the workspace the last launch that was asked chose.
+if [[ "${non_interactive}" != true ]]; then
+  harness_choose_workspace || exit
+fi
 echo "Preparing Kimi workspace..."
 harness_init
+echo "Workspace: ${WORKSPACE_PATH}"
 harness_warn_env_migration
 docker info >/dev/null || { echo "Docker is not ready. Start Docker Desktop and retry." >&2; exit 1; }
 

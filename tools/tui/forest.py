@@ -199,6 +199,10 @@ class ForestState:
 class ForestStep(Step):
     """A titled tree of :class:`Node` rows that answers with a state map."""
 
+    #: A tree of marks is the one surface that is deliberately not self-describing, so it is the one
+    #: that pays for the reading column: :meth:`detail` says what the row under the cursor means.
+    has_detail = True
+
     def __init__(
         self,
         *,

@@ -179,6 +179,7 @@ class BsdChmodPromptCacheTests(unittest.TestCase):
 
     setUp = test_launchers.PromptsScriptTests.setUp
     command = test_launchers.PromptsScriptTests.command
+    remember = test_launchers.PromptsScriptTests.remember
     run_script = test_launchers.PromptsScriptTests.run_script
     require_executable_fixtures = test_launchers.PromptsScriptTests.require_executable_fixtures
     instance_runtime_dir = test_launchers.PromptsScriptTests.instance_runtime_dir

@@ -2,12 +2,14 @@ services:
   bootstrap:
     image: scratch
     environment:
-      WORKSPACE_PATH: "${WORKSPACE_PATH:?Set WORKSPACE_PATH in .env}"
       # Provider credentials and endpoint overrides, named by ./providers, plus the
       # model-scoped key each selected model names in ./models. Compose only resolves what a
       # file declares, so a new provider or a new model key adds its names here;
       # tools/models.py resolve refuses to continue when a definition's variable is missing
       # from this file.
+      #
+      # The workspace is deliberately absent. It is chosen on screen before an instance exists, and
+      # handed to compose.yaml through the launcher's own environment.
       NRP_API_KEY: "${NRP_API_KEY:-}"
       QWEN3_API_KEY: "${QWEN3_API_KEY:-}"
       NRP_BASE_URL: "${NRP_BASE_URL:-}"

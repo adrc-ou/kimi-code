@@ -78,6 +78,17 @@ UNTETHERED_ROOM = 77
 MIN_ROOM = 8
 
 
+#: The tallest panel a step may float over the bottom of its body. A completion list is a lookup,
+#: not a second window: past a handful of rows it is reading a directory listing instead of choosing
+#: one, and the rows it covers belong to the question being answered.
+MAX_OVERLAY_ROWS = 8
+
+#: What the panel's own tail says when the candidates outnumber it. Deliberately not an arrow: the
+#: body's overflow note already uses those, and two different "there is more" markers one row apart
+#: read as two different kinds of more.
+OVERLAY_TAIL = "more"
+
+
 def navigation() -> tuple[Binding, ...]:
     """The keys every step answers, in legend order.
 
@@ -271,6 +282,11 @@ class Step:
     #: step that puts prose *beside* its rows rather than under them has to know how wide the column
     #: it was actually given is, and only the frame knows that.
     frame: L.Frame | None = None
+    #: Whether this step has prose for the reading column, and whether the frame may therefore spend
+    #: its width on one. A pane is a third of a wide window, and a step that fills none of it would
+    #: still pay for the divider, so the frame asks rather than assumes. Set it with
+    #: :meth:`detail`.
+    has_detail: bool = False
     #: Sentences that are true of the whole step rather than of one row — how to read a figure, what
     #: an empty file means. They go in the key overlay, which is the one place with room for a
     #: paragraph: a rule that spends body rows is a rule that shrinks the answer to pay for it.
@@ -324,6 +340,22 @@ class Step:
         """:meth:`detail`'s prose as plain text, for the overlay to wrap in its own width."""
         del state
         return ()
+
+    def overlay(self, state: object) -> tuple[Line, ...] | None:
+        """A floating panel painted over the bottom of the body, or ``None`` for none.
+
+        This is the layer for content that belongs to the *answer in progress* rather than to the
+        list: the directories a completion key offered, a preview of what a half-typed value means.
+        It is floating rather than a run of rows for one reason — it must not reflow what is above
+        it. A candidate list that pushed the question off the top of the body every time a key was
+        struck would take away the thing the user is typing into.
+
+        Returning ``None`` (or nothing at all) says there is no panel this frame; the empty tuple is
+        a panel of zero rows and paints nothing either. The panel is bottom-anchored inside the body
+        and clipped to it, so it can never reach the status line or the legend.
+        """
+        del state
+        return None
 
     def alerts(self, state: object) -> tuple[str, ...]:
         """Sentences about this answer that the operator should not have to scroll to find.
@@ -675,6 +707,7 @@ class Modal:
             self._paint_help()
         else:
             self._paint_body(rows, order)
+            self._paint_overlay()
         self._paint_chrome()
         self.terminal.write(self.screen.paint())
 
@@ -693,6 +726,7 @@ class Modal:
             self.caps.rows,
             footer_rows=footer_rows,
             rail=bool(self._rail),
+            detail=self.step.has_detail,
         )
         self.step.frame = self.frame
         self._detail = self.step.detail(self.session.state)
@@ -703,6 +737,7 @@ class Modal:
             self.caps.rows,
             footer_rows=footer_rows,
             rail=bool(self._rail),
+            detail=self.step.has_detail,
             status_rows=1 + len(self._detail),
         )
         self.step.frame = self.frame
@@ -837,6 +872,40 @@ class Modal:
         )
         L.scrollbar(self.screen, body, window, len(rows), self.caps)
         self._paint_overflow(window, height, at)
+
+    def _paint_overlay(self) -> None:
+        """The step's floating panel, bottom-anchored inside the body and clipped to it.
+
+        Painted after the list and before the chrome, so it covers rows without displacing them and
+        can never reach the status line or the legend — the two things a user needs in order to know
+        what a key will do to what they are looking at.
+
+        The panel gives up rows in order: first those beyond :data:`MAX_OVERLAY_ROWS`, then its own
+        tail as a count, then the rule that separates it, and only at a window too short for any of
+        that does it decline to appear. A completion list that ate the screen it was called from
+        would be a worse answer than no completion list.
+        """
+        lines = self.step.overlay(self.session.state)
+        if not lines:
+            return
+        body = self.frame.body
+        # Two rows are held back: the rule, and at least one row of the body above the panel, so the
+        # panel is visibly *in* a window rather than being the window.
+        budget = min(MAX_OVERLAY_ROWS, body.height - 2)
+        if budget < 1:
+            return
+        if len(lines) > budget:
+            lines = (*lines[: budget - 1], self._overlay_tail(len(lines) - (budget - 1)))
+        rule = body.bottom - len(lines) - 1
+        glyph = L.box_glyphs(self.caps)["h"]
+        self.screen.text(rule, body.left, glyph * body.width, self.caps.color_pair("rule"))
+        for offset, value in enumerate(lines, start=1):
+            row = rule + offset
+            L.paint_line(self.screen, row, L.Rect(row, body.left, 1, body.width), value, self.caps)
+
+    def _overlay_tail(self, hidden: int) -> Line:
+        """``  … +12 more`` — the panel's own overflow count, in the body's own words."""
+        return Line(Segment(f"  … +{hidden} {OVERLAY_TAIL}", self.caps.color_pair("dim")))
 
     def _paint_overflow(self, window: Window, height: int, at: int) -> None:
         """One reserved row under the viewport, naming what is hidden on each side.

@@ -86,6 +86,18 @@ Generated runtime files belong only under `.local/runtime/<instance>/`. Do not
 write credentials, rendered provider configuration, the resolved policy plan,
 approval manifests, bridge private keys, or launcher locks into the workspace.
 
+The workspace itself is chosen on screen by `./start.sh`, never in `.env`. The
+instance identity digests the canonical workspace path, so the answer has to
+exist before the instance directory does and cannot be stored inside it: the
+recently-used list is the one file that deliberately outlives an instance, at
+`.local/workspaces.json`, written by `tools/workspace_registry.py`. Keep it
+there and keep it out of every sweep — an unattended launch and the read-only
+entry points (`./shell.sh`, `./extensions.sh`, `./prompts.sh`) resolve the
+workspace from it, so deleting it does not clean state, it removes the only
+record of what to mount. `tools/workspace_choice.py` is the one thing that asks,
+and it prints exactly the chosen path on standard output: keep every diagnostic
+of its own off that stream, or the launcher captures it as a path.
+
 Anything under that directory that can carry a key is swept at the start of a
 launch as well as at the end, because a launcher that is killed outright runs no
 shutdown; `harness_sweep_secrets` in `tools/runtime.sh` holds that list and is the

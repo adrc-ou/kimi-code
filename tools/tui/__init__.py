@@ -6,8 +6,10 @@ the buffer the diff writes from, ``layout`` divides a window into regions and sc
 fit, ``term`` owns the terminal itself, ``screen`` holds that terminal across a whole run so the
 modal is never torn down between questions, ``app`` runs one step until it answers, ``menu`` is the
 list-of-options step that most of the launcher's steps are, ``forest`` is the tree-of-switches step,
-``input`` is the one-field step for the two questions that take typed text instead of a choice, and
-``flow`` remembers which steps have answered and where a back-navigation should land.
+``input`` is the one-field step for the questions that take a secret instead of a choice, ``paths``
+is what counts as a workspace directory and what ``Tab`` means in one, and ``workspaces`` is the
+field and the remembered list that ask about a directory at once. ``flow`` remembers which steps
+have answered and where a back-navigation should land.
 
 A surface imports ``Step``, ``View``, ``Result`` and ``run``, describes its rows, and gets the rest:
 the title, the step rail, the focus ring, the scrollbar, the overflow counts, the help overlay,
@@ -87,8 +89,8 @@ __all__ = [
     "Line",
     "ListState",
     "ListStep",
-    "MULTI",
     "MISSING",
+    "MULTI",
     "Modal",
     "Node",
     "PAGE_DOWN",
@@ -99,8 +101,8 @@ __all__ = [
     "Result",
     "Row",
     "SINGLE",
-    "Segment",
     "Screen",
+    "Segment",
     "Session",
     "Step",
     "TARGET",

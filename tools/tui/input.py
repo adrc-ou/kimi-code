@@ -68,13 +68,17 @@ CARET_ASCII = "|"
 AT_FIELD = -1
 
 
-def _strike(item: Binding) -> tuple[str, ...]:
+def strike(item: Binding) -> tuple[str, ...]:
     """The spellings of ``item`` that a field could not also be typing.
 
     One printable character is a letter, a digit or a punctuation mark — which is exactly what a
     value is made of. Named keys arrive as ``Up``, modifiers as ``Ctrl-R``, and the space bar as
     ``Space``, so nothing a field needs to keep is lost, and neither is ``Backspace``, which is the
     whole reason this is not simply a ban on short strings.
+
+    Shared with :mod:`tui.workspaces` for the same reason it is a function rather than a line inside
+    :meth:`FieldStep.keys`: two surfaces now hand the letters to a value, and a key the user cannot
+    type and cannot use must disappear from the legend of both.
     """
     return tuple(name for name in item.keys if not (len(name) == 1 and name.isprintable()))
 
@@ -191,7 +195,7 @@ class FieldStep(Step):
         table.insert(at + 1, DELETE_BINDING if state.text else BACK_BINDING)
         out: list[Binding] = []
         for item in table:
-            struck = _strike(item)
+            struck = strike(item)
             if struck:
                 out.append(item if struck == item.keys else replace(item, keys=struck))
         return tuple(out)
