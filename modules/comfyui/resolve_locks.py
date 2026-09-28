@@ -98,7 +98,7 @@ def container_argv(plan: dict[str, Any], pin: dict[str, str]) -> list[str]:
         f"{BACKEND}:{BACKEND}:ro",
         "-w",
         str(mount),
-        f"ghcr.io/astral-sh/uv@{pin['digest'].removeprefix('sha256:')}",
+        f"ghcr.io/astral-sh/uv@{pin['digest']}",
     ] + [str(part) for part in plan["argv"][1:]]
 
 

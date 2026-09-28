@@ -390,8 +390,10 @@ class ContainerMountTests(unittest.TestCase):
                 self.assertTrue(Path(self.plan[key]).is_absolute())
 
     def test_the_resolver_image_is_reached_by_digest(self):
+        # The "@" must be followed by a full algorithm:hex digest — a bare hex after the at-sign
+        # is not a reference docker parses, and the CLI says so with "invalid reference format".
         argv = resolve_locks.container_argv(self.plan, {"digest": "sha256:" + "a" * 64})
-        self.assertIn("ghcr.io/astral-sh/uv@" + "a" * 64, argv)
+        self.assertIn("ghcr.io/astral-sh/uv@sha256:" + "a" * 64, argv)
 
 
 class PlanTests(unittest.TestCase):
