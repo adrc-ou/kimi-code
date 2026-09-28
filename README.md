@@ -799,11 +799,12 @@ The host scripts report a file, line, and exit status for unexpected failures.
 `start.sh` also checks that Docker is ready before selecting releases. Optional
 module settings are documented with each module.
 
-The release selector uses Python's verified HTTPS context. On macOS, if Python
-has no default CA certificates, it loads the system bundle at `/etc/ssl/cert.pem`
-for both release metadata and checksum downloads. Existing trust stores and
-explicit `SSL_CERT_FILE` / `SSL_CERT_DIR` environment settings take precedence.
-For an organization-specific CA bundle, export `SSL_CERT_FILE=/path/to/ca-bundle.pem`
+The release selector and the ComfyUI lock resolver use Python's verified HTTPS
+context. On macOS, if Python has no default CA certificates, they load the
+system bundle at `/etc/ssl/cert.pem` for release metadata, checksum, and
+requirements downloads. Existing trust stores and explicit `SSL_CERT_FILE` /
+`SSL_CERT_DIR` environment settings take precedence. For an
+organization-specific CA bundle, export `SSL_CERT_FILE=/path/to/ca-bundle.pem`
 before launching. Certificate and hostname verification remain enabled.
 
 ## What Docker does and does not protect

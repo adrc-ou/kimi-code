@@ -16,11 +16,14 @@ import hashlib
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "modules" / "comfyui"))
@@ -537,6 +540,37 @@ class FetchDigestTests(unittest.TestCase):
             path = Path(directory) / "requirements.txt"
             path.write_text(body, encoding="utf-8")
             self.assertEqual(resolution.digest_of(body), resolution.digest_file(path))
+
+
+class FetchRequirementsTests(unittest.TestCase):
+    def test_the_fetch_uses_the_shared_verified_ssl_context(self):
+        # The picker verified this release through scripts/select_versions.py, which loads the
+        # system CA bundle on a macOS Python that has no default trust anchors. A fetch with the
+        # bare default context here fails with CERTIFICATE_VERIFY_FAILED on exactly those hosts.
+        body = b"torch==2.11.0\nnumpy==2.0.0\n"
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = body
+        with (
+            mock.patch.object(resolve_locks, "release_ssl_context") as context,
+            mock.patch.object(
+                resolve_locks.urllib.request, "urlopen", return_value=response
+            ) as open_url,
+        ):
+            text = resolve_locks.fetch_requirements("a" * 40)
+        self.assertEqual(text, body.decode("utf-8"))
+        self.assertIs(open_url.call_args.kwargs["context"], context.return_value)
+
+    def test_the_fetch_still_refuses_a_host_it_cannot_verify(self):
+        failure = urllib.error.URLError(
+            ssl.SSLCertVerificationError(1, "certificate verify failed")
+        )
+        with (
+            mock.patch.object(resolve_locks.urllib.request, "urlopen", side_effect=failure),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            resolve_locks.fetch_requirements("a" * 40)
+        self.assertIn("certificate verify failed", str(caught.exception))
 
 
 class EnsureRefusesStaleRequirementsTests(unittest.TestCase):

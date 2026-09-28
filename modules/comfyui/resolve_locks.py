@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Same idiom as ``releases.py``: ``scripts/`` for the shared release selector, whose TLS context is
+# the one the picker already used to verify this release. A macOS Python can have no default trust
+# anchors at all, and this fetch would fail with CERTIFICATE_VERIFY_FAILED on the very host whose
+# picker succeeded.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import resolution  # noqa: E402
+from select_versions import release_ssl_context  # noqa: E402
 
 MODULE = Path(__file__).resolve().parent
 ROOT = MODULE.parents[1]
@@ -114,7 +120,9 @@ def fetch_requirements(commit: str) -> str:
     url = f"{RAW_BASE}/{REPOSITORY}/{commit}/requirements.txt"
     request = urllib.request.Request(url, headers={"User-Agent": "adrc-kimi-harness-lock-resolver"})
     try:
-        with urllib.request.urlopen(request, timeout=60, context=None) as response:
+        with urllib.request.urlopen(
+            request, timeout=60, context=release_ssl_context()
+        ) as response:
             body = response.read(64 * 1024 + 1)
     except OSError as exc:
         raise SystemExit(
