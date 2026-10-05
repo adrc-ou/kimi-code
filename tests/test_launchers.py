@@ -302,7 +302,25 @@ if [[ "$*" == "compose version --format json" ]]; then
 fi
 if [[ "$*" == *"config --environment" ]]; then cat "$TEST_BOOTSTRAP"; exit 0; fi
 if [[ "$*" == *"config --format json" ]]; then "${RESOLVED_STUB:-resolved-config-clean}"; exit 0; fi
-if [[ "$*" == *"kimi --version" ]]; then echo 0.42.0; exit 0; fi
+if [[ "$*" == *"kimi --version" ]]; then
+  # A fresh assets volume has no preload until agent-state-init runs. Model the
+  # service's inherited NODE_OPTIONS and Compose's per-run environment override.
+  node_options='--require /opt/kimi-runtime/tools/abort_listener_floor.cjs'
+  while (( $# )); do
+    if [[ "$1" == -e || "$1" == --env ]]; then
+      shift
+      case "$1" in NODE_OPTIONS=*) node_options="${1#NODE_OPTIONS=}";; esac
+    fi
+    shift
+  done
+  if [[ -n "$node_options" ]]; then
+    echo 'MODULE_NOT_FOUND: runtime preload is not staged yet' >&2
+    exit 1
+  fi
+  echo version-smoke >>"$TEST_EVENTS"
+  echo 0.42.0
+  exit 0
+fi
 if [[ "$*" == *"/register_workspace.py" ]]; then
   echo register-workspace >>"$TEST_EVENTS"; exit 0
 fi
@@ -319,7 +337,7 @@ exit 0
             (self.base / "events").read_text().splitlines(),
             [
                 "configure", "kimi-version", "module-version", "prepare", "install",
-                "start", "register-workspace", "check-services", "browser",
+                "version-smoke", "start", "register-workspace", "check-services", "browser",
             ],
         )
         data = self.workspace / "demo/user/data"
@@ -358,7 +376,7 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             (self.base / "events").read_text(),
-            "kimi-version\nregister-workspace\ncheck-services\nbrowser\n",
+            "kimi-version\nversion-smoke\nregister-workspace\ncheck-services\nbrowser\n",
         )
         self.assertEqual(data.read_text(), "keep")
         self.assertNotIn("Demo instructions", (runtime / "AGENTS.md").read_text())

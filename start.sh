@@ -392,7 +392,10 @@ harness_modules install
 
 harness_compose build
 PROMPT_IMAGE_ID=$(harness_prompt_image_id)
-actual_kimi=$(harness_compose run -T --rm --no-deps kimi-agent kimi --version)
+# This image-only check precedes agent-state-init, so the assets volume can be empty
+# or stale. Clear the runtime preload for this run; normal startup keeps NODE_OPTIONS
+# and waits for the initializer to stage the file before launching Kimi.
+actual_kimi=$(harness_compose run -T --rm --no-deps -e NODE_OPTIONS= kimi-agent kimi --version)
 [[ "${actual_kimi}" == *"${KIMI_CODE_VERSION}"* ]] || { echo "Built Kimi version mismatch: ${actual_kimi}" >&2; exit 1; }
 harness_modules check_build
 
