@@ -174,9 +174,12 @@ is one more thing a reviewer has to trace, so assets belong in
 directories or named volumes. A module that must hand the agent a file the
 launcher generated stages it into a named volume with a network-less root-only
 one-shot, which is what `modules/comfyui/compose.mps.yaml` does for the MPS
-bridge CA certificate at `/run/comfy-bridge/ca.crt`. The same script requires
-every published port to sit on `127.0.0.1` and every container to keep a
-read-only root filesystem.
+bridge CA certificate at `/run/comfy-bridge/ca.crt`. The volume outlives the
+launch that filled it, so such a one-shot has to replace its destination rather
+than write into it: `cp` truncates in place, which fails on a file the previous
+launch left unwritable once `cap_drop` has taken `CAP_FOWNER`. The same script
+requires every published port to sit on `127.0.0.1` and every container to keep
+a read-only root filesystem.
 
 Optional `runtime/tools/service_<id>.py` files define `probe(full)` and return a
 short success description. The launcher's checker discovers only selected probes and runs
