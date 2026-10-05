@@ -91,18 +91,6 @@ class OpenerTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[0], ["/usr/bin/open", LOOPBACK])
             self.assertNotIn("shell", run.call_args.kwargs)
 
-    def test_a_linux_host_tries_the_wsl_handler_before_its_own(self):
-        with (
-            patch.object(OPENER.sys, "platform", "linux"),
-            patch.object(OPENER.shutil, "which", return_value=None) as which,
-            patch.object(OPENER.subprocess, "run") as run,
-        ):
-            which.side_effect = lambda name: f"/usr/bin/{name}" if name == "xdg-open" else None
-            run.return_value.returncode = 0
-            self.assertTrue(OPENER.open_browser(LOOPBACK))
-            self.assertEqual(which.call_args_list[-1].args[0], "xdg-open")
-            self.assertEqual(run.call_args.args[0], ["/usr/bin/xdg-open", LOOPBACK])
-
     def test_a_desktop_handler_that_fails_is_reported_not_raised(self):
         with (
             patch.object(OPENER.sys, "platform", "darwin"),

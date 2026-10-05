@@ -24,7 +24,7 @@ from typing import Any
 
 AGENT = "kimi-agent"
 PROXY = "model-proxy"
-REQUIRED_VOLUMES = {"kimi-state", "serena-state", "kimi-assets"}
+REQUIRED_VOLUMES = {"kimi-state", "serena-state", "harness-state", "kimi-assets"}
 SNAPSHOT_DIRECTORY = "extension-snapshot"
 # A bind source is readable from /proc/self/mountinfo inside the container that owns it, so
 # these are the only two host locations a kimi-agent bind may ever name.
@@ -68,7 +68,14 @@ def check_credentials(
             if not isinstance(mount, dict):
                 raise SystemExit(f"{name} has an unrecognised mount entry")
             source = str(mount.get("source", ""))
-            if mount.get("type") == "bind" and under(os.path.realpath(source), credential_root):
+            if mount.get("type") != "bind":
+                continue
+            resolved = os.path.realpath(source)
+            # Either direction counts. A bind of the credential directory itself is the obvious
+            # mistake, but binding any ancestor of it — the instance directory, or a checkout
+            # above that — exposes the same files as an ordinary subdirectory, and the mount
+            # table will not say so.
+            if under(resolved, credential_root) or under(credential_root, resolved):
                 raise SystemExit(f"{name} bind-mounts a credential path: {source}")
     if expect_secret is not None and expect_secret not in held_by_proxy:
         raise SystemExit(f"provider credential {expect_secret} did not reach {PROXY} alone")

@@ -31,7 +31,6 @@ import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
 #: What ``complete -d`` appends to a directory name, and what an insertion appends here too. It is
 #: a marker as much as a convenience: the next ``Tab`` then lists *inside* the name just completed,
@@ -79,11 +78,6 @@ class Verdict:
     def usable(self) -> bool:
         """Whether the launcher may take this path as its workspace."""
         return not self.error and bool(self.path)
-
-    @property
-    def name(self) -> str:
-        """The final component, which is the part the list prints in bold."""
-        return Path(self.path).name or self.path
 
 
 def is_root(value: str) -> bool:

@@ -370,7 +370,6 @@ def pieces(
     measured: dict[str, Any] | None,
     lane: str,
     values: dict[str, str] | None = None,
-    now: datetime | None = None,
     static: dict[str, str] | None = None,
 ) -> Pieces:
     """Cut one audience's prompt into the documents that make it, priced as honestly as it can.

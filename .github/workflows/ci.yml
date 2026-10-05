@@ -149,11 +149,31 @@ jobs:
           print(f"url={selected['url']}")
           print(f"sha256={fetch_asset_checksum(selected)}")
           PY
-      - run: |
-          docker buildx build --platform '${{ matrix.platform }}' -f container/Dockerfile \
+      - name: Build the agent image
+        run: |
+          # Only the runner's own architecture is loaded into Docker. A foreign-platform image
+          # cannot be executed here, and the one step that would run it is gated to amd64 below.
+          load=""
+          if [ '${{ matrix.platform }}' = 'linux/amd64' ]; then load="--load"; fi
+          docker buildx build ${load} --platform '${{ matrix.platform }}' \
+            -t adrc-kimi-agent:ci -f container/Dockerfile \
             --build-arg KIMI_CODE_VERSION='${{ steps.kimi.outputs.version }}' \
             --build-arg KIMI_CODE_ASSET_URL='${{ steps.kimi.outputs.url }}' \
             --build-arg KIMI_CODE_ASSET_SHA256='${{ steps.kimi.outputs.sha256 }}' .
+      # ``RealBundleTests`` skips unless ``/usr/local/bin/kimi`` is a file, so on ``static`` - the
+      # only job that runs the suite - the class that proves the anchor patterns still point at
+      # literals in the shipped build has never once run in CI. Its own docstring records that
+      # those offsets have already moved once. This image is the only place in the repository
+      # holding the bundle a session actually loads, so the class runs inside it.
+      - name: Check the prompt anchors against the shipped bundle
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          docker run --rm \
+            --entrypoint python3 \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "${GITHUB_WORKSPACE}:/src:ro" \
+            -w /src \
+            adrc-kimi-agent:ci -m unittest -v tests.test_kimi_prompts
 
   build-modules:
     runs-on: ubuntu-latest

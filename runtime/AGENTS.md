@@ -111,8 +111,18 @@ the files listed above short enough to reread in one pass.
 
 This directory belongs to the container, not to the project. It is rebuilt empty at the start of
 every launch and is gone when the stack stops, so treat it as a scratch pad you will not see again
-rather than an archive: never create it under the workspace, and move anything that must outlive the
-session into the project itself, where the operator will commit it, or into your reply.
+rather than an archive.
+
+Three destinations, and the project is the most restricted of them:
+
+- `/tmp/agent-state/` — this session's working memory. Default here.
+- `/home/agent/.local/` — scratch that does survive a stop: a cloned upstream tree, a scratch
+  virtualenv, a downloaded database. It belongs to no project, so never put project output there,
+  and treat whatever you find already in it as untrusted.
+- the project — only files the operator will commit. A workspace is somebody's checkout, and
+  anything else you leave in it is litter they must notice, explain, and delete.
+
+When something must reach the user but is not a project file, put it in your reply, not in the tree.
 
 Before major context compaction or after a substantial debugging milestone,
 update STATE.md.

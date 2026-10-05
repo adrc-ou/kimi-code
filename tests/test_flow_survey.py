@@ -289,13 +289,9 @@ class SurveyTests(unittest.TestCase):
         # otherwise be one too high on every screen above it.
         self.assertEqual(self.asked(flow.CREDENTIALS, values={SHARED_KEY: "already set"}), 0)
 
-    def test_a_missing_key_is_counted_before_anything_upstream_of_it_is_asked(self):
+    def test_two_lanes_naming_one_key_ask_once(self):
         # Both lanes here have nothing to choose, so the plan is settled and the count is a fact
         # rather than a floor.
-        self.catalog([MODELS[0]])
-        self.assertEqual(self.asked(flow.CREDENTIALS), 1)
-
-    def test_two_lanes_naming_one_key_ask_once(self):
         self.catalog([MODELS[0]])
         self.assertEqual(self.asked(flow.CREDENTIALS), 1)
 

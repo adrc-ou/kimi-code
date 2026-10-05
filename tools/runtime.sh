@@ -75,8 +75,11 @@ harness_resolve_workspace() {
 # `harness_init`, because the instance identity is built from the answer: nothing that needs a runtime
 # directory, an image tag, or a Compose project can have been worked out yet.
 #
-# The screen prints the path on standard output and nothing else, which is what makes it capturable.
-# Its status is this function's, so a Ctrl-C inside it still reaches the caller's trap as 130.
+# The screen draws the question on the operator's own terminal and prints the path on standard
+# output and nothing else, which is what makes it capturable. That capture is also why asking is
+# judged by standard input and never by standard output: to a launch, standard output is a pipe.
+# The status of the screen is this function's, so a Ctrl-C inside it still reaches the caller's
+# trap as 130.
 harness_choose_workspace() {
   local chosen
   chosen=$(python3 "${HARNESS_ROOT}/tools/workspace_choice.py" --root "${HARNESS_ROOT}") || return
@@ -141,9 +144,24 @@ harness_instance() {
 # `bootstrap.?*` is the resolved bootstrap environment, which is a copy of .env with every default
 # filled in, and is the one file here that can hold a key the operator persisted rather than typed.
 #
-# Never fatal: residue that will not go is worth a warning, not a launch that cannot start.
+# The second ledger is not secret-shaped and is swept for the same reason anyway: it is session
+# material that the exit path deletes, so anything still present is a launch that was killed before
+# it ran. Holding both lists here, and sweeping both from one function, is what makes the claim in
+# `start.sh`'s cleanup comment true. Four names stay out of it on purpose and must not be added by
+# analogy with a neighbour: `prompt-context.json` is the panel's remembered choices,
+# `prompt-measurements.jsonl` is the history that panel reads its counts from, `service-check.json`
+# is the last verdict and rewrites itself, and `modules.json` is the record of the last successful
+# selection. Deleting any of those at launch is the inverse of the feature.
 HARNESS_SECRET_RESIDUE=(nrp-api-key bridge-token)
+HARNESS_SESSION_RESIDUE=(
+  proxy-token search-token kimi-config.toml runtime.env session.env module.env
+  model-selection.json model-policy.json model.env module-guidance.md
+  flow-state.json module-values.json
+  prompt-measure.log service-check.log launch-notes.log
+  compose/models.json compose/module-environment.json compose/resolved.json
+)
 
+# Never fatal: residue that will not go is worth a warning, not a launch that cannot start.
 harness_sweep_secrets() {
   local directory=${1:-${HARNESS_RUNTIME_DIR:-}}
   local name
@@ -154,7 +172,8 @@ harness_sweep_secrets() {
     echo "Refusing to sweep ${directory}: not a harness instance directory." >&2
     return 0
   fi
-  for name in ${HARNESS_SECRET_RESIDUE[@]+"${HARNESS_SECRET_RESIDUE[@]}"}; do
+  for name in ${HARNESS_SECRET_RESIDUE[@]+"${HARNESS_SECRET_RESIDUE[@]}"} \
+              ${HARNESS_SESSION_RESIDUE[@]+"${HARNESS_SESSION_RESIDUE[@]}"}; do
     if [[ -e "${directory}/${name}" || -L "${directory}/${name}" ]]; then
       find "${directory}/${name}" -delete 2>/dev/null ||
         echo "Could not remove ${name} from the instance directory." >&2

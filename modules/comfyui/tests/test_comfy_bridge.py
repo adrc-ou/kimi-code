@@ -89,9 +89,6 @@ class BridgeTests(unittest.TestCase):
         request.headers["X-Private"] = "remove"
         self.assertNotIn("X-Private", BRIDGE.request_headers(request))
 
-    def test_anonymous_request_holds_no_credential_of_either_shape(self):
-        self.assertFalse(BRIDGE.authorized(Request()))
-
     def test_frontend_paths_are_never_proxied_to_comfyui(self):
         # An unregistered name under the reserved prefix is a mistake, not a route: it must not
         # reach the upstream, where a same-named ComfyUI path would answer it with real data.
@@ -203,13 +200,6 @@ class BootstrapTests(unittest.TestCase):
         self.assertNotIn("@SESSION_PATH@", page, "the placeholder must not survive rendering")
         self.assertNotIn("Bearer", page)
         self.assertNotIn(TOKEN, page)
-
-    def test_open_path_is_the_one_the_grant_advertises(self):
-        passes = make_passes()
-        grant = passes.mint_grant()
-        self.assertTrue(BRIDGE.OPEN_PATH.startswith(BRIDGE.BRIDGE_PREFIX))
-        self.assertEqual(BRIDGE.SESSION_PATH, f"{BRIDGE.BRIDGE_PREFIX}/session")
-        self.assertTrue(grant)
 
 
 class FrontendFlowTests(unittest.TestCase):

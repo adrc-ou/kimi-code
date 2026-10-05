@@ -58,9 +58,6 @@ else:
 #: ``scripts/select_versions.py`` beside the menu it short-circuits.
 KIMI_VERSION_ENV = "KIMI_CODE_VERSION"
 
-#: A read that has not been attempted yet, which is not the same fact as a read that failed.
-_UNTRIED = object()
-
 
 class Survey:
     """The reads several answers share, each taken at most once and each allowed to fail."""

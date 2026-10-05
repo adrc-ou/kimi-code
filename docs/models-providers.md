@@ -457,9 +457,11 @@ step.
 `render_runtime.py` generates `[providers.*]`, `[models.*]` and
 `[secondary_model]` from the plan, so the harness sets the default model and the
 subagent model automatically. Each `[models.*]` table carries a `display_name`
-from `LANE_DISPLAY`, and the picker row is that name with the provider appended
-— for the shipped plan, `Qwen3.8-Flash-Next - Long (queued) (NRP)`,
-`... - Medium (concurrent) (NRP)` and `... - Subagent (automatic) (NRP)`.
+built from the model's label and the lane's `LANE_DISPLAY` phrase — for the
+shipped plan, `Qwen3.8-Flash-Next - Long (queued)`,
+`... - Medium (concurrent)` and `... - Subagent (automatic)` — and no provider
+name. Each table still binds its own provider with a `provider =` key beside
+`model =`, so the row names the lane while the table says who serves it.
 
 **The subagent row cannot be hidden, and is labelled instead.** Kimi Code's
 model list is every configured alias: in the shipped bundle,

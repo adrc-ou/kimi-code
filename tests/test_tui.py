@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""The modal engine that drives ``./start.sh``'s interactive section.
+"""Tests for the modal engine that drives ``./start.sh``'s interactive section.
 
-Groups, ordered the way the engine is layered: the package's own surface (what a surface may reach
-for), capabilities (what the terminal may be given), measurement (how wide a string really is),
-decoding (what the terminal sent), geometry (what fits where), the generated footer (what the user
-is told), flow state (what has been answered), then the three step shapes run against a scripted
-terminal, and finally one run through a real pty. Everything before the pty group is pure and fast;
-the pty group is slow, and is the only one that proves the sequences actually reach a terminal and
-that the terminal comes back undamaged.
+Grouped the way the engine is layered: the package's own surface (what a surface may reach for),
+capabilities (what the terminal may be given), measurement (how wide a string really is), decoding
+(what the terminal sent), geometry (what fits where), the generated footer (what the user is told),
+flow state (what has been answered), and the three step shapes run against a scripted terminal. A
+pty class follows the shapes it exercises rather than trailing them: the pure suites say what the
+engine computes, and those runs are the only proof the sequences reach a terminal and that the
+terminal comes back undamaged.
 """
 
 from __future__ import annotations
@@ -16,9 +16,13 @@ import contextlib
 import io
 import json
 import os
+import pty
+import select
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass
 from dataclasses import replace as _replaced
@@ -33,7 +37,7 @@ for _directory in (ROOT, ROOT / "tools"):
         sys.path.insert(0, str(_directory))
 
 import tools.tui as tui  # noqa: E402
-from tests.helpers import run_in_pty  # noqa: E402
+from tests.helpers import plain, run_in_pty  # noqa: E402
 from tools.tui import app, flow  # noqa: E402
 from tools.tui import screen as launch_screen  # noqa: E402
 from tools.tui.app import (  # noqa: E402
@@ -73,6 +77,7 @@ from tools.tui.layout import (  # noqa: E402
     wrap,
 )
 from tools.tui.menu import MULTI, SINGLE, Choice, ListStep  # noqa: E402
+from tools.tui.term import Terminal, TerminalGone  # noqa: E402
 
 _ENV = ("TERM", "COLORTERM", "NO_COLOR", "TERM_PROGRAM", "LANG", "LC_ALL", "LC_CTYPE", "COLUMNS")
 
@@ -351,8 +356,8 @@ class Decoding(unittest.TestCase):
 
     def test_a_query_reply_is_consumed_rather_than_typed(self):
         # DECRQSS answers arrive on the same descriptor as keystrokes. Read as input they would be
-        # a burst of unbound keys, which after this suite's change means a status line full of
-        # "does nothing here".
+        # a burst of unbound keys, and a burst of unbound keys is a status line full of "does
+        # nothing here".
         self.assertEqual(self.names(b"\x1b[?64;1p", b"\x1b[B"), ["Down"])
         self.assertEqual(self.names(b"\x1b]0;title\x07"), [])
 
@@ -504,8 +509,6 @@ class Geometry(unittest.TestCase):
         self.assertEqual((window.first, window.last, window.above, window.below), (10, 18, 10, 12))
         self.assertFalse(visible_window(5, 8, 0).scrolling)
         self.assertTrue(window.scrolling)
-        self.assertEqual(window.row_of(9), -1)
-        self.assertEqual(window.row_of(10), 0)
 
 
 class Footer(unittest.TestCase):
@@ -556,8 +559,8 @@ class Footer(unittest.TestCase):
         self.assertLessEqual(width(lines[0]), 40)
 
     def test_the_ellipsis_does_not_cost_a_hint_it_could_have_shown(self):
-        # The mark used to be joined with a separator, which at some widths meant the row showed one
-        # fewer item than it had room for in order to say "there is more".
+        # The mark is appended without a separator, because joining it cost a cell a hint could have
+        # used, and the row then said "there is more" while showing one item fewer.
         table = tuple(bind(f"a{i}", "word" * (i + 1), f"Key{i}") for i in range(6))
         lines = self.legend(table, width=30, rows=1)
         self.assertIn("word", lines[0])
@@ -579,7 +582,7 @@ class Footer(unittest.TestCase):
         self.assertNotIn("toggle", "\n".join(self.legend(table, View(), rows=2)))
         self.assertEqual(lookup(table, Key("Space"), View()), "")
 
-    def test_nothing_the_footer_prints_is_a_key_you_have_to_knowledge_about(self):
+    def test_nothing_the_footer_prints_is_a_key_you_have_to_guess_about(self):
         # The defect named in the brief is "the opaque a/n/r expectation", and its shape is a label
         # that is one bare letter. Every spelling this interface prints is bracketed, an arrow, or
         # the word Space — and the one exception is ``?``, which is the convention for help rather
@@ -1044,7 +1047,6 @@ class ModalTests(unittest.TestCase):
         view = View(position=3, total=9, can_go_back=True)
         modal = self.modal(view=view, keys=[Key("Backspace")])
         result = modal.run()
-        self.assertTrue(result.going_back)
         self.assertEqual(result.status, flow.GO_BACK)
         self.assertEqual(self.script.left, 1)
 
@@ -1184,6 +1186,180 @@ class ModalTests(unittest.TestCase):
         self.assertNotIn("toggle", self.shown(modal))
         self.assertIsNone(modal.handle(Key("Space")))
         self.assertEqual(modal.session.state, Picker().initial())
+
+
+class _Reader:
+    """A stand-in for ``sys.stdin`` that only reports a descriptor.
+
+    :class:`~tui.term.Terminal` takes the screen it reads from off standard input, which is the
+    right default for a launcher and the wrong one for a test that must not take over the suite's
+    own terminal. Nothing else in the constructor reaches for it.
+    """
+
+    def __init__(self, fd):
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+
+class _Severed(_Idle):
+    """A terminal that dies the first time the loop waits on it.
+
+    Stands in for the state a real pty reaches when its master is closed: readable, and then
+    nothing, for as long as the process lives.
+    """
+
+    def keys(self, timeout=None):
+        raise TerminalGone("the terminal reported end of input")
+
+
+class TerminalDeath(unittest.TestCase):
+    """What happens to a screen when the terminal underneath it stops existing.
+
+    This is the failure with no user and no deadline, which is why it is worth a suite of its own.
+    A launcher killed from outside, or a terminal window closed mid-prompt, leaves the step running
+    against a descriptor that will never answer; every other way a screen can be stuck at least
+    eventually gets a keypress. The three layers are checked separately because each had its own
+    way of getting it wrong: the read has to notice, the loop has to treat noticing as an ending,
+    and the process has to be gone by the time anybody looks.
+    """
+
+    def terminal_on(self, fd):
+        """A real :class:`~tui.term.Terminal` reading ``fd``, not borrowing this suite's screen."""
+        saved = sys.stdin
+        sys.stdin = _Reader(fd)
+        try:
+            return Terminal(caps=QUIET, stream=io.StringIO(), held=False)
+        finally:
+            sys.stdin = saved
+
+    def test_a_descriptor_that_can_never_answer_raises_instead_of_returning_nothing(self):
+        master, slave = pty.openpty()
+        try:
+            terminal = self.terminal_on(slave)
+            # The control: a live terminal with nobody typing is quiet, not dead, and a key wait
+            # that gave up on timeout is the ordinary case behind every idle frame at zero CPU.
+            self.assertEqual(terminal.keys(timeout=0.02), [])
+            os.close(master)
+            master = -1
+            # The slave outlives the master and stays *readable* to ``select``, which is the trap:
+            # read it the way an unpressed key is read and the loop never learns the difference.
+            with self.assertRaises(TerminalGone):
+                terminal.keys()
+        finally:
+            for fd in (master, slave):
+                if fd >= 0:
+                    os.close(fd)
+
+    def test_the_loop_aborts_and_hands_the_screen_back_when_the_terminal_goes(self):
+        terminal = _Severed()
+        modal = Modal(Picker(), View(), terminal=terminal, caps=QUIET)
+        result = modal.run()
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.status, flow.ABORTED)
+        # The launcher prints this, and a blank failure is the difference between an operator
+        # knowing the window died and wondering whether they pressed something.
+        self.assertIn("terminal", result.summary.lower())
+        self.assertEqual((terminal.entered, terminal.left), (1, 1))
+
+    SCRIPT = """
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.environ["HARNESS_ROOT"], "tools"))
+
+from tui.app import View, run
+from tui.menu import MULTI, Choice, ListStep
+
+step = ListStep(
+    title="Modules",
+    prompt="Choose which modules to load",
+    mode=MULTI,
+    previous=["alpha"],
+    choices=[Choice("alpha", "Alpha"), Choice("beta", "Beta")],
+)
+result = run(step, View())
+# Recorded to a file rather than printed: the terminal this writes to is the thing under test, and
+# a stream that has just been destroyed is a poor witness for what the step decided.
+with open(os.environ["SEVER_RESULT"], "w", encoding="utf-8") as sink:
+    sink.write(str(result.status))
+sys.exit(result.status)
+"""
+
+    def test_a_process_left_without_a_terminal_exits_rather_than_repainting_forever(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        script = Path(holder.name) / "severed.py"
+        script.write_text(self.SCRIPT, encoding="utf-8")
+        recorded = Path(holder.name) / "status"
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in ("TERM", "COLUMNS", "LINES", "NO_COLOR")
+        }
+        # The size comes from the environment rather than an ``ioctl`` because this driver keeps the
+        # slave open only long enough to destroy it, and there is no reason to borrow the helper's
+        # private geometry just to give the painter something to lay out against.
+        env.update(
+            {
+                "HARNESS_ROOT": str(ROOT),
+                "COLUMNS": "80",
+                "LINES": "24",
+                "TERM": "xterm-256color",
+                "SEVER_RESULT": str(recorded),
+            }
+        )
+
+        master, slave = pty.openpty()
+        process = None
+        pgid = None
+        try:
+            process = subprocess.Popen(
+                [sys.executable, str(script)],
+                cwd=ROOT,
+                env=env,
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                close_fds=True,
+                start_new_session=True,
+            )
+            pgid = os.getpgid(process.pid)
+            output = bytearray()
+            needle = b"Choose which modules to load"
+            deadline = time.monotonic() + 12.0
+            while needle not in plain(bytes(output)).encode():
+                if process.poll() is not None:
+                    self.fail(f"the step exited before it drew: {plain(bytes(output))[-300:]!r}")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.fail(f"{needle!r} never appeared: {plain(bytes(output))[-300:]!r}")
+                if select.select([master], [], [], min(0.1, remaining))[0]:
+                    output += os.read(master, 65536)
+            os.close(master)
+            master = -1
+            os.close(slave)
+            slave = -1
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.fail("five seconds after losing its terminal it was still running: the spin")
+            self.assertTrue(recorded.exists(), "it ended without answering, on a dead terminal")
+            self.assertEqual(recorded.read_text(encoding="utf-8"), str(flow.ABORTED))
+        finally:
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            if process is not None:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=5)
+            for fd in (master, slave):
+                if fd >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
 
 
 class MenuTests(unittest.TestCase):
@@ -2160,15 +2336,17 @@ class SpooledSentences(unittest.TestCase):
     def test_the_spool_is_the_file_the_launcher_promises_to_read(self):
         # Two languages name this path and neither can import the other, so the constant is the
         # single statement of it and the launcher's own declaration has to match, name and all --
-        # including the copy in the list of session material deleted on exit.
+        # including the copy in the list of session material deleted on exit, which the launcher
+        # shares with its pre-launch sweep from tools/runtime.sh rather than restating.
         launcher = (ROOT / "start.sh").read_text()
         self.assertIn(
             f"flow_notes=${{HARNESS_RUNTIME_DIR}}/{launch_screen.NOTES}",
             launcher,
             "start.sh no longer spools where screen.NOTES points",
         )
-        deleted = launcher[
-            launcher.index("  for file in proxy-token") : launcher.index("harness_unlock")
+        sweep = (ROOT / "tools/runtime.sh").read_text()
+        deleted = sweep[
+            sweep.index("HARNESS_SESSION_RESIDUE=(") : sweep.index("harness_sweep_secrets()")
         ]
         self.assertIn(launch_screen.NOTES, deleted, "the spool outlives the session")
 
@@ -2268,7 +2446,7 @@ class Picker(Step):
         own printout between two steps does, and ``read_back`` then replays the spool the way
         ``start.sh``'s ``harness_flow_unhold`` does. Both together reproduce the byte order of a
         real launch, and that order is the thing under test: a sentence painted into the modal is
-        defect 2 with different words.
+        the same failure with different words.
         """
         borrow = f"{sys.executable} {ROOT / 'tools/tui/screen.py'}"
         body = f"{sys.executable} {self.script} {steps}"

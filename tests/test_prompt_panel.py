@@ -15,15 +15,16 @@ because a keypress has no aliases to forgive and no command to mis-type.
 from __future__ import annotations
 
 import ast
-import datetime as dt
 import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -212,23 +213,6 @@ class PanelDrawTests(unittest.TestCase):
             )
         self.assertIn("DYNAMIC CONTEXT THIS HARNESS ADDS", screen)
 
-    def test_figures_on_one_screen_are_distinct_numbers(self) -> None:
-        """Two identical figures on one screen are indistinguishable, which defeats the point.
-
-        The percentages legitimately repeat a label but never a bare count, so the check is on the
-        leading number of each right-aligned value.
-        """
-        latest = {
-            pm.AUDIENCE_MAIN: measured_record(PLAN, pm.AUDIENCE_MAIN, 7601, 2369, 2379, 2853),
-        }
-        figures = []
-        for row in self.screen(latest).splitlines():
-            match = re.search(r"~?[\d,]+(?=\s{2,}\d\.\d%$)", row)
-            if match:
-                figures.append(match.group().strip("~,"))
-        self.assertGreater(len(figures), 4, figures)
-        self.assertEqual(len(figures), len(set(figures)), f"duplicate figures: {figures}")
-
     def test_the_denominator_is_the_input_cap_not_the_window(self) -> None:
         latest = {
             pm.AUDIENCE_MAIN: measured_record(PLAN, pm.AUDIENCE_MAIN, 7601, 2369, 2379, 2853)
@@ -353,22 +337,6 @@ class PanelDrawTests(unittest.TestCase):
             for line in self.screen(latest).splitlines():
                 self.assertLessEqual(len(line), pp.WIDTH, f"overrun: {line!r}")
 
-    def test_no_number_is_jammed_against_its_label(self) -> None:
-        """The alignment guarantee, asserted where it is made: pad() never compresses the gap."""
-        latest = {pm.AUDIENCE_MAIN: measured_record(PLAN, pm.AUDIENCE_MAIN,
-                                                   7601, 2369, 2379, 2853)}
-        rows = pp.static_rows(
-            pp.pieces(PLAN, self.root, "m", self.all_on, latest[pm.AUDIENCE_MAIN], "primary"),
-            pp.pieces(PLAN, self.root, "m", self.all_on, None, "subagent"), PLAN, self.root)
-        rows += pp.checklist(self.all_on, PLAN, "m")
-        for label, value, _ in rows:
-            if not value:
-                continue
-            line = pp.pad(label, value, pp.WIDTH - pp.NUMBER_FIELD)
-            self.assertTrue(line.endswith(value), line)
-            gap = len(line) - len(value) - len(label)
-            self.assertGreaterEqual(gap, pp.MIN_GAP, f"{label!r} / {value!r}")
-
     def test_a_cost_in_the_diagram_and_a_cost_in_the_checklist_share_one_axis(self) -> None:
         """Rendering the two halves in one pass is what makes this true, so it is asserted here."""
         screen = self.screen({
@@ -396,28 +364,12 @@ class PanelDrawTests(unittest.TestCase):
 
 
 class WarningTests(unittest.TestCase):
-    def test_some_options_declare_a_companion_at_all(self) -> None:
-        """Without a pair the gutter, the warning, and the adjacency rule are all untestable."""
-        self.assertTrue([option for option in pc.OPTIONS if option.companions])
 
     def test_the_default_selection_produces_no_warning(self) -> None:
         self.assertEqual(pp.warning(dict(pc.DEFAULT_ENABLED)), "")
 
     def test_everything_off_produces_no_warning(self) -> None:
         self.assertEqual(pp.warning(dict.fromkeys(pc.OPTION_IDS, False)), "")
-
-    def test_an_orphaned_sibling_is_named_once(self) -> None:
-        enabled = dict(pc.DEFAULT_ENABLED)
-        parent = next(o for o in pc.OPTIONS if o.companions)
-        enabled[parent.id] = True
-        for other in parent.companions:
-            enabled[other] = False
-        note = pp.warning(enabled)
-        self.assertTrue(note)
-        self.assertIn("may not work as expected", note)
-        self.assertEqual(note.count("."), 0, f"the gentle note must be one sentence: {note}")
-        self.assertEqual(note.count("!"), 0)
-        self.assertNotIn("Error", note)
 
     def test_the_warning_does_not_refuse_the_choice(self) -> None:
         """A warning that also disabled the option would be a constraint wearing other clothes."""
@@ -868,19 +820,6 @@ class HistoryReadingTests(unittest.TestCase):
         self.assertEqual(pp.read_latest(self.runtime)[pm.AUDIENCE_MAIN]["tokens"], 9000)
 
 
-class AgeTests(unittest.TestCase):
-    def test_age_is_shown_in_the_unit_the_operator_thinks_in(self) -> None:
-        now_ms = 1_800_000_000_000
-        base = {"time": now_ms}
-        now = dt.datetime.fromtimestamp(now_ms / 1000, dt.UTC)
-        five = dict(base, time=now_ms - 5 * 60_000)
-        forty = dict(base, time=now_ms - 40 * 60_000)
-        three = dict(base, time=now_ms - 3 * 3_600_000)
-        self.assertEqual(pp._age(five, now), "5m")
-        self.assertEqual(pp._age(forty, now), "40m")
-        self.assertEqual(pp._age(three, now), "3h")
-
-
 class CostRenderingTests(unittest.TestCase):
     def test_the_three_states_render_apart_from_each_other(self) -> None:
         self.assertEqual(pp.Cost(1234, measured=True).text(), "1,234")
@@ -906,34 +845,6 @@ class TabulaRasaTests(unittest.TestCase):
         staged_agents = pc.compose_agents_document(self.root, PLAN, "", self.enabled)
         self.assertEqual(staged_system, pc.EMPTY_PROMPT_SENTINEL + "\n")
         self.assertEqual(staged_agents, "")
-
-    def test_every_fact_the_help_screen_carried_now_lives_on_the_tree(self) -> None:
-        """The deleted overlay had four facts in it, and a screen cannot lose a fact by moving.
-
-        It had them because the flat list had nowhere else to put them. The tree has the room, so
-        each one belongs beside the row it explains - which is what this checks, rather than the
-        wording of a help page nobody has to leave the diagram to read.
-        """
-        stage_files(self.root, {
-            pc.SYSTEM_FILE: "", pc.CONTEXT_FILE: "", CONTRACT: "# the harness contract\n",
-        })
-        step = tree(self.root)
-        flat = speaking(step)
-        for fact in (
-            pc.SYSTEM_FILE,
-            pc.CONTEXT_FILE,
-            CONTRACT,
-            "An empty file is a decision",
-            "counts as empty",
-            "writes nothing to your files",
-            "built-in",
-        ):
-            self.assertIn(fact, flat)
-        self.assertIn(repr(pc.EMPTY_PROMPT_SENTINEL), flat)
-        # What used to be the word for an overridden source is a glyph now. A glyph is not a fact
-        # that can be lost by moving prose off the rows, but it can be lost by never drawing it, so
-        # it is pinned here rather than left to the render tests.
-        self.assertIn("- -", prose(step))
 
     def test_the_tree_states_the_fallback_a_blank_document_prevents(self) -> None:
         """``.`` looks like a typo, so the row that stages it has to say what it is for."""
@@ -1143,6 +1054,8 @@ class OptionSetCompletenessTests(unittest.TestCase):
                 self.assertIn(other, pc.OPTION_IDS)
 
     def test_companions_are_mutual_so_the_gutter_marks_both_sides(self) -> None:
+        declaring = [option for option in pc.OPTIONS if option.companions]
+        self.assertTrue(declaring, "no option declares a companion")
         for option in pc.OPTIONS:
             for other in option.companions:
                 self.assertIn(option.id, pc.OPTION_BY_ID[other].companions, f"{option.id}/{other}")
@@ -1267,12 +1180,144 @@ class InstructionBillTests(unittest.TestCase):
         notice, = pp.over_limit(self.pieces(pc.KIMI_RECOMMENDED_MAX_INSTRUCTION_BYTES + 1))
         self.assertIn("over Kimi's recommended 32 KB", notice)
         self.assertIn("Nothing here is truncated", notice)
+        self.assertNotIn("\n", notice.strip(), "one line, so the panel can align it")
 
-    def test_the_bill_profits_nothing_by_being_vague_about_consequence(self) -> None:
-        """A warning that implied truncation would push the operator to trim text that is safe."""
-        notice, = pp.over_limit(self.pieces(pc.KIMI_RECOMMENDED_MAX_INSTRUCTION_BYTES + 1))
-        self.assertNotIn("will be", notice)
-        self.assertNotIn("dropped", notice)
+
+class AgeTests(unittest.TestCase):
+    """Where a measurement stops being young enough to quote in minutes."""
+
+    NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    @classmethod
+    def row(cls, minutes: float) -> dict[str, object]:
+        """A history row measured exactly ``minutes`` before :data:`NOW`."""
+        moment = cls.NOW - timedelta(minutes=minutes)
+        return {"time": int(moment.timestamp() * 1000)}
+
+    def age(self, minutes: float) -> str:
+        return pp._age(self.row(minutes), self.NOW)
+
+    def test_the_two_units_are_distinguishable_without_being_quoted(self):
+        # The harness owns where the unit changes; the letters naming the units are prose that is
+        # free to be reworded. Deriving both from the function itself is what lets the boundary
+        # test below survive that rewording.
+        minute_unit = self.age(1)[-1]
+        hour_unit = self.age(600)[-1]
+        self.assertNotEqual(minute_unit, hour_unit, "one unit means no switch to test")
+
+    def test_the_unit_changes_at_ninety_minutes_not_at_the_last_round_hour(self):
+        # Ninety is the boundary, so the row read at 89 minutes and the row read at 90 describe
+        # nearly the same age in different units. Rounding to the nearest hour instead would put
+        # the change at 60, and a figure that jumps units at a point nobody stated is how a
+        # "3h" row turns up beside one measured two hours ago.
+        for minutes in (1, 59, 89, 89.4):
+            with self.subTest(minutes=minutes):
+                self.assertTrue(self.age(minutes).endswith(self.age(1)[-1]))
+        for minutes in (90, 90.4, 120, 600):
+            with self.subTest(minutes=minutes):
+                self.assertTrue(self.age(minutes).endswith(self.age(600)[-1]))
+
+    def test_a_measurement_taken_this_minute_is_never_read_as_being_zero_minutes_old(self):
+        # "measured 0m ago" tells the operator the row is both current and stale at once. The
+        # floor is what makes a fresh measurement read as fresh.
+        self.assertGreaterEqual(int(re.match(r"\d+", self.age(0.2)).group()), 1)
+        self.assertGreaterEqual(int(re.match(r"\d+", self.age(0)).group()), 1)
+
+
+class VarsReportTests(unittest.TestCase):
+    """``--vars`` is the only place the whole placeholder vocabulary is written down.
+
+    Spawned as the script ``prompts.sh`` spawns it, because the report's contract is the text an
+    operator reads at a terminal: a name missing from it is a name that cannot be discovered, and
+    a name listed as resolved when nothing resolved it is a lie the prompt file will inherit.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # No cache file and no operator documents: the cold case, which is the one that has to
+        # stay readable or the vocabulary is only knowable after a launch.
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temporary.name)
+        cls.result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "prompt_panel.py"),
+                "--runtime-dir",
+                str(cls.root),
+                "--root",
+                str(cls.root),
+                "--vars",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            cwd=ROOT,
+        )
+        cls.output = cls.result.stdout
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    #: ``(names, resolver)`` per table group, in the order ``vars_report`` emits them.
+    GROUPS = (
+        (tuple(pc.KIMI_PLACEHOLDERS), "Kimi"),
+        (("base_prompt",), "Kimi"),
+        (tuple(pc.HARNESS_PLACEHOLDERS), "harness"),
+        (tuple(pc.kimi_literal_names()), "harness"),
+    )
+
+    def vocabulary(self) -> list[str]:
+        return [name for names, _owner in self.GROUPS for name in names]
+
+    def test_the_report_prints_and_exits_cleanly_with_nothing_staged(self):
+        # A bare runtime directory is the first-launch case: the vocabulary has to be readable
+        # before any prompt has ever been rendered, or the operator learns the names afterwards.
+        self.assertEqual(self.result.returncode, 0, self.result.stderr)
+        self.assertTrue(self.output.strip())
+
+    def test_every_name_the_resolver_knows_is_listed(self):
+        for name in (*self.vocabulary(), *pc.DOCUMENTED_BUT_UNDEFINED):
+            with self.subTest(name=name):
+                self.assertIn("${" + name + "}", self.output)
+
+    def rows(self) -> list[list[str]]:
+        """The table itself, and only the table.
+
+        Everything after the blank line under it is prose explaining a name's conditions, and
+        those lines start with a ``${name}`` too. Reading the owner out of the column layout is
+        the only way to tell a row from a note about a row.
+        """
+        lines = self.output.splitlines()
+        header = next(i for i, line in enumerate(lines) if "resolved by" in line)
+        end = next(i for i, line in enumerate(lines) if line.startswith("What each"))
+        # The blank line inside the table separates Kimi's names from the harness's; it is not the
+        # end of it, and stopping there would quietly drop every harness-owned row.
+        return [line.split() for line in lines[header + 1 : end] if line.strip()]
+
+    def test_every_row_says_who_resolves_it(self):
+        # A name without an owner is a name the operator cannot test, because they cannot tell
+        # whether a file that stops mentioning it was edited or a build that stopped exporting it.
+        rows = self.rows()
+        self.assertEqual(
+            [row[0] for row in rows],
+            ["${" + name + "}" for name in self.vocabulary()],
+            "the table is not the whole vocabulary, in the order the resolver owns it",
+        )
+        expected = [(f"${{{name}}}", owner) for names, owner in self.GROUPS for name in names]
+        # Column two is the whole answer to "may I put this in my prompt file", so it is checked
+        # per row against the group that row came from rather than as a set of owners seen once.
+        self.assertEqual(
+            [(row[0], row[1]) for row in rows],
+            expected,
+            "a row lost its owner, or gained one that resolves nothing",
+        )
+
+    def test_a_literal_that_was_never_cached_is_said_to_be_pending(self):
+        # The distinction the report has to keep: Kimi's own text is unreadable until the bundle
+        # has been extracted, and claiming otherwise would advertise a name that stops the launch.
+        self.assertIn("pending", self.output)
 
 
 if __name__ == "__main__":

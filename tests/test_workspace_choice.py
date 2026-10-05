@@ -229,7 +229,7 @@ class PathPolicyTests(Tree):
         self.assertTrue(fresh.usable)
         self.assertTrue(fresh.creatable)
         self.assertFalse(fresh.exists)
-        self.assertEqual(fresh.name, "new-project")
+        self.assertEqual(os.path.basename(fresh.path), "new-project")
         # Two names deep is a typo, not an intention, and the missing parent is what says so.
         deeper = paths.usable(self.path("nowhere/deep"))
         self.assertFalse(deeper.usable)
@@ -651,7 +651,6 @@ class WorkspaceScreenTests(Screen):
         self.assertNotIn("Remove it from the Recent", frames[-1])
 
 
-
 class ChoiceToolTests(Tree):
     """The contract between the picker and :file:`start.sh`: one line on standard output."""
 
@@ -693,11 +692,31 @@ class ChoiceToolTests(Tree):
         self.assertEqual(result.stdout, self.path("live") + "\n")
         self.assertIn("No terminal", result.stderr)
 
+    def test_a_launch_with_no_terminal_names_the_terminal_as_its_remedy(self):
+        # Nothing remembered, and no terminal to ask with. `--non-interactive` is not why this
+        # launch has no answer, so telling it to drop a flag it never passed sends the operator
+        # off to run the command they just ran.
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "tools/workspace_choice.py"), "--root", str(self.base)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("no terminal to ask with", result.stderr)
+        self.assertIn("./start.sh from a terminal", result.stderr)
+        self.assertNotIn("--non-interactive", result.stderr)
+        # A launch that was never asked has no answer to report as its own.
+        self.assertNotIn("using the remembered workspace", result.stderr)
+
     def test_the_choice_of_a_screen_is_recorded_for_the_next_unattended_launch(self):
         # The screen and the file are one contract: a launch that chose a workspace but did not
         # record it would ask again, and an unattended launch would find nothing to take.
         registry.touch(self.base, self.path("live"))
-        self.assertEqual(workspace_choice.choose(self.base, interactive=False), self.path("live"))
+        self.assertEqual(workspace_choice.choose(self.base), self.path("live"))
         entries = registry.load(self.base)
         self.assertEqual([entry.path for entry in entries], [self.path("live")])
 

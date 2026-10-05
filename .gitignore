@@ -4,6 +4,10 @@
 # Root-anchored so a module or subdirectory prompt file of the same name stays visible.
 /SYSTEM.md
 /CONTEXT.md
+# The tuned ceilings are read by existence and belong to one machine's Docker Desktop allocation.
+# compose.limits.yaml.example is the tracked schema; the live file is not. Root-anchored because
+# tools/runtime.sh reads it only from the repository root.
+/compose.limits.yaml
 .local/
 **/__pycache__/
 **/*.pyc

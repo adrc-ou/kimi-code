@@ -45,8 +45,8 @@ obeys only them must deal with tiers two and three as well as tier one.
 | 6 | Plugin contributions | bundle `127779602` | both | `${plugin_sections}` placement; no plugins installed | yes (already nil) |
 | 7 | Additional directories | bundle `127778552` | both | `/add-dir`, `.kimi-code/local.toml` | yes (already nil) |
 | 8 | Reply style, notify guidance | bundle `127774158`, `127777711` | both | CLI/server only, not file or env | no |
-| 9 | Harness envelope | `tools/policy.py:624-915` | split: limits both, table+parallelism **main only** | the launch panel, per block | yes, per block |
-| 10 | Module guidance | `tools/modules.py:139` | all lanes | deselect the module or switch the block off | yes |
+| 9 | Harness envelope | `tools/policy.py:768-1085` | split: limits both, table+parallelism **main only** | the launch panel, per block | yes, per block |
+| 10 | Module guidance | `tools/modules.py:188` | all lanes | deselect the module or switch the block off | yes |
 | 11 | Subagent role files | `runtime/agents/*.md` | that subagent only | project `.kimi-code/agents/` + `override: true` | yes, delete the file |
 | 12 | Per-step injections | bundle `132970005` registry | each agent separately | one kill switch exists, for `permission_mode` | **no** |
 | 13 | Tool schemas | bundle tool catalogue + MCP servers | per profile | `[tools]`, `tools:`/`disallowedTools:`, `runtime/mcp.json` | partially |
@@ -106,7 +106,7 @@ template contains the literal substring `${base_prompt}`, and it then expands to
 `this.user.getDefaultProfile().renderSystemPrompt(context)` — that is, to Kimi's
 `system_default` fully rendered. So in our `SYSTEM.md.example`, `${base_prompt}`
 means "wrap", and its absence means "replace", exactly as the four-row table in
-`prompt_context.compose_system_document()` (`tools/prompt_context.py:529-549`) specifies.
+`prompt_context.compose_system_document()` (`tools/prompt_context.py:669-720`) specifies.
 
 `renderPrompt` (bundle `127763660`, `_base/utils/render-prompt.ts`) substitutes
 with `/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g`, replacing only `string` and `number`
@@ -202,9 +202,9 @@ itself uses a literal `32768`) — and published as
 **Instruction text is never truncated.** The changelog records silent truncation
 being *replaced* by this warning. The docs give no number.
 
-This stack ships 6,067 bytes of contract source (`runtime/AGENTS.md` with its
-comments stripped) and 9,592 bytes once the all-lane blocks are composed in, out of
-the 32,768-byte budget that the user's own `AGENTS.md` files also draw on. The cap
+This stack ships 6,783 bytes of contract source (`runtime/AGENTS.md`, which carries
+no HTML comments to strip) and 8,879 bytes once the all-lane blocks are composed in,
+out of the 32,768-byte budget that the user's own `AGENTS.md` files also draw on. The cap
 is shared with the operator's project instructions, so growth here spends headroom
 that belongs to them.
 
@@ -216,7 +216,7 @@ from context cleanly. Contrast surface 1, where emptiness means "use Kimi's".
 `.local/runtime/<instance>/AGENTS.md`, published to Compose as
 `KIMI_RENDERED_AGENTS_MD`, bound to `/stage/AGENTS.md:ro` (`compose.yaml:11`), and
 installed by the root-only initializer at `0440` with the ext4 immutable flag
-(`container/initialize-agent-state.py:29,37,77`). It is *not* a verbatim copy of
+(`container/initialize-agent-state.py:29,41,74`). It is *not* a verbatim copy of
 `runtime/AGENTS.md`: that file is only the tier-two source, and the enabled blocks
 are composed after it. The file is always written, even when it composes to empty,
 because Docker turns a missing bind source into a directory and that fails at
@@ -347,8 +347,8 @@ reported rather than silently ignored.
 **Where the composition lands.** The contract goes to
 `.local/runtime/<instance>/AGENTS.md` and is published as
 `KIMI_RENDERED_AGENTS_MD`; the prompt goes to `.../SYSTEM.md` and is published as
-`KIMI_SYSTEM_MD` (`tools/render_runtime.py:164-173`). Both are bound read-only into
-the initializer (`compose.yaml:11,14`) and installed `0440` and immutable. Both are
+`KIMI_SYSTEM_MD` (`tools/render_runtime.py:183-184`). Both are bound read-only into
+the initializer (`compose.yaml:11,15`) and installed `0440` and immutable. Both are
 regenerated every launch, so in-session edits do nothing until the next start, and
 neither is on the cleanup delete-list: they are re-stamped rather than secret, and
 the launcher's checks read them after the session ends.
@@ -387,7 +387,7 @@ prompt template**, rendered by `agentProfileFromFile` →
 `renderPromptTemplateResult(definition.prompt, context, { skillActive },
 basePrompt)`.
 
-**Delivery.** `assemble()` (`tools/modules.py:153`) merges `runtime/{skills,
+**Delivery.** `assemble()` (`tools/modules.py:202`) merges `runtime/{skills,
 agents, tools}` and every selected module's `runtime/{skills, agents, tools}`
 into `.local/runtime/<instance>/assets/` (duplicates raise), which reaches the
 container as volume `kimi-assets` → `/opt/kimi-runtime` (`compose.yaml:194-195`),
@@ -557,8 +557,8 @@ tokens were omitted. `TASK_RESUME_TERMINATION_VARIANT` (bundle `133342901`) is a
 reminder variant for background tasks that outlived a compaction, not part of the
 summary template.
 
-`[loop_control] reserved_context_size` and `compaction_max_attempts` control only
-*when* it fires; `PreCompact`/`PostCompact` hooks exist (`runPreCompact`, bundle
+`[loop_control] reserved_context_size` and `max_attempts_per_step` control how much
+headroom a compaction leaves and how often it may be retried, not *when* it fires; `PreCompact`/`PostCompact` hooks exist (`runPreCompact`, bundle
 `133059871`) but *"their return values are completely ignored"*, so the
 compaction prompt is not replaceable.
 
@@ -605,11 +605,11 @@ Estimated, this checkout, all blocks enabled and the ComfyUI module selected:
 
 | piece | tokens | bytes | reaches |
 | --- | --- | --- | --- |
-| `runtime/AGENTS.md`, comments stripped | 1,659 | 6,633 | both |
+| `runtime/AGENTS.md` | 1,696 | 6,783 | both |
 | usage limits block | 524 | — | both |
-| module guidance, ComfyUI | 564 | 2,254 | both |
-| **composed all-lane contract** | **2,747** | **10,985** | both |
-| composed all-lane contract, no module | 2,183 | — | both |
+| module guidance, ComfyUI | 564 | 2,256 | both |
+| **composed all-lane contract** | **2,784** | **11,135** | both |
+| composed all-lane contract, no module | 2,220 | 8,879 | both |
 | lane table block | 889 | — | main only |
 | parallel-work block | 474 | — | main only |
 | **composed system prompt**, `${base_prompt}` wrapper plus both blocks | **1,368** | **5,469** | main only |
@@ -636,7 +636,7 @@ estimator is Kimi's own heuristic — one token per four ASCII characters, one p
 non-ASCII character — and **not** the provider's tokenizer, so a percentage is a
 sense of scale and not a reservation. The measured contract of 2,379 is an older
 draft of the same document: since that session the contract absorbed the lane-role
-rewrite and the ComfyUI guidance grew, so the composed figure is 2,747 today. The
+rewrite and the ComfyUI guidance grew, so the composed figure is 2,784 today. The
 two are not expected to agree exactly, which is the whole reason both columns
 exist: the estimate is what a launch from this checkout will pay, the measurement
 is what one launch actually paid. And `${cwd_listing}` is inside the framing region, so a
@@ -660,11 +660,14 @@ budget should not quietly spend one of its own.
 
 Two of these numbers are a fence rather than a note.
 `tests/test_prompt_guidance.py::SizeFenceTests` holds the harness's own
-contract text under 2,250 estimated tokens and the generated half of the
-main prompt under 1,400, both with module guidance excluded, so what is
-bounded is the table's no-module row — 2,183 today — rather than the 2,747
+contract text under 2,500 estimated tokens and the generated half of the
+main prompt under 1,550, both with module guidance excluded, so what is
+bounded is the table's no-module row — 2,220 today — rather than the 2,784
 one, because the difference between them is prose this repository does not
-own. The thresholds sit above the figures they bound with deliberate
+own. Each ceiling is paired with how far below it the composed text is
+allowed to sit, so a ceiling cannot drift away from the document it claims
+to bound without a second number moving too. The thresholds sit above the
+figures they bound with deliberate
 slack: a fence tight
 enough to be a weather report fails on every reword and gets loosened
 until it means nothing. Restoring the hand-written provider-policy
@@ -747,7 +750,7 @@ write; `tools/managed_section.py` is deleted and
 `tests/test_configuration.py::test_runtime_agents_md_carries_no_model_number` keeps
 the contract pointing at the generated headings rather than at the workspace file.
 `module-guidance.md` and `extension-snapshot/` are
-both on the launcher's cleanup list now (`start.sh:69,72`), and `${now}`, which the
+both on the launcher's cleanup list now (`start.sh:128,131`), and `${now}`, which the
 upstream docs advertise and `systemPromptVars()` does not implement, is unused
 anywhere in this repository — `${harness.date}` is the name we do resolve.
 

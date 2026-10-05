@@ -71,9 +71,8 @@ Refusal = (DefinitionError, policy.ResolutionError, OSError, ValueError)
 def write_text(path: Path, text: str) -> None:
     """Publish a session artifact atomically, readable only by its owner.
 
-    The temp name used to be a fixed ``<name>.tmp`` created with ``O_EXCL``: a launch killed
-    between the write and the rename left that file behind, and every launch after it died on
-    ``FileExistsError`` with no path to recovery. ``write_private`` picks a unique name.
+    A thin alias of :func:`~private_file.write_private`, which writes through a uniquely named
+    temporary file so that concurrent or interrupted launches cannot collide.
     """
     write_private(path, text)
 
@@ -185,10 +184,9 @@ def agent_rows(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
             span = f", {token_span(tokens)} window" if tokens is not None else ""
             twin["label"] = f"{model['label']} - Long (queued{span})"
             rows.append(twin)
-        if "primary" in model["lanes"]:
-            row = dict(model)
-            row["label"] = f"{model['label']} - Medium (concurrent)"
-            rows.append(row)
+        row = dict(model)
+        row["label"] = f"{model['label']} - Medium (concurrent)"
+        rows.append(row)
     return rows
 
 

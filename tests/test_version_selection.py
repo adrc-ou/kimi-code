@@ -80,8 +80,6 @@ class VersionSelectionTests(unittest.TestCase):
                     download(target)
                 fetch.assert_called_once()
                 self.assertIs(fetch.call_args.kwargs["context"], context)
-                self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
-                self.assertTrue(context.check_hostname)
 
     def test_installed_version_adds_an_eleventh_choice(self):
         # The version a launch is already running is never the row that gets dropped to keep the

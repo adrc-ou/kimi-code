@@ -5,12 +5,19 @@ import importlib.util
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+# The repository root, so that `tests.helpers` resolves under every way of running the suite.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tests.helpers import tracked_files  # noqa: E402
+
 spec = importlib.util.spec_from_file_location(
     "register_workspace", ROOT / "tools/register_workspace.py"
 )
@@ -130,10 +137,9 @@ class ScratchTests(unittest.TestCase):
         for name in registration.LEDGER_FILES:
             self.assertIn(f"{scratch}/{name}", contract)
         self.assertNotIn(".agent-state", contract)
-        for document in [*ROOT.rglob("SKILL.md")]:
-            if ".git" in document.parts or ".local" in document.parts:
-                continue
-            self.assertNotIn(".agent-state", document.read_text(), str(document))
+        for document in tracked_files(".md"):
+            if document.name == "SKILL.md":
+                self.assertNotIn(".agent-state", document.read_text(), str(document))
 
 
 if __name__ == "__main__":

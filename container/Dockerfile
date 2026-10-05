@@ -130,6 +130,7 @@ RUN chmod 0755 /usr/local/sbin/ensure-runtime-user \
       -m 700 \
       /home/agent/.kimi-code \
       /home/agent/.serena \
+      /home/agent/.local \
       /workspace
 
 USER ${AGENT_UID}:${AGENT_GID}

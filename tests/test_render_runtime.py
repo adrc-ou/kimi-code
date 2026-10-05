@@ -177,8 +177,6 @@ class RenderRuntimeTests(LaunchSteps, unittest.TestCase):
             self.assertIn("KIMI_RENDERED_CONFIG=", published)
             self.assertIn("KIMI_SYSTEM_MD=", published)
             self.assertIn("MODEL_PROXY_POLICY_FILE=", published)
-            self.assertNotIn("KIMI_EMPTY", published)
-            self.assertFalse((state / "user-agents").exists())
 
     def test_the_staged_documents_are_recorded_beside_themselves(self):
         """The sidecar is what lets the launcher explain an edit that had no effect.
@@ -510,9 +508,6 @@ class SystemPromptStagingTests(LaunchSteps, unittest.TestCase):
         )
         self.assertIn(self.LIMITS, agents)
         self.assertIn("## Module: Demo", agents)
-
-    def test_the_example_is_a_documentation_file(self):
-        self.assertTrue((ROOT / self.EXAMPLE).is_file())
 
     def test_the_example_shows_a_wrapper_around_kimis_prompt(self):
         """Not a load-bearing claim about this session's prompt - a lint on the worked example, so

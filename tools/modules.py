@@ -186,7 +186,7 @@ def write_json(path, value):
 
 
 def module_agents_text(modules):
-    """The module text that has to reach the agent, staged for the system prompt.
+    """The module text that has to reach the agent, staged for the all-lane operating contract.
 
     Each selected module's own ``AGENTS.md`` is the guidance, verbatim under a heading naming the
     module. It is staged into the instance runtime directory rather than written into the
@@ -236,11 +236,11 @@ def assemble(root, runtime, modules, workspace):
     for module in modules:
         initialize(workspace, module.get("workspace_directories", []))
     if __package__:
-        from .render_runtime import MODULE_GUIDANCE_FILE, write_secret
+        from .render_runtime import MODULE_GUIDANCE_FILE, write_runtime_file
     else:
-        from render_runtime import MODULE_GUIDANCE_FILE, write_secret
+        from render_runtime import MODULE_GUIDANCE_FILE, write_runtime_file
 
-    write_secret(runtime / MODULE_GUIDANCE_FILE, module_agents_text(modules))
+    write_runtime_file(runtime / MODULE_GUIDANCE_FILE, module_agents_text(modules))
 
 
 def reconcile_installed(runtime, modules):
@@ -340,10 +340,10 @@ def main():
         return
     if __package__:
         from .env_values import read_env_values
-        from .render_runtime import write_secret
+        from .render_runtime import write_runtime_file
     else:
         from env_values import read_env_values
-        from render_runtime import write_secret
+        from render_runtime import write_runtime_file
     import shlex
 
     values = read_env_values(Path(os.environ["HARNESS_RESOLVED_BOOTSTRAP"]))
@@ -428,7 +428,7 @@ def main():
         runtime / "compose/module-environment.json",
         {"services": {"kimi-agent": {"environment": agent}}},
     )
-    write_secret(
+    write_runtime_file(
         runtime / "module.env", "".join(f"{k}={shlex.quote(v)}\n" for k, v in session.items())
     )
     # The answers, kept by name for the next pass of the flow to read back. The record is only

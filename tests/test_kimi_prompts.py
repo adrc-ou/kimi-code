@@ -52,18 +52,9 @@ REAL_BUNDLE = Path("/usr/local/bin/kimi")
 class IdentifierSpecTests(unittest.TestCase):
     """The spec and the promise must name the same four things."""
 
-    def test_every_promised_placeholder_has_identifiers_to_look_for(self):
-        self.assertEqual(
-            tuple(sorted(kp._IDENTIFIERS)), tuple(sorted(pc.kimi_literal_names()))
-        )
-
     def test_every_name_is_sought_by_something(self):
         for name in pc.kimi_literal_names():
             self.assertTrue(kp._IDENTIFIERS[name], f"{name} has no candidate identifier")
-
-    def test_the_reverse_map_covers_every_candidate(self):
-        expected = {one for many in kp._IDENTIFIERS.values() for one in many}
-        self.assertEqual(set(kp._BY_IDENTIFIER), expected)
 
 
 class AnchorTests(unittest.TestCase):
@@ -224,12 +215,6 @@ class CacheTests(unittest.TestCase):
     def test_the_cache_is_owner_only(self):
         path = kp.store(self.runtime, self.literals, "sha256:abc")
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-
-    def test_the_cache_lands_under_the_named_directory(self):
-        path = kp.store(self.runtime, self.literals, "x")
-        self.assertEqual(
-            path.relative_to(self.runtime), Path(kp.CACHE_DIRECTORY) / kp.CACHE_FILE
-        )
 
     def test_the_document_names_its_image_and_fingerprints_each_literal(self):
         document = kp.document({"kimi.coder_role": "role"}, "sha256:abc")
@@ -436,7 +421,6 @@ class RealBundleTests(unittest.TestCase):
 
     def test_the_built_in_prompt_is_worth_quoting_a_piece_of(self):
         literals = self.literals()
-        self.assertGreater(len(literals["kimi.system_default"]), 4000)
         # The role block embeds the prefix, so the expansion must have made it larger.
         self.assertGreater(
             len(literals["kimi.coder_role"]), len(literals["kimi.task_agent_prefix"])

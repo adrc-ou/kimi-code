@@ -178,7 +178,7 @@ class AskTests(unittest.TestCase):
         step, given = script.asks[0][0], script.asks[0][1]
         return step, reply, given
 
-    def test_the_step_asks_the_same_question_the_old_picker_printed(self):
+    def test_the_primary_screen_asks_which_model_the_main_agent_should_run(self):
         step, reply, _ = self.ask()
         self.assertEqual(reply, "big")
         self.assertEqual(step.title, PRIMARY)

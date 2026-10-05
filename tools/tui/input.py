@@ -257,7 +257,8 @@ class FieldStep(Step):
     def _field(self, state: FieldState) -> Row:
         """The field's own row: what has been typed, then where the next character goes.
 
-        The focused row is already the one the gutter marks and the theme draws in bold cyan, but
+        The focused row is already the one the gutter marks and the colour roles draw in bold
+        cyan, but
         every one of those cues is a *colour* cue except the marker, and with colour off an empty
         field is otherwise an indistinguishable blank. The caret is the glyph that says text goes
         here, in a terminal that has no cursor to say it with.

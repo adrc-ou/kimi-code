@@ -46,7 +46,10 @@ mount:
   volumes, and the agent sees no host path behind them except the workspace;
 - a root-only, network-isolated one-shot initializer runs before the agent. It
   owns the staging content, repairs ownership to the agent UID/GID, and is the
-  only service with `FOWNER`/`LINUX_IMMUTABLE`;
+  only service with `LINUX_IMMUTABLE`, and the only one in the core stack taking
+  `FOWNER`. The search overlay's own root one-shot, `searxng-init`, also takes
+  `FOWNER` to chown and chmod its cache volume; it holds no `LINUX_IMMUTABLE` and
+  touches no agent-owned path;
 - staged content is root-owned, readable only through the agent's primary group,
   and never writable by the agent. The tree in the runtime-asset mirror volume
   and the empty placeholder volumes for user-scoped agents, skills, and plugins
@@ -145,15 +148,17 @@ module's documentation for its application-specific trust boundary.
 A module that serves a browser UI has to satisfy it without weakening the
 credential that guards the same service's API. ComfyUI on macOS is that case: the
 host application listens on loopback only, and the bridge which makes it reachable
-from the sandbox demands a bearer token on every path, including the ones a page
-loads on the user's behalf.
+from the sandbox demands a credential on every path it forwards: the bearer token
+for an API client, or the session cookie that token bought for a browser. Its own
+two login paths carry no credential and proxy nothing.
 
 The token is never given to a browser. A client already holding it exchanges it
 for one single-use grant; the grant reaches the page in a URL fragment, which a
 browser transmits to no one, logs nowhere, and repeats in no `Referer`; and that
 page redeems the grant for an HttpOnly, SameSite=Strict session cookie before
-rewriting its own address. Grants are valid once and for seconds. Sessions are
-short, bounded in number, and bound to the host that minted them. Every path still
+rewriting its own address. Grants are valid once and for 60 seconds. Sessions are
+bounded in number (8 by default), bound to the host that minted them, and live 12
+hours unless the launcher sets another `--session-ttl`. Every forwarded path still
 authenticates; only the form of proof a browser can carry has changed.
 
 Reachability is not widened either. The sandbox origin is a plaintext listener on

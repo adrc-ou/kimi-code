@@ -46,7 +46,7 @@ cleanup() {
   return "${status}"
 }
 trap cleanup EXIT
-mkdir -p "${fixture}/workspace" "${fixture}/empty" "${fixture}/assets/skills" \
+mkdir -p "${fixture}/workspace" "${fixture}/assets/skills" \
   "${fixture}/assets/agents" "${fixture}/assets/tools" "${fixture}/credentials" \
   "${fixture}/prompt-log"
 touch "${fixture}/config.toml" "${fixture}/SYSTEM.md" "${fixture}/AGENTS.md" "${fixture}/secret" \
@@ -183,7 +183,7 @@ probe = {
     "volumes": [v for v in initializer["volumes"] if v["type"] == "volume"],
     "entrypoint": ["python", "-c"],
     "command": ["import os; from pathlib import Path; "
-                "roots=[Path(\"/state/kimi\"),Path(\"/state/serena\")]; "
+                "roots=[Path(\"/state/kimi\"),Path(\"/state/serena\"),Path(\"/state/local\")]; "
                 "assert all(p.stat().st_uid == os.getuid() and p.stat().st_mode & 511 == 448 for p in roots); "
                 "p=roots[0]/\"server/instances\"; p.mkdir(parents=True,exist_ok=True); "
                 "marker=p/\"preserved\"; "
@@ -215,7 +215,8 @@ unpin = "\n".join([
 unpin_service = dict(initializer, entrypoint=["python", "-c"], command=[unpin])
 print(json.dumps({"services": {"state-init-test": initializer, "state-write-test": probe,
                                "state-unpin-test": unpin_service},
-                  "volumes": {"kimi-state": {}, "serena-state": {}, "kimi-assets": {},
+                  "volumes": {"kimi-state": {}, "serena-state": {}, "harness-state": {},
+                              "kimi-assets": {},
                               "kimi_user_agents": {}, "kimi_user_skills": {},
                               "kimi_user_plugins": {}}}))
 ' >"${fixture}/state-test.json"

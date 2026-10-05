@@ -8,12 +8,14 @@ supply, because a fixture that diverges from ``./models`` and ``./providers`` te
 
 from __future__ import annotations
 
+import atexit
 import fcntl
 import importlib.util
 import os
 import pty
 import re
 import select
+import signal
 import struct
 import subprocess
 import sys
@@ -52,6 +54,45 @@ def add_tools_to_path() -> None:
     tools = str(ROOT / "tools")
     if tools not in sys.path:
         sys.path.insert(0, tools)
+
+
+#: What a fallback scan treats as not-source: version control, the launcher's generated state,
+#: byte-compiled output, and installed dependencies. Only used when ``git`` cannot list the index.
+UNSCANNED_DIRECTORY_NAMES = frozenset(
+    {".git", ".local", ".ruff_cache", ".serena", "__pycache__", "node_modules"}
+)
+
+
+def tracked_files(*suffixes: str) -> list[Path]:
+    """The repository's own files, optionally filtered by suffix such as ``".json"``.
+
+    Several tests assert that no source file says something. Written as a walk of the checkout,
+    that becomes a scan of everything the checkout happens to hold — the dependency tree the agent
+    image installs, staged launcher state, an earlier run's scratch — which is both slower than the
+    repository and a different question than the one being asked. The index is what "tracked" means.
+
+    Falls back to a walk that prunes :data:`UNSCANNED_DIRECTORY_NAMES` when ``git`` declines to
+    answer, since a checkout owned by a different user than the one running the suite is refused by
+    default. The fallback is a superset, so it can only ever be stricter, never laxer.
+    """
+    listed = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z"],
+        check=False,
+        capture_output=True,
+    )
+    if listed.returncode == 0:
+        names = [name for name in map(os.fsdecode, listed.stdout.split(b"\0")) if name]
+        paths = [ROOT / name for name in names]
+    else:
+        paths = []
+        for directory, subdirectories, files in os.walk(ROOT):
+            subdirectories[:] = [
+                name for name in subdirectories if name not in UNSCANNED_DIRECTORY_NAMES
+            ]
+            paths.extend(Path(directory) / name for name in files)
+    if suffixes:
+        paths = [path for path in paths if path.suffix in suffixes]
+    return sorted(path for path in paths if path.is_file())
 
 
 def reserved_context_size() -> int:
@@ -142,7 +183,7 @@ def plain(data: bytes) -> str:
 
     A fullscreen interface writes colour into the middle of a label — the focus wash, a dimmed
     segment — so matching raw bytes against ``[ ] Beta`` is a test that happens to pass only while
-    the theme keeps that row one run of one attribute. Assertions belong on the text.
+    the colour roles keep that row one run of one attribute. Assertions belong on the text.
     """
     return re.sub(_ESCAPE, b"", data).decode("utf-8", "replace")
 
@@ -166,6 +207,65 @@ class PtyRun:
     restored: bool
 
 
+#: Process groups this module has handed a terminal to and not yet finished cleaning up.
+_SPAWNED_GROUPS: set[int] = set()
+
+#: Groups still alive a grace period after :func:`run_in_pty` killed them. Only a process that
+#: refuses to die puts an entry here, which is why a test reads this instead of a raise: the
+#: ``finally`` doing the recording may be unwinding somebody else's failure, and a leak reported by
+#: masking the assertion that was already in flight is a leak nobody sees.
+LEAKED_GROUPS: set[int] = set()
+
+
+def _kill_group(pgid: int) -> None:
+    """``SIGKILL`` every process in ``pgid``, tolerating a group that has already emptied."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _group_alive(pgid: int) -> bool:
+    """Whether any process still belongs to ``pgid``.
+
+    Signal ``0`` asks the question without answering it. A zombie counts as alive, so a caller that
+    spawned the process itself has to reap it before this can report an empty group.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _group_gone(pgid: int, *, grace: float = 2.0) -> bool:
+    """Wait out ``grace`` for ``pgid`` to empty, and report whether it did."""
+    deadline = time.monotonic() + grace
+    while _group_alive(pgid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def reap_spawned_groups() -> None:
+    """Kill any group a test did not finish with, as the suite leaves.
+
+    :func:`run_in_pty` cleans up in a ``finally``, which buys nothing when the suite dies of a
+    signal that cannot be caught — the one way a pty child used to escape holding a terminal whose
+    master was already gone. This covers ordinary exits and unhandled exceptions; it cannot cover
+    ``SIGKILL``, which is why the terminal itself has to notice, in :mod:`tui.term`.
+    """
+    for pgid in sorted(_SPAWNED_GROUPS):
+        _kill_group(pgid)
+    _SPAWNED_GROUPS.clear()
+
+
+atexit.register(reap_spawned_groups)
+
+
 def run_in_pty(
     argv: list[str],
     *,
@@ -185,7 +285,10 @@ def run_in_pty(
     other suite in this repository uses.
 
     Waits for ``expect`` to appear in the stripped output before writing ``keys``, so a test drives
-    the interface rather than racing it.
+    the interface rather than racing it. A needle that never appears is an error rather than a head
+    start: a test that types into a screen that was never drawn proves only that the bytes were
+    accepted, which is how a launcher step that had silently stopped asking could still satisfy the
+    test written to notice.
 
     ``keys`` is either one burst or a list of chunks. A fullscreen loop paints once per batch of
     keystrokes it reads, so a whole script written at once is applied between two frames and every
@@ -195,6 +298,7 @@ def run_in_pty(
     """
     master, slave = pty.openpty()
     process: subprocess.Popen | None = None
+    pgid: int | None = None
     try:
         _set_winsize(slave, rows, columns)
         before = termios.tcgetattr(slave)
@@ -208,18 +312,32 @@ def run_in_pty(
             stdout=slave,
             stderr=slave,
             close_fds=True,
+            # Its own process group, so teardown has something to kill that covers the grandchildren
+            # too. A launcher step driven through ``bash -c`` is that shape: killing the shell alone
+            # leaves the screen it spawned running, on a terminal the shell had open.
+            start_new_session=True,
         )
         # The slave stays open in this process for the whole run. Closing it would let the master
         # report ``EIO`` the moment the child finished, which is a tidy way to learn the child is
         # gone — and also the only descriptor the *line discipline settings* can still be read from
         # afterwards, which is half of what this helper is for. The exit status is polled instead.
+        pgid = os.getpgid(process.pid)
+        _SPAWNED_GROUPS.add(pgid)
         output = bytearray()
         deadline = time.monotonic() + timeout
         if expect:
             needle = expect if isinstance(expect, bytes) else str(expect).encode()
+            # The needle is re-checked after every read rather than before the next one, because the
+            # read that delivers it is also often the read that learns the writer is gone. Ordering
+            # those two facts the other way round fails a run that said exactly what was asked.
             while needle not in plain(bytes(output)).encode():
-                if not _pump(master, output, process, deadline):
-                    break
+                if not _await(master, output, deadline):
+                    if needle in plain(bytes(output)).encode():
+                        break
+                    raise AssertionError(
+                        f"{needle.decode(errors='replace')!r} never appeared on the terminal; "
+                        f"the run said: {plain(bytes(output))[-400:]!r}"
+                    )
         chunks = [keys] if isinstance(keys, (bytes, bytearray)) else list(keys)
         for chunk in chunks:
             if not chunk:
@@ -244,19 +362,57 @@ def run_in_pty(
             bytes(output), plain(bytes(output)), process.poll(), list(after) == list(before)
         )
     finally:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait(timeout=5)
+        # Teardown order is the substance of this block. Kill the group while its leader is still
+        # ours to reap, so the id cannot have been recycled underneath the signal; then close the
+        # terminal; then check the group emptied. The group rather than the child, because the child
+        # is often a shell and the screen is its grandchild — killing only the direct child is how a
+        # launcher step used to be left running on a pty with no master.
+        if process is not None:
+            if pgid is not None:
+                _kill_group(pgid)
+            elif process.poll() is None:
+                process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:  # pragma: no cover - nothing survives the group kill
+                if pgid is not None:
+                    LEAKED_GROUPS.add(pgid)
         for fd in (master, slave):
             if fd >= 0:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
+        if pgid is not None:
+            _SPAWNED_GROUPS.discard(pgid)
+            if not _group_gone(pgid):
+                LEAKED_GROUPS.add(pgid)
 
 
 def _set_winsize(fd: int, rows: int, columns: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("hhhh", rows, columns, 0, 0))
+
+
+def _await(master: int, output: bytearray, deadline: float) -> bool:
+    """Read one exchange from the terminal, reporting whether anything may still follow.
+
+    A pty has writers rather than one writer: the process that was spawned may be a shell that
+    hands the screen to its own child and leaves, and the master keeps delivering that child's
+    output until the last descriptor on the slave side closes. Watching the direct child's liveness
+    here is what made the fixture stop reading microseconds before the line it was waiting for, so
+    the only two endings this recognises are the end of the stream — ``EIO``, which is permanent —
+    and the deadline.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False
+    try:
+        ready = select.select([master], [], [], min(0.1, remaining))[0]
+        if ready:
+            output += os.read(master, 65536)
+    except OSError:
+        return False
+    return time.monotonic() < deadline
 
 
 def _pump(master: int, output: bytearray, process: subprocess.Popen, deadline: float) -> bool:

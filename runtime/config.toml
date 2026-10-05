@@ -10,7 +10,7 @@
 # launch, so an in-session change to harness policy does not survive a restart.
 
 # Replaced with the alias of the model selected for the main agent by ./start.sh.
-default_model = "__KIMI_PRIMARY_ALIAS__"
+default_model = "__KIMI_LANE_ALIAS__"
 
 default_permission_mode = "manual"
 default_plan_mode = false

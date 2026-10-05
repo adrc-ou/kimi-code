@@ -193,29 +193,6 @@ def styled(text: str, attr: str = "") -> Line:
     return Line(Segment(text, attr))
 
 
-def spaced(count: int) -> Line:
-    return Line(Segment(" " * max(0, count)))
-
-
-def columns_line(parts: list[tuple[Line, int]], caps: Caps) -> Line:
-    """Lay parts out in fixed columns, clipping each to its own width.
-
-    Column arithmetic is width-aware for the same reason everything else here is: a label in a CJK
-    locale is twice as wide in cells as it is in characters, and a table that counted characters
-    would put its right-hand columns out of alignment on exactly the rows it meant to emphasise.
-    """
-    out = Line()
-    for index, (value, width) in enumerate(parts):
-        piece = fit(value, width, caps)
-        if index:
-            piece = Line(Segment(" "), *piece.segments)
-        padding = width - piece.width(caps)
-        if padding > 0:
-            piece = Line(*piece.segments, Segment(" " * padding))
-        out = out + piece
-    return out
-
-
 def padded(value: Line, width: int, caps: Caps, *, right: bool = False) -> Line:
     """Pad or clip ``value`` to exactly ``width`` columns."""
     piece = fit(value, width, caps)
@@ -363,10 +340,6 @@ class Window:
     @property
     def scrolling(self) -> bool:
         return bool(self.above or self.below)
-
-    def row_of(self, index: int) -> int:
-        """Body-relative row of a list index, or ``-1`` when it is off-screen."""
-        return index - self.first if self.first <= index < self.last else -1
 
 
 def scroll_for(

@@ -1,16 +1,31 @@
 # Harness maintenance instructions
 
 This repository defines the Kimi Code sandbox and policy harness.
-It is not the writable development workspace used by the contained agent.
 
 `runtime/AGENTS.md` is the authoritative runtime operating contract.
 
+## Two roles, and only one of them is stale
+
+The workspace the operator chooses on the launch screen may be another clone of
+this same repository, and right now it is. One directory can therefore be the
+harness source under review *and* the live workspace the running stack mounted,
+so keep the roles apart, because the safe inference runs in one direction only:
+
+- **Tracked files are source, not the running system.** The live stack rendered
+  its configuration from its own clone before this session began, and it cannot
+  see an edit made here.
+- **Untracked content is live.** The operator's project files, whatever a
+  concurrent agent is writing, and everything below `.local/` belong to the
+  workspace this session is working in. Do not reason from "this checkout is not
+  what is running" to "the state in it is therefore dead residue". For anything
+  untracked that inference is backwards, and acting on it deletes real work.
+
 ## This checkout is not the running instance
 
-The live stack was started from a *different* clone of this repository on the host,
-and it rendered all of its own configuration from that clone at the moment it was
-launched. This checkout is where work is done and reviewed; it is not what is
-running, and the running instance cannot see an edit made here.
+The live stack was started from a *different* clone of this repository on the
+host, and it rendered all of its own configuration from that clone at the moment
+it was launched. This checkout is where work is done and reviewed; it is not what
+is running, and the running instance cannot see an edit made here.
 
 Consequences worth internalising before spending a turn on them:
 
@@ -21,20 +36,37 @@ Consequences worth internalising before spending a turn on them:
   never answer a question about current behaviour by running this checkout's code
   and reporting the result as what is live. The two answers differ, and only one
   of them can be verified from in here.
-- Generated state found *in this checkout* is stale by definition: the launcher
-  lock, rendered configuration, staged prompts and resolved plan under the
-  instance runtime directory belong to some earlier launch of this clone, not to
-  the stack serving this session. Do not quote them as current facts. An instance
-  directory keyed to a *different* clone is only swept the next time the operator
-  launches from this checkout, so treat any residue here as still present.
-- The harness keeps no working files inside the project. The agent's session
-  scratch is `/tmp/agent-state` in the agent container, and the launcher deletes
-  the `.agent-state/` directory an older revision left in the workspace, so a
-  tree that is checked out here is the project's own and not harness state.
-- The trustworthy record of what the live instance was told is its own staged
-  documents and its own resolved plan, which live in the other clone and are not
-  reachable from here. When those matter, say so and ask, rather than
-  reconstructing them from this checkout.
+- Generated launcher state is never written into the workspace. `harness_instance`
+  in `tools/runtime.sh` puts the instance directory under `${HARNESS_ROOT}`, and
+  its id digests that root, the canonical workspace, and the platform. So a
+  `.local/runtime/<instance>/` found *here* belongs to some launch that used this
+  path as its harness root, not to the stack serving this session, and the live
+  one sits in the other clone where nothing in here can reach it. The
+  trustworthy record of what the live instance was told is that clone's own
+  staged documents and resolved plan: when those matter, say so and ask, rather
+  than reconstructing them from a directory that merely looks like them.
+- Not live is not the same as inert, and neither is it safe to delete. Such a
+  directory can still hold a real provider key and the internal tokens, owned by
+  the very account the agent runs as, and no later sweep will reach it, because a
+  launcher sweeps only siblings under its own root. Never open those files to
+  learn whether they still work: report the residue and let the operator decide.
+- The harness keeps no working files inside the project. The agent has exactly two
+  places to write outside it: `/tmp/agent-state`, which is container tmpfs and dies
+  with the stop, and `/home/agent/.local`, a named volume for scratch that has to
+  outlive one launch. Give it that second home deliberately — it is ext4 inside the
+  VM, so it neither pays a round trip per stat nor reports the flapping ownership
+  that makes the virtiofs workspace expensive to walk and breaks `git status` there.
+  The launcher also deletes the `.agent-state/` directory an older revision left in
+  the workspace, so a tree checked out here is the project's own and not harness
+  state. What that leaves unsaid is the trap: nothing sweeps the top level of a
+  workspace's `.local/`, and nothing ever should, because `.local` is the standard
+  Unix user prefix and for any project but this one that tree belongs to somebody's
+  `$HOME`. Scratch a session parks there therefore accumulates for good — one such
+  tree grew past five gigabytes, three quarters of it a single re-downloadable
+  database held twice — which is why the durable scratch volume exists rather than
+  why a sweep would be unsafe to add. Never send an agent's outliving scratch into
+  the project on the theory that the operator will commit it: that is how the tree
+  filled.
 - Report work as "shipped, takes effect on the operator's next launch". The
   update cycle is external and manual: commit and push from this clone, pull in
   the running clone, stop the stack, start it again. Do not claim a change is in
@@ -82,9 +114,13 @@ When changing model, provider, concurrency, context, or proxy behavior:
   reject zero.
 - keep the persistent private cache salt out of logs and tracked files.
 
-Generated runtime files belong only under `.local/runtime/<instance>/`. Do not
-write credentials, rendered provider configuration, the resolved policy plan,
-approval manifests, bridge private keys, or launcher locks into the workspace.
+Generated runtime files belong only under
+`${HARNESS_ROOT}/.local/runtime/<instance>/`: the harness root, not the workspace.
+The launcher refuses to mount a workspace that holds its own root, so the two can
+never be the same directory — but a workspace that is a second clone of this
+repository has a `.local/` of its own, and it is not that directory. Do not write
+credentials, rendered provider configuration, the resolved policy plan, approval
+manifests, bridge private keys, or launcher locks into the workspace.
 
 The workspace itself is chosen on screen by `./start.sh`, never in `.env`. The
 instance identity digests the canonical workspace path, so the answer has to
@@ -96,7 +132,11 @@ entry points (`./shell.sh`, `./extensions.sh`, `./prompts.sh`) resolve the
 workspace from it, so deleting it does not clean state, it removes the only
 record of what to mount. `tools/workspace_choice.py` is the one thing that asks,
 and it prints exactly the chosen path on standard output: keep every diagnostic
-of its own off that stream, or the launcher captures it as a path.
+of its own off that stream, or the launcher captures it as a path. The question
+is drawn on the terminal standard input belongs to, not on that stream, because
+the launcher reads the answer through a command substitution and standard output
+is therefore a pipe for every interactive launch — nothing may decide whether to
+ask by testing it.
 
 Anything under that directory that can carry a key is swept at the start of a
 launch as well as at the end, because a launcher that is killed outright runs no

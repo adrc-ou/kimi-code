@@ -249,6 +249,7 @@ def main() -> None:
     parser.add_argument("--stage", type=Path, default=Path("/stage"))
     parser.add_argument("--kimi-home", type=Path, default=Path("/state/kimi"))
     parser.add_argument("--serena-home", type=Path, default=Path("/state/serena"))
+    parser.add_argument("--local-home", type=Path, default=Path("/state/local"))
     parser.add_argument("--assets", type=Path, default=Path("/state/assets"))
     parser.add_argument("--managed", type=Path, default=Path("/state/managed"))
     parser.add_argument("--merge-module", type=Path, default=Path("/stage/kimi_config_merge.py"))
@@ -260,7 +261,11 @@ def main() -> None:
 
     for name in (*MANAGED_FILES, "config.toml"):
         clear_immutable(args.kimi_home / name)
-    for path in (args.kimi_home, args.serena_home):
+    for path in (args.kimi_home, args.serena_home, args.local_home):
+        if not path.is_dir():
+            # A module overlay or an older fragment that omits the mount is a configuration bug, and
+            # it should say so rather than surface as a bare FileNotFoundError traceback.
+            raise StagingError(f"state volume is not mounted: {path}")
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             repair_tree(fd, args.uid, args.gid)

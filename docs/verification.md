@@ -94,7 +94,7 @@ file; it does not merge project overrides or reuse Kimi's OAuth token store.
 | Serena MCP | Agent container; code navigation/refactoring and language servers | No hosted account; needs a coding project; its Python language server is built into the image and pinned by `runtime/serena-config.yml`, so nothing is downloaded at activation | On |
 | Hugging Face MCP | Hugging Face's servers | Public Hub access; optional HF account/token for authenticated access | When ComfyUI selected; only `hf_fs` exposed |
 | DeepWiki MCP | Hosted by Cognition | Public indexed repositories; no account required | On |
-| GitHub MCP | Executable in agent container, calling GitHub's API | GitHub account and PAT | Off; read-only toolsets configured |
+| GitHub MCP | Executable in agent container, calling GitHub's API | GitHub account and PAT | On, read-only toolsets configured; anonymous until a token is set |
 | Context7 MCP | Hosted by Upstash | No key needed; anonymous calls work at a reduced rate limit. A key raises limits and is the only route to private repositories | On |
 | NVIDIA CUDA docs MCP | NVIDIA's servers | NVIDIA Developer sign-in / OAuth | ComfyUI module; off until configured |
 | SearXNG | Separate local container | Queries outside search engines; no SearXNG account | On |
@@ -149,8 +149,8 @@ module is selected.
    grant write or administration permissions for this read-only configuration.
 5. If the organization requires approval, wait until the token is approved.
 6. Copy the token once into `GITHUB_PERSONAL_ACCESS_TOKEN` in your local `.env`.
-7. In core or module `runtime/mcp.json`, change only `github.enabled` to `true`. Keep `--read-only`
-   and the limited toolsets.
+7. `github.enabled` already ships `true`, so there is nothing to switch on; set it to `false` to
+   take the server out of the launch. Keep `--read-only` and the limited toolsets.
 8. Restart, which runs the full check by itself; its `get_me` call is what
    verifies authentication. Then ask
    Kimi to read a known file, list issues, and list PRs in each selected repository.

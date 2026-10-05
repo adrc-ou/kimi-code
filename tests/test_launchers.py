@@ -19,7 +19,7 @@ for _directory in (ROOT, ROOT / "tools"):
 import prompt_context  # noqa: E402
 import workspace_registry  # noqa: E402
 
-from tests.helpers import run_in_pty  # noqa: E402
+from tests.helpers import run_in_pty, tracked_files  # noqa: E402
 
 
 class LauncherTests(unittest.TestCase):
@@ -264,6 +264,7 @@ volumes = [
     bind(os.environ["WORKSPACE_PATH"], "/workspace", False),
     {"type": "volume", "source": "kimi-state", "target": "/home/agent/.kimi-code"},
     {"type": "volume", "source": "serena-state", "target": "/home/agent/.serena"},
+    {"type": "volume", "source": "harness-state", "target": "/home/agent/.local"},
     {"type": "volume", "source": "kimi-assets", "target": "/opt/kimi-runtime"},
 ]
 volumes += [
@@ -426,10 +427,10 @@ class WorkspaceChoiceTests(unittest.TestCase):
 
     Three things are worth pinning here rather than in the screen's own suite: that the question is
     asked with a terminal attached (it is the first thing ``start.sh`` does, before the launcher
-    borrows the screen for the flow), that its answer reaches the environment the rest of the launch
-    reads, and that the answer is *checked* on the way through. The refusal of anything that holds
-    ``$HOME`` or the checkout is the one thing standing between a mistyped path and an agent that can
-    read the operator's credentials, and it is enforced here as well as on the screen: the
+    borrows the screen for the flow), that its answer reaches the environment the rest of the
+    launch reads, and that the answer is *checked* on the way through. The refusal of anything that
+    holds ``$HOME`` or the checkout is the one thing standing between a mistyped path and an agent
+    that can read the operator's credentials, and it is enforced here as well as on the screen: the
     environment is a hand-written thing.
     """
 
@@ -556,25 +557,75 @@ HARNESS_ROOT={shlex.quote(str(self.root))}
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, str(sibling))
 
-    def test_a_workspace_asked_on_a_terminal_reaches_the_environment_and_the_memory(self):
-        # The screen takes its keystrokes from the launcher's own stdin, exactly like a module's
-        # version menu does, and Enter on the newest row is the whole interaction.
-        self.remember(self.workspace)
+    def choose_in_pty(self, keys, *, expect=b"Choose a workspace directory"):
+        """Run the launcher's own first step on a real terminal, and report what happened.
+
+        ``harness_choose_workspace`` reads the answer from a command substitution, so this is
+        the one shape a launch ever has: standard input is the terminal, standard output is a pipe.
+        """
         script = f"""
 set -euo pipefail
 source {shlex.quote(str(ROOT / "tools" / "runtime.sh"))}
 HARNESS_ROOT={shlex.quote(str(self.root))}
 harness_choose_workspace
-printf "CHOSEN:%s\n" "$WORKSPACE_PATH"
+printf 'CHOSEN:%s\\n' "$WORKSPACE_PATH"
 """
-        session = run_in_pty(["bash", "-c", script], keys=b"\r", cwd=self.base,
-                             env={**self.env, "COLUMNS": "80", "LINES": "24"},
-                             expect=b"workspace directory")
+        return run_in_pty(
+            ["bash", "-c", script],
+            keys=keys,
+            cwd=self.base,
+            env={**self.env, "COLUMNS": "80", "LINES": "24"},
+            expect=expect,
+        )
+
+    def test_a_workspace_asked_on_a_terminal_reaches_the_environment_and_the_memory(self):
+        # The screen takes its keystrokes from the launcher's own stdin, exactly like a module's
+        # version menu does, and Enter on the newest row is the whole interaction.
+        self.remember(self.workspace)
+        session = self.choose_in_pty(b"\r")
         self.assertEqual(session.status, 0, session.screen[-400:])
         self.assertIn(f"CHOSEN:{self.workspace}", session.screen)
         self.assertTrue(session.restored)
         # And the choice is recorded for the launches that will not be asked.
         self.assertEqual(workspace_registry.newest(self.root), str(self.workspace))
+
+    def test_a_checkout_with_nothing_remembered_is_asked_on_its_first_launch(self):
+        # The first launch of a fresh checkout is the case the remembered list cannot serve, so the
+        # question has to be drawn even though the launcher has already captured the stream this
+        # step would otherwise print on. Answering it by typing a path is what an operator with no
+        # history has to be able to do.
+        typed = b"/" + self.workspace.as_posix().lstrip("/").encode()
+        session = self.choose_in_pty([typed, b"\r"])
+        self.assertEqual(session.status, 0, session.screen[-400:])
+        self.assertIn(f"CHOSEN:{self.workspace}", session.screen)
+        self.assertTrue(session.restored)
+        # Nothing here may claim there was no terminal to ask with: the capture is not a missing
+        # terminal, and the sentence used to be the only output a first launch ever produced.
+        self.assertNotIn("No terminal to ask with", session.screen)
+        self.assertEqual(workspace_registry.newest(self.root), str(self.workspace))
+
+    def test_a_captured_answer_is_the_path_alone(self):
+        # Whatever the screen paints must stay off the launcher's pipe, or the escape sequences are
+        # read back as part of the directory name. The remembered row is answered with one Return,
+        # and the only thing the launcher's substitution receives is the path.
+        self.remember(self.workspace)
+        script = (
+            "set -euo pipefail\n"
+            f"chosen=$(cd {shlex.quote(str(self.base))} && "
+            f"HARNESS_ROOT={shlex.quote(str(self.root))} "
+            f"python3 {shlex.quote(str(self.root / 'tools' / 'workspace_choice.py'))} "
+            f"--root {shlex.quote(str(self.root))})\n"
+            'printf "GOT[%s]\\n" "$chosen"'
+        )
+        session = run_in_pty(
+            ["bash", "-c", script],
+            keys=b"\r",
+            cwd=self.base,
+            env={**self.env, "COLUMNS": "80", "LINES": "24"},
+            expect=b"Choose a workspace directory",
+        )
+        self.assertEqual(session.status, 0, session.screen[-400:])
+        self.assertIn(f"GOT[{self.workspace}]", session.screen)
 
 
 class ModuleHookTerminalTests(unittest.TestCase):
@@ -833,17 +884,7 @@ class RetiredEntrypointTests(unittest.TestCase):
         # for - now happens on every launch. A reference that outlives the file would teach the
         # next reader to run a command that no longer exists, so none may remain.
         self.assertFalse((ROOT / "doctor.sh").exists(), "the retired launcher is back")
-        for path in sorted(ROOT.rglob("*")):
-            if (
-                not path.is_file()
-                or ".git" in path.parts
-                or ".local" in path.parts
-                or ".agent-state" in path.parts
-                or "__pycache__" in path.parts
-                or ".ruff_cache" in path.parts
-                or path.suffix in {".so", ".pyc"}
-            ):
-                continue
+        for path in tracked_files():
             try:
                 text = path.read_text()
             except (UnicodeDecodeError, OSError):

@@ -4,9 +4,10 @@
 Kimi stores every setting in one file and saves it by renaming a temporary copy over
 ``$KIMI_CODE_HOME/config.toml``. That file therefore has to be writable by the agent, which
 would also let the agent rewrite harness policy. The merge below keeps the file writable while
-making every policy key authoritative from the host template: keys named in the config policy
-are mirrored from the stored file, and everything else is taken from the freshly rendered
-baseline, so pinned edits and injected tables disappear at the next launch.
+holding the line the other way round: the freshly rendered baseline wins everywhere except at
+the top-level keys that ``runtime/config-policy.json`` names as user-owned, and each of those
+is taken whole from the stored file. A policy edit the agent made by hand, and any table it
+injected outside those keys, therefore disappear at the next launch.
 """
 
 from __future__ import annotations
@@ -69,6 +70,12 @@ def merge(
     Only keys present in ``current`` are honoured. Removing a section from the stored file does
     not delete it from the baseline, because a Kimi rewrite that drops a key it does not model
     must never cost the deployment its configured value.
+
+    Each honoured key is taken whole: the subtree under it comes from ``current`` in full, and is
+    not reconciled with the baseline's version key by key. Inside a user-owned table the stored
+    document is therefore the entire truth, so a key the baseline has started to ship under one is
+    absent until the operator's config carries it. Per-key reconciliation would put a baseline
+    value back into a table this deployment declared not its own.
     """
     merged = copy.deepcopy(dict(baseline))
     if current is None:

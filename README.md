@@ -122,8 +122,11 @@ has the row under its cursor's own words to say what it means, and gets the full
 width.
 
 The first question is asked before that modal opens, because everything after it
-is keyed on the answer: which directory the session works in. The screen is
-headed `Choose a workspace directory` and lists up to ten directories this
+is keyed on the answer: which directory the session works in. It is drawn on your
+terminal even when you pipe the launcher's output to a log, and only the chosen
+path travels back to the launcher, so nothing else can mistake the question for
+part of the answer. The screen is headed `Choose a workspace directory` and lists
+up to ten directories this
 checkout has been used with, newest first, with the most recent already marked —
 so the ordinary launch is `Enter`. Each row shows the whole host path with its
 final directory name in bold, since that is the part you are scanning for. Above
@@ -280,32 +283,22 @@ look nothing like NRP's — a token-per-minute ceiling, a hard context cap, no
 concurrency rule at all — is a definition change, not a proxy change.
 
 The terms NRP publishes, transcribed into `providers/nrp/provider.toml`, are four,
-and the proxy enforces all four with three mechanisms:
+and the proxy enforces all four with three mechanisms: an
+`output_tokens_per_minute` rate ledger published at 200,000 tokens a minute per API
+token *and* model, `max_concurrent_requests` at `model` scope, and one counter
+carrying both `exclusive_above_context_fraction` and
+`aggregate_context_fraction` — which is why three mechanisms cover four terms.
+[docs/models-providers.md](docs/models-providers.md) owns that taxonomy: what each
+rule kind means, which scopes it admits, and how a two-model selection resolves
+against the counters.
 
-- 200,000 output tokens per minute per API token *and* model, as an
-  `output_tokens_per_minute` rule at `credential_model` scope. This is the only
-  term the gateway meters for you, and it returns HTTP 429. NRP counts it over
-  fixed calendar minutes; a rolling one-minute ledger here books each attempt's
-  full output clamp *before* it starts and settles it against measured usage,
-  which is stricter, because an estimate that has to be spent cannot be settled
-  after the fact. The gateway's own `x-ratelimit-*` header wins whenever it
-  reports less headroom.
-- Exactly one concurrent request once a request uses 35% or more of the model's
-  context, as `exclusive_above_context_fraction` at `model` scope. The resolver
-  marks such a lane exclusive and the proxy admits it only when the counter is
-  empty.
-- At most 16 concurrent requests for the model, as `max_concurrent_requests` at
-  `model` scope. NRP does not enforce its own concurrency table at all, so this
-  one is honoured here or nowhere.
-- Their combined context inside 35% of the model's window, as
-  `aggregate_context_fraction` at `model` scope — the same counter as the rule
-  above it, which is why three mechanisms carry four terms.
-
-Because both scope on the model identifier, selecting one model for both lanes
-makes them contend for the same permits, while selecting two models shares only
-the per-key rate ledger. The counter-keying table in
-[docs/models-providers.md](docs/models-providers.md) states exactly how a
-selection resolves.
+What belongs here is the two choices that are this harness's rather than the
+provider's. The ledger is rolling and books each attempt's full output clamp
+*before* it starts, settling against measured usage, because an estimate that has
+to be spent cannot be settled after the fact — stricter than NRP's fixed calendar
+minute, and the gateway's own `x-ratelimit-*` header still wins whenever it reports
+less headroom. And NRP does not enforce its concurrency table at all, so
+`max_concurrent_requests` is honoured here or nowhere.
 
 Two numbers in the provider file are deliberate under-use, and they are the only
 tunables: `[safety].context_margin_percent` (95) and
@@ -318,14 +311,16 @@ tokens per minute.
 A lane's worst-case reservation is its input cap plus its output clamp, both from
 `[lane.*]` in the model definition and both revalidated against the rendered Kimi
 configuration the launcher staged for this run — a configuration the proxy cannot
-honour answers HTTP 503 instead of passing unmeasured traffic. At the shipped
-numbers `qwen3-primary` reserves its whole 262,144-token window, `qwen3-long`
-reserves 965,536, and each `qwen3-subagent` reserves 64,000, which is 5 at once
-against the 332,500 budget: the largest fan-out the rules allow. A permit is not
-charged at that worst case. The gate prices each request from its own estimated
-input plus that lane's output clamp, capped at the lane reservation, so nothing
-runs alone by name: only a request whose price reaches 350,000 does, which for
-`qwen3-long` means one that has actually filled most of its window. Which alias
+honour answers HTTP 503 instead of passing unmeasured traffic. How the reservation
+and the fan-out are derived is
+[docs/models-providers.md](docs/models-providers.md); at the shipped numbers
+`qwen3-primary` reserves its whole 262,144-token window, `qwen3-long` reserves
+965,536, and each `qwen3-subagent` reserves 64,000, which is 5 at once against the
+332,500 budget: the largest fan-out the rules allow. A permit is not charged at
+that worst case. The gate prices each request from its own estimated input plus
+that lane's output clamp, capped at the lane reservation, so nothing runs alone by
+name: only a request whose price reaches 350,000 does, which for `qwen3-long` means
+one that has actually filled most of its window. Which alias
 the main agent launches on is the plan's `agent_lane`, answered on the main-agent
 picker and rendered into Kimi's `default_model`; the wide lane is the shipped
 answer, because under a mandate to use the allowance the provider granted, the
@@ -409,9 +404,11 @@ ceases to exist with the container. Older revisions kept it in the workspace as
 `.agent-state/`; a launch retires that directory when the repository does not track
 it, and leaves it alone when it does.
 
-Module `AGENTS.md` instructions are staged for the session and appended to its
-system prompt, each under a heading naming the module that owns it. The workspace's
-own `AGENTS.md` is never written: it belongs to the project Kimi is working on.
+Module `AGENTS.md` instructions reach every lane and not the system prompt, each
+under a heading naming the module that owns them. The workspace's own `AGENTS.md`
+is never written: it belongs to the project Kimi is working on. Where the staged
+guidance is merged from and how it is assembled is
+[docs/modules.md](docs/modules.md).
 Deselection removes the module's active instructions and runtime assets, while
 leaving its persistent data alone. No separate initialization command is needed.
 
@@ -468,10 +465,12 @@ Enabled by default:
 - Serena;
 - Context7, which needs no credential at all: Upstash answers anonymous calls at a reduced
   rate limit, so enabling it is a config flag, not a signup task.
+- GitHub, which is enabled but stays anonymous until you set `GITHUB_PERSONAL_ACCESS_TOKEN`
+  in `.env`.
 
 Disabled pending operator credentials or configuration:
 
-- GitHub.
+- NVIDIA CUDA docs, from the ComfyUI module.
 
 Configure and authenticate one remote service at a time, create a fresh session,
 inspect `/mcp`, and make one harmless read-only call before enabling the next.
@@ -562,10 +561,25 @@ verified external paths as the launcher.
 ## Persistent agent state and Kimi settings
 
 The agent's own state lives in Docker named volumes, not on host binds: Kimi
-home, Serena cache, the read-only runtime asset mirror, and the placeholder
-volumes that shadow user-level agents, skills, and plugins. Settings saved in
-the Kimi UI therefore persist across restarts, rebuilt images, and changes of
-host identity. Do not delete state volumes to fix an ownership mismatch.
+home, Serena cache, the agent's durable scratch tree, the read-only runtime
+asset mirror, and the placeholder volumes that shadow user-level agents, skills,
+and plugins. Settings saved in the Kimi UI therefore persist across restarts,
+rebuilt images, and changes of host identity. Do not delete state volumes to fix
+an ownership mismatch.
+
+The agent has exactly two places to write that are not the project, and they
+differ only in how long they last. `/tmp/agent-state` is container tmpfs and
+dies with the stop, which is where session working memory belongs.
+`/home/agent/.local` is the `harness-state` volume and survives, intended for
+large re-creatable scratch — a cloned upstream tree, a scratch virtualenv, a
+downloaded database. Nothing is swept out of it automatically, since it exists
+precisely so that one launch's work is still there for the next; delete it with
+`docker volume rm <project>_harness-state` when you want it gone. Both sit on
+ext4 inside the VM rather than on the workspace's shared filesystem, which is
+also why they are not slow to walk and do not confuse `git`. The project tree
+itself holds only files you mean to commit; the runtime contract says so in as
+many words, and `./start.sh` retires the `.agent-state/` directory that an older
+revision used to leave there.
 
 Before Kimi starts, a network-isolated root initializer repairs volume
 ownership to the configured agent UID/GID and stages operator-controlled content
@@ -628,17 +642,12 @@ contract; `SYSTEM.md` falls back to Kimi Code's built-in prompt, which the
 harness reaches by staging a `${base_prompt}` wrapper rather than by copying the
 text out of the binary.
 
-An empty file is a decision, not a missing file. Existence picks the authority
-and emptiness picks the payload: a non-empty `SYSTEM.md` is amended by whatever
-add-ons are switched on, an empty one leaves those add-ons as the whole prompt,
-and an empty one with every add-on off asks for no instructions at all. Kimi
-discards a prompt that is blank once trimmed and silently uses its own, so that
-last case is staged as a lone period — one token, no instructions. Only an absent
-`SYSTEM.md` can reach the built-in prompt. The startup panel reads that emptiness
-as its own answer: a block whose file is there but empty opens as `off`, and
-switching it `on` makes this session ignore the empty file as if it were absent,
-which is Kimi's built-in prompt for `SYSTEM.md` and `runtime/AGENTS.md` for
-`CONTEXT.md`.
+An empty file is a decision, not a missing file: existence picks the authority and
+emptiness picks the payload, and only an absent `SYSTEM.md` can reach Kimi's own
+built-in prompt. [docs/prompts.md](docs/prompts.md) states the resulting four rows
+and why the deliberately-empty case stages a lone period rather than nothing. The
+consequence for the panel is worth naming here: a block whose file is there but
+empty opens as `off`, because that emptiness is an answer the panel has to show.
 
 Both documents are written into the instance runtime directory by
 `tools/render_runtime.py`, passed to Compose as `KIMI_SYSTEM_MD` and
@@ -669,14 +678,11 @@ terminal cannot prompt, so it prints the remembered selection instead of asking.
 `./prompts.sh --vars` lists every placeholder a prompt file may hold and who
 resolves it.
 
-`auto` is the rule in the section above: the operator file if it exists, the
-fallback if it does not. `on` and `off` are this session's overrides of that rule,
-and neither one edits anything. Switching a document off stands a blank override in
-for its whole chain, so nothing `SYSTEM.md` or `CONTEXT.md` says reaches the
-session, while the add-ons you left switched on are still appended; switching it on
-reads the chain as though the file were absent. Both files stay on disk exactly as
-they were. No `.env` or `HARNESS_*` variable governs either document, so this tree
-is the only place to reach them, and the choice arrives intact because the launcher
+`auto` is the rule in the section above; `on` and `off` are this session's
+overrides of it, and neither one edits anything — both files stay on disk exactly as
+they were. [docs/prompts.md](docs/prompts.md) gives the row each override selects
+and why. No `.env` or `HARNESS_*` variable governs either document, so this tree is
+the only place to reach them, and the choice arrives intact because the launcher
 exports the generated `runtime.env` before Compose is given `.env`, which keeps the
 launcher's own paths above it.
 
@@ -763,9 +769,19 @@ this checkout. Those paths normally sit below your home directory, so your
 account name is included; keep it out of `WORKSPACE_PATH` and the harness
 checkout location if it must stay private.
 
-Everything else is now behind named volumes: the harness checkout layout, the
-instance directory name, the rendered configuration, and the generated secret
-filenames under `.local/runtime/` no longer appear in the agent's mount table.
+The agent's own durable state is behind named volumes, and so is everything the
+launcher renders: the rendered configuration, the resolved policy plan, and the
+generated secret filenames under `.local/runtime/` reach no container the agent
+can see. One disclosure is structural rather than accidental. An approved
+extension snapshot has to be staged under the instance directory before it can be
+mounted read-only into the workspace, and a bind source is visible to the
+container that owns it, so approving project extensions does publish the harness
+checkout path and the instance directory name into the agent's mount table.
+Nothing else from that directory travels with it — the snapshot holds only the
+approved agents, skills, and MCP declaration — and `tools/compose_hygiene.py`
+refuses every other agent bind, including any bind in any container that contains
+the credential directory rather than sitting inside it, so an overlay cannot
+acquire that view either.
 The prompt archive is one of those instance-directory paths, and it is a host bind of
 `model-proxy` rather than of the agent, so the agent cannot read it or learn its name.
 Set `COMPOSE_PROJECT_NAME` to something neutral if the default
@@ -776,8 +792,35 @@ sandbox.
 
 Service-local ingress, queue, metadata, transfer, PID, tmpfs, and log bounds are
 always enabled. CPU and RAM needs vary widely with compilers and model sizes, so
-host-wide ceilings are opt-in. Copy `compose.limits.yaml.example` to
-`compose.limits.yaml`, tune it for the machine, and restart.
+host-wide ceilings are opt-in: the launcher appends `compose.limits.yaml` to the
+Compose files whenever that file exists, and `compose.limits.yaml.example` is the
+template it starts from.
+
+This checkout carries a tuned `compose.limits.yaml`, so the ceilings apply from
+the next restart. It is tuned for one machine — a Docker Desktop virtual machine
+of 12 vCPU and 8 GiB — and Compose reads it on every launch, so a change lands on
+the following restart rather than the current session. Re-tune it after any change
+to the VM's resources, and treat the memory caps as headroom rather than budgets:
+a cap that fires is the kernel killing a process mid-run, and a killed test parent
+is how an abandoned terminal child was left behind this stack once. The file is
+yours to un-ship: it is read by existence alone, so deleting it returns the stack
+to running unbounded, exactly as before.
+
+Two resident walkers need telling about `.local/`, because that is where the
+launcher and agent sessions put scratch and it grows far past the repository
+itself. `git` and ripgrep already honour `.gitignore`. The language server does
+not: pyright reads `pyproject.toml` or `pyrightconfig.json`, so `pyproject.toml`
+carries an `exclude` list for it. If you add another tool that indexes the
+checkout, check whether it needs the same treatment.
+
+Nothing in `.local/` is project source — it is ignored wholesale, so no file
+below it is recoverable from Git — but two parts of it are load-bearing and only
+two. `.local/runtime/<instance>/` is swept by name around every launch, with the
+cache salt deliberately excepted, and `.local/workspaces.json` is never swept.
+Anything else at the top of `.local/` is declared by no document and matched by
+no sweep: it is residue from a session that wrote scratch into the checkout
+instead of the container's own `/tmp/agent-state`, and it accumulates until
+someone removes it by hand.
 
 The launcher reports its instance ID. Generated runtime material for that
 instance lives below `.local/runtime/INSTANCE_ID`; replaceable native module installations live

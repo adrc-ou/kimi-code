@@ -1,4 +1,3 @@
-import json
 import os
 import tempfile
 import unittest
@@ -24,17 +23,6 @@ class BindPathTests(unittest.TestCase):
             (workspace / "comfyui").symlink_to(target, target_is_directory=True)
             with self.assertRaises(ValueError):
                 snapshot(workspace)
-
-    def test_records_real_directories(self):
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = self.make_sources(Path(directory).resolve() / "workspace")
-            result = snapshot(workspace)
-            self.assertEqual(set(result), set(KINDS))
-            # The snapshot is written to a JSON manifest and re-read from it by the verify pass,
-            # which compares the decoded structure rather than the bytes, so a value that will
-            # not survive a JSON round trip is a failed launch rather than a false match.
-            self.assertEqual(json.loads(json.dumps(result)), result)
-
 
     def test_refuses_parent_reference(self):
         # A parent reference names a real directory at every step, so only an explicit

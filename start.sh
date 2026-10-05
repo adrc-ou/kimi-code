@@ -102,30 +102,16 @@ cleanup() {
   if [[ "${stack_started}" == true ]]; then
     harness_compose down --remove-orphans >/dev/null 2>&1 || true
   fi
-  # Session material is deleted on exit. The module guidance is regenerated before every render,
-  # and a stale extension snapshot must never outlive the approval that produced it.
+  # Session material is deleted on exit, and `harness_sweep_secrets` deletes those same names again
+  # at the start of the next launch in case this pass never ran. That function owns the static
+  # ledger — `HARNESS_SESSION_RESIDUE` and `HARNESS_SECRET_RESIDUE` in `tools/runtime.sh`, together
+  # with why the panel's remembered choices, its measurement history, `service-check.json` and
+  # `modules.json` stay out of it. Add a name there rather than here, or it gets deleted on a polite
+  # exit and survives a killed one.
   #
-  # The two composed prompt documents are the deliberate exception, and sit alongside each other
-  # for the same reason: they carry no secret, they are rewritten from scratch on every launch,
-  # and once the stack is down they are the only surviving evidence of what this launcher actually
-  # put in front of the model.
-  #
-  # prompt-context.json and prompt-measurements.jsonl persist too and must never join this list:
-  # the first is the startup panel's remembered choices and the second is the history the panel
-  # reads its token counts from. Extending the list by analogy with a neighbour would wipe the
-  # operator's settings on every exit, which is the inverse of the feature.
-  #
-  # service-check.json is the same kind of exception: it is the verdict the last launch reached,
-  # it stamps itself, and the next launch overwrites it. Its log does not survive, because that one
-  # carries the raw output of an exec rather than a redacted conclusion.
-  #
-  # The two newest entries are here for opposite reasons and both matter. flow-state.json is the
-  # interactive sequence's live state machine: while it exists, a step that already answered replays
-  # its answer file instead of asking, so a crash partway through a pass must not leave one behind
-  # for the next launch to mistake for progress. modules.json is deliberately not in this list, since
-  # it is also the record of the last successful selection, which is exactly why the flow that reads
-  # it as a replay has to go. module-values.json is the module environment answers, secrets included.
-  for file in proxy-token search-token kimi-config.toml runtime.env session.env module.env model-selection.json model-policy.json model.env module-guidance.md flow-state.json module-values.json prompt-measure.log service-check.log launch-notes.log compose/models.json compose/module-environment.json compose/resolved.json ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
+  # The module files are the part that cannot live in that ledger: an overlay declares its own
+  # session names, so the set only exists once a launch has chosen its modules.
+  for file in ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
     [[ -f "${HARNESS_RUNTIME_DIR}/${file}" ]] && find "${HARNESS_RUNTIME_DIR}/${file}" -delete
   done
   [[ -d "${HARNESS_RUNTIME_DIR}/extension-snapshot" ]] && rm -rf -- "${HARNESS_RUNTIME_DIR}/extension-snapshot"
@@ -133,8 +119,9 @@ cleanup() {
   # between the copy and its own cleanup must not leave conversation text on the host, and a job
   # that exits early takes its pid down with it, so this directory is cleared unconditionally.
   [[ -d "${HARNESS_RUNTIME_DIR}/prompt-sessions" ]] && rm -rf -- "${HARNESS_RUNTIME_DIR}/prompt-sessions"
-  # Provider keys are session material, and the next launch sweeps them too in case this one was
-  # killed before reaching here. One function holds both ends so the two lists cannot drift.
+  # Provider keys are session material too, and this is the second of the two calls: the same
+  # function runs before anything is rendered, so a launch that never reached here still gets its
+  # residue removed. Both ends name that function, which is what keeps them from drifting.
   harness_sweep_secrets "${HARNESS_RUNTIME_DIR}"
   # The agent's scratch directory left the workspace, so it needs nothing here: the container's
   # own tmpfs holds it and `down` above takes the container with it.

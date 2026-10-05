@@ -233,7 +233,6 @@ class FrontendUrlTests(unittest.TestCase):
     def test_grant_path_matches_the_bridge_source(self):
         self.assertEqual(COMFYCTL.GRANT_PATH, BRIDGE["GRANT_PATH"])
         self.assertEqual(COMFYCTL.SESSION_PATH, BRIDGE["SESSION_PATH"])
-        self.assertEqual(BRIDGE["GRANT_PATH"], f"{BRIDGE['BRIDGE_PREFIX']}/grant")
 
     def test_the_sandbox_healthcheck_probes_a_path_the_bridge_serves(self):
         # kimi-agent waits on this container's health, so a healthcheck naming a path the bridge

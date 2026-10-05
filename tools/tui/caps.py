@@ -8,7 +8,8 @@ one from the other.
 Colour tiers address the sixteen ANSI slots by default rather than emitting RGB. A terminal's
 palette belongs to the person using it: a program that only picks slots inherits whatever
 contrast they configured, instead of authoring contrast it has no way to measure. The truecolor
-tier exists so an explicit theme may use it, not so that one becomes the default.
+tier is there for a role that needs a colour no ANSI slot can express, not as a default that
+would override what the operator picked.
 
 The contracts followed are ``NO_COLOR`` (present and non-empty suppresses colour, but leaves
 bold, underline and dim alone, and per-instance configuration outranks it) and the ``COLORTERM``
@@ -54,7 +55,6 @@ class Caps:
     color: str = ANSI16
     unicode: bool = True
     ambiguous_wide: bool = False
-    theme: str = "dark"
     #: Whether the window title may be rewritten through ``OSC 2``.
     titles: bool = True
     #: Whether mouse reports were asked for; enabling them is always opt-in.
@@ -86,8 +86,8 @@ class Caps:
     def color_pair(self, name: str) -> str:
         """The SGR for one semantic colour role, or ``""`` when colour is suppressed.
 
-        Roles are resolved here and nowhere else, so a theme change is one table and a
-        no-colour terminal gets the same layout rather than a degraded one.
+        Roles are resolved here and nowhere else, so restyling is one table and a no-colour
+        terminal gets the same layout rather than a degraded one.
         """
         if not self.styled:
             return ""
@@ -258,24 +258,20 @@ def detect(
     stream=None,
     *,
     color: str | None = None,
-    theme: str | None = None,
     unicode_override: bool | None = None,
     mouse: bool = False,
     probe: bool = True,
 ) -> Caps:
     """Build the capability record for ``stream``, defaulting to standard output.
 
-    ``color`` and ``theme`` are the caller's explicit answer, and they win: a flag is
-    per-instance configuration, and per-instance configuration outranks the environment.
+    ``color`` is the caller's explicit answer, and it wins: a flag is per-instance
+    configuration, and per-instance configuration outranks the environment.
     """
     text = _locale_text()
     isatty = bool(stream is not None and hasattr(stream, "isatty") and stream.isatty())
     encoding_ok = bool(_UTF8.search(text)) or "utf" in text.lower()
     uses_unicode = encoding_ok if unicode_override is None else unicode_override
     columns, rows = _columns_rows(80, 24)
-    resolved_theme = theme or os.environ.get("HARNESS_TUI_THEME") or "dark"
-    if resolved_theme not in ("dark", "light"):
-        raise ValueError(f"unknown theme {resolved_theme!r}; expected 'dark' or 'light'")
     term = os.environ.get("TERM", "")
     # ``dumb`` and an unset TERM both mean "assume nothing works", and an OSC query is exactly the
     # thing that would come back as literal text. GNU screen additionally rewrites OSC 2 into its
@@ -287,7 +283,6 @@ def detect(
         color=tier,
         unicode=uses_unicode,
         ambiguous_wide=bool(_AMBIGUOUS_WIDE.search(text)),
-        theme=resolved_theme,
         titles=titles,
         mouse=mouse,
         columns=columns,
@@ -326,7 +321,6 @@ def upgrade(caps: Caps, response: bytes) -> Caps:
         color=TRUECOLOR,
         unicode=caps.unicode,
         ambiguous_wide=caps.ambiguous_wide,
-        theme=caps.theme,
         titles=caps.titles,
         mouse=caps.mouse,
         columns=caps.columns,

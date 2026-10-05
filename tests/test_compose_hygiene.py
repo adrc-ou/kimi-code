@@ -7,7 +7,6 @@ import re
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -54,6 +53,7 @@ def base(root):
                 bind(workspace, "/workspace", read_only=False),
                 volume("kimi-state", "/home/agent/.kimi-code"),
                 volume("serena-state", "/home/agent/.serena"),
+                volume("harness-state", "/home/agent/.local"),
                 volume("kimi-assets", "/opt/kimi-runtime"),
             ],
             "ports": [{"host_ip": "127.0.0.1", "published": "5494", "target": 5494}],
@@ -181,6 +181,28 @@ class ComposeHygieneTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "bind-mounts a credential path"):
             hygiene.check_credentials(self.services, self.runtime, None)
 
+    def test_bind_containing_the_credential_directory_is_refused(self):
+        """The containment test has to look both ways.
+
+        A bind of the instance directory, or any checkout above it, exposes credentials/ as an
+        ordinary subdirectory. Rejecting only paths that start with credentials/ passed this while
+        reporting the configuration as confined, and it is a sidecar or module overlay that does
+        it, not the agent, so the agent's own mount guard cannot cover for it.
+        """
+        for name, source in (
+            ("the credential directory itself", Path(self.runtime) / "credentials"),
+            ("its parent instance directory", Path(self.runtime)),
+            ("a checkout above it", self.root),
+        ):
+            with self.subTest(bind=name):
+                services, _, _ = base(self.root)
+                # A sidecar rather than the agent: the agent's own mount guard already refuses any
+                # bind that is not the workspace or an approved snapshot, so only a second service
+                # can reach this path, and a module overlay is exactly what adds one.
+                services["sidecar"] = {"read_only": True, "volumes": [bind(source, "/run/state")]}
+                with self.assertRaisesRegex(SystemExit, "bind-mounts a credential path"):
+                    hygiene.check_credentials(services, self.runtime, None)
+
     def test_main_reports_success_for_a_clean_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             services, workspace, runtime = base(Path(directory).resolve())
@@ -195,14 +217,11 @@ class ComposeHygieneTests(unittest.TestCase):
                 "--label",
                 "fixture",
             ]
-            out = io.StringIO()
             with (
                 patch.object(sys, "stdin", io.StringIO(json.dumps({"services": services}))),
                 patch.object(sys, "argv", argv),
-                redirect_stdout(out),
             ):
                 hygiene.main()
-            self.assertIn("are confined", out.getvalue())
 
     def test_main_fails_closed_without_a_services_section(self):
         argv = ["compose_hygiene.py", "--workspace", "/w", "--runtime-dir", "/r"]

@@ -25,6 +25,11 @@ services:
         volume:
           nocopy: true
       - type: volume
+        source: harness-state
+        target: /state/local
+        volume:
+          nocopy: true
+      - type: volume
         source: kimi-assets
         target: /state/assets
         volume:
@@ -156,6 +161,17 @@ services:
     environment:
       KIMI_CODE_HOME: /home/agent/.kimi-code
       XDG_CONFIG_HOME: /home/agent/.cache/config
+
+      # virtiofs intermittently reports the workspace root itself as owned by uid 0 rather than the
+      # squashed agent uid, so git concludes a root-owned repository is being operated by a stranger
+      # and aborts with "detected dubious ownership". Only `status` shows it in practice, because it
+      # is the command that re-stats the worktree root; read-only plumbing rides the cached attrs.
+      # /workspace is a fixed path in every deployment, so this is a single-path grant, and it is
+      # environment rather than a file because /etc is read-only and $XDG_CONFIG_HOME is tmpfs.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: /workspace
+
       KIMI_DISABLE_TELEMETRY: "1"
       KIMI_CODE_NO_AUTO_UPDATE: "1"
       KIMI_TOKEN_COUNTING_STRATEGY: "measured+estimated"
@@ -181,6 +197,16 @@ services:
       # unlimited setting lives in runtime/config.toml as [subagent]/[swarm]
       # timeout_ms = 0, where the launcher re-pins it as policy.
 
+      # Kimi floors its own abort-listener accounting at 64 per turn signal, an assertion that a
+      # turn should not hold that many cancellable things at once. Unlimited steps and the
+      # long lane's window make that reachable in one ordinary turn, and because the cap is
+      # re-armed every step the warning then repeats with a growing count. The preload re-scales
+      # the assertion instead of removing it: nothing is silenced, and the true count is still
+      # printed above the floor. Only an AbortSignal target is floored, so the language server
+      # and MCP servers that inherit this variable keep their own thresholds.
+      NODE_OPTIONS: "--require /opt/kimi-runtime/tools/abort_listener_floor.cjs"
+      KIMI_ABORT_LISTENER_FLOOR: "${KIMI_ABORT_LISTENER_FLOOR:-2048}"
+
       GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN:-}"
       CONTEXT7_API_KEY: "${CONTEXT7_API_KEY:-}"
 
@@ -201,6 +227,14 @@ services:
       - type: volume
         source: serena-state
         target: /home/agent/.serena
+        volume:
+          nocopy: true
+      # Durable non-project state: cloned upstream trees, scratch environments, downloaded
+      # datasets. On a volume rather than a bind or tmpfs, so it survives a stop, and on ext4
+      # rather than virtiofs, so it neither flaps ownership nor pays a round trip per stat.
+      - type: volume
+        source: harness-state
+        target: /home/agent/.local
         volume:
           nocopy: true
       - type: volume
@@ -258,6 +292,7 @@ services:
 volumes:
   kimi-state:
   serena-state:
+  harness-state:
   kimi-assets:
   kimi_user_agents:
   kimi_user_skills:

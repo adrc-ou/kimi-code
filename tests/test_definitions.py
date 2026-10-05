@@ -415,8 +415,6 @@ class ModelTests(DefinitionFixture):
     def test_a_model_naming_an_unknown_credential_is_refused(self):
         # The provider is where credential ids are defined, so the resolver - not the parser -
         # is what catches this one; loading both trees must still refuse the pair.
-        import policy
-
         providers, models = self.load()
         models[0]["credential"] = "nope"
         with self.assertRaises(ValueError):
@@ -569,8 +567,6 @@ class KeyScopeCounterTests(DefinitionFixture):
     """
 
     def resolve(self, values: dict[str, str]) -> dict:
-        import policy
-
         provider = PROVIDER.replace(
             'label = "Fixture API token"',
             'label = "Fixture API token"\nenv = "FIXTURE_API_KEY"',
@@ -660,7 +656,7 @@ class TreeHygieneTests(DefinitionFixture):
         _, models = definitions.load_definitions(root)
         self.assertEqual([item["id"] for item in models], ["fixture_model"])
 
-    def test_an_underscored_or_uppercase_directory_is_refused(self):
+    def test_an_uppercase_or_spaced_directory_is_refused(self):
         for name in ("Fixture", "fix ture"):
             base = Path(tempfile.mkdtemp())
             self.addCleanup(shutil.rmtree, base, ignore_errors=True)

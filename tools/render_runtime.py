@@ -17,11 +17,12 @@ subagent's alike; ``SYSTEM.md`` composes into the main agent's own prompt and re
 Both are assembled by ``tools/prompt_context.py`` from the operator's files, the selected modules'
 guidance, and the generated envelope sections the startup panel left switched on - the panel's
 choices are the only way to omit any of it, and nothing is ever written inside the workspace. Each
-of the two file halves is the operator's own, and each is a tri-state rather than a box: switched
-off, the session stages the document with that half blank; switched on, the session reads the half
-as though an empty file on disk were no file at all. Neither writes in the workspace. An empty
+of the two file halves is the operator's own, and each is a tri-state rather than a box: left on
+``auto``, existence decides authority and emptiness decides payload; switched off, the half is
+staged blank, so that emptiness is honoured over Kimi's own prompt; switched on, an empty file is
+walked past as though it were absent, and only an absent file reaches that prompt. An empty
 ``SYSTEM.md`` with every main-only add-on switched off stages as a lone period, because Kimi Code
-reads a blank file as "no file" and substitutes its own prompt.
+discards a prompt that trims to nothing and would otherwise substitute its own.
 """
 
 from __future__ import annotations
@@ -59,11 +60,13 @@ MODEL_MARKER = "#__KIMI_MODEL_CONFIG__"
 #: Where ``tools/modules.py`` stages the selected modules' guidance. The modules write it before
 #: this tool runs, and it is never merged into a workspace file.
 MODULE_GUIDANCE_FILE = "module-guidance.md"
-ALIAS_MARKER = "__KIMI_PRIMARY_ALIAS__"
+#: The baseline template's placeholder for the alias of whichever lane the launch designated for
+#: the main agent - which is not always the primary one.
+LANE_ALIAS_MARKER = "__KIMI_LANE_ALIAS__"
 PLACEHOLDER_MARKER = "__MODEL_PROXY_TOKEN__"
 
 
-def write_secret(path: Path, value: str) -> None:
+def write_runtime_file(path: Path, value: str) -> None:
     """Stage one rendered file at mode 0600. See :func:`private_file.write_private`."""
     write_private(path, value)
 
@@ -75,14 +78,14 @@ def ensure_secret(path: Path, generator) -> str:
             return value
     value = generator()
     path.unlink(missing_ok=True)
-    write_secret(path, value)
+    write_runtime_file(path, value)
     return value
 
 
 def kimi_config(root: Path, plan: dict[str, Any], token: str) -> str:
     """Splice the generated model tables into the static behaviour baseline."""
     template = (root / "runtime" / "config.toml").read_text(encoding="utf-8")
-    for marker in (MODEL_MARKER, ALIAS_MARKER):
+    for marker in (MODEL_MARKER, LANE_ALIAS_MARKER):
         if marker not in template:
             raise SystemExit(f"runtime/config.toml is missing the {marker} marker")
     # The proxy-token marker is contributed by the generated providers table, not by the
@@ -91,16 +94,14 @@ def kimi_config(root: Path, plan: dict[str, Any], token: str) -> str:
     generated = render_model_tables(plan, PLACEHOLDER_MARKER)
     if PLACEHOLDER_MARKER not in generated:
         raise SystemExit("generated model configuration lost the proxy token marker")
-    # The main agent's own model is the plan's designated agent lane, which the launch panel
-    # picks; the marker's name predates that choice and stays, because it is the baseline
-    # template's vocabulary, not the plan's.
+    # The main agent's own model is the plan's designated agent lane, which the launch panel picks.
     agent_lane = plan.get("agent_lane") or policy.DEFAULT_AGENT_LANE
     if agent_lane not in plan["lanes"]:
         raise SystemExit(f"plan designates agent lane {agent_lane!r}, which it does not publish")
-    rendered = template.replace(ALIAS_MARKER, plan["lanes"][agent_lane]["alias"])
+    rendered = template.replace(LANE_ALIAS_MARKER, plan["lanes"][agent_lane]["alias"])
     rendered = rendered.replace(MODEL_MARKER, generated)
     rendered = rendered.replace(PLACEHOLDER_MARKER, token)
-    for marker in (MODEL_MARKER, ALIAS_MARKER, PLACEHOLDER_MARKER):
+    for marker in (MODEL_MARKER, LANE_ALIAS_MARKER, PLACEHOLDER_MARKER):
         if marker in rendered:
             raise SystemExit(f"rendered Kimi config still contains {marker}")
     return rendered
@@ -140,7 +141,7 @@ def main() -> None:
     for name, value in ephemeral.items():
         path = args.runtime_dir / name
         path.unlink(missing_ok=True)
-        write_secret(path, value)
+        write_runtime_file(path, value)
     cache_salt = ensure_secret(
         args.runtime_dir / "cache-salt",
         lambda: base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="),
@@ -148,7 +149,7 @@ def main() -> None:
     rendered = prompt_context.apply_config_toggles(
         kimi_config(args.root, plan, ephemeral["proxy-token"]), enabled
     )
-    write_secret(args.runtime_dir / "kimi-config.toml", rendered)
+    write_runtime_file(args.runtime_dir / "kimi-config.toml", rendered)
     # Both documents are installed by the initializer as root-owned and immutable, so customising
     # a prompt never hands the agent a writable one. The all-lane file is always written, even when
     # it resolves to empty: Docker turns a missing bind source into a directory, and that fails at
@@ -162,13 +163,13 @@ def main() -> None:
     system_markdown = args.runtime_dir / prompt_context.STAGED_SYSTEM
     agents_markdown.unlink(missing_ok=True)
     system_markdown.unlink(missing_ok=True)
-    write_secret(
+    write_runtime_file(
         agents_markdown,
         prompt_context.compose_agents_document(
             args.root, plan, module_guidance(args.runtime_dir), enabled, template_values, static
         ),
     )
-    write_secret(
+    write_runtime_file(
         system_markdown,
         prompt_context.compose_system_document(
             args.root, plan, enabled, template_values, static
@@ -187,7 +188,7 @@ def main() -> None:
     content = "".join(f"{key}={shlex.quote(value)}\n" for key, value in runtime_env.items())
     path = args.runtime_dir / "runtime.env"
     path.unlink(missing_ok=True)
-    write_secret(path, content)
+    write_runtime_file(path, content)
     # The staged documents are installed read-only and immutable, so an edit after this moment
     # cannot take effect. Recording what each one was composed from is what lets the launcher at
     # readiness, and the prompt panel afterwards, say that in words instead of leaving the operator
@@ -195,7 +196,7 @@ def main() -> None:
     sources = args.runtime_dir / prompt_context.SOURCES_FILE
     sources.unlink(missing_ok=True)
     payload = json.dumps(prompt_context.document_sources(args.root, static), indent=1) + "\n"
-    write_secret(sources, payload)
+    write_runtime_file(sources, payload)
     screen.note(f"cache_salt_chars={len(cache_salt)}")
 
 

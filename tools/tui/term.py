@@ -15,10 +15,17 @@ So the mode is chosen by the cleanup contract, not by convenience.
 Resize is polled with an ``ioctl`` on every wait rather than caught with ``SIGWINCH``, for the same
 kind of reason: it cannot race the input loop, it needs no handler, and one syscall per keypress
 is not something the user can feel.
+
+A destroyed terminal is answered rather than waited on. A pty slave outlives its master and keeps
+reporting itself readable afterwards, always with end of input, so a wait that treats "nothing yet"
+and "nothing ever" as the same outcome repaints its frame at full processor speed for as long as the
+process survives. :meth:`Terminal.keys` therefore raises :class:`TerminalGone` on both that end of
+input and the hangup errors, and the run loop in :mod:`app` aborts on it.
 """
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import select
@@ -61,6 +68,26 @@ _TIOCGWINSZ = 0x5413
 TITLE_QUERY = b"\033P$q21t\033\\"
 _TITLE_REPLY = b"\033P1r21;"
 _HEXDIGIT = frozenset(b"0123456789abcdefABCDEF")
+
+#: Read errors meaning the terminal is gone rather than merely quiet. The pty hangup is reported
+#: from whichever end is still open when the other closes: reading a pty *master* after its last
+#: slave closed gives ``EIO``, and reading the *slave* after its master closed gives a plain end-of-
+#: read instead -- see :meth:`Terminal.keys`, which treats both as the same news. ``EBADF``,
+#: ``ENODEV`` and ``ENXIO`` are the same fact about other descriptors, and are here because which
+#: one a given driver chooses is not something to depend on.
+#: ``EAGAIN`` and ``EINTR`` deliberately are not here: those really do mean nothing was typed yet.
+TERMINAL_GONE_ERRNOS = frozenset({errno.EIO, errno.EBADF, errno.ENODEV, errno.ENXIO})
+
+
+class TerminalGone(Exception):
+    """The terminal behind a :class:`Terminal` has been destroyed and can never answer again.
+
+    Naming this is what the alternative costs. A dead pty reports itself *readable* to every
+    ``select`` and then hands back nothing, which looks exactly like a timeout with no key pressed,
+    and a loop that reads it that way repaints its frame at full processor speed forever on a screen
+    nobody can see. Anything waiting on input has to tell a silent user from an absent one, and an
+    absent one never comes back.
+    """
 
 
 def _printable(value: str) -> bool:
@@ -219,9 +246,17 @@ class Terminal:
             )
         finally:
             self._title_set = False
-            if self._saved is not None:
-                termios.tcsetattr(self.fd, termios.TCSADRAIN, self._saved)
-                self._saved = None
+            saved, self._saved = self._saved, None
+            if saved is not None:
+                try:
+                    termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
+                except (OSError, termios.error):
+                    # ``termios.error`` descends from Exception, not OSError, and carries no errno,
+                    # so both spellings of a failed call have to be forgiven here. A terminal
+                    # destroyed underneath this process cannot be handed back, and a traceback
+                    # would bury the reason the run actually ended. The attributes died with the
+                    # device, so nothing is left in cbreak mode by skipping this.
+                    pass
 
     def _title_allowed(self) -> bool:
         """Whether the window title may be rewritten, and undone afterwards.
@@ -321,7 +356,6 @@ class Terminal:
             color=self.caps.color,
             unicode=self.caps.unicode,
             ambiguous_wide=self.caps.ambiguous_wide,
-            theme=self.caps.theme,
             titles=self.caps.titles,
             mouse=self.caps.mouse,
             columns=columns,
@@ -342,6 +376,12 @@ class Terminal:
 
         ``timeout`` is for callers with something to poll; the modal loop passes nothing and is
         woken by the user, which is what keeps an idle screen at zero CPU.
+
+        Raises :class:`TerminalGone` when the descriptor can never answer again. A pty whose master
+        has closed reports itself readable for ever and then yields end of input, so treating an
+        empty read as one more turn with no keypress turns a vanished window into a loop that
+        repaints at full speed for the rest of the process's life. The hangup error numbers are the
+        same news from a driver that reports it rudely.
         """
         if self.decoder.waiting:
             if not select.select([self.fd], [], [], ESCAPE_TIMEOUT)[0]:
@@ -350,6 +390,11 @@ class Terminal:
             return []
         try:
             data = os.read(self.fd, 1024)
-        except OSError:
+        except OSError as error:
+            if error.errno in TERMINAL_GONE_ERRNOS:
+                raise TerminalGone(os.strerror(error.errno)) from error
             return []
+        if not data:
+            # The polite spelling of a hangup: readable, then nothing, forever.
+            raise TerminalGone("the terminal reported end of input")
         return self.decoder.feed(data)

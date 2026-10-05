@@ -32,6 +32,7 @@ import kimi_prompts as kp  # noqa: E402
 # TestCase reachable through a module's namespace, so importing the class here would run the
 # whole prompts.sh suite a second time under this file's name.
 from tests import test_launchers  # noqa: E402
+from tests.helpers import tracked_files  # noqa: E402
 
 #: Commands whose first operand is a mode or an owner rather than a file. GNU ``getopt`` permutes a
 #: ``--`` out of the argument list wherever it appears, so ``chmod 700 -- dir`` works on Linux;
@@ -49,14 +50,12 @@ _COMMAND_SEPARATORS = re.compile(r"&&|\|\||;|\||\n")
 def host_scripts() -> list[Path]:
     """The launcher, tool and module scripts this repository expects bash on the host to run.
 
-    Generated trees are skipped by their leading dot: a staged copy under ``.local`` is a second
-    reading of a file already scanned, and one the operator never edits.
+    Only the tracked ones: a staged copy under ``.local`` is a second reading of a file already
+    scanned, and the installed dependency tree is not shell the host runs.
     """
     found = []
-    for path in sorted(ROOT.rglob("*.sh")):
+    for path in tracked_files(".sh"):
         relative = path.relative_to(ROOT)
-        if any(part.startswith(".") for part in relative.parts[:-1]):
-            continue
         if EXCLUDED_PARTS.intersection(relative.parts):
             continue
         found.append(path)

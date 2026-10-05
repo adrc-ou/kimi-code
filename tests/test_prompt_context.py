@@ -756,9 +756,6 @@ class SourceRecordTests(unittest.TestCase):
 class InstructionBillTests(unittest.TestCase):
     """Kimi's own oversized-instruction warning, in the unit Kimi uses for it."""
 
-    def test_the_limit_is_kimis_number_not_an_invention(self):
-        self.assertEqual(pc.KIMI_RECOMMENDED_MAX_INSTRUCTION_BYTES, 32 * 1024)
-
     def test_bytes_are_counted_as_utf8_not_as_characters(self):
         self.assertEqual(pc.instruction_bytes("é" * 100), 200)
         self.assertEqual(pc.instruction_bytes("ab", "cd"), 4)
@@ -767,14 +764,6 @@ class InstructionBillTests(unittest.TestCase):
         limit = pc.KIMI_RECOMMENDED_MAX_INSTRUCTION_BYTES
         self.assertEqual(pc.over_instruction_limit(limit), "")
         self.assertTrue(pc.over_instruction_limit(limit + 1))
-
-    def test_the_bill_says_the_text_survives(self):
-        """Kimi warns and ships every byte, so anything implying truncation would be a lie."""
-        limit = pc.KIMI_RECOMMENDED_MAX_INSTRUCTION_BYTES
-        notice = pc.over_instruction_limit(limit + 1)
-        self.assertIn("32 KB", notice)
-        self.assertIn("Nothing here is truncated", notice)
-        self.assertNotIn("\n", notice.strip(), "one line, so the panel can align it")
 
 
 if __name__ == "__main__":

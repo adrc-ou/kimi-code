@@ -25,10 +25,10 @@ from dataclasses import dataclass, replace
 from . import layout as L
 from .caps import Caps
 from .cells import Screen
-from .flow import CONTINUE, GO_BACK
+from .flow import ABORTED, CONTINUE, GO_BACK
 from .keys import Binding, Key, bind, display, legend_lines, lookup
 from .layout import BLANK, Line, Row, Segment, Window
-from .term import Terminal
+from .term import Terminal, TerminalGone
 
 #: Actions the loop answers itself, so no step can disagree about them by accident.
 FOCUS_UP = "focus-up"
@@ -237,10 +237,6 @@ class Result:
     @property
     def accepted(self) -> bool:
         return self.status == CONTINUE
-
-    @property
-    def going_back(self) -> bool:
-        return self.status == GO_BACK
 
 
 class Step:
@@ -523,17 +519,28 @@ class Modal:
     # -- the loop ---------------------------------------------------------------------------
 
     def run(self) -> Result:
-        """Take over the screen until the step commits, goes back, or aborts."""
+        """Take over the screen until the step commits, goes back, aborts, or loses its terminal.
+
+        A terminal destroyed underneath the loop is an abort rather than a wait. Somebody has to
+        press a key for this loop to end by itself, and a window that no longer exists never will:
+        its descriptor stays readable for the life of the process, so staying means repainting a
+        frame nobody can see, at full speed, forever. ``leave()`` still runs on the way out and
+        forgives the same dead descriptor, so the screen the operator comes back to is their own.
+        """
         with self.terminal:
-            self.adopt()
-            while True:
-                self.paint()
-                for key in self.terminal.keys(timeout=INPUT_POLL):
-                    outcome = self.handle(key)
-                    if outcome is not None:
-                        self.screen.clear()
-                        return outcome
+            try:
                 self.adopt()
+                while True:
+                    self.paint()
+                    for key in self.terminal.keys(timeout=INPUT_POLL):
+                        outcome = self.handle(key)
+                        if outcome is not None:
+                            self.screen.clear()
+                            return outcome
+                    self.adopt()
+            except TerminalGone:
+                self.screen.clear()
+                return Result(ABORTED, summary="The terminal closed while this screen was open.")
 
     def adopt(self) -> None:
         """Pull the terminal's current size into the renderer, after a resize or on entry."""

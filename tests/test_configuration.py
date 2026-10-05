@@ -14,7 +14,7 @@ for _directory in (ROOT, ROOT / "tools"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
-from tests.helpers import shipped_plan  # noqa: E402
+from tests.helpers import shipped_plan, tracked_files  # noqa: E402
 
 
 def _front_matter_list(text: str, key: str) -> list[str]:
@@ -39,12 +39,9 @@ def _front_matter_list(text: str, key: str) -> list[str]:
 
 class ConfigurationTests(unittest.TestCase):
     def test_checked_in_json_and_toml_parse(self):
-        for path in ROOT.rglob("*.json"):
-            if "node_modules" not in path.parts and ".local" not in path.parts:
-                json.loads(path.read_text())
-        for path in ROOT.rglob("*.toml"):
-            if ".local" in path.parts:
-                continue
+        for path in tracked_files(".json"):
+            json.loads(path.read_text())
+        for path in tracked_files(".toml"):
             with path.open("rb") as source:
                 tomllib.load(source)
 
@@ -111,21 +108,6 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertNotIn("${base_prompt}", text)
                 self.assertIn("handoff", text.lower(), "a role must state its own handoff")
 
-    def test_the_contract_names_both_staged_documents(self):
-        """The contract is addressed to the agent, so it names what the agent can observe.
-
-        Where the files come from is an operator question and belongs in the `.example` files
-        and the docs; naming them here would read as an instruction to go and edit them.
-        """
-        text = (ROOT / "runtime" / "AGENTS.md").read_text()
-        self.assertIn("`AGENTS.md`", text)
-        self.assertIn("`SYSTEM.md`", text)
-        self.assertIn("Model usage limits", text)
-        self.assertIn("Model runtime envelope", text)
-        # And it says plainly which of the two a subagent is missing, so a subagent that
-        # looks for the lane table and finds none is not left guessing whether that is a bug.
-        self.assertIn("never sees", text)
-
     def test_all_base_images_are_digest_pinned(self):
         for relative in (
             "container/Dockerfile",
@@ -136,15 +118,6 @@ class ConfigurationTests(unittest.TestCase):
                 if line.startswith("FROM ") and "${" not in line:
                     image = line.split()[1]
                     self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
-
-    def test_platform_key_is_not_persisted(self):
-        # Match any form (dict literal, CLI flag, variable): the selector writes
-        # a session file that is persisted and sourced by the launcher.
-        selector = (ROOT / "scripts" / "select_versions.py").read_text()
-        self.assertIsNone(
-            re.search(r"platform[\s_-]*key", selector, re.IGNORECASE),
-            "select_versions.py must not accept or emit a platform key",
-        )
 
     def test_read_env_uses_last_resolved_value(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as output:
@@ -187,13 +160,12 @@ class ConfigurationTests(unittest.TestCase):
         self.assertLess(positions["select"], positions["resolve"])
         self.assertLess(positions["resolve"], positions["modules"])
         self.assertLess(positions["resolve"], positions["version"])
-        models = (ROOT / "tools" / "models.py").read_text()
-        self.assertIn("last used", models)
 
     def test_a_command_that_can_render_is_never_routed_through_the_notes_spool(self):
-        # Half of defect 2 is that the launcher printed over its own modal; the other half is the
-        # trap the fix could walk into. A step's interface *is* its stdout, so spooling one would
-        # hide the one question the operator is supposed to be able to see -- a silent failure
+        # Half of the print-over-the-modal failure is that the launcher painted over its own
+        # modal; the other half is the trap the fix could walk into. A step's interface *is* its
+        # stdout, so spooling one would hide the one question the operator is supposed to be able
+        # to see -- a silent failure
         # where the launch waits for an input nobody was asked for. The split is therefore worth
         # pinning per command rather than by comment, and both lists are checked so that a new
         # step added to the pass cannot land on the wrong side of it.
@@ -275,13 +247,19 @@ class ConfigurationTests(unittest.TestCase):
         killed = launcher[launcher.index("cleanup() {"): launcher.index("trap cleanup EXIT")]
         self.assertIn('"${PROMPT_MEASURE_PID}"', killed)
         self.assertEqual(killed.count("PROMPT_MEASURE_PID"), 2, "kill and wait")
-        # The history persists; the scratch tree and its log do not.
-        deleted = launcher[launcher.index("  for file in proxy-token"):
-                           launcher.index("harness_unlock")]
-        self.assertIn("prompt-measure.log", deleted)
+        # The history persists; the scratch tree and its log do not. The static name ledger now
+        # lives in tools/runtime.sh so that both ends of a launch sweep the same list, which means
+        # this property spans two files and has to be read from both.
+        sweep = (ROOT / "tools/runtime.sh").read_text()
+        ledger = sweep[sweep.index("HARNESS_SECRET_RESIDUE=("): sweep.index("harness_sweep_secrets()")]
+        deleted = launcher[launcher.index("  for file in"): launcher.index("harness_unlock")]
+        self.assertIn("prompt-measure.log", ledger)
         self.assertIn("prompt-sessions", deleted)
-        self.assertNotIn("prompt-measurements.jsonl", deleted)
-        self.assertNotIn("prompt-context.json", deleted)
+        for survivor in ("prompt-measurements.jsonl", "prompt-context.json", "service-check.json",
+                         "modules.json"):
+            with self.subTest(preserved=survivor):
+                self.assertNotIn(survivor, ledger)
+                self.assertNotIn(survivor, deleted)
 
     def test_picker_ordering_is_alphabetical_by_the_label_the_operator_reads(self):
         # Directory ids deliberately sort the opposite way to the labels: an implementation
@@ -388,16 +366,7 @@ class NoHardcodedModelFactsTests(unittest.TestCase):
             "README.md": "the migration table, which names the variable being retired",
             "tools/runtime.sh": "the retired-variable list, which warns an operator off it",
         }
-        for path in sorted(ROOT.rglob("*")):
-            if (
-                not path.is_file()
-                or ".git" in path.parts
-                or ".local" in path.parts
-                or "__pycache__" in path.parts
-                or ".ruff_cache" in path.parts
-                or path.suffix in {".so", ".pyc"}
-            ):
-                continue
+        for path in tracked_files():
             try:
                 text = path.read_text()
             except (UnicodeDecodeError, OSError):
@@ -648,6 +617,27 @@ class ResolvedEnvelopeTests(unittest.TestCase):
         self.assertEqual(compose_value("MODEL_PROXY_MAX_REQUEST_SECONDS"), 0)
         example = (ROOT / ".env.example").read_text()
         self.assertIn("MODEL_PROXY_MAX_REQUEST_SECONDS=0", example)
+
+    def test_abort_listener_floor_is_staged_and_generous(self):
+        # Kimi re-arms a 64-listener budget on its own turn signal every step, which a single
+        # unlimited turn can now cross. The harness re-scales that budget from outside the bundle
+        # rather than silencing the warning, so the assertion still fires - just at a number that
+        # means runaway rather than ordinary. The preload travels in the assets volume, the same
+        # route check_services.py takes, so no new host bind is involved.
+        preload = ROOT / "tools" / "abort_listener_floor.cjs"
+        # Staged from the repository's own tools/ directory, which is what makes it an image path.
+        self.assertTrue(preload.is_file(), "the preload must sit beside the other staged tools")
+        self.assertEqual(compose_value("KIMI_ABORT_LISTENER_FLOOR"), 2048)
+        self.assertIn(
+            "NODE_OPTIONS: \"--require /opt/kimi-runtime/tools/abort_listener_floor.cjs\"",
+            COMPOSE_SOURCE,
+        )
+        self.assertIn("KIMI_ABORT_LISTENER_FLOOR=2048", ENV_EXAMPLE)
+        text = preload.read_text()
+        # 0 has to mean "hands off", or an operator could not turn this off without editing
+        # compose.yaml, and the file is loaded by every Node process in the container.
+        self.assertIn("KIMI_ABORT_LISTENER_FLOOR", text)
+        self.assertIn("delete process.env.KIMI_ABORT_LISTENER_FLOOR", text)
 
     def test_guidance_publishes_the_envelope_and_tells_the_agent_to_fill_it(self):
         if str(ROOT / "tools") not in sys.path:

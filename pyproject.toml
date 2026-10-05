@@ -9,3 +9,21 @@ ignore = ["S101", "S310", "S603", "S607"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106"]
 "modules/*/tests/*" = ["S105", "S106"]
+
+# Serena keeps a pyright language server alive for this project, and pyright answers to
+# `pyrightconfig.json` or this section — never to `.gitignore`, which is why ruff needs nothing
+# comparable. Without an `exclude` it treats the checkout root as the project and indexes every
+# Python file it can reach, and this checkout keeps its scratch under `.local/`: 10,100 `.py` files
+# against the 95 the repository tracks, most of them inside throwaway virtual environments. Each of
+# those is a metadata read over virtiofs, billed as CPU on the host.
+#
+# Listing a directory here is what makes this file the project root for pyright at all, so the
+# sections above and this one have to stay together.
+[tool.pyright]
+exclude = [
+    ".local",
+    ".ruff_cache",
+    ".serena",
+    "container/node_modules",
+    "**/__pycache__",
+]

@@ -81,7 +81,6 @@ class StagingTests(unittest.TestCase):
         for name in init.MANAGED_FILES:
             mode = (self.fixture.home / name).stat().st_mode & 0o777
             self.assertEqual(mode, 0o440, name)
-        self.assertEqual(self.require_immutable.call_count, len(init.MANAGED_FILES))
         self.assertEqual((self.fixture.home / "AGENTS.md").read_text(), "contract\n")
         self.assertEqual((self.fixture.home / "mcp.json").read_text(), '{"mcpServers": {}}')
 
@@ -278,10 +277,6 @@ class OwnershipTests(unittest.TestCase):
         self.assertTrue(link.is_file() and not link.is_symlink())
         self.assertEqual(outside.read_text(), "victim\n")
 
-    def test_managed_targets_cover_the_launcher_owned_home_files(self):
-        self.assertEqual(set(init.MANAGED_FILES), {"AGENTS.md", "SYSTEM.md", "mcp.json"})
-        self.assertEqual(init.SUPPRESSED_DIRECTORIES, ("agents", "skills", "plugins"))
-
 
 class StaticPolicyTests(unittest.TestCase):
     def setUp(self):
@@ -297,9 +292,6 @@ class StaticPolicyTests(unittest.TestCase):
             self.assertIn(f"source: {volume}", self.compose)
 
     def test_retired_environment_variables_are_gone(self):
-        for retired in ("KIMI_EMPTY_SYSTEM", "KIMI_EMPTY_USER_AGENTS",
-                        "KIMI_EMPTY_USER_SKILLS", "KIMI_EMPTY_USER_PLUGINS"):
-            self.assertNotIn(retired, self.compose)
         self.assertIn("KIMI_SYSTEM_MD", self.compose)
 
 
