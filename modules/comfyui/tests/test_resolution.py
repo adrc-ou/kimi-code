@@ -249,13 +249,24 @@ class TorchCheckTests(unittest.TestCase):
         )
         self.assertEqual(problems, ["x.lock did not resolve torch to the reviewed 2.11.0"])
 
-    def test_a_lock_missing_a_torch_entry_is_refused(self):
-        stripped = "\n".join(
+    def test_a_reviewed_package_this_release_does_not_depend_on_is_not_a_problem(self):
+        # A lock is one release's dependency set, and a release is free to change that set: ComfyUI
+        # dropped torchaudio after v0.35.0, so a lock refusing to resolve one would make a
+        # selectable release uninstallable. The reviewed pins govern the version of what a release
+        # asks for, not which packages every release must ask for.
+        without_audio = "\n".join(
             line for line in LOCK.splitlines() if not line.startswith("torchaudio")
         )
-        problems = resolution.check_torch_text(stripped, self.backend_env, "x.lock")
-        self.assertEqual(len(problems), 1)
-        self.assertIn("torchaudio", problems[0])
+        self.assertEqual(resolution.check_torch_text(without_audio, self.backend_env, "x.lock"), [])
+
+    def test_a_lock_that_resolved_no_torch_at_all_is_refused(self):
+        # The one package with no pass: both installers import torch as their first act after
+        # installing, so a lock naming none of it is not a backend whatever else it pins.
+        without_torch = "\n".join(
+            line for line in LOCK.splitlines() if not line.startswith("torch==")
+        )
+        problems = resolution.check_torch_text(without_torch, self.backend_env, "x.lock")
+        self.assertEqual(problems, ["x.lock did not resolve torch at all"])
 
     def test_a_backend_that_stopped_naming_its_torch_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -304,8 +315,28 @@ class ResolverPinTests(unittest.TestCase):
         pin = resolve_locks.resolver_pin()
         lock = json.loads((ROOT / "modules/comfyui/dependencies.lock.json").read_text())
         self.assertEqual(pin["version"], lock["downloads"]["uv-resolver"]["version"])
-        self.assertEqual(pin["image"], f"ghcr.io/astral-sh/uv:{pin['version']}")
+        self.assertEqual(pin["image"], lock["downloads"]["uv-resolver"]["image"])
+        self.assertEqual(pin["digest"], lock["downloads"]["uv-resolver"]["digest"])
+        # The variant after the version is what puts uv on an operating system, and the image the
+        # container run names has to be the one this version was read out of.
+        self.assertTrue(
+            pin["image"].startswith(f"{resolve_locks.UV_REPOSITORY}:{pin['version']}-"),
+            pin["image"],
+        )
         self.assertRegex(pin["digest"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_the_scratch_image_is_refused_because_it_cannot_resolve(self):
+        # The bare version tag is `FROM scratch`: it holds `/uv` and nothing else, so `uv pip
+        # compile` inside it has no core binary to read a libc from and no Python to build with, and
+        # the resolve dies before it reaches a registry.
+        with self.assertRaises(SystemExit):
+            self.run_pin(
+                {
+                    "version": "0.12.17",
+                    "image": "ghcr.io/astral-sh/uv:0.12.17",
+                    "digest": "sha256:" + "a" * 64,
+                }
+            )
 
     def run_pin(self, entry):
         with tempfile.TemporaryDirectory() as directory:
@@ -396,10 +427,27 @@ class ContainerMountTests(unittest.TestCase):
         self.assertIn("ghcr.io/astral-sh/uv@sha256:" + "a" * 64, argv)
 
     def test_the_entrypoint_names_the_binary_path_the_image_ships(self):
-        # The uv image puts the executable at /uv and keeps it off its PATH, so `--entrypoint uv`
-        # reaches runc as a PATH lookup and dies with "executable file not found in $PATH".
+        # A path rather than the bare `uv`, because the image's own entrypoint is not part of its
+        # published contract, and the two families disagree about where the binary lives: only the
+        # scratch image keeps it at /uv, while every OS-based variant installs it in /usr/local/bin.
+        # resolver_pin accepts nothing but a variant, so this is the path the run can use.
         argv = resolve_locks.container_argv(self.plan, {"digest": "sha256:" + "a" * 64})
-        self.assertEqual(argv[argv.index("--entrypoint") + 1], "/uv")
+        self.assertEqual(argv[argv.index("--entrypoint") + 1], "/usr/local/bin/uv")
+
+    def test_the_pinned_image_and_the_named_entrypoint_agree(self):
+        # The image comes from the lock file and the binary path from this module, and a pair that
+        # disagrees fails inside the container rather than at either, so they are read together.
+        pin = resolve_locks.resolver_pin()
+        argv = resolve_locks.container_argv(self.plan, pin)
+        self.assertIn(f"{resolve_locks.UV_REPOSITORY}@{pin['digest']}", argv)
+        self.assertEqual(argv[argv.index("--entrypoint") + 1], resolve_locks.UV_BINARY)
+
+    def test_the_container_refuses_to_download_a_python(self):
+        # The resolve is only described by the pinned image if the interpreter uv builds with came
+        # from that image as well, so a resolve that cannot find one has to say so rather than pull
+        # an unpinned CPython out of the network.
+        argv = resolve_locks.container_argv(self.plan, {"digest": "sha256:" + "a" * 64})
+        self.assertEqual(argv[argv.index("-e") + 1], "UV_PYTHON_DOWNLOADS=never")
 
 
 class PlanTests(unittest.TestCase):

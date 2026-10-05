@@ -51,7 +51,9 @@ def check_resolver(downloads):
 
     Version and digest have to name the same image: the launcher pulls by digest so a tag cannot be
     retargeted, but it reports the version, and the two agreeing is the only thing that makes the
-    reported number true.
+    reported number true. The tag also has to carry a variant after the version, because the tag
+    without one is the scratch image, and `uv pip compile` cannot run in an image that has nothing
+    but its own binary in it. See `resolve_locks.resolver_pin`.
     """
     resolver = downloads["uv-resolver"]
     version = resolver["version"]
@@ -59,8 +61,10 @@ def check_resolver(downloads):
         raise SystemExit("pinned uv resolver must be an exact release version")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", resolver["digest"]):
         raise SystemExit("invalid uv resolver image digest")
-    if resolver["image"] != f"ghcr.io/astral-sh/uv:{version}":
-        raise SystemExit("uv resolver must be pinned to the official ghcr.io image and its version")
+    if not resolver["image"].startswith(f"ghcr.io/astral-sh/uv:{version}-"):
+        raise SystemExit(
+            "uv resolver must be pinned to an official OS-based ghcr.io image of that version"
+        )
 
 
 def check_profile(entry):

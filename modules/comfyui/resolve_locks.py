@@ -7,9 +7,12 @@ path whose contents were resolved from the release that was chosen, or refuse.
 
 Resolution runs in a digest-pinned container by default. That is deliberate — uv is a build tool,
 and installing one on the operator's machine to answer a question the harness asked would make the
-host part of the reproducibility story. Setting ``COMFYUI_UV_BIN`` points the same plan at a
-native uv instead, for reviewing a lock without pulling an image; the resolver's version is part of
-the lock key either way, so the two can never stand in for each other.
+host part of the reproducibility story. The container has to be one of the OS-based uv images, and
+``resolver_pin`` is what keeps it that way: the bare version tag is a scratch image holding nothing
+but the uv binary, and ``uv pip compile`` needs an operating system under it. Setting
+``COMFYUI_UV_BIN`` points the same plan at a native uv instead, for reviewing a lock without pulling
+an image; the resolver's version is part of the lock key either way, so the two can never stand in
+for each other.
 """
 
 from __future__ import annotations
@@ -39,6 +42,11 @@ BACKEND = MODULE / "backend"
 RAW_BASE = "https://raw.githubusercontent.com"
 REPOSITORY = "Comfy-Org/ComfyUI"
 UV_VERSION_RE = re.compile(r"uv (\S+)")
+UV_REPOSITORY = "ghcr.io/astral-sh/uv"
+# The scratch image keeps its binaries at ``/uv`` and ``/uvx`` and puts neither path anywhere on
+# PATH; every OS-based variant installs both into ``/usr/local/bin``, which is on PATH. The resolver
+# is always one of the variants — see ``resolver_pin`` — so this is the entrypoint worth naming.
+UV_BINARY = "/usr/local/bin/uv"
 
 
 def examine(text: str, name: str, requirements_sha256: str, prof: dict[str, Any]) -> list[str]:
@@ -53,7 +61,16 @@ def examine(text: str, name: str, requirements_sha256: str, prof: dict[str, Any]
 
 
 def resolver_pin() -> dict[str, str]:
-    """The pinned uv the harness trusts to resolve, from the module's dependency lock."""
+    """The pinned uv the harness trusts to resolve, from the module's dependency lock.
+
+    The image has to be one of the variants Astral builds on an operating system rather than the
+    bare version tag. That tag is a ``FROM scratch`` image carrying ``/uv`` and nothing else, and
+    ``uv pip compile`` cannot run inside it: before it resolves anything it works out the libc of
+    the machine by reading the ELF interpreter of one of ``/bin/sh``, ``/usr/bin/env``,
+    ``/bin/dash`` or ``/bin/ls``, and then looks for a Python to build source distributions with. A
+    scratch image offers no binary to read and no interpreter to find, so the resolve dies with
+    "Failed to discover managed Python installations" before it asks a registry for a wheel.
+    """
     lock = json.loads((MODULE / "dependencies.lock.json").read_text(encoding="utf-8"))
     entry = lock.get("downloads", {}).get("uv-resolver")
     if not isinstance(entry, dict):
@@ -63,14 +80,16 @@ def resolver_pin() -> dict[str, str]:
     image = str(entry.get("image", ""))
     if not version or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise SystemExit("The pinned uv resolver needs a version and a sha256 image digest")
-    if not image.startswith("ghcr.io/astral-sh/uv:"):
+    if not image.startswith(f"{UV_REPOSITORY}:"):
         raise SystemExit("The uv resolver must come from the official ghcr.io repository")
     # The container is pulled by digest but named to the operator, and into every lock key, by
     # version. One that could name a different release than it fetches would make the key a claim
-    # about a resolver that never ran.
-    if image != f"ghcr.io/astral-sh/uv:{version}":
+    # about a resolver that never ran, and one with no variant after the version is the scratch
+    # image that cannot resolve at all.
+    if not image.startswith(f"{UV_REPOSITORY}:{version}-"):
         raise SystemExit(
-            f"The uv resolver image is tagged for another version: {image} against {version}"
+            "The uv resolver must be an OS-based image of the pinned version, such as "
+            f"{UV_REPOSITORY}:{version}-python3.12-trixie-slim; {image} is not one"
         )
     return {"version": version, "digest": digest, "image": image}
 
@@ -82,25 +101,30 @@ def container_argv(plan: dict[str, Any], pin: dict[str, str]) -> list[str]:
     both at their host paths, so the one argv built in ``resolution.plan`` is valid inside and
     outside the container and there is no second set of paths to keep in step. The instance root is
     deliberately *not* mounted: it holds the provider key and the proxy token, and resolution needs
-    neither. ``--entrypoint`` is named explicitly because the uv image's own entrypoint is not part
-    of its published contract, and it is named as ``/uv`` because that is where the image places
-    the binary: its PATH does not include it, so the bare name fails container init with
-    "executable file not found in $PATH".
+    neither. ``--entrypoint`` is named explicitly because the image's own entrypoint is not part of
+    its published contract, and it is named as a path because where the variants put the binary is
+    the published half of that contract, while their ``PATH`` is the image's own business.
+    ``UV_PYTHON_DOWNLOADS=never`` is container policy rather than part of the plan: the interpreter
+    uv builds with has to be the one this digest ships, because a CPython fetched during a resolve
+    would be a second unpinned input the lock key cannot see. A profile and an image that fall out
+    of step with each other then fail loudly instead.
     """
     mount = Path(plan["mount"])
     return [
         "docker",
         "run",
         "--rm",
+        "-e",
+        "UV_PYTHON_DOWNLOADS=never",
         "--entrypoint",
-        "/uv",
+        UV_BINARY,
         "-v",
         f"{mount}:{mount}",
         "-v",
         f"{BACKEND}:{BACKEND}:ro",
         "-w",
         str(mount),
-        f"ghcr.io/astral-sh/uv@{pin['digest']}",
+        f"{UV_REPOSITORY}@{pin['digest']}",
     ] + [str(part) for part in plan["argv"][1:]]
 
 

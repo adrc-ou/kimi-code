@@ -55,8 +55,11 @@ COPY modules/comfyui/backend/requirements-custom.lock /tmp/requirements-custom.l
 
 # Three bindings, checked before anything installs. The lock has to say it was built from this
 # commit's requirements — which is what stops one release's dependency set being installed onto
-# another — and it has to still carry the reviewed torch versions, which is the one part of the
-# dependency set that changes what hardware the image can use at all.
+# another — and every reviewed torch package the lock does carry has to be carried as the reviewed
+# +cu130 build, because that is the one part of the dependency set that changes what hardware the
+# image can use at all. That is a version check and not a membership check: a release may stop
+# depending on one of the three, as ComfyUI did with torchaudio after v0.35.0, while a lock with no
+# torch in it at all never reaches this layer because the resolver refuses to hand one out.
 RUN test -n "${COMFYUI_REQUIREMENTS_SHA256}" \
     && printf '%s\n' "${COMFYUI_REQUIREMENTS_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
     && grep -qx "# comfyui-commit=${COMFYUI_COMMIT}" /tmp/requirements-linux.lock \
@@ -66,9 +69,13 @@ RUN test -n "${COMFYUI_REQUIREMENTS_SHA256}" \
     && test -n "${TORCHVISION_VERSION}" \
     && test -n "${TORCHAUDIO_VERSION}" \
     && test -n "${PYTORCH_CUDA_INDEX_URL}" \
-    && grep -q "torch-${TORCH_VERSION}%2Bcu130" /tmp/requirements-linux.lock \
-    && grep -q "torchvision-${TORCHVISION_VERSION}%2Bcu130" /tmp/requirements-linux.lock \
-    && grep -q "torchaudio-${TORCHAUDIO_VERSION}%2Bcu130" /tmp/requirements-linux.lock \
+    && for component in "torch:${TORCH_VERSION}" "torchvision:${TORCHVISION_VERSION}" \
+         "torchaudio:${TORCHAUDIO_VERSION}"; do \
+         name=${component%%:*}; want=${component#*:}; \
+         grep -Eq "^${name}(@|==| )" /tmp/requirements-linux.lock || continue; \
+         grep -q "${name}-${want}%2Bcu130" /tmp/requirements-linux.lock \
+           || { echo "the lock does not carry the reviewed ${name}-${want}+cu130 wheel" >&2; exit 1; }; \
+       done \
     && python -m pip install --no-cache-dir --require-hashes \
        --requirement /tmp/requirements-linux.lock \
     && python -m pip install --no-cache-dir --require-hashes \

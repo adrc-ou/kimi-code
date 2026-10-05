@@ -64,7 +64,10 @@ PyTorch versions are pinned separately in `modules/comfyui/backend/backend.env`.
 automatically move with ComfyUI releases because a framework upgrade can change
 CUDA driver requirements or MPS behavior. Review those pins deliberately: a lock
 that resolved a different PyTorch is refused rather than installed, so a pin
-there is a requirement, not a preference.
+there is a requirement, not a preference. A pin governs the version of a package a release asks
+for, not whether the release must ask for it: a release that stops depending on one of them (as
+ComfyUI did with `torchaudio` after v0.35.0) resolves a lock without it, and a component the
+harness should carry whatever the release wants belongs in `requirements-custom.txt` instead.
 
 Whatever release is chosen, the installers read one file: a hash-checked lock
 under `$HARNESS_RUNTIME_DIR/comfyui/locks/`, named by a key over the platform
@@ -76,7 +79,14 @@ lock is copied to that path with its provenance header prepended, which is why
 the default launch resolves nothing at all.
 
 Resolution runs in the digest-pinned `uv` container recorded in
-`modules/comfyui/dependencies.lock.json`, so a build tool stays off the host. Setting
+`modules/comfyui/dependencies.lock.json`, so a build tool stays off the host. The pinned image has
+to be one of the variants Astral builds on an operating system that also carries a Python: the bare
+version tag is a `FROM scratch` image holding nothing but the `uv` binary, and `uv pip compile`
+reads a core binary to work out its own libc and then looks for an interpreter to build source
+distributions with, so in a scratch image it fails with "Failed to discover managed Python
+installations" before it ever asks a registry for a wheel. `check_locks.py` refuses a pin that names
+no variant, and the container runs with `UV_PYTHON_DOWNLOADS=never` so that the interpreter it
+resolves with is that image's own rather than one uv fetched at the time. Setting
 `COMFYUI_UV_BIN` points the same plan at a native `uv` instead, for reviewing a
 lock without pulling an image; the resolver's version is part of the key either
 way, so the two can never stand in for each other.

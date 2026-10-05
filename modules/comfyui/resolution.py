@@ -360,12 +360,20 @@ def check_torch(path: Path, backend_env: Path) -> list[str]:
 
 
 def check_torch_text(text: str, backend_env: Path, name: str) -> list[str]:
-    """The reviewed torch pins have to be the ones the lock actually resolved.
+    """The reviewed torch pins have to be the versions the lock resolved them to.
 
     A constraint layer is only a request; a resolver that quietly picked a different torch would
     change GPU support, which is the single thing an operator cannot recover from after the image is
     built. The existing CUDA build did this with three greps that only understood a ``+cu130`` wheel
     URL; this covers the PyPI form the macOS lock uses too.
+
+    Every pin is compared against whatever the lock resolved, and a reviewed package the lock does
+    not name is not a contradiction: a release may stop depending on one, as ComfyUI did with
+    ``torchaudio`` after v0.35.0. A reviewed pin says which version to install when a release wants
+    that package, not which packages every release must want — an operator who wants one regardless
+    adds it to ``requirements-custom.txt``, the input meant for that. ``torch`` itself has no such
+    pass, because both installers import it as the first thing they do after installing, so a lock
+    without it is not a backend.
     """
     pins = {}
     for line in backend_env.read_text(encoding="utf-8").splitlines():
@@ -384,9 +392,13 @@ def check_torch_text(text: str, backend_env: Path, name: str) -> list[str]:
             problems.append(f"{backend_env} does not pin {variable}")
             continue
         # Read each package's own pin rather than searching the text for the version: torchvision
-        # and torchaudio share torch's number, so a substring would let one answer for another, and
-        # a lock missing a package entirely would pass.
-        if resolved.get(_canonical(package), "") != version.split("+")[0]:
+        # and torchaudio share torch's number, so a substring would let one answer for another.
+        found = resolved.get(_canonical(package))
+        if found is None:
+            if package == "torch":
+                problems.append(f"{name} did not resolve {package} at all")
+            continue
+        if found != version.split("+")[0]:
             problems.append(f"{name} did not resolve {package} to the reviewed {version}")
     return problems
 
