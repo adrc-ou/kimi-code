@@ -693,11 +693,15 @@ output_rate_margin_percent = 90
 
 
 def count_model(wire_name: str, slug: str) -> str:
-    """One 1,000,000-token model with a 64,000-token subagent lane.
+    """One 1,000,000-token model with a 66,500-token subagent lane.
 
-    The sizes are the shipped model's, so the aggregate budget divides the subagent reservation
-    exactly five times: a resolution that reimposes a provider-wide ceiling on a model that has
-    its own shows up as a fan-out that stops being 5, which is easy to assert and hard to misread.
+    The lane *window* is the shipped model's, and it has to stay that way: this fixture exists
+    to prove the aggregate budget divides a subagent reservation exactly five times, and
+    332,500 // 66,500 == 5 with no remainder, which is the saturated edge the shipped lane now
+    sits on. A resolution that reimposes a provider-wide ceiling on a model that has its own
+    shows up as a fan-out that stops being 5, which is easy to assert and hard to misread. If
+    the shipped window moves, move this with it; if only the input/clamp split inside it moves,
+    this fixture has nothing to follow.
     """
     return f"""
 schema_version = 1
@@ -716,9 +720,9 @@ input_tokens = 196608
 output_clamp_tokens = 65536
 
 [lane.subagent]
-context_tokens = 64000
+context_tokens = 66500
 input_tokens = 55808
-output_clamp_tokens = 8192
+output_clamp_tokens = 10692
 """
 
 

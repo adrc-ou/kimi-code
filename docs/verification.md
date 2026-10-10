@@ -302,6 +302,33 @@ against its provider threshold, and `rates` each rolling ledger's `capacity` and
 even though `exclusive` says true for that lane, because that field is the lane
 worst case and the gate prices the live request.
 
+A turn that never returns is the one fault the health endpoint cannot explain by itself: the
+request that is waiting holds a permit rather than failing, so every counter reads sane. Its
+whole history is in `.local/runtime/<instance>/proxy-log/model-proxy.log`, one record per
+event, each carrying the `rid=` that groups one client request's lines together and keeps them
+separate from every other session sharing the same proxy:
+
+```bash
+grep 'rid=9f2c1a77' .local/runtime/<instance>/proxy-log/model-proxy.log
+```
+
+`status=` on an `upstream_rejected` record says what the endpoint answered, and the `headers=`
+field beside it says whether the endpoint's own quota headers came with that answer — their
+absence is how a rejection that did not come from the provider's limiter is told apart from
+one that did. A `request_received` with no `upstream_dispatch` after it means the request is
+parked at a gate; a `upstream_dispatch` with nothing after it means the endpoint has not
+answered yet. An image-heavy session is checked differently, because its failure is invisible in tokens:
+`grep images_evicted` in that log, or read `image_eviction` and the `images_evicted` /
+`image_bytes_freed` counters from `/healthz`. If `images_evicted` stays at zero while a session
+carries attachments, eviction is off or every image is still unanswered — check
+`MODEL_PROXY_IMAGE_EVICTION`. If it climbs but requests still fail, the body was never the
+problem and the `status=` on the refusals is where to look next.
+
+`client_cancelled` says the turn gave up while the proxy was still retrying,
+which is what a retry horizon longer than the client's timeout looks like. Once a loop has
+refused the same request several times, `failed-<rid>.txt` beside the log holds that request
+whole and can be replayed.
+
 The same plan is composed into the two prompt documents, so what Kimi was told is
 readable without a container shell: the staged copies are
 `.local/runtime/<instance>/SYSTEM.md` and `.../AGENTS.md` on the host, and
@@ -315,10 +342,10 @@ and the nine add-ons with theirs.
 
 With the shipped definitions the model advertises 1,000,000 tokens, which is what
 the two fraction rules are measured against, and the harness slices that one model
-into three lanes of its own choosing — 262,144, 1,000,000 and 64,000 — because the
+into three lanes of its own choosing — 262,144, 1,000,000 and 66,500 — because the
 window a request may grow to is a policy decision about how much of the allowance it
 may hold, not a fact the provider imposes on a single request. Each lane also has
-a *worst-case* reservation — primary 262,144, long 965,536, subagent 64,000 — which is
+a *worst-case* reservation — primary 262,144, long 965,536, subagent 66,500 — which is
 what a permit costs when nothing has been measured. Actual permits are priced from the
 request's own estimated input plus that lane's output clamp, capped at the lane worst
 case, so exclusivity and budget admission follow the size of the request in front of the

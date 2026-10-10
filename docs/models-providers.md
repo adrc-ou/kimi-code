@@ -72,9 +72,9 @@ input_tokens = 900000
 output_clamp_tokens = 65536
 
 [lane.subagent]                 # required for the model to be selectable for subagents
-context_tokens = 64000
+context_tokens = 66500
 input_tokens = 55808
-output_clamp_tokens = 8192
+output_clamp_tokens = 10692
 ```
 
 `schema_version`, `label`, `provider`, `model`, `slug`, `credential` and at

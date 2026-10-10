@@ -47,6 +47,16 @@
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000
     },
+    "images": {
+      "command": "python3",
+      "args": [
+        "/opt/kimi-runtime/tools/analyze_image.py"
+      ],
+      "cwd": "/workspace",
+      "enabled": false,
+      "startupTimeoutMs": 30000,
+      "toolTimeoutMs": 120000
+    },
     "serena": {
       "command": "serena",
       "args": [

@@ -113,12 +113,15 @@ harness_instance() {
   HARNESS_STATE_FILE="${HARNESS_RUNTIME_DIR}/state.env"
   HARNESS_SESSION_FILE="${HARNESS_RUNTIME_DIR}/session.env"
   HARNESS_IMAGE_SUFFIX=${HARNESS_INSTANCE_ID}
-  mkdir -p "${HARNESS_COMPOSE_DIR}" "${HARNESS_RUNTIME_DIR}/prompt-log"
+  mkdir -p "${HARNESS_COMPOSE_DIR}" "${HARNESS_RUNTIME_DIR}/prompt-log" \
+    "${HARNESS_RUNTIME_DIR}/proxy-log"
   chmod 700 "${HARNESS_RUNTIME_DIR}" "${HARNESS_COMPOSE_DIR}"
-  # The proxy is the only writer here and it runs unprivileged, so this is the one directory
-  # under the instance directory that other accounts may write to. Its parent stays 0700, so
-  # reaching it already requires being the operator or root.
-  chmod 777 "${HARNESS_RUNTIME_DIR}/prompt-log"
+  # The proxy is the only writer in either of these and it runs unprivileged, so they are the
+  # only directories under the instance directory that other accounts may write to. Their
+  # parent stays 0700, so reaching them already requires being the operator or root. Only the
+  # prompt archive is emptied when the container stops: proxy-log is the record of the launch
+  # that just ended, which is the one moment a fault that outlived it can still be read.
+  chmod 777 "${HARNESS_RUNTIME_DIR}/prompt-log" "${HARNESS_RUNTIME_DIR}/proxy-log"
   : "${COMPOSE_PROJECT_NAME:=kimi_code_${HARNESS_INSTANCE_ID}}"
   [[ "${COMPOSE_PROJECT_NAME}" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || harness_die "Invalid COMPOSE_PROJECT_NAME" || return
   export HARNESS_INSTANCE_ID HARNESS_RUNTIME_DIR HARNESS_COMPOSE_DIR

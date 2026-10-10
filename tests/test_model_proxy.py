@@ -2077,5 +2077,662 @@ class PromptArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("prompt_log lane=subagent error=", self.output)
 
 
+class ImageEvictionDefaultTests(unittest.TestCase):
+    """The shipped default must be the untouched path, whatever a test turned on earlier."""
+
+    def test_eviction_is_off_until_the_operator_opts_in(self):
+        self.assertFalse(PROXY.IMAGE_EVICTION_ENABLED, "defaults to No, like the launch question")
+
+class ProxyLogTests(unittest.IsolatedAsyncioTestCase):
+    """The file is the whole record; the terminal keeps exactly the lines it always had."""
+
+    def setUp(self):
+        reset_policy_state()
+        clean_counters()
+        self.addCleanup(clean_counters)
+        self.policy = PROXY.current_policy()
+        self.lane = self.policy.lanes["subagent"]
+
+        storage = tempfile.TemporaryDirectory()
+        self.addCleanup(storage.cleanup)
+        self.directory = Path(storage.name) / "proxy-log"
+
+        for name, value in (
+            ("LOG_DIR", self.directory),
+            ("LOG_HOST_DIR", str(self.directory)),
+            ("LOG_UNAVAILABLE", None),
+            # The lifecycle hooks clear the prompt archive too, and that must not reach a real
+            # directory or this class would race the archive tests for it.
+            ("PROMPT_LOG_DIR", Path(storage.name) / "prompt-log-absent"),
+        ):
+            patcher = patch.object(PROXY, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        # The handler is module state, and a test that left one attached would keep appending
+        # to a directory its successor has already deleted.
+        self.addCleanup(self.detach)
+        self.detach()
+
+        self.captured = io.StringIO()
+        patcher = patch.object(sys, "stdout", self.captured)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # Events stamp the ambient request id onto the file, and the async test runner reuses
+        # tasks, so an id left by one case would otherwise appear inside the next.
+        self.addCleanup(PROXY.REQUEST_ID.set, "")
+        PROXY.REQUEST_ID.set("")
+
+    @staticmethod
+    def detach() -> None:
+        for handler in list(PROXY._LOG.handlers):
+            PROXY._LOG.removeHandler(handler)
+            handler.close()
+
+    @property
+    def logged(self) -> str:
+        path = self.directory / PROXY.LOG_FILE_NAME
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def open(self) -> None:
+        self.assertIsNone(PROXY.setup_logging(), "the fixture's log directory is writable")
+
+    class Content:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+
+        async def read(self, _limit: int) -> bytes:
+            return self.body
+
+    def request(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            method="POST",
+            content_type="application/json",
+            headers={},
+            transport=SimpleNamespace(is_closing=lambda: False),
+            app={"client": SimpleNamespace()},
+        )
+
+    async def attempt(self, status: int, body: bytes, headers=None):
+        """One real attempt against a gateway that answered with ``status``."""
+        response = SimpleNamespace(
+            status=status,
+            headers=headers or {},
+            content=self.Content(body),
+            content_length=None,
+            close=lambda: None,
+            release=lambda: None,
+        )
+        session = SimpleNamespace(post=lambda *_a, **_k: asyncio.sleep(0, result=response))
+        with patch.object(PROXY, "upstream_credential", lambda _name: "k" * 40):
+            return await PROXY.stream_attempt(
+                self.request(), session, self.lane, b'{"x":1}', 6, 1000
+            )
+
+    async def test_a_retryable_refusal_reaches_the_file_with_its_reason(self):
+        """The whole point: the status and body a retry used to read and discard are kept."""
+        self.open()
+        PROXY.REQUEST_ID.set("abcd1234")
+
+        outcome = await self.attempt(503, b'{"error":{"message":"no backend capacity"}}')
+
+        self.assertEqual(outcome.status, 503)
+        self.assertIn("no backend capacity", outcome.error_excerpt)
+
+        terminal = self.captured.getvalue()
+        self.assertNotIn("upstream_rejected", terminal)
+        self.assertNotIn("upstream_dispatch", terminal)
+        self.assertNotIn("rid=", terminal, "a live line keeps the shape it always had")
+
+        text = self.logged
+        self.assertIn("upstream_rejected", text)
+        self.assertIn("rid=abcd1234", text, "one id ties a request's lines together")
+        self.assertIn("status=503", text)
+        self.assertIn("no backend capacity", text)
+        self.assertIn("header_ms=", text)
+        self.assertIn("priced_reservation=1000", text)
+        self.assertIn("upstream_dispatch", text, "the file also records that it was sent")
+
+    async def test_a_refusal_forwarded_to_the_client_records_its_status(self):
+        """A 4xx the client is given is a refusal, not the success the word implies."""
+        self.open()
+
+        async def completed(*_args, **_kwargs):
+            return PROXY.Attempt(
+                response=SimpleNamespace(), output_tokens=3, prompt_tokens=4, status=400
+            )
+
+        body = b'{"messages":[]}'
+        with patch.object(PROXY, "stream_attempt", completed):
+            await PROXY.forward_chat(
+                self.request(),
+                self.lane,
+                body,
+                time.monotonic(),
+                body,
+                PROXY.Cost(input=10, output=8192),
+                1000,
+            )
+
+        self.assertIn("request_complete", self.logged)
+        self.assertIn("status=400", self.logged)
+        terminal = self.captured.getvalue()
+        self.assertIn("request_complete lane=subagent", terminal)
+        self.assertNotIn("status=400", terminal, "the live line gained no field")
+
+    async def test_a_client_that_gives_up_leaves_a_record(self):
+        """An abandoned request and one that never arrived were previously indistinguishable."""
+        self.open()
+        request = self.request()
+        request.transport = SimpleNamespace(is_closing=lambda: True)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await PROXY.forward_chat(
+                request,
+                self.lane,
+                b"{}",
+                time.monotonic(),
+                b"{}",
+                PROXY.Cost(input=10, output=8192),
+                1000,
+            )
+
+        self.assertIn("client_cancelled", self.logged)
+        self.assertIn("attempts=0", self.logged)
+
+    async def test_a_loop_stuck_on_one_request_archives_the_body_once(self):
+        self.open()
+        PROXY.REQUEST_ID.set("dump0001")
+        real_sleep = asyncio.sleep
+
+        async def reject(_request, _session, _lane, _body, attempt, _reservation):
+            if attempt < PROXY.FAILURE_DUMP_ATTEMPT + 2:
+                return PROXY.Attempt(retry_after=0.0, status=503, error_excerpt="busy")
+            return PROXY.Attempt(
+                response=SimpleNamespace(), output_tokens=1, prompt_tokens=1, status=200
+            )
+
+        async def immediate(*_args, **_kwargs):
+            return await real_sleep(0)
+
+        body = b'{"messages":[{"role":"user","content":"replay me"}]}'
+        with (
+            patch.object(PROXY, "stream_attempt", reject),
+            patch.object(PROXY.asyncio, "sleep", immediate),
+        ):
+            await PROXY.forward_chat(
+                self.request(),
+                self.lane,
+                body,
+                time.monotonic(),
+                body,
+                PROXY.Cost(input=10, output=8192),
+                1000,
+            )
+
+        dumps = sorted(self.directory.glob("failed-*.txt"))
+        self.assertEqual(len(dumps), 1, "one client request gets one replay file")
+        self.assertIn("replay me", dumps[0].read_text(encoding="utf-8"))
+        self.assertIn("failure_dumped", self.logged)
+
+    async def test_a_dump_larger_than_the_cap_is_described_not_written(self):
+        self.open()
+        PROXY.REQUEST_ID.set("big00001")
+        real_sleep = asyncio.sleep
+
+        async def reject(_request, _session, _lane, _body, attempt, _reservation):
+            if attempt <= PROXY.FAILURE_DUMP_ATTEMPT:
+                return PROXY.Attempt(retry_after=0.0, status=503, error_excerpt="busy")
+            return PROXY.Attempt(
+                response=SimpleNamespace(), output_tokens=1, prompt_tokens=1, status=200
+            )
+
+        async def immediate(*_args, **_kwargs):
+            return await real_sleep(0)
+
+        body = b'{"messages":[{"content":"' + b"x" * 4096 + b'"}]}'
+        with (
+            patch.object(PROXY, "stream_attempt", reject),
+            patch.object(PROXY, "LOG_DUMP_MAX_BYTES", 64),
+            patch.object(PROXY.asyncio, "sleep", immediate),
+        ):
+            await PROXY.forward_chat(
+                self.request(),
+                self.lane,
+                body,
+                time.monotonic(),
+                body,
+                PROXY.Cost(input=10, output=8192),
+                1000,
+            )
+
+        self.assertEqual(list(self.directory.glob("failed-*.txt")), [])
+        self.assertIn("failure_dump_skipped", self.logged)
+        self.assertIn("limit=64", self.logged)
+
+    def test_dumps_roll_by_total_size_and_always_keep_the_newest(self):
+        self.directory.mkdir(parents=True, exist_ok=True)
+        for index in range(6):
+            path = self.directory / f"failed-req{index:04d}.txt"
+            path.write_bytes(b"x" * 4096)
+            stamp = 1_700_000_000 + index
+            os.utime(path, (stamp, stamp))
+
+        with patch.object(PROXY, "LOG_DUMP_BUDGET_BYTES", 12 * 1024):
+            freed = PROXY.prune_failure_dumps()
+
+        kept = sorted(path.name for path in self.directory.glob("failed-*.txt"))
+        self.assertEqual(
+            kept,
+            ["failed-req0003.txt", "failed-req0004.txt", "failed-req0005.txt"],
+            "oldest go first",
+        )
+        self.assertTrue((self.directory / "failed-req0005.txt").exists())
+        self.assertEqual(
+            sum((self.directory / name).stat().st_size for name in kept), 12 * 1024
+        )
+        self.assertEqual(freed, 12 * 1024)
+
+    async def test_dumps_are_cleared_at_both_ends_of_a_run_but_the_log_is_not(self):
+        self.open()
+        self.directory.mkdir(parents=True, exist_ok=True)
+        log = self.directory / PROXY.LOG_FILE_NAME
+        log.write_text("keep me")
+        dump = self.directory / "failed-purge001.txt"
+
+        dump.write_text("prompt text")
+        await PROXY.open_prompt_archive(None)
+        self.assertFalse(dump.exists(), "a launch that was killed still starts clean")
+
+        dump.write_text("prompt text")
+        await PROXY.close_prompt_archive(None)
+        self.assertFalse(dump.exists(), "prompt text does not outlive the stack")
+        self.assertIn("keep me", log.read_text(encoding="utf-8"), "the event log does")
+
+    def test_a_dump_budget_too_small_for_one_dump_stops_startup(self):
+        # Otherwise pruning would evict the dump just written and leave only the event
+        # claiming it was saved.
+        with (
+            patch.object(PROXY, "LOG_DUMP_BUDGET_BYTES", 1024),
+            patch.object(PROXY, "LOG_DUMP_MAX_BYTES", 4096),
+        ):
+            with self.assertRaises(RuntimeError):
+                PROXY.validate_policy()
+
+    def test_an_unwritable_log_directory_costs_only_the_file(self):
+        obstruction = self.directory.parent / "not-a-directory"
+        obstruction.write_text("a file where a parent directory should be")
+
+        with patch.object(PROXY, "LOG_DIR", obstruction / "proxy-log"):
+            reason = PROXY.setup_logging()
+
+        self.assertIsNotNone(reason)
+        PROXY.event("rate_wait", ("lane", "attempt", "delay"), lane="long", attempt=1, delay="1.0s")
+        self.assertIn("rate_wait lane=long attempt=1 delay=1.0s", self.captured.getvalue())
+
+    def test_the_live_set_can_be_widened_without_touching_the_code(self):
+        with patch.dict(os.environ, {"MODEL_PROXY_LIVE_EVENTS": ""}):
+            mirror, names = PROXY._configured_live_events()
+        self.assertFalse(mirror)
+        self.assertEqual(names, PROXY.DEFAULT_LIVE_EVENTS)
+
+        with patch.dict(os.environ, {"MODEL_PROXY_LIVE_EVENTS": "all"}):
+            self.assertTrue(PROXY._configured_live_events()[0])
+
+        with patch.dict(os.environ, {"MODEL_PROXY_LIVE_EVENTS": "upstream_rejected, lane"}):
+            mirror, names = PROXY._configured_live_events()
+        self.assertFalse(mirror)
+        self.assertEqual(names, frozenset({"upstream_rejected", "lane"}))
+
+    async def test_an_upstream_error_body_cannot_split_a_record(self):
+        self.open()
+
+        await self.attempt(500, b"line one\nline two\n")
+
+        refusals = [line for line in self.logged.splitlines() if "upstream_rejected" in line]
+        self.assertEqual(len(refusals), 1, "one attempt is one line, whatever it carried")
+        self.assertIn("\\nline two", refusals[0], "the newline is escaped, not emitted")
+
+
+class ImageEvictionPipelineTests(unittest.IsolatedAsyncioTestCase):
+    """Through the real handler: what is guarded, priced and sent must all be the same body."""
+
+    def setUp(self):
+        # Off unless the operator opted in, so the pipeline under test has to be switched on.
+        patcher = patch.object(PROXY, "IMAGE_EVICTION_ENABLED", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        reset_policy_state()
+        clean_counters()
+        self.addCleanup(clean_counters)
+        self.forwarded = []
+
+        async def capture(_request, lane, body, _started, inbound, cost, reservation):
+            self.forwarded.append((body, inbound, cost, reservation))
+            return PROXY.web.Response(text="ok")
+
+        patcher = patch.object(PROXY, "forward_chat", capture)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.context = live(mutated())
+        self.context.__enter__()
+        self.addCleanup(self.context.__exit__, None, None, None)
+        reset_policy_state()
+
+    def request(self, body: bytes):
+        return SimpleNamespace(
+            method="POST",
+            content_type="application/json",
+            headers={"Authorization": f"Bearer {INTERNAL_TOKEN}"},
+            match_info={"lane": "subagent"},
+            query_string="",
+            rel_url="/subagent/v1/chat/completions",
+            transport=SimpleNamespace(is_closing=lambda: False),
+            app={},
+            read=lambda: asyncio.sleep(0, result=body),
+        )
+
+    async def send(self, messages) -> bytes:
+        """Run the real handler and report the bytes the client sent."""
+        body = json.dumps({"model": "anything", "messages": messages}).encode()
+        response = await PROXY.chat(self.request(body))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(self.forwarded), 1)
+        return body
+
+    async def test_the_forwarded_body_has_no_image_bytes(self):
+        url = "data:image/png;base64," + "A" * 40_000
+        sent = await self.send([
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]},
+            {"role": "assistant", "content": "answered"},
+            {"role": "user", "content": "next"},
+        ])
+
+        body = self.forwarded[0][0]
+        self.assertLess(len(body), len(sent) // 10, "the image must not reach the provider")
+        self.assertNotIn(url.encode(), body)
+        self.assertIn(b"analyze_image", body)
+
+    async def test_the_permit_is_priced_from_the_body_actually_sent(self):
+        """Otherwise a request trimmed to a fraction of its size still pays for the whole."""
+        url = "data:image/png;base64," + "A" * 40_000
+        sent = await self.send([
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]},
+            {"role": "assistant", "content": "answered"},
+        ])
+
+        body, _inbound, cost, reservation = self.forwarded[0]
+        lane = PROXY.current_policy().lanes["subagent"]
+        # The reference is the evicted body before rewrite_model adds cache_salt and clamps
+        # output; pricing is deliberately computed there, not after.
+        evicted, _report = PROXY.evict_body_images(sent)
+        evicted_estimate, evicted_media = PROXY.estimate_input_tokens(evicted)
+        raw_estimate, raw_media = PROXY.estimate_input_tokens(sent)
+
+        self.assertLess(evicted_media, raw_media, "the image no longer counts as media")
+        self.assertEqual(cost.input, evicted_estimate)
+        self.assertEqual(reservation, PROXY.priced_reservation(lane, evicted_estimate))
+        self.assertLess(reservation, PROXY.priced_reservation(lane, raw_estimate))
+
+    async def test_a_body_with_no_images_is_not_rewritten_by_eviction(self):
+        """Compare against eviction plus rewrite, so this measures eviction alone."""
+        messages = [{"role": "user", "content": "just text"}]
+        sent = await self.send(messages)
+
+        lane = PROXY.current_policy().lanes["subagent"]
+        untouched = PROXY.rewrite_model(sent, self.request(sent), lane)
+        self.assertEqual(self.forwarded[0][0], untouched)
+
+
+class ImageEvictionTests(unittest.TestCase):
+    """Eviction is judged on the body that reaches the provider, not the one received."""
+
+    BIG = "data:image/png;base64," + "A" * 40_000
+
+    def setUp(self):
+        patcher = patch.object(PROXY, "IMAGE_EVICTION_ENABLED", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+    SMALL = "data:image/png;base64," + "A" * 500
+
+    def images_in(self, message):
+        """The parts of a message that are still images, wherever they sit."""
+        return [p for p in message["content"] if p.get("type") == "image_url"]
+
+    def texts_in(self, message):
+        return " ".join(
+            p.get("text", "") for p in message["content"] if p.get("type") == "text"
+        )
+
+    def image(self, url, field="image_url", text=None):
+        parts = [] if text is None else [{"type": "text", "text": text}]
+        parts.append({"type": "image_url", field: {"url": url}})
+        return parts
+
+    def answered(self, url, field="image_url"):
+        return {
+            "messages": [
+                {"role": "system", "content": "You are an agent."},
+                {"role": "user", "content": self.image(url, field, "read this")},
+                {"role": "assistant", "content": "It shows a book spread."},
+            ]
+        }
+
+    def test_an_answered_image_becomes_a_handle(self):
+        report = PROXY.evict_answered_images(payload := self.answered(self.BIG))
+
+        self.assertEqual(report.images, 1)
+        self.assertEqual(report.bytes_freed, len(self.BIG.split(",", 1)[1]))
+        text = self.texts_in(payload["messages"][1])
+        self.assertIn("read this", text, "the original text is kept")
+        self.assertIn("analyze_image", text)
+        self.assertIn(f'with handle="{report.handles[0]}"', text)
+
+    def test_the_notice_never_promises_the_bytes_are_still_there(self):
+        """Only images under the session's media dirs are guaranteed to resolve.
+
+        A crop the agent wrote to scratch space is gone once that space is, and a notice that
+        asserts availability invites a re-read loop against bytes that no longer exist — the
+        failure Claude Code shipped as "stripped images prompting the model to repeatedly
+        re-read media that was no longer present".
+        """
+        payload = self.answered(self.BIG)
+        PROXY.evict_answered_images(payload)
+        text = self.texts_in(payload["messages"][1])
+
+        self.assertNotIn("It is still on this machine", text)
+        self.assertIn("may still be", text)
+        self.assertNotIn("always", text.lower(), "no guarantee belongs in this notice")
+        # Quoted, so a model copying the handle does not have to guess where it ends.
+        self.assertIn('handle "sha256:', text)
+        self.assertEqual(self.images_in(payload["messages"][1]), [])
+
+    def test_both_field_spellings_are_evicted(self):
+        for field in ("image_url", "imageUrl"):
+            with self.subTest(field=field):
+                report = PROXY.evict_answered_images(self.answered(self.BIG, field))
+                self.assertEqual(report.images, 1)
+
+    def test_an_unanswered_image_is_left_alone(self):
+        payload = {
+            "messages": [
+                {"role": "user", "content": self.image(self.BIG)},
+                {"role": "assistant", "content": [{"type": "tool_calls"}]},
+            ]
+        }
+
+        self.assertEqual(PROXY.evict_answered_images(payload).images, 0)
+        self.assertEqual(len(self.images_in(payload["messages"][0])), 1)
+
+    def test_an_assistant_tool_call_without_text_has_not_answered_it(self):
+        """Only prose counts as an answer, so a bare tool call keeps the image in view."""
+        payload = {
+            "messages": [
+                {"role": "user", "content": self.image(self.BIG)},
+                {"role": "assistant", "content": ""},
+            ]
+        }
+        self.assertEqual(PROXY.evict_answered_images(payload).images, 0)
+
+    def test_small_images_and_remote_urls_are_not_evicted(self):
+        remote = {"messages": [
+            {"role": "user", "content": self.image("https://example.com/a.png")},
+            {"role": "assistant", "content": "seen"},
+        ]}
+        self.assertEqual(PROXY.evict_answered_images(remote).images, 0)
+        self.assertEqual(PROXY.evict_answered_images(self.answered(self.SMALL)).images, 0)
+
+    def test_eviction_is_monotone_across_a_growing_session(self):
+        """Once rewritten an image never changes again, so the prefix stays cacheable.
+
+        A keep-newest-N window would move its boundary every step and invalidate the cached
+        prefix each time; this rule fires at most once per image.
+        """
+        messages = [{"role": "system", "content": "s"}]
+        settled: list[str] = []
+        for turn in range(4):
+            url = f"data:image/png;base64,{'A' * 40000}{turn}"
+            messages.append({"role": "user", "content": self.image(url)})
+            messages.append({"role": "assistant", "content": f"answer {turn}"})
+            PROXY.evict_answered_images({"messages": messages})
+
+            # Every turn the previous step already finalised must be byte-identical now.
+            for index, previous in enumerate(settled):
+                self.assertEqual(
+                    json.dumps(messages[index], sort_keys=True),
+                    previous,
+                    f"turn {index} changed after it had already been evicted",
+                )
+            settled = [json.dumps(m, sort_keys=True) for m in messages[:-1]]
+
+    def test_message_count_roles_and_pairing_survive(self):
+        payload = self.answered(self.BIG)
+        payload["messages"].append(
+            {"role": "assistant", "content": "ok", "tool_calls": [{"id": "call_1"}]}
+        )
+        payload["messages"].append({"role": "tool", "tool_call_id": "call_1", "content": "done"})
+        def skeleton(document):
+            return [
+                (m.get("role"), m.get("tool_calls"), m.get("tool_call_id"))
+                for m in document["messages"]
+            ]
+
+        before = skeleton(payload)
+        PROXY.evict_answered_images(payload)
+        self.assertEqual(skeleton(payload), before)
+
+    def test_a_body_with_no_images_is_returned_untouched(self):
+        body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+        returned, report = PROXY.evict_body_images(body)
+
+        self.assertIs(returned, body, "no re-serialisation, so no key-order churn")
+        self.assertFalse(report)
+
+    def test_a_body_that_evicts_nothing_is_returned_untouched(self):
+        body = json.dumps(self.answered(self.SMALL)).encode()
+
+        returned, report = PROXY.evict_body_images(body)
+
+        self.assertIs(returned, body)
+        self.assertFalse(report)
+
+    def test_a_second_pass_changes_nothing(self):
+        body = json.dumps(self.answered(self.BIG)).encode()
+        once, first = PROXY.evict_body_images(body)
+        twice, second = PROXY.evict_body_images(once)
+
+        self.assertEqual(first.images, 1)
+        self.assertIs(twice, once, "retrying a forwarded body must not rewrite it again")
+        self.assertEqual(second.images, 0)
+
+    def test_an_unparseable_body_is_passed_through_for_rewrite_model_to_reject(self):
+        body = b'{"messages": ["image_url", broken'
+
+        returned, report = PROXY.evict_body_images(body)
+
+        self.assertIs(returned, body)
+        self.assertFalse(report)
+
+    def test_disabling_eviction_restores_the_inbound_body_exactly(self):
+        body = json.dumps(self.answered(self.BIG)).encode()
+
+        with patch.object(PROXY, "IMAGE_EVICTION_ENABLED", False):
+            returned, report = PROXY.evict_body_images(body)
+
+        self.assertIs(returned, body)
+        self.assertEqual(report.images, 0)
+
+
+    def test_the_replacement_part_carries_only_text_fields(self):
+        """A copied image block would put image-only keys on a text part."""
+        payload = self.answered(self.BIG)
+        payload["messages"][1]["content"][1]["detail"] = "high"
+        payload["messages"][1]["content"][1]["cache_control"] = {"type": "ephemeral"}
+
+        PROXY.evict_answered_images(payload)
+
+        part = payload["messages"][1]["content"][1]
+        self.assertEqual(sorted(part), ["text", "type"])
+
+    def test_a_malformed_data_prefix_does_not_repaste_the_payload_as_a_mime_type(self):
+        """`data:,<huge>` has no media type; trusting the prefix would undo the saving."""
+        url = "data:," + "A" * 60_000
+        payload = {
+            "messages": [
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]},
+                {"role": "assistant", "content": "answered"},
+            ]
+        }
+
+        report = PROXY.evict_answered_images(payload)
+
+        text = payload["messages"][0]["content"][0]["text"]
+        self.assertEqual(report.images, 1)
+        self.assertIn("unknown", text)
+        self.assertLess(len(text), 1200, "the note stayed a note, not a copy of the payload")
+        self.assertNotIn("A" * 100, text)
+
+    def test_a_part_carrying_two_images_evicts_both_and_names_both(self):
+        other = "data:image/png;base64," + "B" * 40_000
+        payload = self.answered(self.BIG)
+        payload["messages"][1]["content"][1]["imageUrl"] = {"url": other}
+
+        report = PROXY.evict_answered_images(payload)
+
+        self.assertEqual(report.images, 2, "neither image may vanish unmentioned")
+        self.assertEqual(len(set(report.handles)), 2)
+        text = payload["messages"][1]["content"][1]["text"]
+        for handle in report.handles:
+            self.assertIn(handle, text)
+
+    def test_a_body_with_duplicate_keys_is_passed_through_untouched(self):
+        """Eviction must not launder a body rewrite_model exists to refuse.
+
+        Parsing with the same duplicate-key rule means such a body never reaches the
+        re-serialise step at all, so it goes on to be rejected exactly as it would have been.
+        """
+        body = (
+            b'{"model":"a","model":"b","messages":'
+            + json.dumps(self.answered(self.BIG)["messages"]).encode()
+            + b"}"
+        )
+
+        returned, report = PROXY.evict_body_images(body)
+
+        self.assertIs(returned, body)
+        self.assertEqual(report.images, 0)
+
+    def test_string_content_is_never_touched(self):
+        payload = {"messages": [
+            {"role": "user", "content": "plain text"},
+            {"role": "assistant", "content": "reply"},
+        ]}
+
+        self.assertEqual(PROXY.evict_answered_images(payload).images, 0)
+        self.assertEqual(payload["messages"][0]["content"], "plain text")
+
+
 if __name__ == "__main__":
     unittest.main()

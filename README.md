@@ -315,8 +315,8 @@ honour answers HTTP 503 instead of passing unmeasured traffic. How the reservati
 and the fan-out are derived is
 [docs/models-providers.md](docs/models-providers.md); at the shipped numbers
 `qwen3-primary` reserves its whole 262,144-token window, `qwen3-long` reserves
-965,536, and each `qwen3-subagent` reserves 64,000, which is 5 at once against the
-332,500 budget: the largest fan-out the rules allow. A permit is not charged at
+965,536, and each `qwen3-subagent` reserves 66,500, which is 5 at once against the
+332,500 budget — exactly, with nothing left over: the largest fan-out the rules allow. A permit is not charged at
 that worst case. The gate prices each request from its own estimated input plus
 that lane's output clamp, capped at the lane reservation, so nothing runs alone by
 name: only a request whose price reaches 350,000 does, which for `qwen3-long` means
@@ -349,8 +349,8 @@ stating plainly, because the interesting cases are invisible:
   ordinary shape of a long chat — one very big request at a time — is exactly the
   shape that runs alone. Starting a swarm *while* that is in flight makes the
   children wait for it, and waiting is not failing: the permit is held for them.
-- Fan-out is a budget decision, not a preference. Five subagents at 64,000 tokens
-  each is 320,000 of the 332,500 in-flight budget, so a sixth cannot start and a
+- Fan-out is a budget decision, not a preference. Five subagents at 66,500 tokens
+  each is all 332,500 of the in-flight budget, so a sixth cannot start and a
   wide-lane request cannot start at all beside them. Running ten children in the
   background does not get ten times the work done; it gets the same work done
   with more of it waiting.
@@ -385,8 +385,115 @@ prompt_log lane=primary time=2026-09-21T03:07:21.964055+00:00 chars=53 file=/…
 The archive lives in `.local/runtime/<instance>/prompt-log`, so the files are readable on
 the host while the stdout lines that name them arrive in `docker compose logs model-proxy`.
 The archive holds conversation text, so its contents are purged when the proxy stops and
-any leftovers are cleared again when it starts. It is the one writable
-host bind the proxy has, and it is mounted into no other container.
+any leftovers are cleared again when it starts. It is mounted into no other container.
+
+### Reading what the proxy actually saw
+
+Every container's stdout arrives in the terminal `./start.sh` is running in, and a proxy that
+retries a provider would drown that screen in one line per attempt. So the live view is
+deliberately a subset, and the full record is a file:
+
+```
+.local/runtime/<instance>/proxy-log/model-proxy.log
+```
+
+The proxy prints that path on one stdout line at launch. Every event is written to the file
+with everything known about it - the upstream status, that status's error body, the endpoint's
+quota headers, how long the attempt ran, and an `rid=` shared by every line of one client
+request, which is what separates two sessions that were talking to the same proxy at the same
+time. Only the events in the proxy's default set also reach stdout, and their lines carry the
+same fields they always did:
+
+```
+upstream_retry lane=long attempt=6 delay=32.5s                                    # terminal
+upstream_retry rid=9f2c1a77 lane=long attempt=6 delay=32.5s status=503 elapsed_seconds=181.3 input_bytes=1400000 priced_reservation=416922 body='{"error":"no backend capacity"}'   # file
+```
+
+Nothing is lost to that split, because the file is the superset: whatever the terminal showed,
+a grep of the file finds, plus what the endpoint actually said. To watch the whole thing
+live while reproducing a fault, set `MODEL_PROXY_LIVE_EVENTS=all` (or a comma-separated list
+of event names) in `.env`.
+
+The file rotates in place, and unlike the prompt archive it is **not** swept when the stack
+stops, because the launch that just ended is exactly the one whose failure you are most likely
+to be reading afterwards — and it holds only numbers and short status lines, not conversation.
+
+A request that a retry loop keeps refusing is additionally archived whole, once per client
+request, as `failed-<rid>.txt` beside the log: the prompt archive holds only requests that
+introduce a new prompt, so without this a turn that dies 143 steps in leaves nothing that can
+be replayed. Those dumps **are** conversation, so they follow the prompt archive's rule and are
+cleared at both ends of a launch, and while the stack is up they roll by total size — oldest
+dropped first, newest always kept — under `MODEL_PROXY_LOG_DUMP_BUDGET_BYTES`. Nothing in the
+log directory can grow without bound.
+
+`/healthz` reports the live set in force and says plainly when the log directory could not be
+opened. It deliberately does not name that directory's path on the host: the endpoint is
+reachable from the agent container, and the directory can hold request bodies. See
+`docs/verification.md` for reading the policy in force.
+
+## Images in long sessions
+
+An inline image is base64 inside the request body, so it rides along on every later step of
+the session that produced it. Measured on one archived request: **3,721,208 of 4,025,030 body
+bytes were images** — 92.4% — leaving ~304 KB for every text part plus the whole tool schema
+set. The schema set was measured separately, on a different request: 114 tools, 169,670 bytes.
+Do not subtract one from the other — they were never in the same body — but either way schemas
+are not what fills these requests.
+Nothing bounds this from outside. Kimi's own `[image] read_byte_budget` (256 KB) covers only
+default reads: `region` and `full_resolution` are exempt, and an attachment pasted through the
+UI is not a read at all. (Both figures are Kimi's documented defaults, from its configuration
+docs rather than from this repository's code.)
+
+So the proxy evicts. Once an assistant turn has answered an image, the image part is replaced
+in place by a text part naming a handle:
+
+```
+[image removed from context after analysis: 2798692 base64 chars, image/png,
+ handle "sha256:524c8d6708db". It may still be on this machine: call the analyze_image
+ tool (named mcp__images__analyze_image wherever tools are namespaced) with
+ handle="sha256:524c8d6708db" and prompt=<what you want from it> to see it again,
+ then continue the task you were working on.]
+```
+
+The rule is deliberately narrow: an image is evicted only when some later assistant message
+contains prose. That makes eviction **monotone** — an image is rewritten at most once, so the
+prefix stops changing and the provider's cache keeps hitting. A "keep the newest N" window
+would move its boundary every step and destroy the cache instead. It also means the attachment
+you just pasted is never taken away before the model has read it.
+
+Nothing is added, removed, reordered, or re-roled, so message counts and every `tool_call_id`
+pairing survive untouched.
+
+`analyze_image` is an MCP server (`tools/analyze_image.py`, registered as `images`) that
+resolves a handle back to the file. It runs in the agent container because that is the
+container which can read `~/.kimi-code/sessions/*/media/`; the proxy cannot. It accepts the
+digest handle, a media key, or the original filename, and returns the picture together with
+the agent's own question. `list_images` shows what is available. It is reachable as
+`mcp__images__analyze_image` where tools are namespaced.
+
+Its listing is scoped to sessions whose recorded working directory is the project the agent is
+in — but that scope is coarse: every session in one container shares the same mount path, so it
+separates projects across containers, not sessions within one. Handles are digests, so a lookup
+still only ever returns an image the caller had already been given, and a symlink planted in a
+media directory is refused rather than served.
+
+It is not a replacement for `ReadMediaFile`, and eviction does not depend on it: eviction is
+origin-agnostic, so a `ReadMediaFile` read is evicted and re-read through the same tool that
+delivered it. `analyze_image` exists for the one case with no path in the transcript — a UI
+attachment, which reaches the model as bare bytes.
+
+Guard and fair-use price are computed from the **evicted** body, so a request trimmed to
+1.4 MB is neither rejected nor priced as if it were still 5 MB. `images_evicted` and
+`image_bytes_freed` are counters on the health endpoint, and each eviction writes an
+`images_evicted` record to the log.
+
+**This is off until you turn it on.** `./start.sh` asks — *"Use smart context reduction strategy
+for multimodal attachments?"* — on every interactive launch, opening on whatever you last
+answered, or on **No** if you have never been asked. The answer is written to
+`MODEL_PROXY_IMAGE_EVICTION`, the same variable `compose.yaml` reads, so nothing translates it
+on the way; an unattended launch with no recorded answer gets No. The reason it is a question
+and not a default is that it changes what the model sees: the bytes are still reachable, but
+only by asking.
 
 ## Persistent workspace contract
 
@@ -782,8 +889,9 @@ approved agents, skills, and MCP declaration — and `tools/compose_hygiene.py`
 refuses every other agent bind, including any bind in any container that contains
 the credential directory rather than sitting inside it, so an overlay cannot
 acquire that view either.
-The prompt archive is one of those instance-directory paths, and it is a host bind of
-`model-proxy` rather than of the agent, so the agent cannot read it or learn its name.
+The prompt archive and the proxy's log directory are two of those instance-directory paths,
+and each is a host bind of `model-proxy` rather than of the agent, so the agent can read
+neither and can learn the host name of neither.
 Set `COMPOSE_PROJECT_NAME` to something neutral if the default
 `kimi_code_<instance-id>` name is not one you want published inside the
 sandbox.

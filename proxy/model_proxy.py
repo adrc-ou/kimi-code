@@ -30,6 +30,13 @@ assumptions.
 The proxy also keeps an archive of the prompts it forwards. Every new user prompt becomes one
 file under a host-visible directory, plus one stdout line pointing at it, and the directory is
 emptied when the container stops. See ``log_prompt``.
+
+Everything the proxy records goes to two places at once. A rotating file under ``LOG_DIR``
+carries every event with its full detail - the upstream status, the error body, the quota
+headers, and an id shared by every line of one client request - while stdout carries only the
+terse line for the events named in ``LIVE_EVENTS``, which is what reaches the terminal the
+stack was launched from. The file is the superset, so nothing is lost by the filtered view;
+see ``event`` and ``setup_logging``.
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -46,10 +54,12 @@ import shutil
 import time
 import tomllib
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from aiohttp import (
@@ -148,6 +158,237 @@ def debug_body(body: bytes, *, redact_cache_salt: bool = False) -> str:
         return json.dumps(payload, indent=2, ensure_ascii=False)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return body.decode("utf-8", errors="replace")
+
+
+# ============================================================
+# Two-tier logging: everything to a file, a chosen subset to the terminal
+# ============================================================
+#
+# Every event is written to a rotating file under LOG_DIR carrying the detail that makes a
+# stuck request explainable - the upstream status, its error body, the quota headers, how long
+# the attempt ran, and an id shared by every line of one client request. Only the events named
+# by LIVE_EVENTS are also written to stdout, and stdout is what ``./start.sh`` streams into the
+# operator's terminal alongside every other container in the stack.
+#
+# The two renderings are deliberately different. The terminal line stays exactly as terse as it
+# has always been, so adding diagnostic detail to the file cannot bury the live signal that the
+# terse set was chosen to preserve. Nothing is lost by that split, because the file is the
+# superset: whatever the terminal shows, a grep of the file finds, plus what the upstream
+# actually said.
+#
+# ``MODEL_PROXY_LIVE_EVENTS`` re-draws the line without a code change: a comma-separated list of
+# event names, or ``all`` to mirror the file verbatim. Promote a name while reproducing a fault
+# and drop it again afterwards.
+
+#: The archive directory inside this container, and the same directory's path on the host,
+#: which is the one an operator can open without going through Docker. The container's root
+#: filesystem is read-only, so the file exists only because compose binds this directory.
+LOG_DIR = Path(os.environ.get("MODEL_PROXY_LOG_DIR", "/var/log/model-proxy"))
+LOG_HOST_DIR = os.environ.get("MODEL_PROXY_LOG_HOST_DIR") or str(LOG_DIR)
+LOG_FILE_NAME = "model-proxy.log"
+LOG_MAX_BYTES = int(os.environ.get("MODEL_PROXY_LOG_MAX_BYTES", str(8 * 1024 * 1024)))
+LOG_BACKUPS = int(os.environ.get("MODEL_PROXY_LOG_BACKUPS", "4"))
+
+#: How many bytes of failure dumps to keep in total, oldest dropped first. Bounded by size
+#: rather than by count because the sessions that produce several dumps are precisely the ones
+#: whose bodies are megabytes: a count bound would still let them grow without limit.
+LOG_DUMP_BUDGET_BYTES = int(
+    os.environ.get("MODEL_PROXY_LOG_DUMP_BUDGET_BYTES", str(100 * 1024 * 1024))
+)
+
+#: An inline image is carried as base64 inside the request body, so its bytes ride along on
+#: every later step of the session that produced them. Measured on a real archived request:
+#: 3,721,208 of 4,025,030 body bytes were images, while all text plus every tool schema came
+#: to ~304 KB. Kimi's own byte budget does not bound this, because `region` and
+#: `full_resolution` reads are exempt from it and a pasted attachment is not a read at all.
+#: The proxy is the last point that sees the body and the only one this harness owns, so
+#: eviction happens here: once an assistant turn has answered an image, the bytes are replaced
+#: in place by a handle the agent can re-read with. See ``evict_answered_images``.
+#: Off unless the operator opted in. ``./start.sh`` asks on every interactive launch and writes
+#: the answer here; a proxy started some other way must not begin rewriting model input on an
+#: assumption nobody confirmed.
+IMAGE_EVICTION_ENABLED = os.environ.get("MODEL_PROXY_IMAGE_EVICTION", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+#: Smaller images stay. Icons and thumbnails are cheap enough that rewriting them trades a
+#: trivial number of bytes for a handle the model then has to reason about.
+IMAGE_EVICTION_MIN_BYTES = int(
+    os.environ.get("MODEL_PROXY_IMAGE_EVICTION_MIN_BYTES", "32768")
+)
+
+#: How much of the digest to show. Enough to be unique across a session's images at the
+#: collision rate that matters here, short enough to be convenient to pass back.
+IMAGE_HANDLE_PREFIX = 12
+
+#: Both spellings are live in this stack, so both are read. See ``_image_urls_of``.
+IMAGE_PART_FIELD_NAMES = ("image_url", "imageUrl")
+
+#: A failure dump is a whole request, which for a multimodal body is megabytes, so this
+#: ceiling is what keeps a few of them from outgrowing the host directory they land in. A
+#: request over the cap is still described in the log; only its replay file is skipped.
+LOG_DUMP_MAX_BYTES = int(
+    os.environ.get("MODEL_PROXY_LOG_DUMP_MAX_BYTES", str(64 * 1024 * 1024))
+)
+
+#: How much of an upstream error body one event may carry. A gateway's whole complaint fits;
+#: the bound matters because that body arrives from the network rather than from this plan.
+LOG_ERROR_EXCERPT_BYTES = 4096
+
+#: Events whose terse line also reaches stdout. This is the set the proxy has always printed,
+#: carried forward unchanged so the launch terminal reads the same as it did before the file
+#: existed. Everything below is also in the file whether or not it is listed here.
+DEFAULT_LIVE_EVENTS = frozenset(
+    {
+        "input_guard",
+        "lane_config",
+        "log_file",
+        "log_unavailable",
+        "policy_drift",
+        "policy_drift_clear",
+        "prompt_log",
+        "prompt_log_purge",
+        "prompt_log_purged",
+        "rate_wait",
+        "request_complete",
+        "request_deadline",
+        "response_limit",
+        "startup_refused",
+        "stream_stall",
+        "upstream_retry",
+        "usage_reporting_unsupported",
+    }
+)
+
+
+def _configured_live_events() -> tuple[bool, frozenset[str]]:
+    """Return ``(mirror_everything, event names)`` from ``MODEL_PROXY_LIVE_EVENTS``."""
+    configured = os.environ.get("MODEL_PROXY_LIVE_EVENTS", "").strip().lower()
+    if not configured:
+        return False, DEFAULT_LIVE_EVENTS
+    if configured in {"all", "*"}:
+        return True, DEFAULT_LIVE_EVENTS
+    return False, frozenset(name.strip() for name in configured.split(",") if name.strip())
+
+
+LIVE_ALL, LIVE_EVENTS = _configured_live_events()
+
+#: Set once per client request and read by every event that request raises, so lines from the
+#: concurrent sessions sharing this one proxy can be told apart after the fact.
+REQUEST_ID: ContextVar[str] = ContextVar("request_id", default="")
+
+#: Why the file sink is unavailable, or None when it is open. Surfaced on /healthz rather than
+#: only at startup, because a bind that was dropped mid-life should not read as a quiet proxy.
+LOG_UNAVAILABLE: str | None = None
+
+_LOG = logging.getLogger("model_proxy")
+
+
+def _one_line(value: object) -> str:
+    """Render a field value as one space-free token.
+
+    An event is one line by contract: the terminal is a scrollback an operator reads, and the
+    file is grepped. Upstream bodies and quoted JSON both carry newlines, so they are escaped
+    rather than allowed to split a record in two.
+    """
+    if isinstance(value, BaseException):
+        text = f"{type(value).__name__}: {value}"
+    else:
+        text = str(value)
+    text = text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return text if " " not in text else f"'{text}'"
+
+
+def event(name: str, terse: Sequence[str] = (), /, **fields: object) -> None:
+    """Record one event in the file, and in the terminal when its kind is live.
+
+    ``terse`` names the fields the terminal line carries, in order; omitting it sends every
+    field, which is right for the one-off notices that already read as short as they can. The
+    file always carries everything, in the order written here.
+
+    The request id goes to the file only. A live line keeps the exact shape it had before this
+    seam existed, because the terminal is read by eye and the file is read by grep, and the id
+    that ties one client request's lines together is worth nothing in the former. Setting
+    ``MODEL_PROXY_LIVE_EVENTS=all`` mirrors the file verbatim instead, id included.
+    """
+    request_id = REQUEST_ID.get()
+    detail = [name]
+    if request_id:
+        detail.append(f"rid={request_id}")
+    detail += [f"{key}={_one_line(value)}" for key, value in fields.items()]
+    full = " ".join(detail)
+    _LOG.debug(full)
+
+    if LIVE_ALL:
+        print(full, flush=True)
+        return
+    if name not in LIVE_EVENTS:
+        return
+    if not fields:
+        print(name, flush=True)
+        return
+
+    chosen = tuple(terse) or tuple(fields)
+    print(
+        " ".join(
+            [name] + [f"{key}={_one_line(fields[key])}" for key in chosen if key in fields]
+        ),
+        flush=True,
+    )
+
+
+def setup_logging() -> str | None:
+    """Open the file sink and return the reason it could not be opened, or None.
+
+    Never fatal. A proxy that cannot write its log still enforces the plan and still answers
+    the terminal; losing the diagnostic file deserves a warning, not a stack that will not
+    start. RotatingFileHandler is not thread-safe and one dump is written from a worker
+    thread, so the archive path keeps its own plain write and only these records use the
+    handler.
+    """
+    global LOG_UNAVAILABLE
+
+    _LOG.setLevel(logging.DEBUG)
+    _LOG.propagate = False
+    # A handler whose emit() raises writes a multi-line "Logging error" traceback to stderr,
+    # which start.sh puts on the operator's terminal beside the launch output. Losing the file
+    # is already reported by LOG_UNAVAILABLE and by /healthz; it must not also cost the
+    # terminal its readability for the rest of the launch.
+    logging.raiseExceptions = False
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        # Not delay=True. Deferring the open past this try block is what let a directory that
+        # exists but cannot be opened — read-only remount, foreign owner, ENOSPC — look
+        # healthy here and then fail on every single emit.
+        handler = RotatingFileHandler(
+            LOG_DIR / LOG_FILE_NAME,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUPS,
+            encoding="utf-8",
+        )
+    except (OSError, ValueError) as exc:
+        LOG_UNAVAILABLE = f"{type(exc).__name__}: {exc}"
+        return LOG_UNAVAILABLE
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03dZ %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"
+    )
+    formatter.converter = time.gmtime
+    handler.setFormatter(formatter)
+    _LOG.addHandler(handler)
+    event(
+        "log_open",
+        directory=LOG_DIR,
+        host_directory=LOG_HOST_DIR,
+        file=LOG_DIR / LOG_FILE_NAME,
+        max_bytes=LOG_MAX_BYTES,
+        backups=LOG_BACKUPS,
+        live="all" if LIVE_ALL else ",".join(sorted(LIVE_EVENTS)),
+    )
+    return None
 
 
 # ============================================================
@@ -263,10 +504,23 @@ def new_prompt(key: str) -> bool:
     return True
 
 
-def write_dump(method: str, url: str, headers: dict[str, str], body: bytes, name: str) -> None:
-    """Render and store one request; the caller decides what a failure is worth."""
-    PROMPT_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    (PROMPT_LOG_DIR / name).write_text(
+def write_dump(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    body: bytes,
+    name: str,
+    directory: Path | None = None,
+) -> None:
+    """Render and store one request; the caller decides what a failure is worth.
+
+    ``directory`` defaults to the prompt archive. A failure dump goes to the log directory
+    instead, which outlives the container, so a fault can still be examined after the stack
+    that produced it has stopped.
+    """
+    destination = directory or PROMPT_LOG_DIR
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / name).write_text(
         request_dump(method, url, headers, body), encoding="utf-8"
     )
 
@@ -304,16 +558,19 @@ async def log_prompt(request: web.Request, lane: LanePolicy, body: bytes) -> Non
         # A ValueError here can only come from encoding text the provider accepted and the
         # local filesystem would not take; either way the prompt is worth a log line and
         # nothing more.
-        print(
-            f"prompt_log lane={lane.name} error={exc.__class__.__name__}: {exc}",
-            flush=True,
-        )
+        event("prompt_log", lane=lane.name, error=exc)
         return
 
-    print(
-        f"prompt_log lane={lane.name} time={now.isoformat(timespec='microseconds')} "
-        f"chars={len(text)} file={PROMPT_LOG_HOST_DIR / name} prompt={prompt_summary(text)!r}",
-        flush=True,
+    event(
+        "prompt_log",
+        ("lane", "time", "chars", "file", "prompt"),
+        lane=lane.name,
+        time=now.isoformat(timespec="microseconds"),
+        chars=len(text),
+        file=PROMPT_LOG_HOST_DIR / name,
+        prompt=prompt_summary(text),
+        depth=depth,
+        key=key[:8],
     )
 
 
@@ -334,10 +591,7 @@ def purge_prompt_log() -> int:
                 entry.unlink()
             removed += 1
         except OSError as exc:
-            print(
-                f"prompt_log_purge path={entry} error={exc.__class__.__name__}: {exc}",
-                flush=True,
-            )
+            event("prompt_log_purge", path=entry, error=exc)
 
     return removed
 
@@ -593,6 +847,10 @@ def validate_policy(policy: RuntimePolicy | None = None) -> None:
         "MODEL_PROXY_SOCK_READ_TIMEOUT": SOCK_READ_TIMEOUT,
         "MODEL_PROXY_INPUT_GUARD_PERCENT": INPUT_GUARD_PERCENT,
         "MODEL_PROXY_MEDIA_TOKEN_ESTIMATE": MEDIA_TOKEN_ESTIMATE,
+        "MODEL_PROXY_LOG_MAX_BYTES": LOG_MAX_BYTES,
+        "MODEL_PROXY_LOG_DUMP_MAX_BYTES": LOG_DUMP_MAX_BYTES,
+        "MODEL_PROXY_LOG_DUMP_BUDGET_BYTES": LOG_DUMP_BUDGET_BYTES,
+        "MODEL_PROXY_IMAGE_EVICTION_MIN_BYTES": IMAGE_EVICTION_MIN_BYTES,
     }
     for name, value in numeric_values.items():
         if value <= 0:
@@ -607,6 +865,17 @@ def validate_policy(policy: RuntimePolicy | None = None) -> None:
         )
     if INPUT_GUARD_PERCENT < 100:
         raise RuntimeError("MODEL_PROXY_INPUT_GUARD_PERCENT must be at least 100")
+    # No rotation history is a legitimate setting - one file, truncated at the cap - so this
+    # is bounded apart from the positive map above rather than folded into it.
+    if LOG_BACKUPS < 0:
+        raise RuntimeError(f"MODEL_PROXY_LOG_BACKUPS must not be negative; got {LOG_BACKUPS}")
+    # The budget has to hold at least one whole dump, or the act of pruning would evict the
+    # dump just written and leave nothing behind but the event that claims it was saved.
+    if LOG_DUMP_BUDGET_BYTES < LOG_DUMP_MAX_BYTES:
+        raise RuntimeError(
+            f"MODEL_PROXY_LOG_DUMP_BUDGET_BYTES={LOG_DUMP_BUDGET_BYTES} cannot hold one dump of "
+            f"MODEL_PROXY_LOG_DUMP_MAX_BYTES={LOG_DUMP_MAX_BYTES}"
+        )
 
     for lane_name, lane in policy.lanes.items():
         if lane.max_input + lane.reserved > lane.context:
@@ -689,7 +958,7 @@ def _refuse(detail: str, cause: BaseException) -> PolicyDrift:
     """Log one line per distinct policy failure and return the error the caller raises."""
     global _policy_error, _policy_error_logged
     if detail != _policy_error or not _policy_error_logged:
-        print(f"policy_drift error={detail}", flush=True)
+        event("policy_drift", error=detail)
         _policy_error_logged = True
     _policy_error = detail
     error = PolicyDrift(detail)
@@ -720,7 +989,7 @@ def current_policy() -> RuntimePolicy:
         raise _refuse(str(exc), exc) from exc
 
     if _policy_error is not None:
-        print("policy_drift_clear", flush=True)
+        event("policy_drift_clear")
     _policy_error = None
     _policy_error_logged = False
     _policy_cache = (stamp[0], stamp[1], policy)
@@ -820,6 +1089,196 @@ def rewrite_model(body: bytes, request: web.Request, lane: LanePolicy) -> bytes:
     payload["model"] = lane.model
     payload["cache_salt"] = CACHE_SALT
     return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
+
+
+@dataclass
+class Eviction:
+    """What one body's eviction did, for the record and for nothing else."""
+
+    images: int = 0
+    bytes_freed: int = 0
+    handles: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return self.images > 0
+
+
+def _looks_like_mime(value: str) -> bool:
+    """Whether a data URL prefix actually carries a media type.
+
+    Deliberately strict: this value is interpolated into the note the model reads, and the
+    alternative — trusting whatever precedes the comma — lets a malformed URL paste payload
+    bytes back into the text written to save space.
+    """
+    return bool(re.fullmatch(r"image/[a-z0-9.+-]{1,32}", value.lower()))
+
+
+def _part_text(part: object) -> str:
+    if not isinstance(part, dict) or part.get("type") != "text":
+        return ""
+    text = part.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def _answers_after(messages: list, index: int) -> bool:
+    """Whether some later assistant turn said something about this image.
+
+    This is the whole eviction rule, and it is monotone by construction: history only grows,
+    so once an image has been answered it stays answered. Each image is therefore rewritten at
+    most once, which keeps the request prefix stable afterwards instead of shifting a
+    keep-newest-N window on every step and invalidating the provider's cache each time.
+
+    An image with no following assistant text is left untouched, which is what protects the
+    attachment the user just pasted and the read the model has not yet answered.
+    """
+    for later in messages[index + 1 :]:
+        if not isinstance(later, dict) or later.get("role") != "assistant":
+            continue
+        content = later.get("content")
+        if isinstance(content, str) and content.strip():
+            return True
+        if isinstance(content, list) and any(_part_text(part).strip() for part in content):
+            return True
+    return False
+
+
+def _image_urls_of(part: dict) -> list[str]:
+    """Every inline url this image part carries, under either spelling.
+
+    A part holding both field names with different images is malformed rather than rare, and
+    replacing it after hashing only the first would destroy the second without a trace.
+    """
+    urls = []
+    for name in IMAGE_PART_FIELD_NAMES:
+        value = part.get(name)
+        if isinstance(value, dict) and isinstance(value.get("url"), str):
+            urls.append(value["url"])
+    return urls
+
+
+def _eviction_note(url: str) -> tuple[str, int, str] | None:
+    """The replacement text for one inline image, the bytes it carried, and its handle."""
+    if not url.startswith("data:"):
+        # A remote reference is already small; the provider fetches it, we do not.
+        return None
+    head, comma, payload = url.partition(",")
+    if not comma:
+        return None
+    size = len(payload)
+    if size < IMAGE_EVICTION_MIN_BYTES:
+        return None
+    # Only trust a mime type that looks like one. `data:,<40000 chars>` has no separator, and
+    # taking everything after `data:` as the type would paste the payload straight back into
+    # the note we are writing to save space.
+    declared = head[5:].split(";", 1)[0]
+    mime = declared if _looks_like_mime(declared) else "unknown"
+    # The digest is of the base64 exactly as it travelled, so the tool that resolves it can
+    # re-encode a file on disk and compare, without needing to have seen this request.
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:IMAGE_HANDLE_PREFIX]
+    handle = f"sha256:{digest}"
+    # The digest is of the base64 exactly as it travelled, so the tool that resolves it can
+    # re-encode a file on disk and compare, without needing to have seen this request.
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:IMAGE_HANDLE_PREFIX]
+    handle = f"sha256:{digest}"
+    # Named the way the client can actually find it. An MCP tool is surfaced as
+    # `mcp__<server>__<tool>`, and an instruction to "call analyze_image" is a handle the model
+    # has no way to act on if it never sees a tool by that bare name — which is exactly the
+    # situation that produces the pointless re-read loop this note exists to prevent.
+    # "may still be available", not "is": only images that live under the session's media
+    # directories are guaranteed to resolve, and a crop the agent wrote to scratch space is
+    # gone once that space is. Asserting availability the tool cannot promise is how an agent
+    # ends up uselessly re-requesting bytes that no longer exist anywhere.
+    note = (
+        f"[image removed from context after analysis: {size} base64 chars, {mime}, "
+        f'handle "{handle}". It may still be on this machine: call the analyze_image tool '
+        f'(named mcp__images__analyze_image wherever tools are namespaced) with '
+        f'handle="{handle}" and prompt=<what you want from it> to see it again, '
+        "then continue the task you were working on.]"
+    )
+    return note, size, handle
+
+
+def evict_answered_images(payload: dict) -> Eviction:
+    """Replace already-answered inline images in a request payload with re-read handles.
+
+    Mutates the parsed body in place. Content parts are swapped text-for-image; no message is
+    added, removed, reordered, or re-roled, so message count, ordering, and every
+    ``tool_call_id`` pairing survive untouched. Returning the count lets the caller decide
+    whether the body actually needs re-serialising.
+    """
+    report = Eviction()
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not IMAGE_EVICTION_ENABLED:
+        return report
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if not _answers_after(messages, index):
+            continue
+
+        for position, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            notes = []
+            for url in _image_urls_of(part):
+                note = _eviction_note(url)
+                if note is not None:
+                    notes.append(note)
+            if not notes:
+                continue
+            text = "\n".join(entry[0] for entry in notes)
+            existing = _part_text(part)
+            # Built fresh rather than copied: a copied part would carry `detail` or
+            # `cache_control` over from the image block onto a text block, where they are not
+            # legal and a strict validator rejects them.
+            replacement: dict[str, object] = {"type": "text"}
+            if existing:
+                replacement["text"] = f"{existing}\n{text}"
+            else:
+                replacement["text"] = text
+            content[position] = replacement
+            for _text, size, handle in notes:
+                report.images += 1
+                report.bytes_freed += size
+                report.handles += (handle,)
+
+    return report
+
+
+def evict_body_images(body: bytes) -> tuple[bytes, Eviction]:
+    """Evict from a raw request body, returning the bytes to forward.
+
+    The substring guard first: a body with no image part is not parsed a second time and is
+    forwarded exactly as it arrived. A body that parses but evicts nothing also comes back
+    untouched, because re-serialising it would perturb key order and byte count for no gain.
+    Anything that fails to parse is passed through for ``rewrite_model`` to reject on the
+    request path, where the error is the caller's business.
+    """
+    if not IMAGE_EVICTION_ENABLED:
+        return body, Eviction()
+    if not any(name.encode() in body for name in IMAGE_PART_FIELD_NAMES):
+        return body, Eviction()
+    try:
+        # Same duplicate-key rule as rewrite_model: parsing leniently here would let a body
+        # that rewrite_model must reject slip through once eviction had made it valid JSON
+        # again, so the two paths would disagree about the same bytes.
+        payload = json.loads(body, object_pairs_hook=_object_no_duplicates)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return body, Eviction()
+    if not isinstance(payload, dict):
+        return body, Eviction()
+
+    report = evict_answered_images(payload)
+    if not report:
+        return body, report
+    try:
+        return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode(), report
+    except (TypeError, ValueError):
+        return body, Eviction()
 
 
 def body_rejects_stream_usage(status: int, body: bytes) -> bool:
@@ -1192,6 +1651,8 @@ class Stats:
     deadline_stops: int = 0
     stream_stalls: int = 0
     policy_errors: int = 0
+    images_evicted: int = 0
+    image_bytes_freed: int = 0
 
 
 class Enforcement:
@@ -1309,6 +1770,15 @@ class Enforcement:
     def is_exclusive(self, lane: LanePolicy) -> bool:
         """True when any counter this lane holds would serve it alone."""
         return any(gate.is_exclusive(lane.reservation) for gate in self.gates_for(lane))
+
+    def price_runs_alone(self, lane: LanePolicy, reservation: int) -> bool:
+        """True when a request priced this high may only be served against an empty counter.
+
+        Judged on the price, not the lane: this is the question whose answer explains why a
+        request had to wait for an idle counter at all, and a wide lane still serves short
+        requests concurrently.
+        """
+        return any(gate.runs_alone(reservation) for gate in self.gates_for(lane))
 
     def snapshot(self) -> dict:
         gates = {
@@ -1540,6 +2010,16 @@ async def health(_request: web.Request) -> web.Response:
                 }
                 for lane, item in policy.lanes.items()
             },
+            "log": {
+                # The host path is deliberately absent: this endpoint is reachable from the
+                # agent container, and the log directory can hold request bodies. The operator
+                # learns the path from the `log_file` line at launch, which goes to stdout.
+                "container_directory": str(LOG_DIR),
+                "unavailable": LOG_UNAVAILABLE,
+                "max_bytes": LOG_MAX_BYTES,
+                "backups": LOG_BACKUPS,
+                "live_events": "all" if LIVE_ALL else sorted(LIVE_EVENTS),
+            },
             "input_guard_percent": INPUT_GUARD_PERCENT,
             "sock_read_timeout_seconds": SOCK_READ_TIMEOUT,
             # Null, not a sentinel number: an operator reading this should be able to tell that
@@ -1554,6 +2034,12 @@ async def health(_request: web.Request) -> web.Response:
                 "deadline_stops": stats.deadline_stops,
                 "stream_stalls": stats.stream_stalls,
                 "policy_errors": stats.policy_errors,
+                "images_evicted": stats.images_evicted,
+                "image_bytes_freed": stats.image_bytes_freed,
+            },
+            "image_eviction": {
+                "enabled": IMAGE_EVICTION_ENABLED,
+                "min_base64_bytes": IMAGE_EVICTION_MIN_BYTES,
             },
         }
     )
@@ -1568,6 +2054,10 @@ async def models(request: web.Request) -> web.Response:
 async def chat(request: web.Request) -> web.StreamResponse:
     started = time.monotonic()
     authorize_client(request)
+    # One id for everything this request causes, so that lines from the sessions sharing this
+    # proxy can be separated afterwards. Each aiohttp handler runs in its own task, and a
+    # ContextVar set here is visible only within that task's copy of the context.
+    REQUEST_ID.set(secrets.token_hex(4))
 
     if request.query_string:
         raise web.HTTPBadRequest(text="query strings are not supported")
@@ -1592,15 +2082,44 @@ async def chat(request: web.Request) -> web.StreamResponse:
 
     async with ingress.slot():
         inbound_body = await request.read()
+        # The record that the request arrived at all, which is the first question a stalled
+        # session asks and was previously only answerable by watching the gate counters move.
+        event("request_received", lane=lane_name, input_bytes=len(inbound_body))
+
+        # Eviction precedes pricing on purpose: the guard and the permit must describe the
+        # request actually sent upstream. A body trimmed from 5 MB to 1.4 MB that is still
+        # priced as 5 MB would be charged for bytes the provider never sees, and could be
+        # forced to run alone for a size it no longer has.
+        outbound_body, eviction = evict_body_images(inbound_body)
+        if eviction:
+            stats.images_evicted += eviction.images
+            stats.image_bytes_freed += eviction.bytes_freed
+            event(
+                "images_evicted",
+                lane=lane_name,
+                images=eviction.images,
+                bytes_freed=eviction.bytes_freed,
+                body_bytes_before=len(inbound_body),
+                body_bytes_after=len(outbound_body),
+                handles=list(eviction.handles),
+            )
 
         guard = lane.max_input * INPUT_GUARD_PERCENT // 100
-        estimate, media = estimate_input_tokens(inbound_body)
+        estimate, media = estimate_input_tokens(outbound_body)
         if estimate > guard:
             stats.guard_rejections += 1
-            print(
-                f"input_guard lane={lane_name} estimate={estimate} guard={guard} "
-                f"media_items={media} input_bytes={len(inbound_body)}",
-                flush=True,
+            # input_bytes stays the live field and keeps meaning "what the client sent", as it
+            # did before eviction existed; the post-eviction size is alongside it, because after
+            # eviction those are different numbers and only one of them tripped the guard.
+            event(
+                "input_guard",
+                ("lane", "estimate", "guard", "media_items", "input_bytes"),
+                lane=lane_name,
+                estimate=estimate,
+                guard=guard,
+                media_items=media,
+                input_bytes=len(inbound_body),
+                evicted_bytes=len(outbound_body),
             )
             # max_size and actual_size are token counts here, not bytes: the guard is
             # a context allowance, and text overrides the byte-worded default.
@@ -1610,7 +2129,7 @@ async def chat(request: web.Request) -> web.StreamResponse:
                 text="request input exceeds the enforced lane context allowance",
             )
 
-        outbound_body = rewrite_model(inbound_body, request, lane)
+        outbound_body = rewrite_model(outbound_body, request, lane)
 
         await log_prompt(request, lane, outbound_body)
 
@@ -1619,7 +2138,9 @@ async def chat(request: web.Request) -> web.StreamResponse:
             lane,
             outbound_body,
             started,
-            inbound_body,
+            # Re-derived from the body actually sent, not the one received: rebuilding from the
+            # inbound copy would reinstate every image this request just evicted.
+            outbound_body,
             # The guard's estimate is the best input figure available before the request
             # runs; a ledger that meters input charges itself from it and settles to the
             # prompt tokens the response reports.
@@ -1642,6 +2163,11 @@ class Attempt:
     ``response`` is set as soon as anything has reached the client. From that
     point the request cannot be retried, because its status line is already sent,
     so a stall has to end the attempt instead of looping.
+
+    ``status`` and ``error_excerpt`` carry what the gateway actually said. They matter most on
+    the paths that hand the client nothing - a retryable status, a usage rejection - where the
+    response is otherwise closed and forgotten, and where the reason a request never completes
+    is therefore otherwise unrecoverable.
     """
 
     response: web.StreamResponse | None = None
@@ -1651,10 +2177,34 @@ class Attempt:
     prompt_tokens: int | None = None
     estimated_output: int | None = None
     stalled: bool = False
+    status: int | None = None
+    error_excerpt: str | None = None
 
     @property
     def streamed(self) -> bool:
         return self.response is not None
+
+
+def _excerpt(body: bytes, limit: int = LOG_ERROR_EXCERPT_BYTES) -> str:
+    """An upstream error body as one bounded, single-line token.
+
+    The bound is not about disk: it is that one record stays one line, and an upstream body is
+    written by something this plan does not control.
+    """
+    if not body:
+        return "<empty>"
+    return _one_line(body[:limit].decode("utf-8", errors="replace"))
+
+
+def _quota_headers(headers) -> dict[str, str]:
+    """The endpoint's own retry and headroom headers, when it sent any.
+
+    Their absence is evidence in its own right. A provider that documents a quota header on
+    every response and did not send one here did not produce this answer, which is how a
+    gateway rejection gets told apart from an intermediary's.
+    """
+    wanted = ("retry-after", "x-ratelimit-remaining", "x-ratelimit-reset")
+    return {name: headers[name] for name in wanted if name in headers}
 
 
 async def stream_attempt(
@@ -1672,12 +2222,24 @@ async def stream_attempt(
             request, upstream_credential(lane.secret_name)
         )
 
+        event(
+            "upstream_dispatch",
+            lane=lane.name,
+            attempt=attempt,
+            input_bytes=len(body),
+            priced_reservation=reservation,
+            lane_reservation=lane.reservation,
+            runs_alone=enforcement.price_runs_alone(lane, reservation),
+        )
+
+        sent = time.monotonic()
         response = await session.post(
             url,
             data=body,
             headers=outbound_headers,
             allow_redirects=False,
         )
+        header_ms = round((time.monotonic() - sent) * 1000)
 
         try:
             for _counter_id, ledger in enforcement.ledgers_for(lane):
@@ -1688,11 +2250,41 @@ async def stream_attempt(
 
                 if response.status in RETRYABLE:
                     response.close()
-                    return Attempt(retry_after=retry_delay(response, attempt))
+                    # The whole answer goes to the file and only its existence to the terminal:
+                    # this is the line the operator already watches, and the reason behind it is
+                    # precisely what a retry loop used to discard.
+                    event(
+                        "upstream_rejected",
+                        lane=lane.name,
+                        attempt=attempt,
+                        status=response.status,
+                        header_ms=header_ms,
+                        input_bytes=len(body),
+                        priced_reservation=reservation,
+                        headers=_quota_headers(response.headers),
+                        body=_excerpt(error_body),
+                    )
+                    return Attempt(
+                        retry_after=retry_delay(response, attempt),
+                        status=response.status,
+                        error_excerpt=_excerpt(error_body),
+                    )
 
                 if body_rejects_stream_usage(response.status, error_body):
                     response.close()
-                    return Attempt(retry_after=0.0, rejected_usage=True)
+                    event(
+                        "usage_rejected",
+                        lane=lane.name,
+                        attempt=attempt,
+                        status=response.status,
+                        body=_excerpt(error_body),
+                    )
+                    return Attempt(
+                        retry_after=0.0,
+                        rejected_usage=True,
+                        status=response.status,
+                        error_excerpt=_excerpt(error_body),
+                    )
 
             if (
                 response.content_length is not None
@@ -1709,19 +2301,29 @@ async def stream_attempt(
             await downstream.prepare(request)
 
             output_bytes = 0
+            # A status the client will read as a refusal is copied into the file while it is
+            # forwarded, because the forwarded copy is the only record of it that survives.
+            peek = bytearray()
 
             try:
                 async for chunk in response.content.iter_any():
                     output_bytes += len(chunk)
                     scanner.feed(chunk)
 
+                    if response.status >= 400 and len(peek) < LOG_ERROR_EXCERPT_BYTES:
+                        peek += chunk[: LOG_ERROR_EXCERPT_BYTES - len(peek)]
+
                     if output_bytes > MAX_RESPONSE_BYTES:
                         response.close()
                         scanner.finish()
-                        print(
-                            f"response_limit lane={lane.name} input_bytes={len(body)} "
-                            f"output_bytes={output_bytes}",
-                            flush=True,
+                        event(
+                            "response_limit",
+                            ("lane", "input_bytes", "output_bytes"),
+                            lane=lane.name,
+                            input_bytes=len(body),
+                            output_bytes=output_bytes,
+                            status=response.status,
+                            attempt=attempt,
                         )
                         if request.transport is not None:
                             request.transport.close()
@@ -1736,9 +2338,15 @@ async def stream_attempt(
                 stats.stream_stalls += 1
                 scanner.finish()
                 response.close()
-                print(
-                    f"stream_stall lane={lane.name} attempt={attempt} bytes={output_bytes}",
-                    flush=True,
+                event(
+                    "stream_stall",
+                    ("lane", "attempt", "bytes"),
+                    lane=lane.name,
+                    attempt=attempt,
+                    bytes=output_bytes,
+                    status=response.status,
+                    header_ms=header_ms,
+                    elapsed_ms=round((time.monotonic() - sent) * 1000),
                 )
                 if request.transport is not None:
                     request.transport.close()
@@ -1748,10 +2356,24 @@ async def stream_attempt(
                     prompt_tokens=scanner.prompt_tokens,
                     estimated_output=scanner.estimated_output(),
                     stalled=True,
+                    status=response.status,
                 )
 
             scanner.finish()
             await downstream.write_eof()
+
+            if response.status >= 400:
+                event(
+                    "upstream_error",
+                    lane=lane.name,
+                    attempt=attempt,
+                    status=response.status,
+                    header_ms=header_ms,
+                    input_bytes=len(body),
+                    output_bytes=output_bytes,
+                    headers=_quota_headers(response.headers),
+                    body=_excerpt(bytes(peek)),
+                )
 
             return _attempt_result(downstream, scanner)
 
@@ -1767,6 +2389,7 @@ def _attempt_result(
         output_tokens=scanner.completion_tokens,
         prompt_tokens=scanner.prompt_tokens,
         estimated_output=scanner.estimated_output(),
+        status=downstream.status,
     )
 
 
@@ -1775,6 +2398,114 @@ def book_output(
 ) -> None:
     """Settle this attempt's rate bookings against what it actually produced."""
     enforcement.settle(lane, bookings, cost, outcome)
+
+
+#: Attempts after which the outbound body is archived, so a request the endpoint keeps
+#: refusing can be replayed byte for byte rather than reconstructed from a transcript.
+FAILURE_DUMP_ATTEMPT = 4
+
+
+def prune_failure_dumps() -> int:
+    """Drop whole-request dumps, oldest first, until they fit the budget.
+
+    The dump just written is always newest, so it is the last one this evicts — a request
+    large enough to exceed the budget on its own sheds everything older rather than itself.
+    """
+    try:
+        paths = list(LOG_DIR.glob("failed-*.txt"))
+    except OSError:
+        return 0
+    dumps: list[tuple[Path, int, int]] = []
+    for path in paths:
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        dumps.append((path, info.st_size, info.st_mtime_ns))
+    dumps.sort(key=lambda item: item[2])
+    total = sum(size for _path, size, _mtime in dumps)
+    freed = 0
+    for path, size, _mtime in dumps:
+        if total <= LOG_DUMP_BUDGET_BYTES:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        freed += size
+    return freed
+
+
+def purge_failure_dumps() -> int:
+    """Remove every whole-request dump. The event log outlives them.
+
+    A dump is prompt text, and prompt text is what this stack promises not to keep past the
+    launch that produced it. The events themselves are a different kind of record — numbers
+    and short status lines, not conversation — and those are what survive for a post-mortem.
+    """
+    try:
+        paths = list(LOG_DIR.glob("failed-*.txt"))
+    except OSError:
+        return 0
+    removed = 0
+    for path in paths:
+        with contextlib.suppress(OSError):
+            path.unlink()
+            removed += 1
+    return removed
+
+
+async def dump_failure_body(
+    request: web.Request, lane: LanePolicy, body: bytes, attempt: int
+) -> None:
+    """Archive the request a retry loop is stuck on, once per client request.
+
+    The prompt archive keeps only requests that introduce a new user prompt, which is what
+    makes it readable, and is exactly why it holds nothing for a turn that dies 143 steps in.
+    Credentials go through the same redaction as every other dump, and the render runs off the
+    loop for the same reason the prompt archive's does: a multimodal body is megabytes.
+    """
+    request_id = REQUEST_ID.get()
+    if not request_id:
+        return
+    if len(body) > LOG_DUMP_MAX_BYTES:
+        event(
+            "failure_dump_skipped",
+            lane=lane.name,
+            attempt=attempt,
+            input_bytes=len(body),
+            limit=LOG_DUMP_MAX_BYTES,
+        )
+        return
+    # Named by the request, not the attempt: every attempt of a stuck request carries the same
+    # body, and a file each would turn one fault into a hundred megabytes.
+    path = LOG_DIR / f"failed-{request_id}.txt"
+    if path.exists():
+        return
+    try:
+        await asyncio.to_thread(
+            write_dump,
+            request.method,
+            f"{lane.base_url}/v1/chat/completions",
+            {},
+            body,
+            path.name,
+            LOG_DIR,
+        )
+    except (OSError, ValueError) as exc:
+        event("failure_dump_failed", lane=lane.name, error=exc)
+        return
+    freed = prune_failure_dumps()
+    event(
+        "failure_dumped",
+        file=path.name,
+        host_file=f"{LOG_HOST_DIR}/{path.name}",
+        attempt=attempt,
+        bytes=path.stat().st_size if path.exists() else 0,
+        budget_bytes=LOG_DUMP_BUDGET_BYTES,
+        freed_bytes=freed,
+    )
 
 
 async def forward_chat(
@@ -1805,15 +2536,26 @@ async def forward_chat(
         attempt_number += 1
 
         if request.transport is None or request.transport.is_closing():
+            # Silent until now. This is the only record that a client gave up on a request the
+            # proxy was still willing to retry, and without it an abandoned request and a
+            # request the proxy never received look identical from the outside.
+            event(
+                "client_cancelled",
+                lane=lane.name,
+                attempts=attempt_number - 1,
+                elapsed_seconds=round(time.monotonic() - started, 3),
+            )
             raise asyncio.CancelledError
 
         elapsed = time.monotonic() - started
         if MAX_REQUEST_SECONDS and elapsed > MAX_REQUEST_SECONDS:
             stats.deadline_stops += 1
-            print(
-                f"request_deadline lane={lane.name} attempts={attempt_number} "
-                f"elapsed_seconds={elapsed:.1f}",
-                flush=True,
+            event(
+                "request_deadline",
+                ("lane", "attempts", "elapsed_seconds"),
+                lane=lane.name,
+                attempts=attempt_number,
+                elapsed_seconds=f"{elapsed:.1f}",
             )
             raise web.HTTPBadGateway(
                 text="upstream did not complete within the policy request limit"
@@ -1823,9 +2565,12 @@ async def forward_chat(
         if bookings is None:
             stats.rate_waits += 1
             delay = enforcement.wait_seconds(lane)
-            print(
-                f"rate_wait lane={lane.name} attempt={attempt_number} delay={delay:.1f}s",
-                flush=True,
+            event(
+                "rate_wait",
+                ("lane", "attempt", "delay"),
+                lane=lane.name,
+                attempt=attempt_number,
+                delay=f"{delay:.1f}s",
             )
             await asyncio.sleep(delay)
             continue
@@ -1837,27 +2582,50 @@ async def forward_chat(
         except (TimeoutError, ClientConnectionError, ServerDisconnectedError) as exc:
             enforcement.settle(lane, bookings, cost, None)
             delay = retry_delay(_HeaderBag({}), attempt_number)
-            print(
-                f"upstream_retry lane={lane.name} attempt={attempt_number} "
-                f"error={type(exc).__name__} delay={delay:.1f}s",
-                flush=True,
+            event(
+                "upstream_retry",
+                ("lane", "attempt", "error", "delay"),
+                lane=lane.name,
+                attempt=attempt_number,
+                error=type(exc).__name__,
+                delay=f"{delay:.1f}s",
+                elapsed_seconds=round(elapsed, 1),
+                input_bytes=len(body),
+                priced_reservation=cost_of_permit,
             )
         else:
             if outcome.streamed:
                 book_output(lane, bookings, cost, outcome)
-                print(
-                    f"request_complete lane={lane.name} input_bytes={len(body)} "
-                    f"attempts={attempt_number} prompt_tokens={outcome.prompt_tokens} "
-                    f"output_tokens={outcome.output_tokens} "
-                    f"estimated_output={outcome.estimated_output} "
-                    # The priced permit beside the pre-request estimate, so the gap between what
-                    # a permit cost and what the request turned out to use is readable from the
-                    # log rather than something an operator has to trust the estimator about.
-                    f"priced_reservation={cost_of_permit} lane_reservation={lane.reservation} "
-                    f"estimated_input={cost.input} "
-                    f"stalled={outcome.stalled} "
-                    f"elapsed_seconds={time.monotonic() - started:.3f}",
-                    flush=True,
+                # The priced permit beside the pre-request estimate, so the gap between what
+                # a permit cost and what the request turned out to use is readable from the
+                # log rather than something an operator has to trust the estimator about.
+                event(
+                    "request_complete",
+                    (
+                        "lane",
+                        "input_bytes",
+                        "attempts",
+                        "prompt_tokens",
+                        "output_tokens",
+                        "estimated_output",
+                        "priced_reservation",
+                        "lane_reservation",
+                        "estimated_input",
+                        "stalled",
+                        "elapsed_seconds",
+                    ),
+                    lane=lane.name,
+                    input_bytes=len(body),
+                    attempts=attempt_number,
+                    status=outcome.status,
+                    prompt_tokens=outcome.prompt_tokens,
+                    output_tokens=outcome.output_tokens,
+                    estimated_output=outcome.estimated_output,
+                    priced_reservation=cost_of_permit,
+                    lane_reservation=lane.reservation,
+                    estimated_input=cost.input,
+                    stalled=outcome.stalled,
+                    elapsed_seconds=f"{time.monotonic() - started:.3f}",
                 )
                 return outcome.response
 
@@ -1865,18 +2633,24 @@ async def forward_chat(
                 USAGE_SUPPORTED = False
                 stats.usage_unsupported += 1
                 body = rewrite_model(inbound_body, request, lane)
-                print(
-                    "usage_reporting_unsupported - retrying without stream_options",
-                    flush=True,
-                )
+                event("usage_reporting_unsupported", note="retrying without stream_options")
 
             enforcement.settle(lane, bookings, cost, None)
             delay = outcome.retry_after if outcome.retry_after is not None else 1.0
-            print(
-                f"upstream_retry lane={lane.name} attempt={attempt_number} "
-                f"delay={delay:.1f}s",
-                flush=True,
+            event(
+                "upstream_retry",
+                ("lane", "attempt", "delay"),
+                lane=lane.name,
+                attempt=attempt_number,
+                delay=f"{delay:.1f}s",
+                status=outcome.status,
+                elapsed_seconds=round(elapsed, 1),
+                input_bytes=len(body),
+                priced_reservation=cost_of_permit,
+                body=outcome.error_excerpt,
             )
+            if attempt_number >= FAILURE_DUMP_ATTEMPT:
+                await dump_failure_body(request, lane, body, attempt_number)
 
         await asyncio.sleep(delay)
 
@@ -1898,18 +2672,35 @@ async def close_client(app: web.Application) -> None:
 
 
 async def open_prompt_archive(app: web.Application) -> None:
-    """Start from an empty archive: a container that was killed never got the chance."""
+    """Start from an empty archive: a container that was killed never got the chance.
+
+    Whole-request dumps are conversation text too, so they are cleared on the same terms.
+    """
     stale = purge_prompt_log()
-    print(
-        f"prompt_log directory={PROMPT_LOG_HOST_DIR} "
-        f"summary_chars={PROMPT_SUMMARY_CHARS} stale_entries={stale}",
-        flush=True,
+    event(
+        "prompt_log",
+        ("directory", "summary_chars", "stale_entries"),
+        directory=PROMPT_LOG_HOST_DIR,
+        summary_chars=PROMPT_SUMMARY_CHARS,
+        stale_entries=stale,
+        stale_dumps=purge_failure_dumps(),
     )
 
 
 async def close_prompt_archive(app: web.Application) -> None:
-    """Prompt text does not outlive the stack that produced it."""
-    print(f"prompt_log_purged entries={purge_prompt_log()}", flush=True)
+    """Prompt text does not outlive the stack that produced it.
+
+    That covers both kinds of prompt text: the archive, and the whole-request dumps a stalled
+    retry loop writes beside the log. The event log itself deliberately survives, because
+    numbers and short status lines are not conversation, and a fault that only surfaces after
+    the stack is down has nowhere else to be read.
+    """
+    event(
+        "prompt_log_purged",
+        ("entries",),
+        entries=purge_prompt_log(),
+        dumps=purge_failure_dumps(),
+    )
 
 
 def create_app() -> web.Application:
@@ -1929,19 +2720,37 @@ def create_app() -> web.Application:
 
 
 def main() -> None:
+    unavailable = setup_logging()
     validate_policy()
     try:
         verify_credentials(BASELINE_POLICY)
     except PolicyDrift as exc:
         # One clean line rather than a traceback: start.sh surfaces the container's stderr,
         # and the fact names something the operator can mount, not a crash to debug.
+        event("startup_refused", error=exc)
         raise SystemExit(f"model-proxy will not start: {exc}") from None
     for name, lane in sorted(BASELINE_POLICY.lanes.items()):
-        print(
-            f"lane={name} alias={lane.alias} provider={lane.provider_name} "
-            f"context={lane.context} input={lane.max_input} output={lane.output_clamp} "
-            f"reservation={lane.reservation} counters={','.join(lane.counters)}",
-            flush=True,
+        event(
+            "lane_config",
+            lane=name,
+            alias=lane.alias,
+            provider=lane.provider_name,
+            context=lane.context,
+            input=lane.max_input,
+            output=lane.output_clamp,
+            reservation=lane.reservation,
+            counters=",".join(lane.counters),
+        )
+    # Where to read the whole record, named once on the terminal so the filtered live view is
+    # never a dead end. A bind the operator has not mounted says so here rather than silently
+    # logging to a path that does not exist.
+    if unavailable:
+        event("log_unavailable", directory=LOG_DIR, error=unavailable)
+    else:
+        event(
+            "log_file",
+            file=f"{LOG_HOST_DIR}/{LOG_FILE_NAME}",
+            live="all" if LIVE_ALL else "default",
         )
     web.run_app(create_app(), host="0.0.0.0", port=8080, access_log=None)  # noqa: S104
 

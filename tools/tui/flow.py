@@ -77,6 +77,7 @@ KIMI_VERSION = "kimi-version"
 MODULE_VERSION = "module-version"
 MODULE_VALUES = "module-values"
 CONTEXT = "context"
+EVICTION = "image-eviction"
 CREDENTIALS = "credentials"
 STEPS = (
     MODEL,
@@ -86,6 +87,7 @@ STEPS = (
     MODULE_VERSION,
     MODULE_VALUES,
     CONTEXT,
+    EVICTION,
     CREDENTIALS,
 )
 

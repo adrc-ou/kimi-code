@@ -107,9 +107,10 @@ default = true
 #
 #   context_margin_percent      aggregate in-flight context budget, as a share of the
 #                               35% threshold. At 95% of 350,000 the derived budget is
-#                               332,500: five 64,000-token subagents (320,000) fit inside
-#                               it, and a full-size concurrent-lane request overlaps one
-#                               of them (262,144 + 64,000 = 326,144) but never two. The
+#                               332,500: five 66,500-token subagents fill it exactly
+#                               (5 x 66,500 = 332,500), and a full-size concurrent-lane
+#                               request overlaps one of them (262,144 + 66,500 = 328,644)
+#                               but never two. The
 #                               wide lane is not in that arithmetic: a request priced at
 #                               or above 350,000 is admitted only when the pool is empty,
 #                               because that is rule 2, and a lane capped at 965,536 is

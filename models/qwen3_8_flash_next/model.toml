@@ -58,7 +58,37 @@ output_clamp_tokens = 65536
 
 # Subagent lane. Five concurrent children at this size is what the provider's aggregate
 # context rule permits, and ./start.sh derives Kimi's swarm concurrency from it.
+#
+# reservation = input_tokens + output_clamp_tokens. context_tokens is NOT a term in it; the
+# window only has to be >= that sum, and tools/policy.py silently shrinks input to
+# (context - clamp) if it is not. So widening the window is free, and the real ceiling is the
+# fan-out rule: 332,500 // 66,500 == 5 but // 66,501 == 4, which makes 66,500 the largest
+# reservation this lane can hold at five-wide. Keeping input at 55,808 leaves 10,692 for the
+# clamp -- the most answer budget available without either costing a child its concurrency or
+# costing it compaction headroom.
+#
+# Why the clamp matters more than it looks. Kimi requests max_tokens = the whole lane window on
+# every call (measured: 64,000 on all 12,299 subagent requests, 262,144 on primary, 1,000,000 on
+# long), and the proxy answers with min(asked, output_clamp_tokens). This lane is therefore the
+# tightest clamp of the three in both ratio and effect, and it fails children two ways:
+#   - a step truncated at the clamp: 9 of 231 children (3.9%) ended their FINAL report truncated;
+#   - a compaction summary truncated: 11 (4.8%) hit CompactionTruncatedError, because Kimi asks
+#     min(window, 131072) completion tokens for a summary and used to be answered 8,192.
+# These are disjoint; together 20 children (8.7%) died of output length. Every one surfaced to
+# its parent as an explicit failure, never as silent corruption -- but the parent then re-derived
+# the work by hand or respawned children with hand-tuned "under 500 words" prompts.
+#
+# Raising the clamp costs the in-flight permit price (priced from the clamp too) and the
+# per-minute output booking, but NOT context: compaction fires at min(0.85 x input, input -
+# reserved_context_size), and input is unchanged at 55,808, so the trigger stays 47,436.
+# Do not trade input for clamp to get more answer room -- that moves the trigger to 39,424,
+# 16.9% sooner, and adds ~1,900 compaction events across this corpus.
+#
+# The next rung up is a real decision, not an oversight: fan-out 4 allows a reservation of
+# 83,125, i.e. a clamp of 27,317 with input still 55,808, which covers the largest answer any
+# lane has ever produced (26,222). That would essentially eliminate both truncation channels at
+# the cost of one fifth of swarm width.
 [lane.subagent]
-context_tokens = 64000
+context_tokens = 66500
 input_tokens = 55808
-output_clamp_tokens = 8192
+output_clamp_tokens = 10692

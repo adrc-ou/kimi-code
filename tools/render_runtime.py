@@ -113,6 +113,17 @@ def module_guidance(runtime_dir: Path) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
+#: Written by ``tools/image_eviction.py`` from the operator's launch answer, and empty when the
+#: answer was no. Read here rather than derived from the environment variable so that the text
+#: and the enforced behaviour are produced by one decision at one moment.
+MULTIMODAL_GUIDANCE_FILE = "multimodal-eviction.md"
+
+
+def multimodal_guidance(runtime_dir: Path) -> str:
+    path = runtime_dir / MULTIMODAL_GUIDANCE_FILE
+    return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -166,7 +177,13 @@ def main() -> None:
     write_runtime_file(
         agents_markdown,
         prompt_context.compose_agents_document(
-            args.root, plan, module_guidance(args.runtime_dir), enabled, template_values, static
+            args.root,
+            plan,
+            module_guidance(args.runtime_dir),
+            enabled,
+            template_values,
+            static,
+            multimodal_guidance(args.runtime_dir),
         ),
     )
     write_runtime_file(

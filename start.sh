@@ -186,7 +186,7 @@ flow=(python3 tools/tui/flow.py --runtime-dir "${HARNESS_RUNTIME_DIR}")
 # The steps in the order they are asked, and the status a step leaves with when the user asked for
 # the one before it. tools/tui/flow.py owns both. A back-request is navigation rather than failure,
 # which is why it is the one status the pass does not report as one.
-flow_steps=model,subagent,modules,kimi-version,module-version,module-values,context,credentials
+flow_steps=model,subagent,modules,kimi-version,module-version,module-values,context,image-eviction,credentials
 flow_back=3
 
 state_file=${HARNESS_STATE_FILE}
@@ -319,6 +319,16 @@ harness_flow_pass() {
   [[ "${non_interactive}" == true ]] && panel+=(--plain)
   harness_flow_step "${panel[@]}" || return
 
+  # Whether multimodal attachments are shrunk out of later requests is the last thing that can
+  # change what the proxy sends. It is asked after the context panel because that panel decides
+  # how large a prompt this launch will assemble. The answer is written as
+  # MODEL_PROXY_IMAGE_EVICTION, which is the variable compose.yaml already reads, so nothing has
+  # to translate it on the way.
+  eviction=(python3 tools/image_eviction.py)
+  [[ "${non_interactive}" == true ]] && eviction+=(--non-interactive)
+  harness_flow_step "${eviction[@]}" || return
+  harness_flow_source "${HARNESS_RUNTIME_DIR}/image-eviction.env" || return
+
   # Asking for the keys the chosen lanes use is the last question of the launch, and it lives here
   # rather than beside the model picker because it needs the resolved plan: which credentials are
   # actually used is a fact about both lanes together.
@@ -408,6 +418,7 @@ cp -- "${session_file}" "${state_file}"
 chmod 600 "${state_file}"
 cp "${HARNESS_RUNTIME_DIR}/modules.json" "${HARNESS_RUNTIME_DIR}/last-modules.json"
 cp "${HARNESS_RUNTIME_DIR}/model-selection.json" "${HARNESS_RUNTIME_DIR}/last-model-selection.json"
+cp "${HARNESS_RUNTIME_DIR}/image-eviction.json" "${HARNESS_RUNTIME_DIR}/last-image-eviction.json"
 find "${session_file}" -delete
 
 wait_for_url() {

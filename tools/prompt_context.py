@@ -641,6 +641,7 @@ def compose_agents_document(
     enabled: Mapping[str, bool] | None = None,
     values: Mapping[str, str] | None = None,
     static: Mapping[str, str] | None = None,
+    multimodal_guidance: str = "",
 ) -> str:
     """The all-lane contract: tier one or tier two, then every enabled all-lane add-on.
 
@@ -660,6 +661,11 @@ def compose_agents_document(
     parts.extend(enabled_guidance(plan, policy.AUDIENCE_LANE, choices))
     if choices[OPTION_MODULE_GUIDANCE] and module_guidance.strip():
         parts.append(module_guidance.strip("\n"))
+    # Not a panel add-on, and deliberately so. Module guidance is a choice about how much to
+    # tell an agent; this text exists only when the behaviour it describes is actually on, so
+    # the launch answer gates it and a switch here could only produce the two disagreeing.
+    if multimodal_guidance.strip():
+        parts.append(multimodal_guidance.strip("\n"))
     parts = [part for part in parts if part]
     if not parts:
         return ""

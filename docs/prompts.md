@@ -557,8 +557,11 @@ tokens were omitted. `TASK_RESUME_TERMINATION_VARIANT` (bundle `133342901`) is a
 reminder variant for background tasks that outlived a compaction, not part of the
 summary template.
 
-`[loop_control] reserved_context_size` and `max_attempts_per_step` control how much
-headroom a compaction leaves and how often it may be retried, not *when* it fires; `PreCompact`/`PostCompact` hooks exist (`runPreCompact`, bundle
+`[loop_control] reserved_context_size` controls how much headroom a compaction leaves *and*
+part of when it fires — `shouldCompact` triggers on `used >= maxSize * trigger_ratio` **or**
+`used + reserved >= maxSize`, so `reserved` is a second trigger, not just a post-hoc margin.
+`max_attempts_per_step` governs how often a compaction may be retried. `PreCompact`/`PostCompact`
+hooks exist (`runPreCompact`, bundle
 `133059871`) but *"their return values are completely ignored"*, so the
 compaction prompt is not replaceable.
 

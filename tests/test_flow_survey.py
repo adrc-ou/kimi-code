@@ -413,19 +413,28 @@ class SurveyTests(unittest.TestCase):
 
     # -- and what the rail does with it ------------------------------------------------------
 
-    def test_a_two_question_launch_numbers_its_two_screens_from_the_first(self):
+    def test_the_rail_counts_every_screen_this_launch_will_actually_draw(self):
         # The defect, end to end: a host with one model, no loadable module and no key to ask for
-        # has two screens in it, and the first one has to say so. Before there was a forecast this
-        # same launch opened on "1 of 8" and counted down as it went.
+        # has few screens in it, and the first one has to say how many. Before there was a
+        # forecast this same launch opened on "1 of 8" and counted down as it went.
+        #
+        # multimodal-eviction is a question this host has no short-circuit for, so it is always
+        # drawn; the survey has no predicate for it and leaves it at the default of one screen,
+        # which is correct. The credentials screen is still forecast away, because the key is
+        # already set.
         self.catalog([MODELS[0]])
         answers = self.survey(values={SHARED_KEY: "already set"})
         self.assertEqual(answers[flow.CREDENTIALS], 0)
+        self.assertNotIn(
+            flow.EVICTION, answers, "a step with nothing to predict is left off the line"
+        )
         state = flow.Flow(self.runtime, flow.STEPS)
         state.begin()
         state.survey(answers)
-        self.assertEqual(state.visible(), (flow.KIMI_VERSION, flow.CONTEXT))
-        self.assertEqual(state.rail(flow.KIMI_VERSION), (1, 2))
-        self.assertEqual(state.rail(flow.CONTEXT), (2, 2))
+        self.assertEqual(state.visible(), (flow.KIMI_VERSION, flow.CONTEXT, flow.EVICTION))
+        self.assertEqual(state.rail(flow.KIMI_VERSION), (1, 3))
+        self.assertEqual(state.rail(flow.CONTEXT), (2, 3))
+        self.assertEqual(state.rail(flow.EVICTION), (3, 3))
 
 
 if __name__ == "__main__":
