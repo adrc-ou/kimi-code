@@ -488,12 +488,16 @@ Guard and fair-use price are computed from the **evicted** body, so a request tr
 `images_evicted` record to the log.
 
 **This is off until you turn it on.** `./start.sh` asks — *"Use smart context reduction strategy
-for multimodal attachments?"* — on every interactive launch, opening on whatever you last
-answered, or on **No** if you have never been asked. The answer is written to
-`MODEL_PROXY_IMAGE_EVICTION`, the same variable `compose.yaml` reads, so nothing translates it
-on the way; an unattended launch with no recorded answer gets No. The reason it is a question
-and not a default is that it changes what the model sees: the bytes are still reachable, but
-only by asking.
+for multimodal attachments?"* — on every interactive launch. What it opens on comes from one of
+three places, in order: the answer you gave last launch, then a `MODEL_PROXY_IMAGE_EVICTION` you
+wrote in `.env`, then **No** — and the screen names which of the three it used, so a declaration
+outranked by a remembered answer is visible rather than merely missing. Either way the answer is
+written to `.local/runtime/<instance>/image-eviction.env` and exported, which is what the proxy
+container finally reads. So **`.env` is the control for the launches nobody asks about** —
+`--non-interactive`, a read-only entry point, a machine answering its first question — and not for
+one you have already clicked through, where the click is the later decision. The reason it is a
+question and not a default is that it changes what the model sees: the bytes are still reachable,
+but only by asking.
 
 ## Persistent workspace contract
 

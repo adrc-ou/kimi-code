@@ -251,7 +251,8 @@ class ConfigurationTests(unittest.TestCase):
         # lives in tools/runtime.sh so that both ends of a launch sweep the same list, which means
         # this property spans two files and has to be read from both.
         sweep = (ROOT / "tools/runtime.sh").read_text()
-        ledger = sweep[sweep.index("HARNESS_SECRET_RESIDUE=("): sweep.index("harness_sweep_secrets()")]
+        ledger = sweep[sweep.index("HARNESS_SECRET_RESIDUE=(") :]
+        ledger = ledger[: ledger.index("harness_sweep_secrets()")]
         deleted = launcher[launcher.index("  for file in"): launcher.index("harness_unlock")]
         self.assertIn("prompt-measure.log", ledger)
         self.assertIn("prompt-sessions", deleted)

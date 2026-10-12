@@ -324,7 +324,7 @@ harness_flow_pass() {
   # how large a prompt this launch will assemble. The answer is written as
   # MODEL_PROXY_IMAGE_EVICTION, which is the variable compose.yaml already reads, so nothing has
   # to translate it on the way.
-  eviction=(python3 tools/image_eviction.py)
+  eviction=(python3 tools/image_eviction.py --root "${root}")
   [[ "${non_interactive}" == true ]] && eviction+=(--non-interactive)
   harness_flow_step "${eviction[@]}" || return
   harness_flow_source "${HARNESS_RUNTIME_DIR}/image-eviction.env" || return

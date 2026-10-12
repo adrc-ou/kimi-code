@@ -9,20 +9,26 @@ the gateway will accept. It also means the model sees a handle where it once saw
 to ask for them back through ``analyze_image`` to look again. An operator working on one dense
 scan may prefer the bytes stay put.
 
-The answer travels as ``MODEL_PROXY_IMAGE_EVICTION``, which is the variable
-:file:`compose.yaml` already hands to the proxy, so no mapping table stands between what was
-answered and what is enforced.
+Three sources decide what a launch opens on, in the order an operator's intent hardens: the answer
+given at this screen last launch, then a ``MODEL_PROXY_IMAGE_EVICTION`` declared in :file:`.env`,
+then **No**. The screen names which of the three it used. The declaration is the control for the
+launches nobody is asked about -- ``--non-interactive``, a read-only entry point, a machine
+answering its first question -- while the click is the later and more specific act, so it outranks
+the line that every copied :file:`.env.example` carries. That ranking has to be said out loud: an
+operator who set the value and watched the proxy report it off had no way to tell whether the file
+was being ignored or their own earlier click was winning.
 
-Two defaults, and the difference between them is the whole reason this is a question rather than
-a constant. With no record of ever having been asked, the answer is **No**: the feature is new,
-it changes what the model sees, and an unlooked-at default that alters model input is the kind
-of thing an operator should opt into once rather than inherit silently. Once the operator has
-answered, every later launch opens on that answer, because a question re-asked with a different
-default every time is a question nobody reads.
+The answer is written to :file:`image-eviction.env`, which the launcher exports and sources and
+:file:`compose.yaml` interpolates into the proxy container -- the same variable by name at every
+hop, so no mapping table stands between what was answered and what is enforced. With no remembered
+answer and no declaration, it is **No**: the feature changes what the model sees, and an
+unlooked-at default that alters model input is the kind of thing an operator should opt into once
+rather than inherit silently.
 
 :file:`last-image-eviction.json` is copied into the instance directory at the launcher's commit
 point beside the other remembered answers, so an abandoned launch cannot rewrite a preference
-nobody confirmed.
+nobody confirmed. The answer is committed to the flow state as well, which is what lets a launch
+walking backwards stop here instead of stepping over it.
 """
 
 from __future__ import annotations
@@ -35,11 +41,13 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
-    from .tui import flow
+    from .env_values import read_env_values
+    from .tui import flow, screen
     from .tui.app import View, run
     from .tui.menu import SINGLE, Choice, ListStep
 else:  # run as a script by the launcher, which puts ``tools/`` alone on the path
-    from tui import flow
+    from env_values import read_env_values
+    from tui import flow, screen
     from tui.app import View, run
     from tui.menu import SINGLE, Choice, ListStep
 
@@ -52,6 +60,9 @@ ENV_VARIABLE = "MODEL_PROXY_IMAGE_EVICTION"
 #: The `mcpServers` key registered in ``runtime/mcp.json``. Named here so the launcher and that
 #: file cannot drift into gating a server that no longer exists.
 SERVER_KEY = "images"
+#: The operator's own configuration file, read for one key and never printed. Same reader
+#: :mod:`tools.modules` uses to see what was declared before the launcher overrode it.
+OPERATOR_ENV = ".env"
 CHOSEN_FILE = "image-eviction.json"
 PREVIOUS_FILE = "last-image-eviction.json"
 OUTPUT_ENV = "image-eviction.env"
@@ -61,6 +72,13 @@ OFF = "off"
 
 #: The first answer, for an operator who has never been asked. See the module docstring.
 FIRST_DEFAULT = OFF
+
+#: Which decision the opening default came from, said out loud on the screen and in the replay
+#: line. Without it a declared ``.env`` value that a remembered answer outranks is simply missing,
+#: and the only way to notice is to debug the proxy.
+SOURCE_REMEMBERED = "your last launch's answer"
+SOURCE_DECLARED = "your .env declaration"
+SOURCE_BUILTIN = "this build's default"
 
 CHOICES = (
     Choice(
@@ -122,10 +140,53 @@ def remembered(runtime: Path) -> str:
     return answer_of(stored if isinstance(stored, (bool, str)) else "")
 
 
-def choose(previous: str, non_interactive: bool, view: View | None = None) -> str:
+def declared(root: Path) -> str:
+    """What :file:`.env` says about this one variable, or an empty string when it says nothing.
+
+    Read for this key alone and never printed: the same file holds the provider credentials, which
+    is why every launcher step goes through :func:`tools.env_values.read_env_values` instead of
+    sourcing it.
+    """
+    try:
+        values = read_env_values(root / OPERATOR_ENV)
+    except OSError:
+        return ""
+    return answer_of(values.get(ENV_VARIABLE, ""))
+
+
+def opening(runtime: Path, root: Path) -> tuple[str, str]:
+    """The answer a launch starts on, and the name of whatever chose it.
+
+    Three sources, ordered by how recently the operator committed to them. An answer they gave the
+    screen beats a value written in :file:`.env`, because clicking is the later and more specific
+    act and :file:`.env.example` ships this key declared — an example file must not be able to
+    overrule a decision somebody actually made. A declaration still beats nothing, which is what
+    makes :file:`.env` a working control for the launches nobody asks about: ``--non-interactive``,
+    a read-only entry point, a machine answering its first question.
+    """
+    answer = remembered(runtime)
+    if answer:
+        return answer, SOURCE_REMEMBERED
+    answer = declared(root)
+    if answer:
+        return answer, SOURCE_DECLARED
+    return FIRST_DEFAULT, SOURCE_BUILTIN
+
+
+def choose(
+    previous: str, non_interactive: bool, view: View | None = None, source: str = ""
+) -> str:
     default = previous or FIRST_DEFAULT
     if non_interactive or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return default
+    head = [
+        "Large attachments dominate a long session's request body. Once the model has",
+        "answered about an image, this option replaces its bytes with a re-readable handle.",
+    ]
+    # Said on the screen rather than left to inference: a declaration quietly outranked by a
+    # remembered answer is indistinguishable from a declaration that does nothing.
+    if source:
+        head.append(f"Opening on {source}.")
     step = ListStep(
         title=TITLE,
         prompt=PROMPT,
@@ -140,10 +201,7 @@ def choose(previous: str, non_interactive: bool, view: View | None = None) -> st
             for choice in CHOICES
         ],
         previous=[default],
-        head=(
-            "Large attachments dominate a long session's request body. Once the model has",
-            "answered about an image, this option replaces its bytes with a re-readable handle.",
-        ),
+        head=tuple(head),
     )
     result = run(step, view if view is not None else View())
     if result.status == flow.GO_BACK:
@@ -249,6 +307,11 @@ def main(argv: list[str] | None = None) -> int:
         help="instance runtime directory the answer is recorded in",
     )
     parser.add_argument(
+        "--root",
+        default=os.environ.get("HARNESS_ROOT", ""),
+        help="harness root whose .env declares the answer for a launch nobody is asked about",
+    )
+    parser.add_argument(
         "--print-only",
         action="store_true",
         help="report the answer, write nothing",
@@ -258,14 +321,53 @@ def main(argv: list[str] | None = None) -> int:
     if not args.runtime_dir:
         parser.error("--runtime-dir or HARNESS_RUNTIME_DIR is required")
     runtime = Path(args.runtime_dir)
+    root = Path(args.root) if args.root else Path(__file__).resolve().parents[1]
 
-    previous = remembered(runtime)
-    answer = choose(previous, args.non_interactive)
+    standing, source = opening(runtime, root)
     if args.print_only:
-        print(answer)  # noqa: S106 - an operator-facing report, not a credential
+        print(standing)  # noqa: S106 - an operator-facing report, not a credential
         return 0
+
+    # A step in the launch like the eight around it, and the flow state is what makes it one. The
+    # rail has to be able to say which of the nine this is, and the answer has to be committed or
+    # Back from the credential step walks straight past it -- the hole `tools/prompt_panel.py`
+    # documents for the context step, in the step launched beside it.
+    asking = not args.non_interactive and sys.stdin.isatty() and sys.stdout.isatty()
+    state = flow.running(runtime)
+    rendering = state.plan(flow.EVICTION, 1 if asking else 0) if state else asking
+    if rendering:
+        position, total = state.rail(flow.EVICTION) if state else (1, 1)
+        try:
+            answer = choose(
+                standing,
+                non_interactive=False,
+                view=View(
+                    position=position,
+                    total=total,
+                    can_go_back=bool(state and state.previous(flow.EVICTION)),
+                ),
+                source=source,
+            )
+        except flow.BackRequested:
+            # Leaving without naming the target is how a back-request goes quiet: the next pass
+            # would replay every committed step, redraw nothing, and arrive back here.
+            flow.back_from(state, flow.EVICTION)
+    else:
+        # An unattended launch, or a pass replaying an answer this launch already has. Nothing here
+        # may take over a screen that is not a terminal, and the line says which source answered.
+        screen.note(f"Multimodal attachments: {standing}, from {source}.")
+        answer = choose(standing, non_interactive=True)
+
+    # Recorded on every path, including the ones that never drew a screen: this file is the only
+    # thing between the operator and `${MODEL_PROXY_IMAGE_EVICTION:-0}` in `compose.yaml`, and the
+    # launcher sources it as a step that must have produced its output before returning.
     runtime.mkdir(parents=True, exist_ok=True)
     record(runtime, answer)
+    if state and rendering:
+        # Only a screen that was actually drawn commits. An answer that skipped its own screens is
+        # a step with nothing on the rail, and committing it would restore what `plan(..., 0)` just
+        # took off -- the rule `tools/models.py` applies to the model lanes.
+        state.commit(flow.EVICTION, answer)
     return 0
 
 

@@ -320,8 +320,12 @@ parked at a gate; a `upstream_dispatch` with nothing after it means the endpoint
 answered yet. An image-heavy session is checked differently, because its failure is invisible in tokens:
 `grep images_evicted` in that log, or read `image_eviction` and the `images_evicted` /
 `image_bytes_freed` counters from `/healthz`. If `images_evicted` stays at zero while a session
-carries attachments, eviction is off or every image is still unanswered — check
-`MODEL_PROXY_IMAGE_EVICTION`. If it climbs but requests still fail, the body was never the
+carries attachments, either eviction is off or every image is still unanswered, and
+`image_eviction.enabled` on `/healthz` is what tells those apart. When it reads false, the launch
+answer is why, not `.env`: the screen's remembered answer outranks a `MODEL_PROXY_IMAGE_EVICTION`
+declaration, and only a launch nobody was asked about takes the declaration — the screen names the
+source it opened on, and `${HARNESS_RUNTIME_DIR}/image-eviction.json` keeps the answer it settled
+on. If it climbs but requests still fail, the body was never the
 problem and the `status=` on the refusals is where to look next.
 
 `client_cancelled` says the turn gave up while the proxy was still retrying,

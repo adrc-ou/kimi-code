@@ -21,7 +21,7 @@ import resolution  # noqa: E402
 DOCKERFILE = ROOT / "backend" / "Dockerfile.cuda"
 # The image installs into this fixed path, and the assertions name it literally, so the test has to
 # use the same name rather than a temporary one: a check aimed at a different file proves nothing.
-LOCK_PATH = Path("/tmp/requirements-linux.lock")
+LOCK_PATH = Path("/tmp/requirements-linux.lock")  # noqa: S108 - the path the assertions name
 C38_COMMIT = "6b747c0428c343e1417219641db93a4fb7cb69ae"
 C38_SHA = "c8325341fcc03b480f7ddb902ce6049e418ecf718232efeaacbfe51aaa79b3fe"
 # One reviewed CUDA wheel as a resolved lock writes it: the direct URL pin, then its hash.
