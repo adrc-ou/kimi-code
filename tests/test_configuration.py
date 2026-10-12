@@ -532,6 +532,17 @@ class ResolvedEnvelopeTests(unittest.TestCase):
         # A full swarm beside a primary request is not, so the proxy queues it instead.
         self.assertGreater(fan_out * subagent + primary, budget)
 
+    def test_only_the_subagent_lane_overrides_the_model_effort(self):
+        # Effort is per lane so a child can be asked to think less than the agent that spawned
+        # it: thinking blocks were 12-38% of what five audit children appended to their own
+        # context on this lane. The two agent-facing lanes must keep the model's own default,
+        # or the child's bargain quietly becomes the parent's.
+        self.assertEqual(self.lanes["subagent"]["default_effort"], "low")
+        for lane in ("primary", "long"):
+            self.assertEqual(self.lanes[lane]["default_effort"], "xhigh")
+        for entry in self.lanes.values():
+            self.assertIn(entry["default_effort"], entry["support_efforts"])
+
     def test_rate_ledger_is_booked_in_the_provider_unit(self):
         rates = [c for c in self.counters.values() if c["family"] == "rate"]
         self.assertTrue(rates)

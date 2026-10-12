@@ -165,6 +165,7 @@ class RenderRuntimeTests(LaunchSteps, unittest.TestCase):
                 table = config["models"][entry["alias"]]
                 self.assertEqual(table["max_context_size"], entry["context_tokens"])
                 self.assertEqual(table["max_input_size"], entry["input_tokens"])
+                self.assertEqual(table["default_effort"], entry["default_effort"])
                 provider = config["providers"][entry["provider_name"]]
                 self.assertEqual(provider["base_url"], f"http://model-proxy:8080/{lane}/v1")
 

@@ -75,6 +75,7 @@ output_clamp_tokens = 65536
 context_tokens = 66500
 input_tokens = 55808
 output_clamp_tokens = 10692
+default_effort = "low"          # optional override of the model default
 ```
 
 `schema_version`, `label`, `provider`, `model`, `slug`, `credential` and at
@@ -104,7 +105,11 @@ that large. It may not be smaller than any declared lane window.
 
 A model declares **capabilities**, never costs or limits. `capabilities`,
 `support_efforts` and the effort default are copied into the generated Kimi
-model table. The `long` lane exists so the wide window is a lane with its own
+model table, and a lane may override that default with its own
+`default_effort` — which is how a child gets asked to think less than the agent
+that spawned it without either agent-facing lane following it. The effort is the
+one lane knob that costs no fair-use arithmetic: it changes neither the
+reservation nor the window, only what the lane spends its window on. The `long` lane exists so the wide window is a lane with its own
 name, route, alias and accounting rather than a number every request inherits,
 and because the two agent lanes are peers it is the one the launcher opens on by
 default; a model that declares only `primary` simply offers one row.

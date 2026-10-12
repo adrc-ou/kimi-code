@@ -88,7 +88,16 @@ output_clamp_tokens = 65536
 # 83,125, i.e. a clamp of 27,317 with input still 55,808, which covers the largest answer any
 # lane has ever produced (26,222). That would essentially eliminate both truncation channels at
 # the cost of one fifth of swarm width.
+# Effort is a lane knob rather than a model fact precisely so a child can be asked to think
+# less than the agent that spawned it. Measured over five audit children on this lane, thinking
+# blocks were 12-38% of everything they appended to their own context, and every one of them
+# compacted at least three times against the 47,436-token trigger — so the reasoning replay is
+# a real share of the window, and giving it up is a real trade against the self-checking a wide
+# charter needs. `low` is declared here, not in `[thinking] effort` (which is global and
+# user-owned), and lands in this lane's own generated Kimi table; the per-request
+# `thinkingEffort` field in an agent's wire log is what shows the lane actually took effect.
 [lane.subagent]
 context_tokens = 66500
 input_tokens = 55808
 output_clamp_tokens = 10692
+default_effort = "low"

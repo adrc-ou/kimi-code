@@ -1176,10 +1176,6 @@ def _eviction_note(url: str) -> tuple[str, int, str] | None:
     # re-encode a file on disk and compare, without needing to have seen this request.
     digest = hashlib.sha256(payload.encode()).hexdigest()[:IMAGE_HANDLE_PREFIX]
     handle = f"sha256:{digest}"
-    # The digest is of the base64 exactly as it travelled, so the tool that resolves it can
-    # re-encode a file on disk and compare, without needing to have seen this request.
-    digest = hashlib.sha256(payload.encode()).hexdigest()[:IMAGE_HANDLE_PREFIX]
-    handle = f"sha256:{digest}"
     # Named the way the client can actually find it. An MCP tool is surfaced as
     # `mcp__<server>__<tool>`, and an instruction to "call analyze_image" is a handle the model
     # has no way to act on if it never sees a tool by that bare name — which is exactly the
