@@ -54,7 +54,7 @@ import shutil
 import time
 import tomllib
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -202,8 +202,8 @@ LOG_DUMP_BUDGET_BYTES = int(
 #: to ~304 KB. Kimi's own byte budget does not bound this, because `region` and
 #: `full_resolution` reads are exempt from it and a pasted attachment is not a read at all.
 #: The proxy is the last point that sees the body and the only one this harness owns, so
-#: eviction happens here: once an assistant turn has answered an image, the bytes are replaced
-#: in place by a handle the agent can re-read with. See ``evict_answered_images``.
+#: eviction happens here: once an assistant turn has followed an image, the bytes are replaced
+#: in place by a handle the agent can re-read with. See ``evict_seen_images``.
 #: Off unless the operator opted in. ``./start.sh`` asks on every interactive launch and writes
 #: the answer here; a proxy started some other way must not begin rewriting model input on an
 #: assumption nobody confirmed.
@@ -218,6 +218,18 @@ IMAGE_EVICTION_ENABLED = os.environ.get("MODEL_PROXY_IMAGE_EVICTION", "0").strip
 #: trivial number of bytes for a handle the model then has to reason about.
 IMAGE_EVICTION_MIN_BYTES = int(
     os.environ.get("MODEL_PROXY_IMAGE_EVICTION_MIN_BYTES", "32768")
+)
+
+#: The size backstop, and the reason it is not the main rule. An image is only rewritten once an
+#: assistant turn has followed it, so a body that is large because of images the model has *not*
+#: seen yet — a batch pasted at once, or one tool turn's worth of screenshots — is beyond that
+#: rule entirely. When the body would still go out over this many bytes, the oldest of what
+#: remains is rewritten until it fits, and the newest image is always kept: the model may lose
+#: pixels it has already been shown, but never the thing it is being asked about right now.
+#: Measured on the request that motivated it: 4.2 MB of body, of which 4.17 MB was base64.
+#: Zero disables the backstop and leaves the assistant-turn rule as the only rewrite.
+IMAGE_EVICTION_FALLBACK_BYTES = int(
+    os.environ.get("MODEL_PROXY_IMAGE_EVICTION_FALLBACK_BYTES", str(4 * 1024 * 1024))
 )
 
 #: How much of the digest to show. Enough to be unique across a session's images at the
@@ -238,9 +250,11 @@ LOG_DUMP_MAX_BYTES = int(
 #: the bound matters because that body arrives from the network rather than from this plan.
 LOG_ERROR_EXCERPT_BYTES = 4096
 
-#: Events whose terse line also reaches stdout. This is the set the proxy has always printed,
-#: carried forward unchanged so the launch terminal reads the same as it did before the file
-#: existed. Everything below is also in the file whether or not it is listed here.
+#: Events whose terse line also reaches stdout. This is the set the proxy printed before the file
+#: existed, plus the two that a session's stalled request actually needs: ``request_received`` is
+#: how you tell a body the proxy never answered from one it never saw, and ``images_evicted`` is
+#: how you tell eviction that is working from eviction that is never firing. Everything below is
+#: also in the file whether or not it is listed here.
 DEFAULT_LIVE_EVENTS = frozenset(
     {
         "input_guard",
@@ -255,9 +269,11 @@ DEFAULT_LIVE_EVENTS = frozenset(
         "rate_wait",
         "request_complete",
         "request_deadline",
+        "request_received",
         "response_limit",
         "startup_refused",
         "stream_stall",
+        "images_evicted",
         "upstream_retry",
         "usage_reporting_unsupported",
     }
@@ -1093,14 +1109,44 @@ def rewrite_model(body: bytes, request: web.Request, lane: LanePolicy) -> bytes:
 
 @dataclass
 class Eviction:
-    """What one body's eviction did, for the record and for nothing else."""
+    """What one body's eviction did, for the record and for nothing else.
+
+    ``seen`` and ``pending`` exist because ``images`` alone cannot answer the question a stalled
+    multimodal session actually asks. A zero there means either that nothing in the body was old
+    enough to rewrite, or that the rewrite never fired — and those want opposite fixes. Read them
+    together: images seen but not rewritten is the normal shape of a request whose attachments the
+    model has not been shown yet, and it is ``pending`` that says so.
+
+    ``bytes_noticed`` is the text written in place of the bytes removed, which is what makes a
+    body's projected size computable without serialising it twice.
+    """
 
     images: int = 0
     bytes_freed: int = 0
     handles: tuple[str, ...] = ()
+    #: Inline and remote image references found in a body this pass parsed.
+    seen: int = 0
+    #: Of those, the ones still ahead of the last assistant turn: large enough to be worth
+    #: rewriting, and not yet old enough for the rule to touch them.
+    pending: int = 0
+    #: Of ``images``, the ones the size backstop rewrote rather than the assistant-turn rule.
+    forced: int = 0
+    bytes_noticed: int = 0
 
     def __bool__(self) -> bool:
         return self.images > 0
+
+    @property
+    def projected(self) -> int:
+        """What a body of ``body_bytes`` will weigh once these rewrites are serialised.
+
+        A projection, not a measurement: it counts the note text as written rather than as
+        JSON-escaped, which is a couple of bytes per note against images of at least
+        ``IMAGE_EVICTION_MIN_BYTES``. The backstop it feeds decides a megabyte question, so it
+        does not need the last byte to be right, and re-serialising to find out would cost more
+        than the answer.
+        """
+        return -self.bytes_freed + self.bytes_noticed
 
 
 def _looks_like_mime(value: str) -> bool:
@@ -1120,26 +1166,34 @@ def _part_text(part: object) -> str:
     return text if isinstance(text, str) else ""
 
 
-def _answers_after(messages: list, index: int) -> bool:
-    """Whether some later assistant turn said something about this image.
+def _last_assistant_index(messages: list) -> int:
+    """The index of the final assistant turn, or -1 while the conversation has had none.
 
-    This is the whole eviction rule, and it is monotone by construction: history only grows,
-    so once an image has been answered it stays answered. Each image is therefore rewritten at
-    most once, which keeps the request prefix stable afterwards instead of shifting a
-    keep-newest-N window on every step and invalidating the provider's cache each time.
+    This one number is the whole eviction rule. At or before it, every message is history the
+    model has already been shown, so an image sitting there has been looked at and its bytes are
+    now worth less than the handle that replaces them. After it lies the trailing run — the
+    attachment the user has just pasted, and the tool results this very step exists to deliver —
+    and pixels there are the only thing the model has to work from.
 
-    An image with no following assistant text is left untouched, which is what protects the
-    attachment the user just pasted and the read the model has not yet answered.
+    The rule is monotone by construction: history only grows, so the boundary only moves forward,
+    so an image once rewritten is never restored. Each image is therefore rewritten at most once,
+    which keeps the request prefix stable afterwards instead of shifting a keep-newest-N window on
+    every step and invalidating the provider's cache each time.
+
+    What this deliberately stops requiring is prose. An earlier version counted an image answered
+    only once some later assistant turn had said something in text about it, and that misjudged
+    the workload this exists for: a vision agent's first move after an image is a crop read or a
+    zoom, not a paragraph, so the largest attachment in the session rode every one of those steps.
+    Measured on the request that motivated this, 4.17 MB of a 4.22 MB body was base64 that a
+    tool-call turn had already made redundant. Reasoning the model shows nowhere and tool calls it
+    acts on are both evidence it saw the image; only the pixels' absence can be corrected later,
+    and only by the re-read handle this writes.
     """
-    for later in messages[index + 1 :]:
-        if not isinstance(later, dict) or later.get("role") != "assistant":
-            continue
-        content = later.get("content")
-        if isinstance(content, str) and content.strip():
-            return True
-        if isinstance(content, list) and any(_part_text(part).strip() for part in content):
-            return True
-    return False
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            return index
+    return -1
 
 
 def _image_urls_of(part: dict) -> list[str]:
@@ -1156,8 +1210,13 @@ def _image_urls_of(part: dict) -> list[str]:
     return urls
 
 
-def _eviction_note(url: str) -> tuple[str, int, str] | None:
-    """The replacement text for one inline image, the bytes it carried, and its handle."""
+def _inline_payload(url: str) -> tuple[str, int, str] | None:
+    """One image reference as (mime, base64 length, base64), or None if it is not worth writing.
+
+    Kept apart from :func:`_eviction_note` because counting what a body carries must not pay for
+    the digest: the pass that tallies ``seen`` and ``pending`` runs over every image in the
+    request, including the ones the rule is about to leave alone.
+    """
     if not url.startswith("data:"):
         # A remote reference is already small; the provider fetches it, we do not.
         return None
@@ -1172,6 +1231,11 @@ def _eviction_note(url: str) -> tuple[str, int, str] | None:
     # the note we are writing to save space.
     declared = head[5:].split(";", 1)[0]
     mime = declared if _looks_like_mime(declared) else "unknown"
+    return mime, size, payload
+
+
+def _eviction_note(mime: str, size: int, payload: str) -> tuple[str, int, str]:
+    """The replacement text for one inline image, the bytes it carried, and its handle."""
     # The digest is of the base64 exactly as it travelled, so the tool that resolves it can
     # re-encode a file on disk and compare, without needing to have seen this request.
     digest = hashlib.sha256(payload.encode()).hexdigest()[:IMAGE_HANDLE_PREFIX]
@@ -1194,8 +1258,45 @@ def _eviction_note(url: str) -> tuple[str, int, str] | None:
     return note, size, handle
 
 
-def evict_answered_images(payload: dict) -> Eviction:
-    """Replace already-answered inline images in a request payload with re-read handles.
+def _image_parts(messages: list) -> Iterator[tuple[int, list, int, dict]]:
+    """Every image part in a conversation, with the content list and slot that hold it.
+
+    Both passes walk this, and both must walk it in the same order: that agreement is what makes
+    the backstop's "oldest first" the same oldest the assistant-turn rule would have reached
+    first, so a body whose images are old enough to trim is never trimmed out of order.
+    """
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for position, part in enumerate(content):
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                yield index, content, position, part
+
+
+def _evict_part(
+    content: list, position: int, part: dict, notes: list[tuple[str, int, str]], report: Eviction
+) -> None:
+    """Swap one image part for the text replacing it, and book what that changed."""
+    text = "\n".join(entry[0] for entry in notes)
+    existing = _part_text(part)
+    # Built fresh rather than copied: a copied part would carry `detail` or
+    # `cache_control` over from the image block onto a text block, where they are not
+    # legal and a strict validator rejects them.
+    replacement: dict[str, object] = {"type": "text"}
+    replacement["text"] = f"{existing}\n{text}" if existing else text
+    content[position] = replacement
+    for note, size, handle in notes:
+        report.images += 1
+        report.bytes_freed += size
+        report.bytes_noticed += len(note)
+        report.handles += (handle,)
+
+
+def evict_seen_images(payload: dict) -> Eviction:
+    """Replace inline images an assistant turn has already followed with re-read handles.
 
     Mutates the parsed body in place. Content parts are swapped text-for-image; no message is
     added, removed, reordered, or re-roled, so message count, ordering, and every
@@ -1207,42 +1308,59 @@ def evict_answered_images(payload: dict) -> Eviction:
     if not isinstance(messages, list) or not IMAGE_EVICTION_ENABLED:
         return report
 
-    for index, message in enumerate(messages):
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        if not _answers_after(messages, index):
-            continue
-
-        for position, part in enumerate(content):
-            if not isinstance(part, dict) or part.get("type") != "image_url":
+    boundary = _last_assistant_index(messages)
+    for index, content, position, part in _image_parts(messages):
+        # Strictly before the boundary: the turn at the boundary has not itself been answered
+        # yet, so anything it carries is still the model's present, not its past.
+        behind = index < boundary
+        notes = []
+        for url in _image_urls_of(part):
+            report.seen += 1
+            inline = _inline_payload(url)
+            if inline is None:
                 continue
-            notes = []
-            for url in _image_urls_of(part):
-                note = _eviction_note(url)
-                if note is not None:
-                    notes.append(note)
-            if not notes:
+            if not behind:
+                report.pending += 1
                 continue
-            text = "\n".join(entry[0] for entry in notes)
-            existing = _part_text(part)
-            # Built fresh rather than copied: a copied part would carry `detail` or
-            # `cache_control` over from the image block onto a text block, where they are not
-            # legal and a strict validator rejects them.
-            replacement: dict[str, object] = {"type": "text"}
-            if existing:
-                replacement["text"] = f"{existing}\n{text}"
-            else:
-                replacement["text"] = text
-            content[position] = replacement
-            for _text, size, handle in notes:
-                report.images += 1
-                report.bytes_freed += size
-                report.handles += (handle,)
+            notes.append(_eviction_note(*inline))
+        if notes:
+            _evict_part(content, position, part, notes, report)
 
     return report
+
+
+def _force_oldest_images(payload: dict, report: Eviction, body_bytes: int) -> None:
+    """Size backstop: rewrite the oldest images still in the body until it fits again.
+
+    The assistant-turn rule cannot reach the trailing run, so a request that is large because of
+    images the model has *not* been shown yet — a board of references pasted at once, or one tool
+    turn's worth of screenshots — is beyond it altogether. This trims those oldest-first and
+    always keeps the newest image part, because the one the model is being asked about now is the
+    one whose absence changes its answer rather than merely costing it a re-read.
+
+    A body whose newest image alone exceeds the limit is still sent whole. Shrinking it is not
+    this proxy's job, and refusing the request would trade a slow turn for no turn.
+
+    Mutates ``report``, which is why it takes one rather than returning one: the two passes are
+    one rewrite of one body, and the caller must re-serialise on the combined result.
+    """
+    limit = IMAGE_EVICTION_FALLBACK_BYTES
+    if limit <= 0 or body_bytes + report.projected <= limit:
+        return
+
+    candidates = []
+    for _index, content, position, part in _image_parts(payload.get("messages") or []):
+        inlines = [inline for inline in map(_inline_payload, _image_urls_of(part)) if inline]
+        if inlines:
+            candidates.append((content, position, part, inlines))
+
+    # The last one stays: see the docstring.
+    for content, position, part, inlines in candidates[:-1]:
+        notes = [_eviction_note(*inline) for inline in inlines]
+        report.forced += len(notes)
+        _evict_part(content, position, part, notes, report)
+        if body_bytes + report.projected <= limit:
+            return
 
 
 def evict_body_images(body: bytes) -> tuple[bytes, Eviction]:
@@ -1253,6 +1371,9 @@ def evict_body_images(body: bytes) -> tuple[bytes, Eviction]:
     untouched, because re-serialising it would perturb key order and byte count for no gain.
     Anything that fails to parse is passed through for ``rewrite_model`` to reject on the
     request path, where the error is the caller's business.
+
+    Both passes run before that second decision, so a body the size backstop alone trimmed is
+    still re-serialised exactly once, and a body neither pass touched still leaves byte for byte.
     """
     if not IMAGE_EVICTION_ENABLED:
         return body, Eviction()
@@ -1268,7 +1389,8 @@ def evict_body_images(body: bytes) -> tuple[bytes, Eviction]:
     if not isinstance(payload, dict):
         return body, Eviction()
 
-    report = evict_answered_images(payload)
+    report = evict_seen_images(payload)
+    _force_oldest_images(payload, report, len(body))
     if not report:
         return body, report
     try:
@@ -1647,7 +1769,13 @@ class Stats:
     deadline_stops: int = 0
     stream_stalls: int = 0
     policy_errors: int = 0
+    # Seen and pending are the denominators that make images_evicted readable: zero evictions is
+    # normal for a body whose attachments the model has not been shown yet, and is the whole bug
+    # for one whose attachments it has. See ``Eviction``.
+    images_seen: int = 0
+    images_pending: int = 0
     images_evicted: int = 0
+    images_forced: int = 0
     image_bytes_freed: int = 0
 
 
@@ -2030,12 +2158,16 @@ async def health(_request: web.Request) -> web.Response:
                 "deadline_stops": stats.deadline_stops,
                 "stream_stalls": stats.stream_stalls,
                 "policy_errors": stats.policy_errors,
+                "images_seen": stats.images_seen,
+                "images_pending": stats.images_pending,
                 "images_evicted": stats.images_evicted,
+                "images_forced": stats.images_forced,
                 "image_bytes_freed": stats.image_bytes_freed,
             },
             "image_eviction": {
                 "enabled": IMAGE_EVICTION_ENABLED,
                 "min_base64_bytes": IMAGE_EVICTION_MIN_BYTES,
+                "fallback_body_bytes": IMAGE_EVICTION_FALLBACK_BYTES or None,
             },
         }
     )
@@ -2087,13 +2219,33 @@ async def chat(request: web.Request) -> web.StreamResponse:
         # priced as 5 MB would be charged for bytes the provider never sees, and could be
         # forced to run alone for a size it no longer has.
         outbound_body, eviction = evict_body_images(inbound_body)
-        if eviction:
+        stats.images_seen += eviction.seen
+        stats.images_pending += eviction.pending
+        # Emitted for any body that carried images, not only for one that shed any. A session
+        # wedged on a multimodal request asks "is eviction running at all?", and the only honest
+        # answer needs the case where the count moved and nothing was rewritten to be on the
+        # record too; `images=0 pending=3` is that answer, and it is silent under the old gate.
+        if eviction or eviction.seen:
             stats.images_evicted += eviction.images
+            stats.images_forced += eviction.forced
             stats.image_bytes_freed += eviction.bytes_freed
             event(
                 "images_evicted",
+                (
+                    "lane",
+                    "images",
+                    "forced",
+                    "seen",
+                    "pending",
+                    "bytes_freed",
+                    "body_bytes_before",
+                    "body_bytes_after",
+                ),
                 lane=lane_name,
                 images=eviction.images,
+                forced=eviction.forced,
+                seen=eviction.seen,
+                pending=eviction.pending,
                 bytes_freed=eviction.bytes_freed,
                 body_bytes_before=len(inbound_body),
                 body_bytes_after=len(outbound_body),

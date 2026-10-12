@@ -117,15 +117,22 @@ services:
 
       # Image eviction. Inline images dominate a multimodal session's request body - 92% of a
       # real archived request - and Kimi's own byte budget exempts the region and
-      # full_resolution reads that produce the largest ones. Once an assistant turn has
-      # answered an image, the proxy replaces its base64 with a handle the agent can re-read
-      # through the `images` MCP server. Monotone by design: an image is rewritten at most
-      # once, so the request prefix stays stable afterwards instead of invalidating the
-      # provider's cache on every step. ./start.sh asks the operator every interactive launch;
-      # this default is what an unattended launch gets when no answer was ever recorded, and
-      # it matches the panel's own first-time default of No.
+      # full_resolution reads that produce the largest ones. Once an assistant turn has followed
+      # an image, the proxy replaces its base64 with a handle the agent can re-read through the
+      # `images` MCP server. Monotone by design: an image is rewritten at most once, so the
+      # request prefix stays stable afterwards instead of invalidating the provider's cache on
+      # every step. ./start.sh asks the operator every interactive launch; this default is what
+      # an unattended launch gets when no answer was ever recorded, and it matches the panel's
+      # own first-time default of No.
       MODEL_PROXY_IMAGE_EVICTION: "${MODEL_PROXY_IMAGE_EVICTION:-0}"
       MODEL_PROXY_IMAGE_EVICTION_MIN_BYTES: "${MODEL_PROXY_IMAGE_EVICTION_MIN_BYTES:-32768}"
+      # The size backstop, and the only pass that can reach images the model has not been shown
+      # yet. A batch pasted at once, or one tool turn's worth of screenshots of it, is newer than
+      # the last assistant turn and so beyond the rule above; this trims those oldest-first, and
+      # never the newest, once the body would go out over this many bytes. Measured on the
+      # request that motivated it: 4.2 MB, of which 4.17 MB was base64, and the endpoint never
+      # answered it. Zero leaves the rule above as the only rewrite.
+      MODEL_PROXY_IMAGE_EVICTION_FALLBACK_BYTES: "${MODEL_PROXY_IMAGE_EVICTION_FALLBACK_BYTES:-4194304}"
 
     secrets:
       - proxy_internal_token

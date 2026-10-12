@@ -444,7 +444,7 @@ default reads: `region` and `full_resolution` are exempt, and an attachment past
 UI is not a read at all. (Both figures are Kimi's documented defaults, from its configuration
 docs rather than from this repository's code.)
 
-So the proxy evicts. Once an assistant turn has answered an image, the image part is replaced
+So the proxy evicts. Once an assistant turn has followed an image, the image part is replaced
 in place by a text part naming a handle:
 
 ```
@@ -455,11 +455,19 @@ in place by a text part naming a handle:
  then continue the task you were working on.]
 ```
 
-The rule is deliberately narrow: an image is evicted only when some later assistant message
-contains prose. That makes eviction **monotone** — an image is rewritten at most once, so the
-prefix stops changing and the provider's cache keeps hitting. A "keep the newest N" window
-would move its boundary every step and destroy the cache instead. It also means the attachment
-you just pasted is never taken away before the model has read it.
+The rule is a position, not a judgement. An image is kept until *any* assistant turn follows it,
+and a turn that says nothing but calls a tool counts. That makes eviction **monotone** — the
+boundary only moves forward as history grows, so an image is rewritten at most once, the prefix
+stops changing, and the provider's cache keeps hitting. A "keep the newest N" window would move
+its boundary every step and destroy the cache instead. It also still protects the present:
+everything after the last assistant turn is what the model is working from right now — the
+attachment you just pasted, the crops your last call just returned — and those pixels stay.
+
+Requiring prose instead would have missed the workload this exists for. A vision agent's first
+move after an image is a crop read or a zoom, not a paragraph, so the largest attachment in the
+session rides every one of those steps. The request that motivated this change carried 4.17 MB of
+base64 in a 4.22 MB body, 2.8 MB of it an image the model had already acted on twice: the bytes
+were redundant, the model simply had not written about them yet.
 
 Nothing is added, removed, reordered, or re-roled, so message counts and every `tool_call_id`
 pairing survive untouched.
@@ -482,10 +490,25 @@ origin-agnostic, so a `ReadMediaFile` read is evicted and re-read through the sa
 delivered it. `analyze_image` exists for the one case with no path in the transcript — a UI
 attachment, which reaches the model as bare bytes.
 
+**The size backstop.** The rule above is blind to images the model has not been shown yet, so a
+request that is large because of *fresh* attachments — a board of references pasted at once, one
+tool turn's worth of screenshots of them — needs a second pass. Past
+`MODEL_PROXY_IMAGE_EVICTION_FALLBACK_BYTES` (4 MB by default) the oldest of what remains is
+rewritten until the body fits, and the newest image is always kept: the model may lose pixels it
+has already been shown, never the thing it is being asked about now. If the newest image alone is
+over the line the body still goes — shrinking it would turn a slow turn into no turn. Zero leaves
+the rule above as the only rewrite.
+
 Guard and fair-use price are computed from the **evicted** body, so a request trimmed to
-1.4 MB is neither rejected nor priced as if it were still 5 MB. `images_evicted` and
-`image_bytes_freed` are counters on the health endpoint, and each eviction writes an
-`images_evicted` record to the log.
+1.4 MB is neither rejected nor priced as if it were still 5 MB.
+
+`images_seen`, `images_pending`, `images_evicted`, `images_forced` and `image_bytes_freed` are
+counters on the health endpoint, and a request that carried any image at all writes an
+`images_evicted` record whether or not it shed one. `pending` is what makes `evicted` readable:
+zero evictions is normal for a body whose attachments the model has not been shown yet, and is
+the entire bug for a body whose attachments it has. Both `request_received` and `images_evicted`
+are on the live event list, so neither needs the log file — which the agent container deliberately
+cannot read, and which is why the second question took a health endpoint to answer the first time.
 
 **This is off until you turn it on.** `./start.sh` asks — *"Use smart context reduction strategy
 for multimodal attachments?"* — on every interactive launch. What it opens on comes from one of

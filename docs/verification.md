@@ -317,11 +317,18 @@ field beside it says whether the endpoint's own quota headers came with that ans
 absence is how a rejection that did not come from the provider's limiter is told apart from
 one that did. A `request_received` with no `upstream_dispatch` after it means the request is
 parked at a gate; a `upstream_dispatch` with nothing after it means the endpoint has not
-answered yet. An image-heavy session is checked differently, because its failure is invisible in tokens:
-`grep images_evicted` in that log, or read `image_eviction` and the `images_evicted` /
-`image_bytes_freed` counters from `/healthz`. If `images_evicted` stays at zero while a session
-carries attachments, either eviction is off or every image is still unanswered, and
-`image_eviction.enabled` on `/healthz` is what tells those apart. When it reads false, the launch
+answered yet. An image-heavy session is checked differently, because its failure is invisible in
+tokens. `images_evicted` is on the live event list, so the launch terminal prints a line for every
+request that carried an image at all, whether or not it shed one, and the pair `pending`/`seen`
+says which of the two silences you are looking at: `seen=3 pending=3 images=0` is a body whose
+attachments are all newer than the last assistant turn, which is normal, while
+`seen=3 pending=0 images=0` is a rule that is not firing, which is not. `forced` counts the
+rewrites that came from the size backstop rather than from that rule. The same figures are
+cumulative on `/healthz` (`images_seen`, `images_pending`, `images_evicted`, `images_forced`,
+`image_bytes_freed`) beside the `image_eviction` block that says what is configured. If
+`images_evicted` stays at zero while a session carries attachments, either eviction is off or
+every image is still unseen by a later turn, and `image_eviction.enabled` on `/healthz` is what
+tells those apart. When it reads false, the launch
 answer is why, not `.env`: the screen's remembered answer outranks a `MODEL_PROXY_IMAGE_EVICTION`
 declaration, and only a launch nobody was asked about takes the declaration — the screen names the
 source it opened on, and `${HARNESS_RUNTIME_DIR}/image-eviction.json` keeps the answer it settled

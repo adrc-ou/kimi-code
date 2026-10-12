@@ -1,7 +1,7 @@
 """The re-read path for images the proxy evicts from conversation context.
 
 These tests hold the contract between the two halves of the feature: the handle minted in
-``model_proxy.evict_answered_images`` is the handle ``analyze_image`` resolves, and the bytes
+``model_proxy.evict_seen_images`` is the handle ``analyze_image`` resolves, and the bytes
 returned are the bytes the model was originally shown.
 """
 

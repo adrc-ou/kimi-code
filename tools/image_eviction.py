@@ -4,10 +4,10 @@
 The question is one boolean, and it is asked here rather than assumed because the answer trades
 two things the operator cares about in opposite directions. Inline images are re-sent on every
 later step of the session that produced them — measured on one real archived request, 92.4% of
-the body was base64 — so evicting them once answered keeps long image sessions inside whatever
-the gateway will accept. It also means the model sees a handle where it once saw pixels, and has
-to ask for them back through ``analyze_image`` to look again. An operator working on one dense
-scan may prefer the bytes stay put.
+the body was base64 — so evicting them once the model has moved past them keeps long image
+sessions inside whatever the gateway will accept. It also means the model sees a handle where it
+once saw pixels, and has to ask for them back through ``analyze_image`` to look again. An
+operator working on one dense scan may prefer the bytes stay put.
 
 Three sources decide what a launch opens on, in the order an operator's intent hardens: the answer
 given at this screen last launch, then a ``MODEL_PROXY_IMAGE_EVICTION`` declared in :file:`.env`,
@@ -95,15 +95,16 @@ CHOICES = (
 
 EXPLAINED = {
     ON: (
-        "Once the model has answered about an image, its base64 is replaced in the "
-        "outbound request by a handle, and the `analyze_image` tool can return the "
-        "picture again later. Each image is rewritten at most once, so the prompt "
-        "prefix stays stable and the gateway's cache keeps working."
+        "Once the model has moved past an image -- any later assistant turn counts, including "
+        "one that only calls a tool -- its base64 is replaced in the outbound request by a "
+        "handle, and the `analyze_image` tool can return the picture again later. Each image is "
+        "rewritten at most once, so the prompt prefix stays stable and the gateway's cache keeps "
+        "working."
     ),
     OFF: (
         "Requests carry every attachment exactly as Kimi assembled them, on every step. "
         "Nothing is hidden from the model, and a long image-heavy session grows its "
-        "request body until the endpoint refuses it."
+        "request body until the endpoint refuses it or simply stops answering it."
     ),
 }
 
@@ -181,7 +182,7 @@ def choose(
         return default
     head = [
         "Large attachments dominate a long session's request body. Once the model has",
-        "answered about an image, this option replaces its bytes with a re-readable handle.",
+        "moved past an image, this option replaces its bytes with a re-readable handle.",
     ]
     # Said on the screen rather than left to inference: a declaration quietly outranked by a
     # remembered answer is indistinguishable from a declaration that does nothing.
@@ -219,14 +220,13 @@ GUIDANCE = """\
 ## Multimodal attachments are context-trimmed in this session
 
 Inline images are large enough to dominate a request — nine tenths of a real archived
-session's body was base64 picture — so once an assistant turn has produced prose after an
-image, the proxy replaces that image's bytes in the outbound request with a short notice
-carrying a handle. This is invisible to you as a user action; it changes only what later
-requests carry.
+session's body was base64 picture — so once an assistant turn has followed an image, the proxy
+replaces that image's bytes in the outbound request with a short notice carrying a handle.
+This is invisible to you as a user action; it changes only what later requests carry.
 
 What that means in practice:
 
-- **Your own text is the durable record.** Anything you write out from an image survives;
+- **Your own prose is the durable record.** Anything you write out from an image survives;
   anything you only looked at and did not describe is no longer in front of you. When you read
   an image, write down what you will need later, in as much detail as you will need it.
 - **The picture is not gone, only unfolded.** The notice names the tool that folds it back
@@ -235,14 +235,16 @@ What that means in practice:
   image this project can still return.
 - **Ask once, precisely.** A re-read costs a round trip and the image will be trimmed again
   afterwards, so ask the question you actually need answered rather than browsing.
-- **An image nobody has written about yet is still before you.** Trimming looks backwards from
-  prose: an image is folded away only once some assistant turn has said something in text after
-  it. A reply that is only a tool call does not count, so the attachment you were just given is
-  genuinely still there while you are working on it.
-- **But nothing checks *which* image a later sentence was about.** Any prose after a picture is
-  enough to fold that picture away, even prose answering a different question entirely. So the
-  habit that keeps you informed is: read the image, and write down what you took from it,
-  before you move on to something else.
+- **Position folds it, not what you said.** An image is kept only until *any* assistant turn
+  follows it, and a turn that says nothing but calls a tool counts. So the attachment you were
+  just handed, and the results of the calls you just made, are genuinely before you — and the
+  moment you act again the older ones are gone. It never matters which image a later sentence
+  was about, so the habit that keeps you informed is: read the image, and write down what you
+  took from it, before you move on to something else.
+- **Plan one read ahead, not two.** Calling a tool to look closer has already folded the wider
+  view, so ask what you need from an image in the same breath as you fetch it. When a whole
+  batch arrives at once and the request would go out too large, the oldest of them folds first
+  and the newest is always kept: if the order you look at them in matters, ask one at a time.
 """
 
 

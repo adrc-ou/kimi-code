@@ -2009,7 +2009,11 @@ class PromptArchiveTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(files, [])
-        self.assertEqual(self.output.strip(), "")
+        # `request_received` is on the live list now, so stdout is not silent for any request.
+        # What must stay absent is the prompt announcement: a harness injection is not a new
+        # prompt, and the arrival record is there precisely so the two can be told apart.
+        self.assertNotIn("prompt=", self.output)
+        self.assertIn("request_received", self.output)
 
     async def test_the_rest_of_a_turn_adds_nothing_and_the_next_prompt_does(self):
         prompt = "Refactor the auth module"
@@ -2520,7 +2524,7 @@ class ImageEvictionTests(unittest.TestCase):
         }
 
     def test_an_answered_image_becomes_a_handle(self):
-        report = PROXY.evict_answered_images(payload := self.answered(self.BIG))
+        report = PROXY.evict_seen_images(payload := self.answered(self.BIG))
 
         self.assertEqual(report.images, 1)
         self.assertEqual(report.bytes_freed, len(self.BIG.split(",", 1)[1]))
@@ -2538,7 +2542,7 @@ class ImageEvictionTests(unittest.TestCase):
         re-read media that was no longer present".
         """
         payload = self.answered(self.BIG)
-        PROXY.evict_answered_images(payload)
+        PROXY.evict_seen_images(payload)
         text = self.texts_in(payload["messages"][1])
 
         self.assertNotIn("It is still on this machine", text)
@@ -2551,37 +2555,109 @@ class ImageEvictionTests(unittest.TestCase):
     def test_both_field_spellings_are_evicted(self):
         for field in ("image_url", "imageUrl"):
             with self.subTest(field=field):
-                report = PROXY.evict_answered_images(self.answered(self.BIG, field))
+                report = PROXY.evict_seen_images(self.answered(self.BIG, field))
                 self.assertEqual(report.images, 1)
 
-    def test_an_unanswered_image_is_left_alone(self):
+    def test_an_image_the_model_has_not_been_shown_is_left_alone(self):
+        """The trailing run is the model's present, so its pixels stay.
+
+        This is the case the boundary exists for: an attachment the user has just pasted, and a
+        tool result the current step exists to deliver. Nothing has followed either of them, so
+        there is no evidence the model saw them and nothing a handle could stand in for.
+        """
+        for messages in (
+            [{"role": "user", "content": self.image(self.BIG)}],
+            [
+                {"role": "user", "content": "earlier"},
+                {"role": "assistant", "content": "an answer"},
+                {"role": "user", "content": self.image(self.BIG, text="and this")},
+            ],
+        ):
+            with self.subTest(messages=len(messages)):
+                payload = {"messages": messages}
+                report = PROXY.evict_seen_images(payload)
+
+                self.assertEqual(report.images, 0)
+                self.assertEqual(len(self.images_in(payload["messages"][-1])), 1)
+
+    def test_an_assistant_tool_call_without_text_has_still_seen_it(self):
+        """A turn that says nothing but calls a tool is evidence the model looked.
+
+        Requiring prose here is what wedged a real transcription session: its first move after a
+        2.8 MB attachment was two crop reads, so the attachment rode every later step and the
+        body that had to be sent grew to 4.2 MB. Reasoning shown nowhere and tool calls acted on
+        both mean the pixels have done their work.
+        """
+        for content in ("", None, [{"type": "thinking", "thinking": "let me crop this"}]):
+            with self.subTest(content=content):
+                payload = {
+                    "messages": [
+                        {"role": "user", "content": self.image(self.BIG)},
+                        {"role": "assistant", "content": content, "tool_calls": [{"id": "c"}]},
+                        {"role": "tool", "tool_call_id": "c", "content": "done"},
+                    ]
+                }
+
+                self.assertEqual(PROXY.evict_seen_images(payload).images, 1)
+                self.assertEqual(self.images_in(payload["messages"][0]), [])
+
+    def test_the_image_a_tool_result_carries_survives_the_step_that_delivers_it(self):
+        """Exactly the request that a prose-only rule could not shrink, in its real shape."""
         payload = {
             "messages": [
-                {"role": "user", "content": self.image(self.BIG)},
-                {"role": "assistant", "content": [{"type": "tool_calls"}]},
+                {"role": "user", "content": self.image(self.BIG, text="transcribe this")},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "a"}, {"id": "b"}]},
+                {"role": "tool", "tool_call_id": "a", "content": self.image(self.BIG + "A")},
+                {"role": "tool", "tool_call_id": "b", "content": self.image(self.BIG + "B")},
             ]
         }
 
-        self.assertEqual(PROXY.evict_answered_images(payload).images, 0)
-        self.assertEqual(len(self.images_in(payload["messages"][0])), 1)
+        report = PROXY.evict_seen_images(payload)
 
-    def test_an_assistant_tool_call_without_text_has_not_answered_it(self):
-        """Only prose counts as an answer, so a bare tool call keeps the image in view."""
+        self.assertEqual(report.images, 1, "the attachment the model has now seen")
+        self.assertEqual(report.seen, 3, "every image in the body is counted")
+        self.assertEqual(report.pending, 2, "the two crops are not old enough yet")
+        self.assertEqual(len(self.images_in(payload["messages"][0])), 0)
+        for slot in (2, 3):
+            self.assertEqual(len(self.images_in(payload["messages"][slot])), 1)
+
+    def test_an_image_carried_by_the_last_assistant_turn_stays(self):
+        """The boundary is strict: the turn at it has itself not been answered yet."""
         payload = {
             "messages": [
-                {"role": "user", "content": self.image(self.BIG)},
-                {"role": "assistant", "content": ""},
+                {"role": "user", "content": "look"},
+                {"role": "assistant", "content": self.image(self.BIG)},
             ]
         }
-        self.assertEqual(PROXY.evict_answered_images(payload).images, 0)
+
+        self.assertEqual(PROXY.evict_seen_images(payload).images, 0)
+
+    def test_the_counts_tell_a_stalled_rule_from_a_quiet_one(self):
+        """The pair that was missing when eviction ran for a session and never fired once.
+
+        ``images`` alone reads the same for "nothing was old enough" and "the rule never
+        matched"; ``pending`` is what separates them, and it is free to carry.
+        """
+        old = {"messages": [
+            {"role": "user", "content": self.image(self.BIG)},
+            {"role": "assistant", "content": "seen it"},
+        ]}
+        fresh = {"messages": [{"role": "user", "content": self.image(self.BIG)}]}
+
+        self.assertEqual(
+            (PROXY.evict_seen_images(old).images, old["messages"][0]["content"][0]["type"]),
+            (1, "text"),
+        )
+        report = PROXY.evict_seen_images(fresh)
+        self.assertEqual((report.images, report.seen, report.pending), (0, 1, 1))
 
     def test_small_images_and_remote_urls_are_not_evicted(self):
         remote = {"messages": [
             {"role": "user", "content": self.image("https://example.com/a.png")},
             {"role": "assistant", "content": "seen"},
         ]}
-        self.assertEqual(PROXY.evict_answered_images(remote).images, 0)
-        self.assertEqual(PROXY.evict_answered_images(self.answered(self.SMALL)).images, 0)
+        self.assertEqual(PROXY.evict_seen_images(remote).images, 0)
+        self.assertEqual(PROXY.evict_seen_images(self.answered(self.SMALL)).images, 0)
 
     def test_eviction_is_monotone_across_a_growing_session(self):
         """Once rewritten an image never changes again, so the prefix stays cacheable.
@@ -2595,7 +2671,7 @@ class ImageEvictionTests(unittest.TestCase):
             url = f"data:image/png;base64,{'A' * 40000}{turn}"
             messages.append({"role": "user", "content": self.image(url)})
             messages.append({"role": "assistant", "content": f"answer {turn}"})
-            PROXY.evict_answered_images({"messages": messages})
+            PROXY.evict_seen_images({"messages": messages})
 
             # Every turn the previous step already finalised must be byte-identical now.
             for index, previous in enumerate(settled):
@@ -2619,7 +2695,7 @@ class ImageEvictionTests(unittest.TestCase):
             ]
 
         before = skeleton(payload)
-        PROXY.evict_answered_images(payload)
+        PROXY.evict_seen_images(payload)
         self.assertEqual(skeleton(payload), before)
 
     def test_a_body_with_no_images_is_returned_untouched(self):
@@ -2671,7 +2747,7 @@ class ImageEvictionTests(unittest.TestCase):
         payload["messages"][1]["content"][1]["detail"] = "high"
         payload["messages"][1]["content"][1]["cache_control"] = {"type": "ephemeral"}
 
-        PROXY.evict_answered_images(payload)
+        PROXY.evict_seen_images(payload)
 
         part = payload["messages"][1]["content"][1]
         self.assertEqual(sorted(part), ["text", "type"])
@@ -2686,7 +2762,7 @@ class ImageEvictionTests(unittest.TestCase):
             ]
         }
 
-        report = PROXY.evict_answered_images(payload)
+        report = PROXY.evict_seen_images(payload)
 
         text = payload["messages"][0]["content"][0]["text"]
         self.assertEqual(report.images, 1)
@@ -2699,7 +2775,7 @@ class ImageEvictionTests(unittest.TestCase):
         payload = self.answered(self.BIG)
         payload["messages"][1]["content"][1]["imageUrl"] = {"url": other}
 
-        report = PROXY.evict_answered_images(payload)
+        report = PROXY.evict_seen_images(payload)
 
         self.assertEqual(report.images, 2, "neither image may vanish unmentioned")
         self.assertEqual(len(set(report.handles)), 2)
@@ -2730,8 +2806,205 @@ class ImageEvictionTests(unittest.TestCase):
             {"role": "assistant", "content": "reply"},
         ]}
 
-        self.assertEqual(PROXY.evict_answered_images(payload).images, 0)
+        self.assertEqual(PROXY.evict_seen_images(payload).images, 0)
         self.assertEqual(payload["messages"][0]["content"], "plain text")
+
+
+class ImageEvictionFallbackTests(unittest.TestCase):
+    """The size backstop, which is the only pass that can reach a fresh batch of images.
+
+    The limit is patched down rather than met with real megabytes: what is under test is the
+    ordering, the floor, and the byte arithmetic, none of which care how high the line sits.
+    Every expectation below is derived from those three, not from a counted constant.
+    """
+
+    #: ~40 KB of base64, comfortably over the 32 KB minimum that makes an image worth a handle.
+    UNIT = "data:image/png;base64," + "A" * 40_000
+    LIMIT = 100_000
+    SMALL = "data:image/png;base64," + "A" * 500
+
+    def setUp(self):
+        for name, value in (
+            ("IMAGE_EVICTION_ENABLED", True),
+            ("IMAGE_EVICTION_FALLBACK_BYTES", self.LIMIT),
+        ):
+            patcher = patch.object(PROXY, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def parts(self, urls):
+        return [{"type": "image_url", "image_url": {"url": url}} for url in urls]
+
+    def batch(self, count: int, unit: str | None = None) -> dict:
+        """One user message carrying `count` images, with no assistant turn anywhere near them.
+
+        The shape the assistant-turn rule cannot reach at all, which is why this pass exists.
+        """
+        unit = unit or self.UNIT
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": self.parts(
+                        f"{unit[:-2]}{index:02d}" for index in range(count)
+                    ),
+                }
+            ]
+        }
+
+    def urls_left(self, payload: dict) -> list[str]:
+        return [
+            part["image_url"]["url"]
+            for message in payload["messages"]
+            for part in message.get("content") or []
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        ]
+
+    def test_a_body_under_the_line_is_left_entirely_alone(self):
+        body = json.dumps(self.batch(2)).encode()
+
+        returned, report = PROXY.evict_body_images(body)
+
+        self.assertLess(len(body), self.LIMIT, "the fixture is below the line it is testing")
+        self.assertEqual((report.images, report.forced, report.pending), (0, 0, 2))
+        self.assertIs(returned, body)
+
+    def test_it_trims_oldest_first_and_stops_once_the_body_fits(self):
+        body = json.dumps(self.batch(6)).encode()
+
+        returned, report = PROXY.evict_body_images(body)
+        kept = self.urls_left(json.loads(returned))
+
+        self.assertEqual(report.forced, report.images, "nothing here was old enough for the rule")
+        self.assertGreater(report.forced, 0)
+        self.assertEqual(len(kept), 6 - report.forced)
+        self.assertTrue(kept[-1].endswith("05"), "the newest image is the last one standing")
+        self.assertLessEqual(len(returned), self.LIMIT, "and it stopped as soon as the body fit")
+
+    def test_the_newest_image_is_never_touched_however_far_over_the_body_is(self):
+        """One oversized attachment is the provider's problem, not a blank request.
+
+        Refusing here would turn a slow turn into no turn, and a model asked about an image and
+        handed a handle for it answers about nothing at all.
+        """
+        giant = "data:image/png;base64," + "A" * (self.LIMIT * 3)
+        body = json.dumps(self.batch(1, giant)).encode()
+
+        returned, report = PROXY.evict_body_images(body)
+
+        self.assertFalse(report)
+        self.assertEqual((report.seen, report.pending), (1, 1))
+        self.assertIs(returned, body, "over the line and sent anyway")
+
+    def test_a_forced_image_is_still_readable_by_handle(self):
+        """The backstop trades pixels for a handle, so the handle has to be in the body."""
+        body = json.dumps(self.batch(6)).encode()
+
+        returned, report = PROXY.evict_body_images(body)
+
+        self.assertEqual(len(set(report.handles)), report.images)
+        for handle in report.handles:
+            self.assertIn(handle.encode(), returned)
+
+    def test_zero_disables_it_and_leaves_the_rule_alone(self):
+        body = json.dumps(self.batch(6)).encode()
+
+        with patch.object(PROXY, "IMAGE_EVICTION_FALLBACK_BYTES", 0):
+            returned, report = PROXY.evict_body_images(body)
+
+        self.assertFalse(report)
+        self.assertEqual(len(self.urls_left(json.loads(returned))), 6)
+
+    def test_a_forced_image_stays_forced_on_the_next_step(self):
+        """The backstop must not move its own window, or the cached prefix breaks every step.
+
+        Monotonicity is what the assistant-turn rule gets from a boundary that only moves
+        forward; the size pass needs it from a body that only shrinks, which is what a rewrite
+        to a few hundred bytes of note buys.
+        """
+        once, first = PROXY.evict_body_images(json.dumps(self.batch(6)).encode())
+        twice, second = PROXY.evict_body_images(once)
+
+        self.assertGreater(first.forced, 0)
+        self.assertEqual(second.images, 0, "nothing left that it would rewrite again")
+        self.assertIs(twice, once, "a retry of a forwarded body must not move it")
+
+    def test_the_rule_and_the_backstop_share_one_reserialisation(self):
+        """Both passes are one rewrite of one body, decided on their combined result."""
+        payload = {"messages": [
+            {"role": "user", "content": self.parts([f"{self.UNIT[:-2]}00"])},
+            {"role": "assistant", "content": "seen"},
+            {"role": "user", "content": self.parts([f"{self.UNIT[:-2]}01"])},
+            {"role": "user", "content": self.parts([f"{self.UNIT[:-2]}02"])},
+            {"role": "user", "content": self.parts([f"{self.UNIT[:-2]}03"])},
+        ]}
+        body = json.dumps(payload).encode()
+
+        returned, report = PROXY.evict_body_images(body)
+
+        self.assertEqual(report.images - report.forced, 1, "exactly one went by the rule")
+        self.assertGreater(report.forced, 0, "and the rest had to go by size")
+        self.assertLess(len(returned), self.LIMIT)
+        self.assertTrue(self.urls_left(json.loads(returned))[-1].endswith("03"))
+
+    def test_a_body_of_small_images_is_never_forced(self):
+        """Nothing here is worth a handle, so the backstop leaves it as Kimi assembled it."""
+        payload = {"messages": [{"role": "user", "content": self.parts([self.SMALL] * 40)}]}
+        body = json.dumps(payload).encode()
+
+        with patch.object(PROXY, "IMAGE_EVICTION_FALLBACK_BYTES", 500):
+            returned, report = PROXY.evict_body_images(body)
+
+        self.assertFalse(report)
+        self.assertEqual(report.seen, 40, "counted, and correctly left alone")
+        self.assertIs(returned, body)
+
+    def test_a_disabled_eviction_never_reaches_the_backstop(self):
+        """The operator's answer gates both passes, not just the first."""
+        body = json.dumps(self.batch(6)).encode()
+
+        with patch.object(PROXY, "IMAGE_EVICTION_ENABLED", False):
+            returned, report = PROXY.evict_body_images(body)
+
+        self.assertIs(returned, body)
+        self.assertEqual((report.images, report.seen), (0, 0))
+
+
+class EvictionObservabilityTests(unittest.TestCase):
+    """The two events that let a stalled multimodal session be diagnosed from the launch screen.
+
+    Both were written to the file only, so proving eviction had never fired took a read of the
+    health endpoint from inside the container — which is not where an operator is when a session
+    has stopped moving.
+    """
+
+    def test_arrival_and_eviction_both_reach_stdout(self):
+        self.assertIn("request_received", PROXY.DEFAULT_LIVE_EVENTS)
+        self.assertIn("images_evicted", PROXY.DEFAULT_LIVE_EVENTS)
+
+    def test_the_live_line_omits_the_handles_and_keeps_the_numbers(self):
+        """A batch of ten digests on a terminal line is noise; the file has them.
+
+        The terse tuple is the whole difference between the two sinks, so it is pinned here
+        rather than left to whatever the default turns out to be.
+        """
+        with patch.object(PROXY, "LIVE_EVENTS", frozenset({"images_evicted"})), patch.object(
+            PROXY, "LIVE_ALL", False
+        ), patch("sys.stdout", new_callable=io.StringIO) as out:
+            PROXY.event(
+                "images_evicted",
+                ("lane", "images", "forced", "seen", "pending"),
+                lane="long",
+                images=1,
+                forced=0,
+                seen=3,
+                pending=2,
+                handles=["sha256:aaaaaaaaaaaa"],
+                body_bytes_before=4_221_429,
+            )
+
+        line = out.getvalue().strip()
+        self.assertEqual(line, "images_evicted lane=long images=1 forced=0 seen=3 pending=2")
 
 
 if __name__ == "__main__":
