@@ -13,6 +13,7 @@ modules/example/
 ├── README.md                # recommended: requirements, security and operation
 ├── runtime/
 │   ├── mcp.json             # optional: {"mcpServers": {...}}
+│   ├── mcp-contracts.json   # reviewed interfaces for hosted MCP declarations
 │   ├── skills/<name>/SKILL.md
 │   ├── agents/<name>.md
 │   └── tools/<name>         # optional: helpers and service probes
@@ -24,6 +25,14 @@ modules/example/
     ├── compose-config.sh    # optional: called by core Compose checks
     └── build.sh             # optional: called by CI
 ```
+
+Hosted MCP servers use module-owned `runtime/mcp-contracts.json` interface
+baselines. Assembly validates server ownership and tool-selection coverage and
+stages only selected modules' contracts through the read-only runtime assets.
+Startup compares them with the existing discovery response; no allowlist is
+automatically changed. Offline CI validates enabled hosted coverage even for
+unselected modules. See [MCP compatibility at startup](mcp-compatibility.md) for
+the manifest format, OAuth/disabled scope and review workflow.
 
 ## Manifest
 
@@ -167,7 +176,7 @@ For the same reason, a module Compose overlay must not add host binds to
 `kimi-agent`. `tools/compose_hygiene.py` runs against the fully resolved launch
 configuration, and `tests/compose-config.sh` runs it again over the core files,
 the generated approved-extension fragment, and each module overlay; only the
-workspace bind and staged extension-snapshot binds are accepted. Every source
+workspace bind and read-only approved-extension volume subpaths are accepted. Every source
 path a bind names is disclosed in the agent's mount table, and each extra mount
 is one more thing a reviewer has to trace, so assets belong in
 `<runtime>/assets/` and per-instance state belongs in declared workspace
@@ -185,6 +194,8 @@ Optional `runtime/tools/service_<id>.py` files define `probe(full)` and return a
 short success description. The launcher's checker discovers only selected probes and runs
 them with its bounded subprocess wrapper. Do not return response bodies,
 credentials or sensitive URLs in diagnostics.
+Reserve the `service_*.py` filename pattern for these probes; core helpers are also
+staged beside them and must use other names to stay out of automatic discovery.
 
 Modules are trusted host programs, **not a sandbox for third-party plugins**.
 Review them as carefully as the launcher. Never source module hooks from the

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from . import busy
 from . import layout as L
 from .caps import Caps
 from .cells import Screen
@@ -511,6 +512,7 @@ class Modal:
         #: from the frame, so it is recomputed with it on every paint, and read by the pane beside
         #: the list, by the bar under it when there is no pane, and by the key overlay.
         self._detail: list[Line] = []
+        self._wait_at: tuple[int, int] | None = None
         # Ahead of ``initial()``, so a step may measure text while working out where to open.
         step.caps = self.caps
         step.frame = self.frame
@@ -535,6 +537,10 @@ class Modal:
                     for key in self.terminal.keys(timeout=INPUT_POLL):
                         outcome = self.handle(key)
                         if outcome is not None:
+                            if getattr(self.terminal, "held", False) and outcome.status in {
+                                CONTINUE, GO_BACK
+                            }:
+                                self.paint(waiting=True)
                             self.screen.clear()
                             return outcome
                     self.adopt()
@@ -686,7 +692,7 @@ class Modal:
 
     # -- painting ---------------------------------------------------------------------------
 
-    def paint(self) -> None:
+    def paint(self, *, waiting: bool = False) -> None:
         """Compose the frame into the back buffer, then write only what changed."""
         # Two passes, because the footer's height is a negotiation: the legend says how many rows it
         # would like, the frame says how many a window this short can spare, and only then does the
@@ -715,8 +721,19 @@ class Modal:
         else:
             self._paint_body(rows, order)
             self._paint_overlay()
-        self._paint_chrome()
-        self.terminal.write(self.screen.paint())
+        self._wait_at = None
+        self._paint_chrome(waiting=waiting)
+        if waiting:
+            # The title and progress stay legible; every interactive row below them recedes.
+            self.screen.dim_below(self.frame.rule_top.top,
+                                  self.caps.color_pair("waiting") or self.caps.sgr("2"))
+            with busy.rendering() as managed:
+                self.terminal.write(self.screen.paint())
+                if managed and self._wait_at is not None:
+                    busy.activate(*self._wait_at, unicode=self.caps.unicode,
+                                  styled=self.caps.styled)
+        else:
+            self.terminal.write(self.screen.paint())
 
     def _fit(self, footer_rows: int) -> None:
         """Lay the frame out, then let the bar under the list grow into the prose it has to hold.
@@ -749,21 +766,24 @@ class Modal:
         )
         self.step.frame = self.frame
 
-    def _paint_chrome(self) -> None:
+    def _paint_chrome(self, *, waiting: bool = False) -> None:
         frame = self.frame
         L.paint_rule(self.screen, frame.rule_top, self.caps)
         if frame.has("status"):
             L.paint_rule(self.screen, frame.rule_bottom, self.caps)
         if frame.has("title"):
+            title = Line(Segment(self.step.title or "Configure", self.caps.color_pair("title")))
+            if waiting and not frame.has("rail"):
+                title = self._waiting_line(title, frame.title.top)
             L.paint_line(
                 self.screen,
                 frame.title.top,
                 self._span(frame.title.top),
-                Line(Segment(self.step.title or "Configure", self.caps.color_pair("title"))),
+                title,
                 self.caps,
             )
         if frame.has("rail"):
-            self._paint_rail()
+            self._paint_rail(waiting=waiting)
         if not frame.detail.blank:
             self._paint_detail()
         if frame.has("status"):
@@ -793,7 +813,14 @@ class Modal:
                 break
             L.paint_line(self.screen, row, L.Rect(row, pane.left, 1, pane.width), value, self.caps)
 
-    def _paint_rail(self) -> None:
+    def _waiting_line(self, line: Line, row: int) -> Line:
+        """Reserve a spinner cell even when the header would otherwise fill the window."""
+        prefix = L.fit(line, max(0, self.caps.columns - 2), self.caps)
+        self._wait_at = (row, min(self.caps.columns - 1, prefix.width(self.caps) + 1))
+        glyph = busy.UNICODE_FRAMES[0] if self.caps.unicode else busy.ASCII_FRAMES[0]
+        return Line(*prefix.segments, Segment(" " + glyph, self.caps.color_pair("info")))
+
+    def _paint_rail(self, *, waiting: bool = False) -> None:
         """Position and label, plus a fill bar.
 
         The count answers "where am I"; the bar answers "how much is left" without being read. It is
@@ -806,14 +833,17 @@ class Modal:
             done = max(1, min(width, round(width * view.position / view.total)))
             filled, empty = ("▰", "▱") if self.caps.unicode else ("#", ".")
             fill = "  " + filled * done + empty * (width - done)
+        line = Line(
+            Segment(self._rail, self.caps.color_pair("info")),
+            Segment(fill, self.caps.color_pair("rule")),
+        )
+        if waiting:
+            line = self._waiting_line(line, self.frame.rail.top)
         L.paint_line(
             self.screen,
             self.frame.rail.top,
             self._span(self.frame.rail.top),
-            Line(
-                Segment(self._rail, self.caps.color_pair("info")),
-                Segment(fill, self.caps.color_pair("rule")),
-            ),
+            line,
             self.caps,
         )
 

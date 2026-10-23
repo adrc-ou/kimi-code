@@ -48,10 +48,12 @@ MODULE_SESSION_FILES=()
 COMPOSE_PID=""
 PROMPT_MEASURE_PID=""
 DEEP_CHECK_PID=""
+TUI_BUSY_PID=""
 # Deliberately not in MODULE_PIDS: the watch loop treats an exited module pid as a failed launch,
 # and a Mac whose caffeinate went away has lost a convenience, not a service.
 KEEPWAKE_PID=""
 stack_started=false
+extensions_staged=false
 # Declared up here rather than beside the flow that sets it, because cleanup is trapped for the
 # whole script and `set -u` would turn an early failure into a second one: a trap that errors
 # leaves the user holding a borrowed alternate screen with nothing left to hand it back.
@@ -68,6 +70,7 @@ flow_notes=${HARNESS_RUNTIME_DIR}/launch-notes.log
 # a server's own error text.
 SERVICE_REPORT_CONTAINER=/tmp/service-check.json
 SERVICE_REPORT_NAME=service-check.json
+SERVICE_CHECK_RUN_ID=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 # Long enough for Chromium, the language servers and a first session to finish starting: the whole
 # point of the background pass is to judge a settled stack rather than a busy one.
 SERVICE_SETTLE_SECONDS=45
@@ -89,18 +92,23 @@ cleanup() {
   if [[ -s "${flow_notes:-/nonexistent}" ]]; then
     cat "${flow_notes}"
   fi
-  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}" "${KEEPWAKE_PID}"; do
+  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}" "${KEEPWAKE_PID}" "${TUI_BUSY_PID}"; do
     if [[ -n "${pid}" ]]; then
       kill "${pid}" 2>/dev/null || true
     fi
   done
-  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}" "${KEEPWAKE_PID}"; do
+  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}" "${KEEPWAKE_PID}" "${TUI_BUSY_PID}"; do
     if [[ -n "${pid}" ]]; then
       wait "${pid}" 2>/dev/null || true
     fi
   done
   if [[ "${stack_started}" == true ]]; then
     harness_compose down --remove-orphans >/dev/null 2>&1 || true
+  fi
+  if [[ "${extensions_staged}" == true ]]; then
+    harness_compose run -T --rm --no-deps extension-state-init \
+      --gid "${LOCAL_GID:-1000}" --clear </dev/null >/dev/null 2>&1 ||
+      echo "Could not clear the approved extension volume; the next launch will replace it." >&2
   fi
   # Session material is deleted on exit, and `harness_sweep_secrets` deletes those same names again
   # at the start of the next launch in case this pass never ran. That function owns the static
@@ -114,7 +122,6 @@ cleanup() {
   for file in ${MODULE_SESSION_FILES[@]+"${MODULE_SESSION_FILES[@]}"}; do
     [[ -f "${HARNESS_RUNTIME_DIR}/${file}" ]] && find "${HARNESS_RUNTIME_DIR}/${file}" -delete
   done
-  [[ -d "${HARNESS_RUNTIME_DIR}/extension-snapshot" ]] && rm -rf -- "${HARNESS_RUNTIME_DIR}/extension-snapshot"
   # The measurement job copies the agent's home out of the container to read it. Being killed
   # between the copy and its own cleanup must not leave conversation text on the host, and a job
   # that exits early takes its pid down with it, so this directory is cleared unconditionally.
@@ -130,6 +137,10 @@ cleanup() {
   exit "${status}"
 }
 trap cleanup EXIT
+
+# Invalidate a previous verdict before this launch can fail during configuration or build.
+python3 tools/check_report.py pending --report "${HARNESS_RUNTIME_DIR}/${SERVICE_REPORT_NAME}" \
+  --run-id "${SERVICE_CHECK_RUN_ID}" --mode quick
 
 # macOS runs its idle timer on its own schedule, and a Mac that dozes takes the containers, the
 # model proxy and any ComfyUI job down with it for the length of the sleep. `caffeinate -i` refuses
@@ -216,6 +227,11 @@ harness_flow_unhold() {
   unset HARNESS_TUI_SCREEN
   "${screen[@]}" leave || true
   screen_held=false
+  if [[ -n "${TUI_BUSY_PID:-}" ]]; then
+    kill "${TUI_BUSY_PID}" 2>/dev/null || true
+    wait "${TUI_BUSY_PID}" 2>/dev/null || true
+    TUI_BUSY_PID=""
+  fi
   harness_flow_notes
 }
 
@@ -369,6 +385,8 @@ screen=(python3 tools/tui/screen.py --runtime-dir "${HARNESS_RUNTIME_DIR}")
 if [[ "${flow_live}" == true ]] && "${screen[@]}" enter; then
   export HARNESS_TUI_SCREEN=held
   screen_held=true
+  "${screen[@]}" animate --owner-pid "$$" &
+  TUI_BUSY_PID=$!
   # Whatever a killed launch left unsaid is not this launch's news, so the notes start empty.
   : >"${flow_notes}"
 fi
@@ -402,12 +420,19 @@ harness_modules install
 
 harness_compose build
 PROMPT_IMAGE_ID=$(harness_prompt_image_id)
-# This image-only check precedes agent-state-init, so the assets volume can be empty
-# or stale. Clear the runtime preload for this run; normal startup keeps NODE_OPTIONS
-# and waits for the initializer to stage the file before launching Kimi.
-actual_kimi=$(harness_compose run -T --rm --no-deps -e NODE_OPTIONS= kimi-agent kimi --version)
+# This checks the image alone: no workspace, extensions, state volumes or session environment.
+# In particular it must not try mounting nested extensions before the real session starts.
+actual_kimi=$(docker run --rm --platform "${HARNESS_DOCKER_PLATFORM}" --network none \
+  --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 64 \
+  -e NODE_OPTIONS= "adrc-kimi-agent:${HARNESS_IMAGE_SUFFIX}" kimi --version)
 [[ "${actual_kimi}" == *"${KIMI_CODE_VERSION}"* ]] || { echo "Built Kimi version mismatch: ${actual_kimi}" >&2; exit 1; }
 harness_modules check_build
+
+# Stream the approved archive through the Docker API. No host snapshot path is mounted into
+# either the staging container or the agent, so Docker Desktop need not resolve those paths.
+extensions_staged=true
+harness_compose run -T --rm --no-deps extension-state-init \
+  <"${HARNESS_RUNTIME_DIR}/extension-snapshot.tar"
 
 # The questions are over: this is the commit point, and the first line of it says so to the
 # interactive sequence. Ending the flow here rather than only in cleanup() means a launch that goes
@@ -535,10 +560,16 @@ PY
 # the human-readable results have already been printed or logged by then, and a report is a copy of
 # them rather than the only record.
 collect_service_report() {
+  local mode=$1
   local host="${HARNESS_RUNTIME_DIR}/${SERVICE_REPORT_NAME}"
-  if harness_compose cp kimi-agent:"${SERVICE_REPORT_CONTAINER}" "${host}" >/dev/null 2>&1; then
-    chmod 600 "${host}" 2>/dev/null || true
+  local temporary
+  temporary=$(mktemp) || return 0
+  if harness_compose cp kimi-agent:"${SERVICE_REPORT_CONTAINER}" "${temporary}" >/dev/null 2>&1; then
+    python3 tools/check_report.py collect --source "${temporary}" --report "${host}" \
+      --run-id "${SERVICE_CHECK_RUN_ID}" --mode "${mode}" || true
   fi
+  rm -f -- "${temporary}"
+  return 0
 }
 
 # The quick pass proves that ports answer and enabled servers initialise; the full pass is the one
@@ -550,14 +581,16 @@ deep_service_check() {
   : >"${log}" && chmod 600 "${log}"
   echo "Full service check starts in ${SERVICE_SETTLE_SECONDS}s." >>"${log}"
   sleep "${SERVICE_SETTLE_SECONDS}"
+  python3 tools/check_report.py pending --report "${HARNESS_RUNTIME_DIR}/${SERVICE_REPORT_NAME}" \
+    --run-id "${SERVICE_CHECK_RUN_ID}" --mode full
   if harness_compose exec -T kimi-agent /opt/serena/bin/python \
       /opt/kimi-runtime/tools/check_services.py --full \
-      --report "${SERVICE_REPORT_CONTAINER}" >>"${log}" 2>&1; then
+      --report "${SERVICE_REPORT_CONTAINER}" --run-id "${SERVICE_CHECK_RUN_ID}" >>"${log}" 2>&1; then
     echo "Full service check passed." >>"${log}"
   else
     echo "Full service check reported problems; see the results above." >>"${log}"
   fi
-  collect_service_report
+  collect_service_report full
   return 0
 }
 
@@ -580,10 +613,11 @@ if wait_for_url http://127.0.0.1:5494/api/v1/healthz "" "" 90; then
   # Checked before the browser opens, on purpose: a readiness probe that competes with a first
   # session booting beside it can time out for reasons that say nothing about the service.
   if ! harness_compose exec -T kimi-agent /opt/serena/bin/python \
-      /opt/kimi-runtime/tools/check_services.py --report "${SERVICE_REPORT_CONTAINER}"; then
+      /opt/kimi-runtime/tools/check_services.py --report "${SERVICE_REPORT_CONTAINER}" \
+      --run-id "${SERVICE_CHECK_RUN_ID}"; then
     echo "Service checks need attention. The stack remains running; the results are above, and the full pass follows." >&2
   fi
-  collect_service_report
+  collect_service_report quick
   echo "Full service check runs in ${SERVICE_SETTLE_SECONDS}s; verdict: ${HARNESS_RUNTIME_DIR}/service-check.log"
   # Detached from the terminal on purpose: the job runs while the operator is already working, and
   # its value is the log and the report, not a block of text that lands in the middle of a reply.

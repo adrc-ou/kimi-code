@@ -22,6 +22,43 @@ import workspace_registry  # noqa: E402
 from tests.helpers import run_in_pty, tracked_files  # noqa: E402
 
 
+class PlatformTests(unittest.TestCase):
+    def detect(self, system, machine, *, wsl=False):
+        script = '''
+set -euo pipefail
+source "$TEST_ROOT/tools/runtime.sh"
+uname() { case "$1" in -s) echo "$TEST_SYSTEM";; -m) echo "$TEST_MACHINE";; esac; }
+grep() { [[ "$TEST_WSL" == true ]]; }
+harness_platform
+bash -c 'printf "%s\\n" "$HARNESS_PLATFORM" "$HARNESS_DOCKER_PLATFORM" "$HARNESS_KIMI_ASSET"'
+'''
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False,
+                              env={**os.environ, "TEST_ROOT": str(ROOT), "TEST_SYSTEM": system,
+                                   "TEST_MACHINE": machine, "TEST_WSL": str(wsl).lower(),
+                                   "HARNESS_DOCKER_PLATFORM": "linux/wrong"})
+
+    def test_container_platform_matches_host_cpu_and_kimi_asset(self):
+        for system, machine, wsl, host, platform, asset in (
+            ("Darwin", "arm64", False, "darwin-arm64", "linux/arm64", "arm64"),
+            ("Darwin", "x86_64", False, "darwin-x86_64", "linux/amd64", "x64"),
+            ("Linux", "aarch64", False, "linux-arm64", "linux/arm64", "arm64"),
+            ("Linux", "arm64", False, "linux-arm64", "linux/arm64", "arm64"),
+            ("Linux", "x86_64", False, "linux-x86_64", "linux/amd64", "x64"),
+            ("Linux", "x86_64", True, "wsl2-x86_64", "linux/amd64", "x64"),
+        ):
+            with self.subTest(system=system, machine=machine, wsl=wsl):
+                result = self.detect(system, machine, wsl=wsl)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(),
+                                 [host, platform, f"kimi-code-linux-{asset}.tar.gz"])
+
+    def test_unsupported_host_stops_before_selecting_an_image(self):
+        result = self.detect("Linux", "riscv64")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unsupported host architecture", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -37,6 +74,9 @@ class LauncherTests(unittest.TestCase):
             "tools/runtime.sh",
             "tools/modules.py",
             "tools/private_file.py",
+            "tools/extension_volume.py",
+            "tools/mcp_compatibility.py",
+            "tools/check_report.py",
             "tools/safe_workspace_init.py",
             "tools/workspace_choice.py",
             "tools/workspace_registry.py",
@@ -241,7 +281,7 @@ exec "$TEST_REAL_PYTHON" "$@"
         )
         # The launcher asserts confinement against the resolved configuration before it starts
         # anything, so the stub has to describe a real one: the workspace bind, the staged
-        # volumes, and the five snapshot binds approve_extensions.py always emits.
+        # volumes, and the five read-only extension subpaths approve_extensions.py emits.
         self.command(
             "resolved-config-clean",
             """
@@ -259,7 +299,6 @@ def bind(source, target, read_only=True):
     }
 
 
-snapshot = os.path.join(os.environ["HARNESS_RUNTIME_DIR"], "extension-snapshot")
 volumes = [
     bind(os.environ["WORKSPACE_PATH"], "/workspace", False),
     {"type": "volume", "source": "kimi-state", "target": "/home/agent/.kimi-code"},
@@ -268,7 +307,8 @@ volumes = [
     {"type": "volume", "source": "kimi-assets", "target": "/opt/kimi-runtime"},
 ]
 volumes += [
-    bind(f"{snapshot}/{relative}", f"/workspace/{relative}")
+    {"type": "volume", "source": "approved-extensions", "target": f"/workspace/{relative}",
+     "read_only": True, "volume": {"nocopy": True, "subpath": relative}}
     for relative in (
         ".kimi-code/agents",
         ".agents/agents",
@@ -302,7 +342,26 @@ if [[ "$*" == "compose version --format json" ]]; then
 fi
 if [[ "$*" == *"config --environment" ]]; then cat "$TEST_BOOTSTRAP"; exit 0; fi
 if [[ "$*" == *"config --format json" ]]; then "${RESOLVED_STUB:-resolved-config-clean}"; exit 0; fi
+if [[ "$*" == *"extension-state-init"* ]]; then
+  if [[ "$*" == *--clear* ]]; then
+    echo clear-extensions >>"$TEST_EVENTS"
+  else
+    "$TEST_REAL_PYTHON" -c '
+import sys, tarfile
+with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as source:
+    assert any(member.name == ".kimi-code/mcp.json" for member in source)
+'
+    echo stage-extensions >>"$TEST_EVENTS"
+    if [[ "${TEST_FAIL_EXTENSION_STAGE:-false}" == true ]]; then exit 17; fi
+  fi
+  exit 0
+fi
 if [[ "$*" == *"kimi --version" ]]; then
+  # The version check needs the built executable alone, with none of the service mounts.
+  [[ "$1" == run ]] || { echo 'version check must use the image alone' >&2; exit 1; }
+  case "$*" in
+    *--mount*|*--volume*|*--env-file*) echo 'version check inherited mounts' >&2; exit 1;;
+  esac
   # A fresh assets volume has no preload until agent-state-init runs. Model the
   # service's inherited NODE_OPTIONS and Compose's per-run environment override.
   node_options='--require /opt/kimi-runtime/tools/abort_listener_floor.cjs'
@@ -324,8 +383,23 @@ fi
 if [[ "$*" == *"/register_workspace.py" ]]; then
   echo register-workspace >>"$TEST_EVENTS"; exit 0
 fi
-if [[ "$*" == *"/check_services.py"* ]]; then echo check-services >>"$TEST_EVENTS"; exit 0; fi
-if [[ "$*" == *"cp kimi-agent:"* ]]; then echo '{"mode":"fixture"}' >"${@: -1}"; exit 0; fi
+if [[ "$*" == *"/check_services.py"* ]]; then
+  echo check-services >>"$TEST_EVENTS"
+  run_id=''
+  for ((i=1; i<=$#; i++)); do
+    if [[ "${!i}" == --run-id ]]; then j=$((i+1)); run_id=${!j}; fi
+  done
+  echo "$run_id" >"$TEST_EVENTS.run-id"
+  exit 0
+fi
+if [[ "$*" == *"cp kimi-agent:"* ]]; then
+  run_id=$(cat "$TEST_EVENTS.run-id")
+  cat >"${@: -1}" <<EOF
+{"mode":"quick","run_id":"$run_id","state":"complete",
+ "exit_code":0,"checks":[],"counts":{}}
+EOF
+  exit 0
+fi
 if [[ "$*" == *"logs --no-color"* ]]; then echo browser >>"$TEST_EVENTS"; exit 0; fi
 if [[ "$*" == *"up --remove-orphans"* ]]; then sleep 1; exit 0; fi
 exit 0
@@ -337,7 +411,8 @@ exit 0
             (self.base / "events").read_text().splitlines(),
             [
                 "configure", "kimi-version", "module-version", "prepare", "install",
-                "version-smoke", "start", "register-workspace", "check-services", "browser",
+                "version-smoke", "stage-extensions", "start", "register-workspace",
+                "check-services", "browser", "clear-extensions",
             ],
         )
         data = self.workspace / "demo/user/data"
@@ -347,7 +422,10 @@ exit 0
         # session it displaces, and its report is carried out of the container and left private.
         report = runtime / "service-check.json"
         self.assertEqual(os.stat(report).st_mode & 0o777, 0o600)
-        self.assertEqual(json.loads(report.read_text()), {"mode": "fixture"})
+        recorded = json.loads(report.read_text())
+        self.assertEqual(recorded["mode"], "quick")
+        self.assertEqual(recorded["state"], "complete")
+        self.assertEqual(recorded["run_id"], (self.base / "events.run-id").read_text().strip())
         # A module's own guidance has exactly one route to the agent, and it is the all-lane
         # contract rather than the main agent's voice.
         contract = (runtime / "AGENTS.md").read_text()
@@ -376,7 +454,8 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             (self.base / "events").read_text(),
-            "kimi-version\nversion-smoke\nregister-workspace\ncheck-services\nbrowser\n",
+            "kimi-version\nversion-smoke\nstage-extensions\nregister-workspace\n"
+            "check-services\nbrowser\nclear-extensions\n",
         )
         self.assertEqual(data.read_text(), "keep")
         self.assertNotIn("Demo instructions", (runtime / "AGENTS.md").read_text())
@@ -416,6 +495,17 @@ exit 0
         self.assertFalse((self.workspace / "AGENTS.md").exists())
         # Remembered choices are not wiped by the launch that read them.
         self.assertTrue((runtime / prompt_context.PREFS_FILE).is_file())
+        # A partial extension transfer must clear its private volume and never start the agent.
+        (self.base / "events").write_text("")
+        self.env["TEST_FAIL_EXTENSION_STAGE"] = "true"
+        failed = self.run_script("start.sh", "--non-interactive")
+        self.env.pop("TEST_FAIL_EXTENSION_STAGE")
+        self.assertEqual(failed.returncode, 17, failed.stderr)
+        events = (self.base / "events").read_text().splitlines()
+        self.assertIn("stage-extensions", events)
+        self.assertEqual(events[-1], "clear-extensions")
+        self.assertNotIn("register-workspace", events)
+        self.assertEqual(data.read_text(), "keep")
         # A resolved configuration that hands the agent an arbitrary host path has to stop
         # the launch before anything is started.
         self.command(

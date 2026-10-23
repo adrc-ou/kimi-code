@@ -111,7 +111,9 @@ class Handler(BaseHTTPRequestHandler):
 
         params = urllib.parse.urlencode({"q": query, "format": "json", "language": "auto"})
         request = urllib.request.Request(
-            f"{SEARXNG_URL}/search?{params}", headers={"Accept": "application/json"}
+            f"{SEARXNG_URL}/search?{params}",
+            # Derive identity from the socket, never caller-supplied forwarding headers.
+            headers={"Accept": "application/json", "X-Real-IP": self.client_address[0]},
         )
         try:
             with urllib.request.urlopen(request, timeout=CONNECT_TIMEOUT) as response:

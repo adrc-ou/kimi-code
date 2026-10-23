@@ -103,6 +103,11 @@ class Screen:
             if 0 <= at < self.columns:
                 self._back[row][at] = Cell(" ", attr)
 
+    def dim_below(self, top: int, attr: str) -> None:
+        """Retain the completed frame's text while replacing its interactive emphasis."""
+        for row in range(max(0, top), self.rows):
+            self._back[row] = [Cell(cell.char, attr) for cell in self._back[row]]
+
     def box(
         self,
         top: int,

@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.test_mcp_compatibility import contract
 from tools.modules import assemble, choose, discover, module_agents_text, ordered
 from tools.safe_workspace_init import UnsafeWorkspace, initialize
 from tools.tui.app import Result
@@ -120,6 +121,24 @@ class ModuleTests(unittest.TestCase):
         )
         (path / "runtime/mcp.json").write_text(json.dumps({"mcpServers": {"serena": {}}}))
         with self.assertRaises(ValueError):
+            assemble(self.root, self.runtime, discover(self.root), self.workspace)
+
+    def test_module_contract_ownership_staging_and_deselection(self):
+        path = self.module()
+        runtime = path / "runtime"
+        runtime.mkdir()
+        config = {"url": "https://example.invalid", "enabledTools": ["read"]}
+        (runtime / "mcp.json").write_text(json.dumps({"mcpServers": {"demo": config}}))
+        manifest = {"schema_version": 1, "servers": {"demo": contract(config)}}
+        (runtime / "mcp-contracts.json").write_text(json.dumps(manifest))
+        assemble(self.root, self.runtime, discover(self.root), self.workspace)
+        staged = self.runtime / "assets/mcp-contracts.json"
+        self.assertIn("demo", json.loads(staged.read_text())["servers"])
+        assemble(self.root, self.runtime, [], self.workspace)
+        self.assertNotIn("demo", json.loads(staged.read_text())["servers"])
+        manifest["servers"]["foreign"] = manifest["servers"].pop("demo")
+        (runtime / "mcp-contracts.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "contract"):
             assemble(self.root, self.runtime, discover(self.root), self.workspace)
 
     def test_missing_environment_fails_closed_and_session_value_is_not_persisted(self):

@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-10-12",
+  "generated_at": "2026-10-23",
   "images": {
     "ghcr.io/astral-sh/uv:0.8.22": "sha256:9874eb7afe5ca16c363fe80b294fe700e460df29a55532bbfea234a0f12eddb1",
     "golang:1.27-bookworm": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
     "node:22-bookworm-slim": "sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5",
     "python:3.12-slim-bookworm": "sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254",
-    "python:3.14-alpine": "sha256:7f2ec713f0436c59df2362d973b6a05af9e87ba78f0e94f5245c302984a7a1fd",
+    "python:3.14-alpine": "sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72",
     "anchore/syft:v1.33.0": "sha256:f94e5d9fce1f2278491a8e3a63bd5f6ddb81fdfdbb8bf7a1637565c1d5344357",
     "anchore/grype:v0.99.1": "sha256:aeaded256cc61f162774b1c0e19f44e1787d0ae7cdc8e8917e9ea2528375090e"
   },
@@ -17,7 +17,7 @@
     "proxy/requirements.lock": "sha256:476e040b96fd0542472a586a144c094c2136ae724ad4d5e8951b0f1293e61810",
     "container/package-lock.json": "sha256:7488f388ed9b9ba3e57a177c493fce73ef735fbb0b1b030a03efb82a8cbd1a8f",
     "container/serena.lock": "sha256:cb1f3d408c0a91f34c8b3701cba1e789312f91e8f72880b42bf5dd1d197e1001",
-    "proxy/Dockerfile": "sha256:c1e792bb56e619332bebfdb5e2e0821fec6e4ac0060096194d0f3ae2fbf1522e",
-    "search-adapter/Dockerfile": "sha256:69e216c0eaea66eb6e1d4e70c9e33f5b3d05ce2affddcdc41c1c6d97abdd35d5"
+    "proxy/Dockerfile": "sha256:46ecde5af2ae2d2e5a0dfcceeb3a1ea760da1d594ba0a5dd151a8e0266fdb6f0",
+    "search-adapter/Dockerfile": "sha256:5d9faade02ae659211d07995a026d8dc6b36fa247381145aa42a368407925e7d"
   }
 }

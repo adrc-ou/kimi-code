@@ -9,23 +9,21 @@ import json
 import os
 import shutil
 import stat
+import tarfile
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 if __package__:
+    from . import extension_volume
     from .git_query import git_text
-    from .safe_workspace_init import UnsafeWorkspace, components
+    from .safe_workspace_init import OPEN_DIR, UnsafeWorkspace, components, open_directory
 else:
+    import extension_volume
     from git_query import git_text
-    from safe_workspace_init import UnsafeWorkspace, components
+    from safe_workspace_init import OPEN_DIR, UnsafeWorkspace, components, open_directory
 
-PRIVILEGED = (
-    ".kimi-code/agents",
-    ".agents/agents",
-    ".kimi-code/skills",
-    ".agents/skills",
-    ".kimi-code/mcp.json",
-)
+PRIVILEGED = extension_volume.ROOTS
 
 
 def sha256(path: Path) -> str:
@@ -85,6 +83,10 @@ def inspect_path(workspace: Path, relative: str) -> dict[str, str]:
             entries[rel] = sha256(item)
         else:
             raise ValueError(f"special extension object is not allowed: {rel}")
+    # An empty root directory, like an empty MCP file, may just be a mountpoint. Creating
+    # that placeholder grants no executable content and must not invalidate an approval.
+    if entries == {f"{relative}/": "directory"}:
+        return {}
     return entries
 
 
@@ -136,7 +138,12 @@ def require_approval(workspace: Path, manifest: Path) -> dict[str, object]:
     approved = json.loads(manifest.read_text())
     if approved.get("workspace", {}).get("path") != current["workspace"]["path"]:
         raise SystemExit("extension approval belongs to a different workspace")
-    if approved.get("extensions") != current["extensions"]:
+    entries = approved.get("extensions")
+    if isinstance(entries, dict):
+        # Read older approvals that recorded empty root mountpoints without rewriting them.
+        entries = {relative: {} if value == {f"{relative}/": "directory"} else value
+                   for relative, value in entries.items()}
+    if entries != current["extensions"]:
         raise SystemExit(
             "privileged project extensions changed; stop services, review with "
             "./extensions.sh list, approve with ./extensions.sh approve, then rerun ./start.sh"
@@ -174,17 +181,44 @@ def copy_snapshot(source: Path, target: Path, relative: str) -> tuple[Path, str]
     return destination, "directory"
 
 
-def yaml_quote(value: str) -> str:
-    return json.dumps(value)
+def prepare_mountpoints(workspace: Path) -> None:
+    """Reserve empty targets without rewriting project content or following links.
+
+    Docker-created directories can have the wrong host owner, and runc can reject a missing
+    nested file target on Docker Desktop. The empty placeholders carry no configuration; the
+    approved content stays in the snapshot mounted over them.
+    """
+    root_fd = os.open(workspace, OPEN_DIR)
+    try:
+        for relative in PRIVILEGED:
+            if not relative.endswith(".json"):
+                target = open_directory(root_fd, relative, os.getuid(), create=True)
+                os.close(target)
+        parent = open_directory(root_fd, ".kimi-code", os.getuid(), create=True)
+        try:
+            try:
+                descriptor = os.open("mcp.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                     | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=parent)
+            except FileExistsError:
+                # Approval already inspected it; never truncate or rewrite an existing file.
+                info = os.stat("mcp.json", dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("MCP mountpoint is not a single-link regular file") from None
+                return
+            os.close(descriptor)
+        finally:
+            os.close(parent)
+    finally:
+        os.close(root_fd)
 
 
-def prepare(workspace: Path, manifest: Path, state_dir: Path, output: Path) -> None:
+def prepare(workspace: Path, manifest: Path, state_dir: Path, output: Path) -> Path:
     approved = require_approval(workspace, manifest)
-    snapshot_root = state_dir / "extension-snapshot.new"
-    final_root = state_dir / "extension-snapshot"
-    if snapshot_root.exists():
-        shutil.rmtree(snapshot_root)
-    snapshot_root.mkdir(parents=True, mode=0o700)
+    snapshots = state_dir / "extension-snapshot"
+    snapshots.mkdir(parents=True, mode=0o700, exist_ok=True)
+    # Keep the reviewed bytes separate while verifying the copy. Docker receives an archive
+    # over stdin; none of these host paths becomes a container mount source.
+    snapshot_root = Path(tempfile.mkdtemp(prefix="snapshot-", dir=snapshots))
     mounts = []
     for relative in PRIVILEGED:
         source, kind = copy_snapshot(workspace, snapshot_root, relative)
@@ -199,30 +233,46 @@ def prepare(workspace: Path, manifest: Path, state_dir: Path, output: Path) -> N
         elif relative.endswith(".json"):
             expected_copy[relative] = {relative: hashlib.sha256(b"{}\n").hexdigest()}
         else:
-            expected_copy[relative] = {f"{relative}/": "directory"}
+            expected_copy[relative] = {}
     if source_after_copy != expected or copied != expected_copy:
         raise SystemExit("extension content changed while its snapshot was created")
-    if final_root.exists():
-        shutil.rmtree(final_root)
-    os.replace(snapshot_root, final_root)
-    lines = ["services:", "  kimi-agent:", "    volumes:"]
-    for source, target, _kind in mounts:
-        adjusted = final_root / source.relative_to(snapshot_root)
-        lines.extend(
-            [
-                "      - type: bind",
-                f"        source: {yaml_quote(str(adjusted))}",
-                f"        target: {yaml_quote(target)}",
-                "        read_only: true",
-                "        bind:",
-                "          create_host_path: false",
-            ]
-        )
+    prepare_mountpoints(workspace)
+    archive_path = state_dir / "extension-snapshot.tar"
+    descriptor = os.open(archive_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        with tarfile.open(fileobj=stream, mode="w") as archive:
+            for relative in PRIVILEGED:
+                archive.add(snapshot_root / relative, arcname=relative)
+    volume = extension_volume.VOLUME
+    fragment = {
+        "services": {
+            "kimi-agent": {"volumes": [
+                {"type": "volume", "source": volume, "target": target, "read_only": True,
+                 "volume": {"nocopy": True, "subpath": relative}}
+                for relative, (_, target, _) in zip(PRIVILEGED, mounts, strict=True)
+            ]},
+            extension_volume.SERVICE: {
+                "image": "adrc-kimi-agent:${HARNESS_IMAGE_SUFFIX:?Generated by start.sh}",
+                "platform": "${HARNESS_DOCKER_PLATFORM:?Detected by the launcher}",
+                "profiles": ["extension-staging"], "user": "0:0", "network_mode": "none",
+                "read_only": True, "cap_drop": ["ALL"],
+                "cap_add": ["CHOWN", "DAC_OVERRIDE", "FOWNER"],
+                "security_opt": ["no-new-privileges:true"], "pids_limit": 64,
+                "entrypoint": ["python3", "-c", Path(extension_volume.__file__).read_text()],
+                "command": ["--gid", "${LOCAL_GID:-1000}"],
+                "volumes": [{"type": "volume", "source": volume, "target": "/extensions",
+                             "volume": {"nocopy": True}}],
+            },
+        },
+        "volumes": {volume: {}},
+    }
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".tmp")
-    temporary.write_text("\n".join(lines) + "\n")
+    temporary.write_text(json.dumps(fragment, indent=2) + "\n")
     os.chmod(temporary, 0o600)
     os.replace(temporary, output)
+    return snapshot_root
 
 
 def main() -> None:

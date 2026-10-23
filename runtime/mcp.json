@@ -24,7 +24,7 @@
       "enabledTools": [
         "read_wiki_structure",
         "read_wiki_contents",
-        "ask_question"
+        "ask_wiki_question"
       ],
       "startupTimeoutMs": 30000,
       "toolTimeoutMs": 120000

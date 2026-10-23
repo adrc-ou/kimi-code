@@ -34,9 +34,12 @@ runs, and a green result means nothing about fair-use enforcement.
    python3 -m json.tool .local/runtime/<instance>/service-check.json
    ```
 
-   The JSON report is whichever pass ran last, so it stamps itself with
-   `generated_at` and `mode` and holds one `{kind, name, status, detail}` entry
-   per check plus a `counts` summary and the exit verdict. It survives the launch
+   The JSON report stamps itself with `generated_at`, `mode`, the launch's
+   `run_id` and `state` (`pending` or `complete`). It holds one
+   `{kind, name, status, detail}` entry per check, MCP `compatibility` findings,
+   a `counts` summary and the exit verdict. A pending report has no verdict and
+   must not be read as a pass. Only a completed report from the current launch
+   and pass replaces it. It survives the launch
    that produced it; the log, which also carries raw container output, does not.
 
    Nothing has to be rerun to check a configuration change. The agent's MCP file
@@ -60,6 +63,13 @@ budget is retried once, because a container that is still busy starting produces
 timeout no checker can attribute to a service; a probe that answers with a failure
 is reported immediately, and a result reached on the retry says so in its detail.
 
+The same discovery response is compared with reviewed hosted MCP contracts:
+missing configured tools or changed selected schemas are `FAIL`; changed selected
+tool descriptions/behavior metadata or missing baselines require review (`SETUP`).
+New tools outside an explicit allowlist are reported without enabling them.
+These checks add no discovery round trips. The full pass compares again before
+calling approved smoke recipes; a contract needing review suppresses those calls.
+
 Full mode allows 60 seconds per probe and adds a real public web search through
 the authenticated search adapter and SearXNG, enabled module functional probes,
 and representative read-only MCP calls: Hugging Face file metadata, DeepWiki
@@ -82,6 +92,11 @@ works. Editing, private data access, symbol queries against a specific project,
 model-driven tool selection, OAuth sessions, and approved project/plugin
 extensions need the functional checks below. The checker uses the harness MCP
 file; it does not merge project overrides or reuse Kimi's OAuth token store.
+
+For contract format, limits, focused discovery and the reviewed update workflow,
+see [MCP compatibility at startup](mcp-compatibility.md). Compatibility is a
+diagnostic at discovery time, not a permission gate or a promise that a hosted
+service cannot change later.
 
 ## 2. Understand what runs where
 
@@ -124,6 +139,13 @@ value you already generated; it is not a search-provider API key. SearXNG's
 describes how `SEARXNG_SECRET` supplies that setting. The service is not published
 on a host port in this harness. Upstream engines can still throttle requests or
 return CAPTCHAs; a healthy container cannot rule that out.
+
+The quick search check tests adapter readiness; the full check requires results
+from an authenticated query. A failing individual engine does not imply an outage
+when other engines still supply results. Tor-only Ahmia and Torch are excluded
+because the harness has no Tor proxy. The adapter supplies the socket client's IP
+to SearXNG, and `searxng/limiter.toml` trusts private Docker proxy addresses and
+loopback for that header; inbound caller forwarding headers are never reused.
 
 ## 3. Configure credentials
 
@@ -195,6 +217,9 @@ See [Hugging Face's MCP guide](https://huggingface.co/docs/hub/agents-mcp).
 
 No registration or token is required for the configured public endpoint.
 It is already enabled. The full check reads the structure of `python/cpython`.
+The allowlist uses the live catalog's `read_wiki_structure`, `read_wiki_contents`
+and `ask_wiki_question` names. A missing configured tool fails discovery with
+its name in the check result; do not remove the allowlist to bypass that failure.
 For your own target, ask Kimi to read its wiki structure; a repository that has
 not been indexed may need indexing on [DeepWiki](https://deepwiki.com/).
 Private Devin access is a different service and is not configured here.
@@ -414,7 +439,7 @@ An assistant's unsupported statement that a tool works is not evidence.
 | “Use the Playwright CLI skill to open `about:blank`, take a snapshot and screenshot, then close its test browser.” | CLI works independently of Chrome MCP and produces the requested artifacts. |
 | “Activate my coding project with Serena, list its files, show the symbols in the verification file, and find references to the test function.” | Correct project path and actual symbol/reference results, not just text search. |
 | “Use Hugging Face `hf_fs` to stat and read `hf://models/openai-community/gpt2/README.md`.” | Metadata and model-card text from the public repo. No model weights need downloading. |
-| “Use DeepWiki to list `python/cpython` wiki structure, read a relevant page, and answer a small question using `ask_question`.” | All three allowed tools return useful content. |
+| “Use DeepWiki to list `python/cpython` wiki structure, read a relevant page, and answer a small question using `ask_wiki_question`.” | All three allowed tools return useful content. |
 | “Use GitHub MCP to identify my account, read a known repository file, and list issues and PRs.” | Identity plus each required repository permission succeeds. |
 | “Use Context7 to resolve a library and query its docs.” | Both tools succeed with a valid returned library ID. |
 | “Use NVIDIA CUDA docs to find the documentation for `cudaMalloc`.” | A real documentation tool call succeeds after OAuth. |
@@ -504,8 +529,8 @@ prepares before the agent starts. Check both halves after any change to
 
    Expected entries are the `/workspace` bind, the `/docker/volumes/...` named
    volumes, Docker's own `/etc/host*`, `/etc/resolv.conf` and `docker-init`
-   files, and, only for a workspace with approved project extensions, its
-   `.local/runtime/<instance>/extension-snapshot/...` snapshots. No individual
+   files, and the read-only subpaths of the `approved-extensions` named volume.
+   No host `extension-snapshot` path, individual
    harness file, generated configuration, or `.local/runtime` secret filename
    may appear. The workspace path itself cannot be hidden; use one whose name is
    not sensitive.
@@ -643,8 +668,8 @@ MCP servers need their own equivalent connection, read and disposable-write test
 
 - Every expected enabled server appears in a fresh Kimi `/mcp` view.
 - A UI settings change saved without an error and survived a restart, and the
-  agent's mount table contains no harness file paths beyond its workspace and any
-  approved project-extension snapshots.
+  agent's mount table contains no harness host paths; its sole host bind is the workspace,
+  and approved extensions appear as read-only named-volume subpaths.
 - The quick and full service checks the launcher ran have no unexplained
   failures; every `SETUP` or
   `MANUAL` result has been resolved or explicitly recorded as unused.

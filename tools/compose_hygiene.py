@@ -3,7 +3,7 @@
 
 Reads `docker compose config --format json` on stdin. These are the properties the harness
 claims about the agent container: its writable world is the workspace, no host path other than
-the workspace and the approved-extension snapshot appears in its mount table, nothing it can
+the workspace appears in its mount table, nothing it can
 see names a provider credential, every published port is loopback, and every container keeps a
 read-only root filesystem. Compose overlays accumulate long after a reviewer looked, so each
 check fails closed: an unrecognised shape is a failure rather than a skip, which turns a
@@ -22,13 +22,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .extension_volume import ROOTS, VOLUME
+else:
+    from extension_volume import ROOTS, VOLUME
+
 AGENT = "kimi-agent"
 PROXY = "model-proxy"
 REQUIRED_VOLUMES = {"kimi-state", "serena-state", "harness-state", "kimi-assets"}
-SNAPSHOT_DIRECTORY = "extension-snapshot"
-# A bind source is readable from /proc/self/mountinfo inside the container that owns it, so
-# these are the only two host locations a kimi-agent bind may ever name.
-SNAPSHOT_TARGETS = ("/workspace/.kimi-code/", "/workspace/.agents/")
+EXTENSION_TARGETS = {f"/workspace/{relative}": relative for relative in ROOTS}
 CREDENTIAL_DIRECTORY = "credentials"
 LOOPBACK = "127.0.0.1"
 
@@ -87,11 +89,17 @@ def check_agent_mounts(
     agent = services.get(AGENT)
     if agent is None:
         raise SystemExit("the configuration has no kimi-agent service")
-    snapshot_root = os.path.join(runtime_dir, SNAPSHOT_DIRECTORY)
     volumes: set[str] = set()
     for mount in entries(AGENT, agent, "volumes"):
         kind = mount.get("type") if isinstance(mount, dict) else None
         if kind == "volume":
+            if mount.get("source") == VOLUME or mount.get("target") in EXTENSION_TARGETS:
+                options = mount.get("volume") or {}
+                expected = EXTENSION_TARGETS.get(mount.get("target"))
+                if (mount.get("source") != VOLUME or expected is None
+                        or mount.get("read_only") is not True or options.get("nocopy") is not True
+                        or options.get("subpath") != expected):
+                    raise SystemExit("kimi-agent has an unsafe approved extension volume mount")
             volumes.add(str(mount.get("source")))
             continue
         if kind != "bind":
@@ -116,8 +124,6 @@ def check_agent_mounts(
             continue
         if mount.get("read_only") is not True:
             raise SystemExit(f"kimi-agent bind is not read-only: {source}")
-        if under(source, snapshot_root) and target.startswith(SNAPSHOT_TARGETS):
-            continue
         raise SystemExit(f"kimi-agent exposes host bind {source} at {target}")
     missing = REQUIRED_VOLUMES - volumes
     if missing:

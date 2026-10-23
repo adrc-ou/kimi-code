@@ -22,6 +22,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 #: What must never outlive the launch that wrote it, in the three shapes the sweep recognises.
 SECRET_RESIDUE = (
+    "extension-snapshot.tar",
+    "extension-snapshot/snapshot-fixture/.kimi-code/mcp.json",
+    "extension-snapshot.new/.kimi-code/mcp.json",
     "credentials/nrp__api_key",
     "credentials/deselected__key",
     "nrp-api-key",

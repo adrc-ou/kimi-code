@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "servers": {
+    "deepwiki": {
+      "reviewed_at": "2026-10-23",
+      "auth_profile": "anonymous",
+      "catalog_names": [
+        "ask_wiki_question",
+        "read_wiki_contents",
+        "read_wiki_structure"
+      ],
+      "tools": {
+        "ask_wiki_question": {
+          "input_schema_sha256": "fc67cfc7a6567b5e0626916674d71a6cea7adcd20e88636705dc5b577846f2e3",
+          "output_schema_sha256": "320e41851b1ddd813b3b4f83174e2640e71cfbbe58cf9a54adf22443c789d814",
+          "metadata_sha256": "13f24c857db5f6f98e1ef035493f94e31e999eb432769e21791191503fa615e4"
+        },
+        "read_wiki_contents": {
+          "input_schema_sha256": "fe2300899f7b8843c53281353c51001b5f77244a259c46b383a1d3b23ce2c137",
+          "output_schema_sha256": "320e41851b1ddd813b3b4f83174e2640e71cfbbe58cf9a54adf22443c789d814",
+          "metadata_sha256": "310ad92706dcfeacccd9c2dde73f0ecbabbaa24c2912bce22fd0b13eb7fde197"
+        },
+        "read_wiki_structure": {
+          "input_schema_sha256": "fe2300899f7b8843c53281353c51001b5f77244a259c46b383a1d3b23ce2c137",
+          "output_schema_sha256": "320e41851b1ddd813b3b4f83174e2640e71cfbbe58cf9a54adf22443c789d814",
+          "metadata_sha256": "18703cfbd66108d2d004c95d15ebd10b35e8282a60bb7c3b2b8fa2809a5f95c3"
+        }
+      }
+    },
+    "context7": {
+      "reviewed_at": "2026-10-23",
+      "auth_profile": "anonymous",
+      "catalog_names": [
+        "query-docs",
+        "resolve-library-id"
+      ],
+      "tools": {
+        "query-docs": {
+          "input_schema_sha256": "6de42261733299e7ae8815e320222feeb3a2e91e0f25f32728af5ad13b2452c1",
+          "output_schema_sha256": null,
+          "metadata_sha256": "ad006d3f5d2289dba34ff4632ccbbd21ca2df3f1ffdbe1a3e2423170113c0cff"
+        },
+        "resolve-library-id": {
+          "input_schema_sha256": "ff2f303df2072ada223b45bd44955411763b5b6513f9a680400872732fe976b6",
+          "output_schema_sha256": null,
+          "metadata_sha256": "3762d96d656b665e53942b803b2a9e9fc4274b81c1342c5e7e6bc77d5d6457c9"
+        }
+      }
+    }
+  }
+}

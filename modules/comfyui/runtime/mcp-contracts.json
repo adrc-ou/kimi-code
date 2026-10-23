@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "servers": {
+    "huggingface": {
+      "reviewed_at": "2026-10-23",
+      "auth_profile": "configured-bearer",
+      "catalog_names": [
+        "hf_fs",
+        "hf_whoami",
+        "hub_repo_details",
+        "hub_repo_search"
+      ],
+      "tools": {
+        "hf_fs": {
+          "input_schema_sha256": "298fafd65458bb3129f3f0c64de06bd3f7fb90cfb3805cf1d80f635fcbb19425",
+          "output_schema_sha256": "833451b0b18293a008aa36ba8ff54e7d8c0403b22caaa2563a1eb0a69f54e7e3",
+          "metadata_sha256": "ee8ab8d4af7431e78449ef656bd061d9085c24907791a8b69ebd32fb40fac308"
+        }
+      }
+    }
+  }
+}

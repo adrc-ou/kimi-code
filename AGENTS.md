@@ -204,8 +204,9 @@ the workspace's `AGENTS.md`: that file belongs to whatever project the agent is
 working on, so never reintroduce a managed section, a marker pair, or any other
 generated block there.
 
-`kimi-agent` must receive no host binds other than the workspace, plus approved
-project-extension snapshots. Bind sources are visible in the agent's mount table,
+`kimi-agent` must receive no host binds other than the workspace. Approved project
+extensions are streamed into a root-owned named volume and mounted as read-only subpaths.
+Bind sources are visible in the agent's mount table,
 so never mount a path that names credentials, instance identities, or operator
 directories. `tools/compose_hygiene.py` enforces this against the fully resolved
 launch configuration, and `tests/compose-config.sh` runs it again over the core

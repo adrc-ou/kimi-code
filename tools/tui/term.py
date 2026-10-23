@@ -26,16 +26,15 @@ input and the hangup errors, and the run loop in :mod:`app` aborts on it.
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
 import select
-import struct
 import sys
 import termios
 import time
 import tty
 from types import TracebackType
 
+from . import busy
 from .caps import TRUECOLOR, Caps, detect, truecolor_query, upgrade
 from .cells import (
     ALT_OFF,
@@ -61,7 +60,6 @@ ESCAPE_TIMEOUT = 0.03
 #: the limit exists so that a terminal sending something unexpected cannot fill the input buffer.
 REPLY_LIMIT = 128
 
-_TIOCGWINSZ = 0x5413
 #: DECRQSS asking for the current window title (``OSC 0`` is reported as ``21``). A terminal that
 #: does not implement it stays silent, and silence means the title is left alone rather than
 #: overwritten with something we cannot undo.
@@ -131,12 +129,8 @@ def _title_from_reply(response: bytes) -> str | None:
 def winsize(fd: int, fallback: tuple[int, int] = (80, 24)) -> tuple[int, int]:
     """Ask the kernel for the window's current size, since only the kernel knows."""
     try:
-        packed = fcntl.ioctl(fd, _TIOCGWINSZ, bytearray(8))
+        columns, rows = os.get_terminal_size(fd)
     except OSError:
-        return fallback
-    try:
-        rows, columns = struct.unpack("HH", bytes(packed)[:4])
-    except struct.error:  # pragma: no cover - only a short ioctl result can do this
         return fallback
     return (columns or fallback[0], rows or fallback[1])
 
@@ -220,7 +214,9 @@ class Terminal:
             # one. ``paint()`` emits a diff against the buffer this process believes is on screen,
             # and a fresh process believes nothing is on screen, so without this the previous
             # step's frame would show straight through the gaps in the new one.
-            self._write(CLEAR + HIDE_CURSOR + (MOUSE_ON if self.mouse else ""))
+            with busy.rendering():
+                busy.cancel()
+                self._write(CLEAR + HIDE_CURSOR + (MOUSE_ON if self.mouse else ""))
             return
         self._write(ALT_ON + HIDE_CURSOR + (MOUSE_ON if self.mouse else ""))
 
@@ -239,7 +235,8 @@ class Terminal:
                 # launcher, which leaves it once the whole interactive sequence is over; handing it
                 # back here is exactly the flicker this mode exists to remove, and so is the
                 # trailing newline, which would scroll the frame the next step is about to redraw.
-                self._write(RESET + (MOUSE_OFF if self.mouse else "") + restore)
+                with busy.rendering():
+                    self._write(RESET + (MOUSE_OFF if self.mouse else "") + restore)
                 return
             self._write(
                 RESET + (MOUSE_OFF if self.mouse else "") + ALT_OFF + SHOW_CURSOR + restore + "\r\n"

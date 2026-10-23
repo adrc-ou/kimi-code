@@ -106,6 +106,7 @@ _ROLES = {
     "warn": "\033[33m",  # yellow: needs attention, but is not an error
     "info": "\033[34m",  # blue: incidental information
     "dim": "\033[2m",  # dim: superseded, and always paired with a hollow mark
+    "waiting": "\033[2;90m",  # completed controls while the next screen prepares
     "rule": "\033[90m",  # bright black: chrome that should recede
     "over": "\033[1;35m",  # bold magenta: a session override, which is unusual by design
     "error": "\033[1;31m",
@@ -238,13 +239,18 @@ def _color_tier(isatty: bool, forced: str | None) -> str:
     return _detected_tier()
 
 
-def _columns_rows(fallback_columns: int, fallback_rows: int) -> tuple[int, int]:
-    """Window size, preferring the environment hint that pty callers and ``resize(1)`` set.
+def _columns_rows(stream, fallback_columns: int, fallback_rows: int) -> tuple[int, int]:
+    """Measure the drawing terminal; environment hints only back up an unavailable device.
 
-    ``shutil.get_terminal_size`` already consults ``COLUMNS``/``LINES`` before the kernel, so this
-    is the whole of the policy — re-reading those variables here would only create a second and
-    slightly different answer to the same question.
+    The launcher sometimes captures stdout while the question draws on a separate tty stream.
+    Measuring stdout or trusting stale COLUMNS/LINES would fit the frame to the wrong window.
     """
+    try:
+        columns, rows = os.get_terminal_size(stream.fileno())
+        if columns > 0 and rows > 0:
+            return max(20, columns), max(6, rows)
+    except (AttributeError, OSError, ValueError):
+        pass
     try:
         import shutil
 
@@ -271,7 +277,7 @@ def detect(
     isatty = bool(stream is not None and hasattr(stream, "isatty") and stream.isatty())
     encoding_ok = bool(_UTF8.search(text)) or "utf" in text.lower()
     uses_unicode = encoding_ok if unicode_override is None else unicode_override
-    columns, rows = _columns_rows(80, 24)
+    columns, rows = _columns_rows(stream, 80, 24)
     term = os.environ.get("TERM", "")
     # ``dumb`` and an unset TERM both mean "assume nothing works", and an OSC query is exactly the
     # thing that would come back as literal text. GNU screen additionally rewrites OSC 2 into its
