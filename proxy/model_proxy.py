@@ -636,6 +636,11 @@ class LanePolicy:
     output_clamp: int
     reserved: int
     counters: tuple[str, ...]
+    #: Whether this lane's upstream wants the private cache salt the harness adds to every
+    #: request. The salt exists so a shared gateway cannot key its prompt cache on one operator's
+    #: content; an engine running on the operator's own machine has no such cache to protect, and
+    #: a field it does not model is a field it is free to reject.
+    sends_cache_salt: bool = True
 
     @property
     def reservation(self) -> int:
@@ -720,9 +725,16 @@ def _lane_from_plan(name: str, entry: dict, providers: dict, reserved: int) -> L
         raise PolicyDrift(
             f"lane {name} names credential {entry.get('credential')!r}, which the plan omits"
         )
-    base_url = str(provider.get("base_url", "")).rstrip("/")
-    if not base_url.startswith(("http://", "https://")):
+    # The provider's documented origin and the lane's own are checked separately and both have to
+    # be usable. A lane carries a URL only because the resolver derived it from the provider at
+    # launch, so a plan whose provider half is empty is inconsistent whatever the lane says, and
+    # trusting the lane alone would let a mangled plan route traffic nobody reconciled.
+    provider_url = str(provider.get("base_url", "")).rstrip("/")
+    if not provider_url.startswith(("http://", "https://")):
         raise PolicyDrift(f"provider {entry['provider']} publishes no usable endpoint")
+    base_url = str(entry.get("base_url") or provider_url).rstrip("/")
+    if not base_url.startswith(("http://", "https://")):
+        raise PolicyDrift(f"lane {name} publishes no usable endpoint")
     return LanePolicy(
         name=name,
         alias=str(entry["alias"]),
@@ -735,6 +747,7 @@ def _lane_from_plan(name: str, entry: dict, providers: dict, reserved: int) -> L
         output_clamp=_positive(entry, "output_clamp_tokens", f"lane {name}"),
         reserved=reserved,
         counters=tuple(sorted(entry.get("counters") or ())),
+        sends_cache_salt=bool(provider.get("sends_cache_salt", True)),
     )
 
 
@@ -1103,7 +1116,8 @@ def rewrite_model(body: bytes, request: web.Request, lane: LanePolicy) -> bytes:
     if REQUEST_USAGE and USAGE_SUPPORTED and payload.get("stream") is True:
         payload.setdefault("stream_options", {"include_usage": True})
     payload["model"] = lane.model
-    payload["cache_salt"] = CACHE_SALT
+    if lane.sends_cache_salt:
+        payload["cache_salt"] = CACHE_SALT
     return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
 
 

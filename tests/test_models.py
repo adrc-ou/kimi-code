@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools import models
+from tools import local_llm, models
 from tools.tui import flow
 from tools.tui.app import Result, View
 from tools.tui.input import FieldStep
@@ -52,6 +52,17 @@ def answer(lane, model_id):
     """A scripted result for a lane, with the summary its step would really have produced."""
     model = next(item for item in MODELS if item["id"] == model_id)
     return Result(value=model_id, summary=model["label"])
+
+
+def provider_table(models: list[dict]) -> dict:
+    """A provider table just deep enough for the host-eligibility filter.
+
+    The filter reads only ``requires``, which none of these declare - and an absent requirement is
+    "served from anywhere", exactly what a cloud provider is. Passing ``None`` here used to be
+    harmless; the picker now consults the provider before it draws a row, so the fixture says what
+    the real catalog would.
+    """
+    return {model["provider"]: {"id": model["provider"], "requires": []} for model in models}
 
 
 class Screen(io.StringIO):
@@ -113,6 +124,46 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(row.id, "fast")
         self.assertEqual(row.label, "Fast Little Model")
         self.assertEqual(row.hint, "[acme] (last used)")
+
+    def test_the_row_is_also_written_as_table_cells(self):
+        row = models._option(MODELS[0], "fast", "wide")
+        # Model, Provider, Lane, Ready, mark. The same five facts the label and the hint carry, so
+        # the grid and the narrow fallback can never disagree about what a row claims.
+        self.assertEqual(
+            row.cells, ("Fast Little Model", "acme", "", local_llm.READY, "(last used)")
+        )
+        self.assertEqual(row.label, "Fast Little Model")
+
+    def test_a_model_the_host_has_no_weights_for_offers_itself_as_not_installed(self):
+        """A remote model is always ready; a local one is ready only once verified.
+
+        The picker can answer that without touching the network and without hashing a hundred
+        gigabytes, which is the whole reason ``Ready?`` is a column and not a probe.
+        """
+        uninstalled = dict(
+            MODELS[0],
+            provider_label="Local (MPS)",
+            install={"variant": "UD-Q4_K_XL", "lock": "weights.lock.json", "sampling": {}},
+            lock_path=Path("/nonexistent/weights.lock.json"),
+            weights_dir=Path("/nonexistent/weights"),
+        )
+        self.assertEqual(
+            models._option(uninstalled, "", "fast").cells,
+            ("Fast Little Model", "Local (MPS)", "", local_llm.MISSING, "(default)"),
+        )
+        # No install block at all is not "missing", it is "nothing here installs".
+        self.assertEqual(models._option(MODELS[0], "", "fast").cells[3], local_llm.READY)
+
+    def test_each_screen_declares_its_own_columns(self):
+        primary = models.COLUMNS["primary"]
+        self.assertEqual(
+            [column.header for column in primary], ["Model", "Provider", "Lane", "", ""]
+        )
+        subagent = models.COLUMNS["subagent"]
+        self.assertEqual([column.header for column in subagent], ["Model", "Provider", "", ""])
+        # The subagent screen has one row per model, so the lane it names would be the same
+        # sentence on every row - a column that says nothing is a column that costs width.
+        self.assertNotIn("Lane", [column.header for column in subagent])
 
     def test_an_answered_lane_never_touches_the_terminal(self):
         # No tty is faked here, which is the point: reaching the modal would raise, and a lane the
@@ -373,6 +424,68 @@ class CredentialTests(unittest.TestCase):
             str(caught.exception),
         )
 
+    def test_a_generated_credential_is_minted_without_asking_anyone(self):
+        # A local engine has no issuer, so there is nothing to paste and nobody to ask: the
+        # launcher's own credential step has to step around it rather than present a prompt for a
+        # key that does not exist yet. `run` is patched with a call that fails the test, so a
+        # regression here is a screen the operator sees, not a silent extra round trip.
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        runtime = directory / "runtime"
+        plan = {
+            "lanes": {"subagent": {"provider": "local_mps", "credential": "default"}},
+            "providers": {
+                "local_mps": {
+                    "label": "Local (MPS)",
+                    "credentials": {
+                        "default": {
+                            "env": "LOCAL_MPS_API_KEY",
+                            "prompt": "Local engine token",
+                            "label": "Local engine token",
+                            "key_url": "",
+                            "generate": True,
+                        }
+                    },
+                }
+            },
+        }
+        with mock.patch.object(
+            models, "run", mock.Mock(side_effect=AssertionError("a generated key took a screen"))
+        ):
+            models.materialise_credentials(plan, runtime, {})
+        target = runtime / models.CREDENTIALS_DIR / "local_mps__default"
+        token = target.read_text()
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertGreaterEqual(len(token), 32)
+        self.assertNotIn("\n", token)
+        self.assertRegex(token, r"^[A-Za-z0-9_-]+$")
+        self.assertNotIn(token, self.written())
+        # A second launch mints a different value; the engine is a new process either way.
+        models.materialise_credentials(plan, runtime, {})
+        self.assertNotEqual(target.read_text(), token)
+
+    def test_an_operator_who_pinned_the_generated_name_keeps_their_value(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        runtime = directory / "runtime"
+        declaration = {
+            "env": "LOCAL_MPS_API_KEY",
+            "prompt": "Local engine token",
+            "label": "Local engine token",
+            "key_url": "",
+            "generate": True,
+        }
+        plan = {
+            "lanes": {"subagent": {"provider": "local_mps", "credential": "default"}},
+            "providers": {
+                "local_mps": {"label": "Local (MPS)", "credentials": {"default": declaration}}
+            },
+        }
+        models.materialise_credentials(plan, runtime, {"LOCAL_MPS_API_KEY": "mine"})
+        self.assertEqual(
+            (runtime / models.CREDENTIALS_DIR / "local_mps__default").read_text(), "mine"
+        )
+
     def test_a_prompted_value_lands_in_the_secret_file_and_nowhere_else(self):
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, directory, True)
@@ -409,7 +522,7 @@ class SelectTests(unittest.TestCase):
         self.stdin = mock.patch.object(sys, "stdin", Screen())
         self.stdout = mock.patch.object(sys, "stdout", self.screen)
         self.definitions = mock.patch.object(
-            models, "load_definitions", lambda root: (None, MODELS)
+            models, "load_definitions", lambda root: (provider_table(MODELS), MODELS)
         )
         for patcher in (self.stdin, self.stdout, self.definitions):
             patcher.start()
@@ -546,7 +659,8 @@ class SelectTests(unittest.TestCase):
 
     def test_a_lane_with_no_candidates_is_refused_before_the_first_screen(self):
         only_subagent = [model for model in MODELS if model["lanes"] == ["subagent"]]
-        with mock.patch.object(models, "load_definitions", lambda root: (None, only_subagent)):
+        answers = (provider_table(only_subagent), only_subagent)
+        with mock.patch.object(models, "load_definitions", lambda root: answers):
             with mock.patch.dict(os.environ, self.environment, clear=True):
                 with self.assertRaises(models.DefinitionError) as caught:
                     models.cmd_select(self.root, self.runtime, non_interactive=False)
@@ -592,7 +706,7 @@ class WindowTests(unittest.TestCase):
             },
         ]
         self.definitions = mock.patch.object(
-            models, "load_definitions", lambda root: (None, self.models)
+            models, "load_definitions", lambda root: (provider_table(self.models), self.models)
         )
         self.stdin = mock.patch.object(sys, "stdin", Screen())
         self.stdout = mock.patch.object(sys, "stdout", self.screen)
@@ -632,7 +746,8 @@ class WindowTests(unittest.TestCase):
         )
 
     def test_the_twin_is_named_by_the_window_its_own_definition_declares(self):
-        labels = {row["id"]: row["label"] for row in models.lane_rows(self.models, "primary")}
+        rows = models.lane_rows(self.models, "primary")
+        labels = {row["id"]: models.row_label(row) for row in rows}
         self.assertEqual(labels["roomy@long"], "Roomy Model - Long (queued, 1M window)")
         # Not every long lane is a megabyte, and the row that says so must not be a string
         # somebody has to remember to edit.
@@ -653,7 +768,7 @@ class WindowTests(unittest.TestCase):
             }
         ]
         self.assertEqual(
-            [row["label"] for row in models.lane_rows(flat, "primary")],
+            [models.row_label(row) for row in models.lane_rows(flat, "primary")],
             ["One Model - Long (queued)", "One Model - Medium (concurrent)"],
         )
 

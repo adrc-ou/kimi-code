@@ -39,13 +39,14 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
+    from . import host_caps, policy
     from . import models as model_step
     from . import modules as module_step
-    from . import policy
     from .definitions import load_definitions
     from .env_values import read_env_values
     from .tui import flow
 else:
+    import host_caps
     import policy
     from definitions import load_definitions
     from env_values import read_env_values
@@ -82,9 +83,29 @@ class Survey:
         return self._memo[name]
 
     @property
+    def caps(self) -> dict[str, Any] | None:
+        """This host's measured capabilities, or ``None`` when the probe itself failed."""
+        return self._once("caps", lambda: host_caps.caps(self.runtime, self.root))
+
+    @property
     def definitions(self) -> tuple[dict, list[dict]] | None:
-        """The operator's provider and model catalog, or ``None`` when it will not load."""
-        return self._once("definitions", lambda: load_definitions(self.root))
+        """The catalog this host can serve, or ``None`` when it will not load.
+
+        Filtered exactly as :func:`tools.models.cmd_select` filters it: a rail that counted a
+        screen the launcher never shows is the same lying progress bar this survey exists to
+        prevent, and a model hidden by the host is hidden from both.
+        """
+
+        def produce() -> tuple[dict, list[dict]]:
+            providers, models = load_definitions(self.root)
+            measured = self.caps
+            if measured is None:
+                # Nothing measurable means nothing gated on a capability is offerable; cloud
+                # providers ask for none and survive.
+                measured = {"capabilities": []}
+            return host_caps.filter_definitions(providers, models, measured)
+
+        return self._once("definitions", produce)
 
     @property
     def values(self) -> dict[str, str] | None:
@@ -221,11 +242,7 @@ def unanswered_credentials(survey: Survey, selections: list[dict[str, str]]) -> 
             primary = models[selection["primary"]]
         except KeyError:
             return None
-        agent_lane = (
-            policy.DEFAULT_AGENT_LANE
-            if policy.DEFAULT_AGENT_LANE in primary["lanes"]
-            else "primary"
-        )
+        agent_lane = policy.designated_lane(primary)
         try:
             plan = policy.resolve(
                 model_step.apply_endpoint_overrides(providers, values),

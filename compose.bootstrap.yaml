@@ -13,6 +13,16 @@ services:
       NRP_API_KEY: "${NRP_API_KEY:-}"
       QWEN3_API_KEY: "${QWEN3_API_KEY:-}"
       NRP_BASE_URL: "${NRP_BASE_URL:-}"
+      # The local engine's origin and its token. The token is normally generated per session by
+      # the launcher (providers/local_mps names `generate = true`), and this name is the override:
+      # pin one here and every launch on this machine reuses it. Declared because the launcher
+      # reads its .env through this file and nothing else.
+      LOCAL_MPS_BASE_URL: "${LOCAL_MPS_BASE_URL:-}"
+      LOCAL_MPS_API_KEY: "${LOCAL_MPS_API_KEY:-}"
+      # The Hugging Face hub token, for gated weight repositories and for the rate limits that
+      # make a large download finish. The same variable the ComfyUI module's hub MCP already uses.
+      # It is read on the host by tools/local_llm.py and is never mounted into a container.
+      HF_TOKEN: "${HF_TOKEN:-}"
       KIMI_BACKGROUND_TASK_SLOTS: "${KIMI_BACKGROUND_TASK_SLOTS:-}"
       GITHUB_RELEASES_TOKEN: "${GITHUB_RELEASES_TOKEN:-}"
       COMFYUI_MODELS_PATH: "${COMFYUI_MODELS_PATH:-}"

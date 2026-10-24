@@ -191,6 +191,12 @@ For authenticated access:
 Do not enable paid Jobs or community Space execution just to run this test.
 See [Hugging Face's MCP guide](https://huggingface.co/docs/hub/agents-mcp).
 
+The same variable serves a second consumer when a local model is installed:
+`tools/local_llm.py` sends it to `huggingface.co` to fetch a pinned weight set.
+That path needs no MCP approval and no extra scope - a read-only token is enough,
+and it is never sent anywhere else, including to a mirror configured through a
+lock file's `base`.
+
 ### DeepWiki
 
 No registration or token is required for the configured public endpoint.
@@ -638,6 +644,67 @@ Host-approved project agents, skills and MCP declarations need
 Restart afterward. Skills are instructions, not independently listening servers;
 verify a representative task using each skill you depend on. Extra project/plugin
 MCP servers need their own equivalent connection, read and disposable-write tests.
+
+## 7. Verify a model served locally
+
+Nothing in section 1 proves this path, because it runs on the host: the engine is
+outside every container, and the capability that gates it is absent on any machine
+that is not an arm64 Mac. Do these on the Mac itself, once per model.
+
+1. **Confirm the host was measured, not assumed.** `./start.sh` prints one line
+   before the questions:
+   `Host: Darwin/arm64 memory=251GiB free_disk=…GiB accelerators=metal`. If it
+   says `accelerators=none`, the local provider will not appear, and that is the
+   correct answer rather than a fault to work around. `python3 tools/host_caps.py
+   probe` prints the same measurement as JSON.
+2. **Check what the picker is allowed to offer.**
+   `python3 tools/local_llm.py status` prints `Ready` or `Not Installed` per
+   local model, and that string is exactly what the `Ready?` column will show.
+   On a 32 GB Mac the 27B should be listed and Flash-Next should not appear at
+   all - `models/local_mps/qwen3_8_flash_next/model.toml` gates it at 160 GiB.
+3. **Prove the pin, before trusting a download.** The lock is the claim; the hub
+   is the witness:
+   `curl -s "https://huggingface.co/api/models/<repo>/paths-info/<revision>" -H 'content-type: application/json' -d '{"paths":["<file>"]}'`
+   The `lfs.oid` returned must equal the lock's `sha256` and the `size` must match
+   too. Do this whenever a lock is edited; `scripts/check_locks.py` checks the
+   shape, and only this check catches a mistyped digest that would otherwise waste
+   a hundred gigabytes.
+4. **Install on purpose, not by accident.** `python3 tools/local_llm.py install
+   <provider>/<model>` fetches, digests, and writes `weights/install.json`.
+   Interrupting it is a test in itself: re-running must resume from the `.part`
+   rather than restart, and deleting a shard's last megabyte must produce a
+   refetch rather than a `Ready`. Then run it again and confirm it asks for
+   nothing.
+5. **Start the engine and check what it answers.** With a plan resolved
+   (`models.py resolve`), `python3 tools/local_llm.py serve <provider>/<model>`
+   holds the foreground and prints the port, context and slot count it derived
+   from the plan. From another shell, `python3 tools/local_llm.py check
+   <provider>/<model>` should report `Ready, engine listening`, and
+   `curl -s -H "Authorization: Bearer $(cat .local/runtime/<instance>/credentials/local_mps__default)" http://127.0.0.1:<port>/v1/models`
+   must list the wire name from `model.toml` - that name is what the proxy rewrites
+   every request to, so a mismatch means the alias flag did not take.
+6. **Confirm the policy actually narrowed.** Launch and read
+   `.local/runtime/<instance>/model-policy.json`: the local lane's `base_url`
+   should carry the model's own port, `limits.subagent_concurrency` should be the
+   provider's concurrency rule rather than the 5 a cloud pool supports, and
+   `GET http://127.0.0.1:8080/healthz` from the launcher should show the local
+   lane's endpoint with no shared context budget beside it.
+7. **Exercise the two ways one model can be served at once.** Choose
+   `Qwen3.8-Flash-Next` from NRP as the main model and the same label from
+   `Local (MPS)` as the subagent. Kimi's `/model` list must then show the provider
+   in each display name - without it the two rows are indistinguishable - and the
+   proxy's health output must show the two lanes on different origins.
+8. **Prove the background install does not block.** Select a `Not Installed`
+   model and let the launch continue; the questions must end on schedule, the
+   launch must print where the download is being logged, and the lane must go
+   live within that session rather than after a restart. Ask the agent something
+   before it finishes: a refused request with the installer's log named is the
+   correct behaviour, a silent reroute to another provider is not.
+
+The weight tree is invisible to git by construction, and worth confirming on a
+machine that has one: `git status --porcelain` must say nothing about
+`models/*/*/weights/`, and `git check-ignore -q models/<provider>/<id>/weights/x.gguf`
+must exit 0 while the same command on `weights.lock.json` exits 1.
 
 ## Completion checklist
 

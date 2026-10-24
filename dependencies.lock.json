@@ -13,6 +13,13 @@
   "sources": {
     "github/github-mcp-server": "7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d"
   },
+  "downloads": {
+    "llama-cpp-macos-arm64": {
+      "version": "b11846",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11846/llama-b11846-bin-macos-arm64.tar.gz",
+      "digest": "sha256:b145e8065883ef6b124d47fa2ff5fc8a046bafe415a7e1db1efb00b0809a2ee1"
+    }
+  },
   "files": {
     "proxy/requirements.lock": "sha256:476e040b96fd0542472a586a144c094c2136ae724ad4d5e8951b0f1293e61810",
     "container/package-lock.json": "sha256:7488f388ed9b9ba3e57a177c493fce73ef735fbb0b1b030a03efb82a8cbd1a8f",

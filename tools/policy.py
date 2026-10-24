@@ -24,6 +24,7 @@ from a number in ``.env``.
 from __future__ import annotations
 
 from typing import Any, NamedTuple
+from urllib.parse import urlsplit, urlunsplit
 
 if __package__:
     from .definitions import (
@@ -69,6 +70,25 @@ LANE_DISPLAY = {
 #: spent; the queueing that costs is bounded by the same pool either way.
 AGENT_LANES = ("primary", "long")
 DEFAULT_AGENT_LANE = "long"
+
+
+def designated_lane(model: dict[str, Any], wanted: str = "") -> str:
+    """Which agent lane a launch on ``model`` can actually use.
+
+    ``wanted`` when the model declares it - the row the operator picked, or the window the last
+    launch recorded. Otherwise ``primary``: a model served without a long lane has exactly one
+    agent lane, and a designation carried in from another machine's answer is not a request this
+    model can honour. This is a clamp rather than a refusal because a
+    :file:`last-model-selection.json` has to stay readable by a host that cannot serve what it
+    records - and the selection itself still fails downstream naming the model, which is the fact
+    worth reporting. ``policy.resolve`` keeps refusing an explicit designation a model cannot
+    serve; what it must not have to catch is a default that was never asked for.
+    """
+    lanes = model.get("lanes") or {}
+    requested = wanted or DEFAULT_AGENT_LANE
+    if requested in lanes:
+        return str(requested)
+    return "primary"
 
 #: Which generated guidance a caller may ask for. ``lane`` is what every audience gets - the
 #: numbers that bound it - and ``main`` adds the blocks only the primary agent can act on.
@@ -422,6 +442,27 @@ def _shared_counters(
     return result
 
 
+def _lane_base_url(provider: dict[str, Any], model: dict[str, Any]) -> str:
+    """The origin one lane's requests are sent to.
+
+    An engine serves one model per process, so two local models on one host need two listeners.
+    A model that runs on the operator's machine therefore names its own port, and only the port
+    of the provider's origin is rewritten: ``base_url_env`` still moves the host for every model
+    of that provider at once, and a remote model - which declares no port - keeps the provider's
+    origin exactly as published.
+    """
+    base = str(provider["base_url"])
+    install = model.get("install") or {}
+    port = int(install.get("port") or 0)
+    if not port:
+        return base
+    parts = urlsplit(base)
+    host = parts.hostname or ""
+    if parts.username:
+        host = f"{parts.username}@{host}"
+    return urlunsplit(parts._replace(netloc=f"{host}:{port}"))
+
+
 def _lane_entry(
     lane: str,
     model: dict[str, Any],
@@ -453,6 +494,10 @@ def _lane_entry(
         "provider": provider["id"],
         "provider_name": f"{provider['id']}-{lane}",
         "route": f"/{lane}/v1",
+        # Where this lane's traffic actually goes. Usually the provider's origin; a model served
+        # on the operator's own machine brings its own port, because one process per model means
+        # one listener per model. The proxy reads the lane's value and falls back to the provider's.
+        "base_url": _lane_base_url(provider, model),
         "model": model["model"],
         "credential": model["credential"],
         # The declared name, kept even when the provider-scoped key won, because the launcher
@@ -468,6 +513,33 @@ def _lane_entry(
         "counters": counters,
         "display_name": f"{model['label']} - {LANE_DISPLAY.get(lane, lane)}",
     }
+
+
+def _disambiguate_labels(
+    selected: dict[str, dict[str, Any]], providers: dict[str, dict[str, Any]]
+) -> None:
+    """Say who serves a lane when the same model name is served two ways in this plan.
+
+    Two definitions of one model - a cloud gateway and a server on the operator's own machine -
+    carry the same human label by design, because the label is a fact about the model. Kimi's own
+    model list shows nothing but ``display_name``, so a plan that uses both would list one name
+    twice and the operator would pick by guessing.
+
+    Counting rows would be wrong: one model already occupies two of them, and those are told
+    apart by the lane phrase the display name carries. The trigger is one label spanning more than
+    one provider, and nothing else - which is also why a plan with no second provider in it keeps
+    the display names it has always had.
+    """
+    servers: dict[str, set[str]] = {}
+    for lane in selected.values():
+        servers.setdefault(lane["label"], set()).add(lane["provider"])
+    for lane in selected.values():
+        if len(servers[lane["label"]]) < 2:
+            continue
+        provider_label = providers[lane["provider"]]["label"]
+        lane["display_name"] = (
+            f"{lane['label']} [{provider_label}] - {LANE_DISPLAY.get(lane['lane'], lane['lane'])}"
+        )
 
 
 def resolve(
@@ -546,6 +618,8 @@ def resolve(
             f"it declares {', '.join(sorted(primary['lanes']))}"
         )
 
+    _disambiguate_labels(selected, providers)
+
     # Counters are built once per provider and model, with the full list of lanes bound to
     # that pair, and only then bound back to each lane by membership. That order matters: a
     # model whose provider publishes no context rule gets no context counter at all, and a
@@ -615,6 +689,10 @@ def resolve(
                         "env": credential["env"],
                         "key_url": credential["key_url"],
                         "secret_name": credential["secret_name"],
+                        # A credential with no issuer: an engine on the operator's own machine is
+                        # authenticated by a token the launcher mints for this session, which is
+                        # also the token the engine is started with.
+                        "generate": bool(credential.get("generate", False)),
                         # Present only on a model-scoped credential: the provider-scoped
                         # variable this key would have fallen back to, which is the other half
                         # of what the launcher tells the operator to set.
@@ -622,6 +700,8 @@ def resolve(
                     }
                     for credential_id, credential in provider["credentials"].items()
                 },
+                "requires": list(provider.get("requires") or ()),
+                "sends_cache_salt": bool(provider.get("sends_cache_salt", True)),
                 "rules": provider["rules"],
             }
             for provider_id, provider in providers.items()

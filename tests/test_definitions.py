@@ -6,6 +6,7 @@ breaks exactly one thing in it.
 """
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -67,23 +68,44 @@ output_clamp_tokens = 1024
 """
 
 
+#: Which provider a model manifest names, read out of the text so a fixture is filed where its
+#: own definition says it belongs. Discovery refuses a model whose directory disagrees with its
+#: ``provider`` key, so a writer that filed by some other rule could not build a legal tree.
+PROVIDER_KEY = re.compile(r'^provider\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
 def write_tree(
     root: Path,
     provider: str = PROVIDER,
     models: dict[str, str] | None = None,
     provider_id: str = "fixture",
 ) -> Path:
+    """One provider and its models, laid out the way ``./models`` is laid out.
+
+    Each model is filed under ``models/<provider>/<name>/``, with ``<provider>`` read from the
+    manifest rather than assumed from ``provider_id``, so a test can plant a model naming a
+    provider that does not exist and discovery will drop it for the real reason. A fixture that
+    had to be filed by hand could disagree with its own text, and the tree would then be illegal
+    for a reason unrelated to what the test is asking about.
+    """
     directory = root / "providers" / provider_id
     directory.mkdir(parents=True)
     (directory / "provider.toml").write_text(provider)
     for name, text in (models or {"fixture_model": MODEL}).items():
-        model_dir = root / "models" / name
+        declared = PROVIDER_KEY.search(text)
+        model_dir = root / "models" / (declared.group(1) if declared else provider_id) / name
         model_dir.mkdir(parents=True)
         (model_dir / "model.toml").write_text(text)
     return root
 
 
 class DefinitionFixture(unittest.TestCase):
+    def tree_base(self) -> Path:
+        """An empty directory to build a tree in, removed with the test."""
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        return base
+
     def tree(self, **kwargs) -> Path:
         base = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, base, ignore_errors=True)
@@ -102,7 +124,7 @@ class ProviderTests(DefinitionFixture):
     def test_a_valid_tree_loads(self):
         providers, models = self.load()
         self.assertEqual(list(providers), ["fixture"])
-        self.assertEqual([item["id"] for item in models], ["fixture_model"])
+        self.assertEqual([item["id"] for item in models], ["fixture/fixture_model"])
         provider = providers["fixture"]
         self.assertEqual(provider["base_url"], "https://fixture.invalid")
         self.assertEqual(provider["protocol"], "openai")
@@ -346,7 +368,7 @@ class ModelTests(DefinitionFixture):
         # model directory in place while its provider definition is absent.
         orphan = MODEL.replace('provider = "fixture"', 'provider = "nowhere"')
         providers, models = self.load(models={"fixture_model": MODEL, "orphan": orphan})
-        self.assertEqual([item["id"] for item in models], ["fixture_model"])
+        self.assertEqual([item["id"] for item in models], ["fixture/fixture_model"])
         self.assertNotIn("nowhere", providers)
 
     def test_a_model_with_no_lane_entry_is_refused(self):
@@ -421,7 +443,7 @@ class ModelTests(DefinitionFixture):
             policy.resolve(
                 providers,
                 {item["id"]: item for item in models},
-                {"primary": "fixture_model", "subagent": "fixture_model"},
+                {"primary": "fixture/fixture_model", "subagent": "fixture/fixture_model"},
                 reserved_context_size=1024,
             )
 
@@ -505,7 +527,7 @@ class AgentLaneTests(DefinitionFixture):
         return policy.resolve(
             providers,
             {item["id"]: item for item in parsed},
-            {"primary": "fixture_model", "subagent": "fixture_model"},
+            {"primary": "fixture/fixture_model", "subagent": "fixture/fixture_model"},
             reserved_context_size=1024,
             **kwargs,
         )
@@ -590,7 +612,7 @@ class KeyScopeCounterTests(DefinitionFixture):
         return policy.resolve(
             providers,
             {item["id"]: item for item in parsed},
-            {"primary": "a_model", "subagent": "b_model"},
+            {"primary": "fixture/a_model", "subagent": "fixture/b_model"},
             reserved_context_size=1024,
             key_values=values,
             # These fixtures declare no long lane, and this class is about key scoping.
@@ -654,7 +676,7 @@ class TreeHygieneTests(DefinitionFixture):
         (root / "models" / "notes").mkdir()
         (root / "models" / "notes" / "README.md").write_text("work in progress\n")
         _, models = definitions.load_definitions(root)
-        self.assertEqual([item["id"] for item in models], ["fixture_model"])
+        self.assertEqual([item["id"] for item in models], ["fixture/fixture_model"])
 
     def test_an_uppercase_or_spaced_directory_is_refused(self):
         for name in ("Fixture", "fix ture"):
@@ -669,14 +691,14 @@ class TreeHygieneTests(DefinitionFixture):
         root = self.tree()
         target = root / "elsewhere.toml"
         target.write_text(MODEL)
-        (root / "models" / "fixture_model" / "model.toml").unlink()
-        (root / "models" / "fixture_model" / "model.toml").symlink_to(target)
+        (root / "models" / "fixture" / "fixture_model" / "model.toml").unlink()
+        (root / "models" / "fixture" / "fixture_model" / "model.toml").symlink_to(target)
         with self.assertRaisesRegex(definitions.DefinitionError, "Unsafe model definition"):
             definitions.load_definitions(root)
 
     def test_a_symlink_inside_a_tree_is_refused(self):
         root = self.tree()
-        (root / "models" / "fixture_model" / "link").symlink_to(root / "providers")
+        (root / "models" / "fixture" / "fixture_model" / "link").symlink_to(root / "providers")
         with self.assertRaisesRegex(definitions.DefinitionError, "Unsafe"):
             definitions.load_definitions(root)
 
@@ -685,9 +707,210 @@ class TreeHygieneTests(DefinitionFixture):
         self.assertIn("not valid TOML", message)
 
 
+#: A provider that serves models on the machine the harness is launching on, and one of its
+#: models with weights to install. ``requires`` is what lets the picker hide them from a host
+#: without Metal; ``[install]`` is what gives ``Ready?`` something to report on.
+LOCAL_PROVIDER = """
+schema_version = 1
+label = "Local (Fixture)"
+requires = ["metal"]
+
+[endpoint]
+base_url = "http://host.docker.internal:8181"
+base_url_env = "LOCAL_FIXTURE_BASE_URL"
+protocol = "openai"
+sends_cache_salt = false
+
+[[credential]]
+id = "default"
+label = "Local engine token"
+env = "LOCAL_FIXTURE_API_KEY"
+generate = true
+
+[[rule]]
+kind = "max_concurrent_requests"
+scope = "model"
+limit = 2
+"""
+
+LOCAL_MODEL = MODEL.replace('provider = "fixture"', 'provider = "local_fixture"') + """
+[requires]
+memory_gib = 32
+disk_gib = 40
+
+[install]
+variant = "UD-Q4_K_XL"
+
+[install.sampling]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+"""
+
+#: The shape is what discovery checks; :mod:`local_llm` is what reads the digests inside it.
+LOCAL_LOCK = '{"schema_version": 1, "source": {}, "files": []}\n'
+
+
+def local_tree(
+    root: Path,
+    *,
+    provider: str = LOCAL_PROVIDER,
+    model: str = LOCAL_MODEL,
+    lock: str | None = LOCAL_LOCK,
+) -> Path:
+    """A local-serving provider, one model with weights to install, and its lock file."""
+    root = write_tree(root, provider, {"local_model": model}, provider_id="local_fixture")
+    if lock is not None:
+        model_dir(root).joinpath("weights.lock.json").write_text(lock)
+    return root
+
+
+def model_dir(root: Path) -> Path:
+    return root / "models" / "local_fixture" / "local_model"
+
+
+class LocalServingTests(DefinitionFixture):
+    """The keys that make one model serveable by two providers, and what they may not do.
+
+    ``[requires]`` and ``[install]`` describe bytes that run on the operator's own machine. On a
+    model a remote gateway serves, they would be a gate no code can evaluate and a download no
+    one performs - and a requirement nobody checks reads to the next reader as protection.
+    """
+
+    def test_a_local_provider_and_model_load(self):
+        base = local_tree(self.tree_base())
+        providers, models = definitions.load_definitions(base)
+        provider = providers["local_fixture"]
+        self.assertEqual(provider["requires"], ["metal"])
+        self.assertFalse(provider["sends_cache_salt"])
+        self.assertTrue(provider["credentials"]["default"]["generate"])
+        model = models[0]
+        self.assertEqual(model["where"], "models/local_fixture/local_model")
+        self.assertEqual(model["requires"], {"memory_gib": 32, "disk_gib": 40})
+        self.assertEqual(model["install"]["variant"], "UD-Q4_K_XL")
+        self.assertEqual(model["install"]["lock"], "weights.lock.json")
+        self.assertEqual(
+            model["install"]["sampling"], {"temperature": 1.0, "top_p": 0.95, "top_k": 20.0}
+        )
+        self.assertEqual(model["weights_dir"], model_dir(base) / "weights")
+        self.assertEqual(model["lock_path"], model_dir(base) / "weights.lock.json")
+
+    def test_a_remote_model_declares_nothing_about_the_host(self):
+        providers, models = definitions.load_definitions(self.tree())
+        self.assertEqual(providers["fixture"]["requires"], [])
+        self.assertTrue(providers["fixture"]["sends_cache_salt"])
+        self.assertFalse(providers["fixture"]["credentials"]["default"]["generate"])
+        self.assertEqual(models[0]["requires"], {"memory_gib": 0, "disk_gib": 0})
+        self.assertIsNone(models[0]["install"])
+
+    def test_a_remote_model_cannot_require_host_memory(self):
+        base = self.tree_base()
+        write_tree(base, models={"fixture_model": MODEL + "\n[requires]\nmemory_gib = 8\n"})
+        with self.assertRaises(definitions.DefinitionError) as caught:
+            definitions.load_definitions(base)
+        self.assertIn("serves this model remotely", str(caught.exception))
+
+    def test_a_remote_model_cannot_have_weights_to_install(self):
+        base = self.tree_base()
+        write_tree(base, models={"fixture_model": MODEL + '\n[install]\nvariant = "Q4"\n'})
+        (base / "models" / "fixture" / "fixture_model" / "weights.lock.json").write_text(LOCAL_LOCK)
+        with self.assertRaises(definitions.DefinitionError) as caught:
+            definitions.load_definitions(base)
+        self.assertIn("[install]", str(caught.exception))
+
+    def test_install_needs_the_lock_that_pins_it(self):
+        """A row that could never be verified must not be offered at all."""
+        with self.assertRaises(definitions.DefinitionError) as caught:
+            definitions.load_definitions(local_tree(self.tree_base(), lock=None))
+        message = str(caught.exception)
+        self.assertIn("weights.lock.json", message)
+        self.assertIn("cannot be verified", message)
+
+    def test_an_unknown_host_capability_is_refused(self):
+        broken = LOCAL_PROVIDER.replace('requires = ["metal"]', 'requires = ["opencl"]')
+        with self.assertRaisesRegex(definitions.DefinitionError, "opencl"):
+            definitions.load_definitions(local_tree(self.tree_base(), provider=broken))
+
+    def test_a_generated_credential_does_not_also_name_an_issuer(self):
+        broken = LOCAL_PROVIDER.replace(
+            'generate = true', 'generate = true\nkey_url = "https://fixture.invalid/keys"'
+        )
+        with self.assertRaisesRegex(definitions.DefinitionError, "one of those is a lie"):
+            definitions.load_definitions(local_tree(self.tree_base(), provider=broken))
+
+    def test_install_lock_must_be_a_name_not_a_path(self):
+        broken = LOCAL_MODEL.replace(
+            'variant = "UD-Q4_K_XL"', 'variant = "Q4"\nlock = "../evil.json"'
+        )
+        with self.assertRaisesRegex(definitions.DefinitionError, "not a path"):
+            definitions.load_definitions(local_tree(self.tree_base(), model=broken))
+
+    def test_weights_are_data_and_not_definition(self):
+        """A symlink inside a downloaded weight set cannot fail a launch.
+
+        The publisher chooses that tree's layout, and the HuggingFace cache is built out of
+        symlinks. Exempting it from the walk is not exempting it from verification - only
+        :mod:`local_llm` opens it, and it digests every file there.
+        """
+        base = local_tree(self.tree_base())
+        weights = model_dir(base) / "weights"
+        weights.mkdir()
+        (weights / "blob").symlink_to(base / "providers")
+        _, models = definitions.load_definitions(base)
+        self.assertEqual([item["id"] for item in models], ["local_fixture/local_model"])
+        # ...and one directory up, the same object is still refused.
+        (model_dir(base) / "link").symlink_to(base / "providers")
+        with self.assertRaisesRegex(definitions.DefinitionError, "Unsafe model definition"):
+            definitions.load_definitions(base)
+
+
+class DefinitionTreeLayoutTests(DefinitionFixture):
+    """Where a model manifest must live, and what the two-level layout is owed.
+
+    The provider directory is not decoration: it is what makes ``rm -rf models/<provider>/`` a
+    complete removal, and what lets a provider the host cannot serve drop its models by itself.
+    """
+
+    def test_a_model_at_the_old_depth_is_refused_with_the_move(self):
+        base = self.tree_base()
+        write_tree(base)
+        (base / "models" / "fixture" / "fixture_model").rename(base / "models" / "fixture_model")
+        with self.assertRaises(definitions.DefinitionError) as caught:
+            definitions.load_definitions(base)
+        message = str(caught.exception)
+        self.assertIn("one level too shallow", message)
+        self.assertIn("models/<provider>/<model>/model.toml", message)
+
+    def test_the_directory_must_agree_with_the_provider_key(self):
+        """Built by hand, because :func:`write_tree` files by the key and cannot mis-file.
+
+        The mismatch is the one thing the two-level layout can get wrong silently - a model read
+        as belonging to provider A while its manifest says B - so it is refused rather than
+        resolved by preferring either side.
+        """
+        base = self.tree_base()
+        write_tree(base)
+        misplaced = base / "models" / "fixture" / "misfiled"
+        misplaced.mkdir(parents=True)
+        misfiled_text = MODEL.replace('provider = "fixture"', 'provider = "elsewhere"')
+        (misplaced / "model.toml").write_text(misfiled_text)
+        with self.assertRaises(definitions.DefinitionError) as caught:
+            definitions.load_definitions(base)
+        self.assertIn("its directory says", str(caught.exception))
+
+    def test_a_provider_the_host_cannot_serve_takes_its_models_with_it(self):
+        """The one mechanism the eligibility filter reuses instead of a second hiding rule."""
+        base = local_tree(self.tree_base())
+        _, both = definitions.load_definitions(base)
+        self.assertEqual(len(both), 1)
+        providers, _ = definitions.load_definitions(base)
+        del providers["local_fixture"]
+        remaining = definitions.discover_models(base, providers)
+        self.assertEqual(remaining, [])
+
+
 class ShippedTreeTests(unittest.TestCase):
     """The definitions this repository ships with are themselves valid."""
-
     def test_the_shipped_trees_load(self):
         providers, models = definitions.load_definitions(ROOT)
         self.assertTrue(providers and models)

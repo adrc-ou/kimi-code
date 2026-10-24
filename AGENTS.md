@@ -80,6 +80,31 @@ context window, concurrency ceiling, or policy percentage anywhere else, and in
 particular not to `.env`. When NRP republishes its terms, one edit to
 `providers/nrp/provider.toml` must be enough.
 
+Model definitions live at `models/<provider>/<model>/model.toml`, and the model
+identifier is that qualified pair, because one model name can be served by more
+than one provider and the two servings differ in every way the resolver cares
+about — window, credential, host floors, download. Do not collapse them into one
+manifest with a provider switch: the directory is what makes dropping a provider
+drop its models, which is also the entire mechanism behind host-capability
+gating.
+
+A provider that runs models on the operator's own machine (`local_mps`, and the
+planned `local_cuda`) states that in `requires`, and every model under it needs an
+`[install]` block plus a `weights.lock.json` pinning one Hugging Face commit and
+the SHA-256 of every file. Weights are never versioned and never fetched with a
+package: they land in `models/<provider>/<id>/weights/`, ignored by git and by
+`.dockerignore`, verified at download time by `tools/local_llm.py`, and reported
+`Ready` only once those digests have been matched and recorded beside them. Never
+weaken that reporting to "the files are there": a correctly sized wrong file is
+the exact failure a digest exists for. A local model server runs **on the host**,
+outside every container limit, because a Docker VM has no access to the GPU or to
+unified memory — the same reason the ComfyUI MPS backend does — so its origin is
+`host.docker.internal`, its listener must be reachable from the VM rather than
+loopback-bound, and the session credential the proxy mounts is the same token the
+engine is started with. Set a model's `[requires]` floors from its pinned quant's
+arithmetic, not from the machine in front of you; a requirement lowered to fit one
+Mac is a crash on the next one.
+
 When changing model, provider, concurrency, context, or proxy behavior:
 - preserve compliance with every rule the selected providers publish, and keep
   the resolver's derived limits the largest those rules allow rather than
@@ -116,6 +141,13 @@ When changing model, provider, concurrency, context, or proxy behavior:
 
 Generated runtime files belong only under
 `${HARNESS_ROOT}/.local/runtime/<instance>/`: the harness root, not the workspace.
+The one exception is `${HARNESS_ROOT}/.local/runtimes/`, which is the second
+deliberately-persistent name in that tree — beside `.local/workspaces.json` — and
+holds the fetched host binaries (the pinned `llama.cpp` build) that take minutes
+to download and nothing a session owns. It carries no key, is never swept by
+`harness_sweep_secrets`, and must never hold generated *configuration*, a plan, a
+credential, or anything instance-scoped: if it is instance state it belongs under
+`.local/runtime/<instance>/` and dies with the launch.
 The launcher refuses to mount a workspace that holds its own root, so the two can
 never be the same directory — but a workspace that is a second clone of this
 repository has a `.local/` of its own, and it is not that directory. Do not write

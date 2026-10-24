@@ -8,6 +8,10 @@
 .git
 .env
 .local
+# Downloaded model weights: a host-side input to a host-side engine, never an input to a build.
+# Left out for the same reason .local is - a context this large would be re-sent on every build,
+# and nothing in any Dockerfile reads it.
+/models/*/*/weights/
 .serena/
 .agent-state/
 .playwright-cli/

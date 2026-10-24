@@ -1,0 +1,86 @@
+# Provider definition: models that run on the operator's own Apple silicon machine.
+#
+# Schema and rationale: docs/models-providers.md. The directory name is the identifier models
+# reference with `provider = "local_mps"`.
+#
+# This provider is not a service anybody operates, so most of what a provider file normally
+# transcribes - an endpoint with terms of use, a key issued by a dashboard, a fair-use fraction -
+# does not exist here. What replaces them is capacity: one engine process holds one model in
+# memory, on memory the rest of the machine is also spending, so the concurrency rules below are
+# statements about the hardware rather than about a policy someone published.
+
+schema_version = 1
+label = "Local (MPS)"
+
+# The host gate. `metal` is answered by tools/host_caps.py, which reports it only for Darwin on
+# arm64 - the one combination where the GPU addresses the same memory the CPU does, which is what
+# lets a 17 GB weight set run in a laptop at all. A host without it never sees this provider in
+# ./start.sh: providers/local_mps is filtered out of the catalog before the picker runs, and every
+# model under it goes with it, which is the same mechanism that already drops a model whose
+# provider directory is absent. `local_cuda` will name `cuda` the same way.
+requires = ["metal"]
+
+[endpoint]
+# The Mac as the Docker Desktop VM sees it. Reaching 127.0.0.1 on the host from a container is not
+# possible, which is why the ComfyUI MPS bridge listens on this same gateway address; the engine
+# tools/local_llm.py starts binds the interface for the same reason. No /v1 suffix - the proxy
+# appends its own route per request.
+base_url = "http://host.docker.internal:8181"
+base_url_env = "LOCAL_MPS_BASE_URL"
+
+# llama-server, and every other engine worth supporting here, answers the OpenAI chat-completions
+# shape - so the proxy that already fronts NRP needs no new code path, only a new origin per lane.
+protocol = "openai"
+
+# The private cache salt exists so a shared gateway cannot key its prompt cache on one operator's
+# content. There is no shared cache to protect here, and an engine is under no obligation to
+# ignore a request field it does not model.
+sends_cache_salt = false
+
+# No issuer, no dashboard, no key to paste. The launcher generates this token per session, writes
+# it to the same mode-0600 credentials directory the proxy already mounts, and hands the same
+# value to the engine it starts - which is what lets a listener that has to be reachable from the
+# VM refuse strangers without the operator configuring anything.
+#
+# `env` is the override: pin a value in .env and this session uses it instead of a fresh one.
+[[credential]]
+id = "default"
+label = "Local engine token"
+prompt = "Local engine token (leave blank to generate one for this session)"
+env = "LOCAL_MPS_API_KEY"
+generate = true
+
+# ------------------------------------------------------------
+# Capacity
+#
+# There are no published terms to transcribe, so each rule is the harness's own statement about
+# one model on one machine, and `scope = "model"` because the machine is shared between them:
+# 27B is dense and answers two requests at a time from a 32 GiB host; Flash-Next is a 125B MoE
+# whose 51 B n-gram embedding table leaves no room for a second resident sequence on any host
+# that can hold it at all.
+#
+# The provider-scoped default is what an unlisted local model gets. It has to exist for two
+# reasons: a model with no rule at all would have no counter and no ceiling, and the resolver
+# would then publish its own fan-out of 8 (the harness default for an unconstrained provider)
+# against one engine process. The number below is the loosest of the model-scoped rows, so it
+# never tightens a model that has stated better, and `default = true` means a model's own row
+# displaces it rather than stacking beside it.
+# ------------------------------------------------------------
+
+[[rule]]
+kind = "max_concurrent_requests"
+scope = "model"
+models = ["Qwen3.8-27B"]
+limit = 2
+
+[[rule]]
+kind = "max_concurrent_requests"
+scope = "model"
+models = ["Qwen3.8-Flash-Next"]
+limit = 1
+
+[[rule]]
+kind = "max_concurrent_requests"
+scope = "provider"
+limit = 2
+default = true

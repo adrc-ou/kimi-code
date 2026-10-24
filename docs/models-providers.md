@@ -6,14 +6,31 @@ describes either. A model change is a directory choice at startup; a policy
 change is one edit to one file.
 
 ```text
-providers/nrp/provider.toml        # endpoint, named credentials, policy rules, safety margins
-models/qwen3_8_flash_next/model.toml  # immutable facts about one model, naming a provider
+providers/nrp/provider.toml              # endpoint, credentials, host requirement, policy rules
+models/nrp/qwen3_8_flash_next/model.toml # one model, as one provider serves it
 ```
 
 Like `modules/`, there is no central registry: a folder without its manifest is
 ignored, so an operator adds support by copying a directory in and removes it by
 deleting the directory. Both trees are discovered by `tools/definitions.py`, and
 a tree that is present but malformed fails startup rather than being skipped.
+
+Model definitions nest under the provider that serves them, because that pair -
+not the model name - is the unit everything else already treats as one thing:
+policy keys each counter `<provider>/<wire model>`, secrets are
+`<provider>__<credential>`, and one model name can legitimately be served two
+ways. `Qwen3.8-Flash-Next` from NRP is a 1M-token window metered against
+published fair-use terms; the same model from `local_mps` is a 128K slice of the
+operator's own memory with a 111 GB download in front of it. Those are two
+definitions, not one file with a switch in it, and the model's identifier is the
+qualified `local_mps/qwen3_8_flash_next` so a selection document can say which
+serving it recorded. The directory half of that name is also what makes removal
+atomic: dropping a provider directory, or a host that cannot satisfy its
+`requires`, retires every model it served in one step.
+
+A `model.toml` one level too shallow is refused with the move to make, rather
+than ignored: a discovery rule that quietly skipped an operator's copied
+directory would look like a model that had disappeared.
 
 Definitions are host-trusted operator configuration, **not a sandbox**. They are
 still read strictly, because these files decide which endpoint receives an API
@@ -24,8 +41,14 @@ Identifiers:
 
 | Pattern | Applies to | Why |
 | --- | --- | --- |
-| `[a-z][a-z0-9_]*` | `providers/<id>`, `models/<id>`, `credential.id`, `model.provider`, `model.credential` | Directory names are stable keys; `_` is allowed, `-` is not, so `-` can separate fields in generated names |
+| `[a-z][a-z0-9_]*` | `providers/<id>`, the `<id>` in `models/<provider>/<id>`, `credential.id`, `model.provider`, `model.credential` | Directory names are stable keys; `_` is allowed, `-` is not, so `-` can separate fields in generated names |
 | `[a-z][a-z0-9]*` | `model.slug` | The slug forms Kimi aliases (`qwen3-primary`), so it must not contain the `_`/`-` separators used around it |
+
+The model's identifier elsewhere in the launcher is `"<provider>/<id>"` - the
+qualified pair - because two providers may serve one model name and a selection
+that recorded only the second half would not say which was chosen. Slugs stay
+globally unique, since two servings sharing a slug would generate identical
+aliases.
 | `[A-Z][A-Z0-9_]*` | `endpoint.base_url_env`, `credential.env`, `model.key_env` | All three name a variable in `.env` |
 
 Neither a provider directory id nor a credential id may contain `__`, even
@@ -41,7 +64,7 @@ Slugs must be unique across all models: two models sharing a slug would
 generate identical Kimi aliases, and identical model-scoped credential names,
 which is refused at discovery.
 
-## `models/<id>/model.toml`
+## `models/<provider>/<id>/model.toml`
 
 ```toml
 schema_version = 1
@@ -76,6 +99,23 @@ context_tokens = 66500
 input_tokens = 55808
 output_clamp_tokens = 10692
 default_effort = "low"          # optional override of the model default
+
+# Below here belongs to a model served on the operator's own machine, and is
+# refused on one a remote gateway serves. Both blocks describe bytes that run here.
+[requires]
+memory_gib = 32                 # host floors in GiB, measured by tools/host_caps.py; 0 = none
+disk_gib = 24
+
+[install]
+variant = "UD-Q4_K_XL"          # the quantised build weights.lock.json pins
+lock = "weights.lock.json"      # optional; a file name in this directory, never a path
+port = 8181                     # optional; replaces only the port of the provider's origin
+
+[install.sampling]              # optional; the vendor's defaults for the engine itself
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
 ```
 
 `schema_version`, `label`, `provider`, `model`, `slug`, `credential` and at
@@ -83,6 +123,16 @@ least one `[lane.*]` table are required; unrecognised keys are refused so a typo
 cannot silently disable a limit. Lane names are exactly `primary`, `long` and
 `subagent`. All three lane numbers are positive integers, and a model must
 declare both `primary` and `subagent` to appear in either picker.
+
+`[requires]` and `[install]` are the local half of that contract, and both are
+refused on a model whose provider declares no host requirement: a floor nobody
+measures and a download nobody performs are worse than absent, because they read
+as protection. The converse holds too - every model under a provider that does
+name a capability must declare `[install]`, because without a pinned lock there
+is nothing to verify and no honest answer for the picker's `Ready?` column.
+`port` is what lets two local models coexist: one engine process serves one
+model, so one listener each, while `base_url_env` still moves the host for all of
+them. Two models of one provider naming the same port is refused at discovery.
 
 Three numbers per lane, and what they mean:
 
@@ -120,11 +170,14 @@ default; a model that declares only `primary` simply offers one row.
 schema_version = 1
 label = "NRP"
 policy_url = "https://nrp.ai/documentation/userdocs/ai/llm-managed/fair-use"
+requires = []                             # optional; host capabilities this provider needs
+                                          # ("metal", "cuda"). Absent = served from anywhere.
 
 [endpoint]
 base_url = "https://litellm.lib.ou.edu"   # origin only, no /v1 path
 base_url_env = "NRP_BASE_URL"             # optional .env name that overrides it
 protocol = "openai"                       # openai | anthropic
+sends_cache_salt = true                   # optional; false for an engine with no shared cache
 
 [[credential]]
 id = "default"
@@ -132,6 +185,8 @@ label = "NRP managed-LLM API token"
 prompt = "NRP API token"                  # optional; defaults to label
 env = "NRP_API_KEY"                       # .env name the value is read from
 key_url = "https://litellm.lib.ou.edu/ui/?page=api-keys"
+                                          # generate = true instead: the launcher mints the
+                                          # value per session, and key_url must then be absent
 
 [[rule]]
 kind = "aggregate_context_fraction"
@@ -154,6 +209,31 @@ lets an operator redirect the provider from `.env` without editing the
 definition — the definition stays the documented default, and the override is
 applied by `tools/models.py resolve`. `protocol` becomes the Kimi provider
 `type`, so a future Anthropic-style endpoint needs no code change.
+
+**Host requirement.** `requires` names capabilities `tools/host_caps.py` measures
+on the machine running the launcher - `metal` for Darwin on arm64, `cuda`
+reserved for the provider that will need it. Unknown names are refused at load,
+because a typo in a capability list silences a whole provider and nothing else
+would say so. A provider that names none is served from anywhere and is never
+filtered. Filtering happens before the picker: the provider is removed from the
+catalog and `discover_models`' existing rule ("a model whose provider is absent
+is dropped") takes its models with it, so there is one mechanism for hiding a
+model and it is the one that already exists. On a host that supports no local
+provider, `./start.sh` shows nothing about local models at all.
+
+**Cache salt.** `sends_cache_salt` defaults to true. The harness adds a private
+salt to every request so a shared gateway cannot key its prompt cache on one
+operator's content; an engine running on that operator's own machine has no such
+cache to protect and no obligation to tolerate a field it does not model, so a
+local provider sets it false and the proxy omits the key for those lanes.
+
+**Generated credentials.** `generate = true` declares a credential nobody
+issues. The launcher mints one value per session, writes it through the same
+mode-0600 path the proxy mounts as a Docker secret, and hands the same value to
+the engine it starts - which is how a listener that must be reachable from the VM
+refuses strangers with nothing for the operator to configure. `env` stays
+meaningful beside it as the override, so it is still required, and `key_url` is
+refused: a credential cannot both have no issuer and name where to get one.
 
 **Credentials and key scope.** A key can be handed out per model or per provider,
 and the operator picks which without touching code. `credential` in a model is
@@ -282,6 +362,94 @@ request rather than deadlocking. At the shipped provider the two derived numbers
 are 332,500 in-flight tokens (95% of 350,000) and 180,000 booked output tokens
 per minute (90% of 200,000).
 
+## Local serving: weights, engine, and `Ready?`
+
+A provider that names a host capability is served by a process on that machine,
+and that adds three things the resolver and the proxy do not otherwise have to
+know about: weights that must be fetched and verified, an engine that must be
+running before a lane answers, and a per-lane origin, because one engine process
+holds one model.
+
+**Nothing about the request path changes.** The proxy already takes its upstream
+URL from the plan per lane and speaks one wire format, so a local model is a new
+`base_url`, not a new code path. Prompt archiving, failure dumps, lane policy and
+the config-drift check apply to local traffic exactly as they do to cloud traffic,
+and the agent container still has exactly one model egress. The engine therefore
+has to be an OpenAI-compatible chat-completions server - which `llama-server`,
+Ollama, LM Studio, vLLM and SGLang all are - and `local_mps` and a future
+`local_cuda` differ in their engine, not in their contract.
+
+Image eviction is the one policy knob whose *reason* is cloud-shaped: its
+documented motives are staying inside what a metered gateway accepts, keeping a
+shared cache prefix stable, and not paying tokens for pixels twice. None of those
+apply to a loopback server, and eviction remains off unless the operator turns it
+on - where it still helps, for a different reason, because a re-sent image is KV
+cache the host cannot use for anything else.
+
+**`weights.lock.json`.** One tracked file per local model, beside its manifest:
+
+```json
+{
+  "schema_version": 1,
+  "source": {
+    "hub": "huggingface",
+    "repo": "unsloth/Qwen3.8-27B-GGUF",
+    "revision": "<40-hex commit>",
+    "upstream": "Qwen/Qwen3.8-27B",
+    "license": "apache-2.0",
+    "base": "https://mirror.example"
+  },
+  "files": [{"path": "one-file.gguf", "sha256": "<64-hex>", "size": 17559178144}]
+}
+```
+
+HuggingFace is the source of record and the revision is a commit, never a branch:
+`main` would let a publisher change a hundred gigabytes underneath a definition
+that claims to describe it, and only the digest would notice - after the
+download. `base` is an optional mirror of the same layout; the digest decides
+whether a mirror is trusted, and the hub token is never sent to one. The weights
+themselves are never versioned: they land in `models/<provider>/<id>/weights/`,
+which is git-ignored and `.dockerignore`d, so "delete the model directory" removes
+the download with it and `git status` never sees either.
+
+The download is plain HTTPS through the standard library rather than
+`huggingface_hub`: that package installs dependencies at launch, follows mutable
+refs, and builds its cache from symlinks - which `definitions._walk_safe` refuses
+anywhere in the definition tree. The weights subtree is exempt from that walk
+because its contents belong to whoever published the checkpoint, but it is exempt
+from nothing else: only `tools/local_llm.py` opens it, and it digests every file.
+
+**`Ready?` is a claim about verification.** `weights/install.json` records the
+commit, the variant, and the digests that were matched, and it is the only thing
+that makes a model report `Ready`. Correctly-sized files with no marker are
+reported `Not Installed` until something has read them once - which
+`install` does in place, without refetching, so hand-copied weights cost a hash
+and not a transfer. The digest is never recomputed at launch: the picker's column
+is marker plus sizes, because hashing 111 GB per screen would be the last thing a
+launch did.
+
+**The engine** is a pinned host binary in `dependencies.lock.json` under
+`downloads`, fetched from the official release and verified against the digest
+the way the Kimi bundle is - the same `sha256:` check
+`scripts/select_versions.py` applies - then unpacked under
+`.local/runtimes/llama-cpp/<version>/`, outside the project tree.
+`LOCAL_MPS_LLAMA_SERVER` points at a build of the operator's and skips the fetch.
+Extraction refuses any member that would write outside its directory, and keeps
+the versioned dylib symlinks a real macOS release is built from.
+
+**Lifecycle, and why nothing blocks the operator.** The launcher measures the host
+before the questions, so the picker shows only what this machine can run. After
+`./start.sh` commits the answers, a selected model that is not installed is
+provisioned in the background and its lane goes live mid-session - the questions
+are never waiting on a download. A model that *is* installed has its engine
+started before `docker compose up`, so the first request finds a server. Each is
+a host process tracked so shutdown stops it: a model server cannot run in a
+container on macOS, because Docker's VM has no access to the Metal device or to
+unified memory, which is the same reason the ComfyUI MPS backend runs on the
+host. That listener is reachable from the VM (loopback is not - the gateway
+address arrives at the Mac on another interface), so it is bound broadly and
+authenticated by the session token; `LOCAL_MPS_BIND` narrows it.
+
 ## Resolution
 
 `tools/policy.py resolve()` takes the two selected models plus their providers
@@ -297,13 +465,21 @@ model splits ledgers, it does not enlarge any allowance.
 
 1. **Lane membership.** `primary` comes from the primary selection, `subagent`
    from the subagent selection, and `long` exists only if the primary model
-   declares it. Dropping a lane drops its route, its alias, and its counters.
+   declares it. Dropping a lane drops its route, its alias, and its counters. A
+   lane's `base_url` is the provider's origin with the model's `[install].port`
+   substituted where one is declared - which is what lets two local models be two
+   processes - and the proxy checks the provider's origin and the lane's
+   separately, because a plan whose halves disagree is drift even when one half
+   would still route.
    The selection also designates which of those lanes the *main agent* launches
    on (`agent_lane`, one of `primary` or `long`, defaulting to `long`), which
    decides only the alias rendered into Kimi's `default_model`; designating a
    lane the selected model does not declare is a refusal, not a fallback,
    because a launch that quietly got the smaller window would believe it had the
-   larger one. Every route stays open either way, so Kimi's own model picker can
+   larger one. What the launcher *does* clamp is a designation nobody asked for:
+   `policy.designated_lane` settles an `agent_lane` a different machine recorded
+   onto a model that has no such lane, which is a plan being carried between
+   hosts rather than an operator's request. Every route stays open either way, so Kimi's own model picker can
    still move the session between them mid-flight. The two agent lanes are peers
    rather than tiers, which is why `tools/policy.py` keeps one label map —
    `LANE_DISPLAY` — and every human-facing surface reads its entry for the lane
@@ -380,6 +556,16 @@ atomically) and are deleted when the launcher exits:
 | `model.env` | `models.py resolve` | `start.sh`, then Compose interpolation | `KIMI_SUBAGENT_CONCURRENCY`, `KIMI_BACKGROUND_TASK_SLOTS` — only the values `compose.yaml` interpolates; lane aliases reach Kimi through the rendered config |
 | `credentials/<provider>__<credential>` | `render_runtime.py` | proxy (via Docker secret) | One key value each, where a model-scoped credential id is the synthesised `<credential>__<slug>`; stale files from deselected models are removed |
 | `compose/models.json` | `models.py resolve` | Compose (`-f`, appended by `tools/runtime.sh`) | Secrets declaration + the proxy service's secret list |
+| `host-caps.json` | `host_caps.py summary`, from `start.sh` | `host_caps.caps()` via `models.py` and `flow_survey.py` | This machine's platform, memory, free disk and accelerator capabilities; the one probe the picker, the resolver and the launch notes all read |
+| `local-model.log` | `local_llm.py serve` / `provision` | the operator | One line per download and the engine's own output. Deliberately not deleted with the rest: it is where a failed 111 GB fetch is explained after the session that started it has ended |
+
+Two artifacts survive a launch, because deleting either would throw away work
+that took hours rather than a session: the weights themselves, at
+`models/<provider>/<id>/weights/`, and `weights/install.json` beside them
+recording which digests were matched. Both are git-ignored and
+`.dockerignore`d, and both are removed by deleting the model's own directory.
+`credentials/local_mps__default` does *not* survive, by design: it is the session
+token a locally-started engine was given, and a new launch starts a new engine.
 
 The plan is a versioned document (`schema_version = 1`); the proxy refuses a plan
 whose version it does not understand. Only lanes present in the plan get routes,
@@ -433,9 +619,12 @@ prompt" survives upstream.
 
 ## Adding a model
 
-1. `cp -r models/qwen3_8_flash_next models/new_thing`
+1. `cp -r models/nrp/qwen3_8_flash_next models/nrp/new_thing` — under the
+   provider directory that serves it. Serving one model from a second provider is
+   a second directory with the same leaf name, not an edit to the first.
 2. Set `label`, `model` (wire name), a unique `slug`, the `provider` and
    `credential` ids, `[context].advertised_tokens`, and the lanes you want.
+   `provider` must equal the directory it sits in.
 3. Optionally set `key_env` to a variable name of your own — that is what lets
    this model carry its own key in `.env` instead of sharing the one its
    `credential` names. Whatever you choose, add that name to
@@ -444,18 +633,61 @@ prompt" survives upstream.
 
 Delete the directory to remove it. Nothing else references model ids.
 
+A **local** model takes two more steps. Write its `weights.lock.json` with one
+pinned commit and the SHA-256 of every file - read them from the hub's own API
+(`paths-info` returns the LFS `oid`, which is the file's SHA-256) rather than
+guessing, and let `python3 scripts/check_locks.py` refuse the shape if it is
+wrong. Then declare `[requires]` from the arithmetic, not from the hardware in
+front of you: the memory floor is the pinned quant's resident size plus KV for
+the widest lane plus what the harness's own container VM takes from the same
+pool, and a floor that has been lowered to fit a machine is a promise the engine
+will break at first use. `[install].port` must be unique within the provider.
+
 ## Adding a provider
 
 1. Create `providers/acme/provider.toml` with `[endpoint]`, one or more
    `[[credential]]` tables, and the `[[rule]]` set you can actually enforce.
 2. Add every `credential.env` / `base_url_env` name to
    `compose.bootstrap.yaml`'s bootstrap environment.
-3. Point a model at it with `provider = "acme"`.
+3. Point a model at it with `provider = "acme"`, in `models/acme/`.
 
 A model whose provider directory is missing is dropped from both pickers rather
 than failing startup, which is how you park a model while its provider is being
 rewritten. Removing a provider directory therefore removes its models in one
-step.
+step - and it is the same mechanism that removes them on a host that cannot
+satisfy the provider's `requires`, which is why a local provider needs no
+hiding rule of its own.
+
+A provider whose models run on the operator's machine additionally names a
+capability in `requires`, sets `sends_cache_salt = false`, gives its credential
+`generate = true`, and publishes real capacity rules (`max_concurrent_requests`
+per model, plus a provider default for the models nobody transcribed yet). The
+engine it needs is a `downloads` entry in `dependencies.lock.json`, and
+`tools/host_caps.py` is where a new capability gets its measurement.
+
+## The launcher's model screen
+
+Both model questions are a table, because the same model name now appears once
+per provider and a label cannot say which is which. The columns are Model,
+Provider, Lane, then two unlabelled state columns - `Ready` or `Not Installed`,
+and `(last used)` / `(default)` where a row carries a mark - which need no header
+because their content already reads as itself. Navigation is unchanged
+(arrows, space to select, enter to confirm): `tools/tui/menu.py` grew the columns
+beside the existing single-choice list rather than replacing it, so the module and
+version menus render exactly as before.
+
+Each row is written twice, as cells and as the older label-plus-hint pair, and a
+window too narrow to align every column gets the older rendering rather than a
+grid with truncated model names. Below the list the status line re-joins the
+marked row's cells into one sentence, and repeats its hint only when the grid is
+not being drawn - or when the row cannot be selected, where the hint is the reason
+and the grid has no column for it.
+
+`Ready?` is a fact about the host, not a guess: it comes from
+`tools/local_llm.py`, and a model with no `[install]` block is always ready
+because no code here installs anything for it. The column is what the automatic
+download is offered against - selecting a `Not Installed` model proceeds, and
+provisioning happens after the questions end.
 
 ## Kimi's model picker
 
@@ -465,7 +697,13 @@ subagent model automatically. Each `[models.*]` table carries a `display_name`
 built from the model's label and the lane's `LANE_DISPLAY` phrase — for the
 shipped plan, `Qwen3.8-Flash-Next - Long (queued)`,
 `... - Medium (concurrent)` and `... - Subagent (automatic)` — and no provider
-name. Each table still binds its own provider with a `provider =` key beside
+name, with one exception: when a plan serves one model label through two
+providers, every lane carrying that label gains the provider in brackets
+(`Qwen3.8-Flash-Next [Local (MPS)] - Long (queued)`), because two rows of an
+identical name would otherwise be chosen by guessing. One label across two lanes
+of the *same* provider is not that case — those rows already differ by their lane
+phrase — so an ordinary launch reads exactly as it did. Each table still binds
+its own provider with a `provider =` key beside
 `model =`, so the row names the lane while the table says who serves it.
 
 **The subagent row cannot be hidden, and is labelled instead.** Kimi Code's

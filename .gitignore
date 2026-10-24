@@ -8,6 +8,12 @@
 # compose.limits.yaml.example is the tracked schema; the live file is not. Root-anchored because
 # tools/runtime.sh reads it only from the repository root.
 /compose.limits.yaml
+# Model weights, downloaded on demand into the definition that pins them. Never versioned: the
+# tracked artifact is models/<provider>/<id>/weights.lock.json, which names one commit and the
+# SHA-256 of every file, so the bytes are reproducible and pointless to store. Pattern-anchored to
+# the two-level definition tree, which keeps a project checked out under ./models visible and stops
+# this rule from matching anything a contributor might mean to commit.
+/models/*/*/weights/
 .local/
 **/__pycache__/
 **/*.pyc

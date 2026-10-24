@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import shlex
 import sys
 import tomllib
@@ -29,15 +30,17 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
-    from . import policy
+    from . import host_caps, local_llm, policy
     from .definitions import LANES, DefinitionError, load_definitions
     from .env_values import read_env_values
     from .private_file import write_private, write_private_json
     from .tui import flow, screen
     from .tui.app import View, run
     from .tui.input import FieldStep
-    from .tui.menu import SINGLE, Choice, ListStep
+    from .tui.menu import SINGLE, Choice, Column, ListStep
 else:
+    import host_caps
+    import local_llm
     import policy
     from definitions import LANES, DefinitionError, load_definitions
     from env_values import read_env_values
@@ -45,7 +48,7 @@ else:
     from tui import flow, screen
     from tui.app import View, run
     from tui.input import FieldStep
-    from tui.menu import SINGLE, Choice, ListStep
+    from tui.menu import SINGLE, Choice, Column, ListStep
 
 SELECTABLE = ("primary", "subagent")
 #: Suffix on a main-agent-screen row that launches the agent on the queued long lane instead of
@@ -182,10 +185,10 @@ def agent_rows(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
             twin["id"] = f"{model['id']}{AGENT_SUFFIX}"
             tokens = long_window_tokens(model)
             span = f", {token_span(tokens)} window" if tokens is not None else ""
-            twin["label"] = f"{model['label']} - Long (queued{span})"
+            twin["lane_label"] = f"Long (queued{span})"
             rows.append(twin)
         row = dict(model)
-        row["label"] = f"{model['label']} - Medium (concurrent)"
+        row["lane_label"] = "Medium (concurrent)"
         rows.append(row)
     return rows
 
@@ -242,21 +245,59 @@ def prompts(override: str, non_interactive: bool, choices: list[dict[str, Any]])
     return not override and not non_interactive and len(choices) > 1
 
 
+#: The model picker's columns, per screen. The last two carry no header deliberately: "Ready",
+#: "Not Installed" and "(last used)" are already whole sentences, and a label above them would
+#: repeat the row. The subagent screen has no Lane column because it offers one row per model -
+#: the screen *is* the lane.
+COLUMNS: dict[str, tuple[Column, ...]] = {
+    "primary": (Column("Model"), Column("Provider"), Column("Lane"), Column(), Column()),
+    "subagent": (Column("Model"), Column("Provider"), Column(), Column()),
+}
+
+
+def row_label(model: dict[str, Any]) -> str:
+    """One row's whole name: the model, and which of its trades this row offers.
+
+    The definition carries the model's own label and the row adds the lane phrase, because the
+    table puts them in separate columns. Anywhere a row has to be one string - the status line,
+    the narrow fallback, the line the launcher prints once the questions are over - it is composed
+    here, so no two surfaces can spell the same row differently.
+    """
+    label = str(model["label"])
+    lane = str(model.get("lane_label") or "")
+    return f"{label} - {lane}" if lane else label
+
+
+def provider_name(model: dict[str, Any]) -> str:
+    """Who serves this row; the id stands in when the caller supplied no provider label."""
+    return str(model.get("provider_label") or model["provider"])
+
+
 def _option(model: dict[str, Any], previous: str, default: str) -> Choice:
     """One candidate row: its name, and what the launcher already knows about it.
 
     ``last used`` and ``default`` are mutually exclusive here exactly as they were in the old
     printer, because an id that is both needs saying once.
+
+    Each fact is written twice - into a table cell and into the label/hint pair - because the grid
+    needs a window wide enough to align five columns, and a narrower one should still show the
+    operator everything the row knew before this was a table. Neither rendering may add a fact the
+    other lacks.
     """
     marks = []
     if previous and model["id"] == previous:
         marks.append("last used")
     elif model["id"] == default:
         marks.append("default")
-    hint = f"[{model['provider']}]"
+    provider = provider_name(model)
+    lane = str(model.get("lane_label") or "")
+    mark = f"({'; '.join(marks)})" if marks else ""
+    cells = (str(model["label"]), provider, lane, local_llm.status_text(model), mark)
+    label = row_label(model)
+    hint = f"[{provider}]"
     if marks:
         hint = f"{hint} ({'; '.join(marks)})"
-    return Choice(id=model["id"], label=model["label"], hint=hint)
+    return Choice(id=model["id"], label=label, hint=hint, cells=cells)
 
 
 def choose(
@@ -299,6 +340,7 @@ def choose(
         mode=SINGLE,
         choices=[_option(model, previous, default) for model in choices],
         previous=[default],
+        columns=COLUMNS.get(lane, ()),
     )
     result = run(step, view if view is not None else View())
     if result.status == flow.GO_BACK:
@@ -386,13 +428,50 @@ def require_bootstrap_declarations(root: Path, plan: dict[str, Any]) -> None:
         )
 
 
+def unsupported_reason(
+    model: dict[str, Any], providers: dict[str, Any], measured: dict[str, Any]
+) -> str:
+    """Why this host cannot serve a model a previous host could, in the words to say it.
+
+    Only ever computed for a model that *is* defined and *was* selected, which is the one case
+    where filtering silently would leave the operator staring at a list they did not choose. A
+    selection carried between machines - an M1 Max reading what an M3 Ultra answered - is normal,
+    and the refusal has to name the shortfall rather than the absence.
+    """
+    provider = providers.get(model["provider"]) or {}
+    missing = sorted(set(provider.get("requires") or ()) - set(measured.get("capabilities") or ()))
+    if missing:
+        have = ", ".join(measured.get("capabilities") or ()) or "none"
+        return (
+            f"providers/{model['provider']} serves it on {'/'.join(missing)}, and this host "
+            f"({measured.get('system', '?')}/{measured.get('arch', '?')}) reports {have}"
+        )
+    required = model.get("requires") or {}
+    memory = int(required.get("memory_gib") or 0)
+    if memory > int(measured.get("memory_gib") or 0):
+        return (
+            f"it needs {memory} GiB of memory and this host reports "
+            f"{measured.get('memory_gib', 0)} GiB"
+        )
+    disk = int(required.get("disk_gib") or 0)
+    if disk > int(measured.get("free_disk_gib") or 0):
+        return (
+            f"its weights need {disk} GiB of free disk and this volume has "
+            f"{measured.get('free_disk_gib', 0)} GiB"
+        )
+    return ""
+
+
 def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
-    _, models = load_definitions(root)
+    providers, defined = load_definitions(root)
+    _, models = host_caps.filter_definitions(
+        providers, defined, host_caps.caps(runtime, root)
+    )
     for lane in SELECTABLE:
         if not selectable(models, lane):
             raise DefinitionError(
-                f"no available model declares a {lane} lane; add one under models/<id>/model.toml "
-                "with a provider that exists in ./providers"
+                f"no available model declares a {lane} lane; add one under "
+                "models/<provider>/<id>/model.toml with a provider that exists in ./providers"
             )
     previous = read_json(runtime / PREVIOUS_SELECTION, {})
     if not isinstance(previous, dict):
@@ -498,7 +577,7 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
         # Held until the sequence settles rather than printed as each lane closes: going back would
         # otherwise leave the superseded answer in the scrollback next to the one that replaced it,
         # two lines that cannot both be true.
-        lines[lane] = f"{PROMPTS[lane]}: {model['label']} [{model['provider']}]{suffix}"
+        lines[lane] = f"{PROMPTS[lane]}: {row_label(model)} [{provider_name(model)}]{suffix}"
         index += 1
     screen.note(*(lines[lane] for lane in lanes))
     # In lane order, not answer order: backing up and re-answering would otherwise reorder the
@@ -506,7 +585,11 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
     # a lane's value, because every other consumer of this file reads model ids there and a row id
     # it cannot look up would fail the launch.
     document = {lane: selection[lane] for lane in lanes}
-    document["agent_lane"] = agent_lane
+    # A row that was picked carries its own window through ``split_agent_row``, so this only
+    # settles the launches where no screen ran: the value would otherwise be whatever the last
+    # launch happened to record, on a model that may not have that lane at all.
+    chosen = {model["id"]: model for model in models}
+    document["agent_lane"] = policy.designated_lane(chosen[selection["primary"]], agent_lane)
     write_json(runtime / SELECTION, document)
     return 0
 
@@ -536,6 +619,10 @@ def used_credentials(plan: dict[str, Any]) -> list[dict[str, str]]:
             "key_url": declaration.get("key_url", ""),
             "provider": provider_id,
             "provider_label": plan["providers"][provider_id]["label"],
+            # A credential the launcher generates rather than collects. Read with .get so a plan
+            # written before the key existed still materialises, exactly as the proxy treats a
+            # missing sends_cache_salt as the older default.
+            "generate": bool(declaration.get("generate", False)),
             # Set only for a model-scoped credential: the variable that key fell back from,
             # which the operator may equally well have filled in.
             "fallback_env": declaration.get("fallback_env", ""),
@@ -700,6 +787,15 @@ def materialise_credentials(plan: dict[str, Any], runtime: Path, values: dict[st
     directory.mkdir(parents=True, exist_ok=True)
     directory.chmod(0o700)
     used = used_credentials(plan)
+    # A credential with no issuer is given one value per launch, shared by every lane that names
+    # it, and written to the same mode-0600 file as a prompted key: from the proxy's side there is
+    # no difference, since it reads a secret and puts it in a Bearer header. tools/local_llm.py
+    # reads that same file to start the engine that has to accept it, which is the only reason the
+    # value never has to be asked for, printed, or stored anywhere else.
+    values = dict(values)
+    for item in used:
+        if item["generate"] and not values.get(item["env"], "").strip():
+            values[item["env"]] = secrets.token_urlsafe(32)
     answers = credential_values(used, values, runtime, flow.running(runtime))
     wanted = set()
     for item in used:
@@ -755,14 +851,32 @@ def model_environment(plan: dict[str, Any], values: dict[str, str]) -> dict[str,
 
 
 def cmd_resolve(root: Path, runtime: Path) -> int:
-    providers, model_list = load_definitions(root)
+    providers, defined = load_definitions(root)
     values = bootstrap_values(root)
     providers = apply_endpoint_overrides(providers, values)
-    models = {model["id"]: model for model in model_list}
+    measured = host_caps.caps(runtime, root)
+    providers, models_list = host_caps.filter_definitions(providers, defined, measured)
+    models = {model["id"]: model for model in models_list}
     selection = read_json(runtime / SELECTION)
     if not isinstance(selection, dict):
         raise DefinitionError(f"{SELECTION} must contain an object")
+    # An answer from a different machine is filtered out of the catalog above, so without this the
+    # operator reads "selected model is not available; defined models: ..." for a model that is
+    # sitting in the tree with a directory and everything.
+    for lane in SELECTABLE:
+        chosen = str(selection.get(lane, ""))
+        if chosen in models:
+            continue
+        dropped = next((item for item in defined if item["id"] == chosen), None)
+        if dropped is not None:
+            reason = unsupported_reason(dropped, providers, measured)
+            if reason:
+                raise DefinitionError(
+                    f"the selected {lane} model {chosen} cannot be served on this host: {reason}"
+                )
     agent_lane = str(selection.get("agent_lane") or policy.DEFAULT_AGENT_LANE)
+    if selection.get("primary") in models:
+        agent_lane = policy.designated_lane(models[str(selection["primary"])], agent_lane)
     plan = policy.resolve(
         providers,
         models,

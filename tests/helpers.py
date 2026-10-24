@@ -101,27 +101,38 @@ def reserved_context_size() -> int:
         return tomllib.load(source)["loop_control"]["reserved_context_size"]
 
 
-def shipped_plan() -> dict:
-    """Resolve the checked-in definitions exactly as ``./start.sh`` does.
+#: Which definition the shipped numbers in this suite are stated against. The cloud model, not
+#: whichever directory sorts first: the local definitions are sized for the machine they run on,
+#: and their concurrency comes from a rule about memory rather than from a provider's published
+#: fair-use terms, so a test written against one would be measuring a different document.
+SHIPPED_MODEL = "nrp/qwen3_8_flash_next"
+
+
+def shipped_plan(model_id: str = SHIPPED_MODEL, agent_lane: str | None = None) -> dict:
+    """Resolve one selection from the checked-in definitions exactly as ``./start.sh`` would.
 
     Seven suites needed this and each had its own copy, which meant a change to the resolution
     contract had seven places to be wrong in. Providers are shallow-copied because the launcher
     layers ``.env`` overrides onto them and a test must not read operator state - nor write into
     a dictionary :func:`definitions.load_definitions` may hand out again.
 
-    The selection is the first defined model for both lanes, which is the one configuration this
-    repository ships with full definitions for and the case every policy number is stated against.
+    Both lanes take one model unless asked otherwise, and the agent lane is the one that model
+    actually declares: the same clamp the launcher applies, so a plan built for a model without a
+    long lane cannot fail for a reason the launch itself would not hit.
     """
     add_tools_to_path()
     import definitions
     import policy
 
-    providers, models = definitions.load_definitions(ROOT)
+    providers, model_list = definitions.load_definitions(ROOT)
+    defined = {model["id"]: model for model in model_list}
+    chosen = model_id if model_id in defined else model_list[0]["id"]
     return policy.resolve(
         {pid: dict(provider) for pid, provider in providers.items()},
-        {model["id"]: model for model in models},
-        {"primary": models[0]["id"], "subagent": models[0]["id"]},
+        defined,
+        {"primary": chosen, "subagent": chosen},
         reserved_context_size=reserved_context_size(),
+        agent_lane=policy.designated_lane(defined[chosen]) if agent_lane is None else agent_lane,
     )
 
 

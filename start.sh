@@ -45,6 +45,11 @@ docker info >/dev/null || { echo "Docker is not ready. Start Docker Desktop and 
 
 MODULE_PIDS=()
 MODULE_SESSION_FILES=()
+# Supervisors for the model engines running on this host. Deliberately separate from MODULE_PIDS:
+# the watch loop treats an exited module pid as a failed launch, and a weight set still downloading
+# - or a download that failed - must not tear down a working session. `cleanup` kills them either
+# way, which is what keeps a hundred gigabytes from outliving the run.
+LOCAL_LLM_PIDS=()
 COMPOSE_PID=""
 PROMPT_MEASURE_PID=""
 DEEP_CHECK_PID=""
@@ -89,12 +94,12 @@ cleanup() {
   if [[ -s "${flow_notes:-/nonexistent}" ]]; then
     cat "${flow_notes}"
   fi
-  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}" "${KEEPWAKE_PID}"; do
+  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} ${LOCAL_LLM_PIDS[@]+"${LOCAL_LLM_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}" "${KEEPWAKE_PID}"; do
     if [[ -n "${pid}" ]]; then
       kill "${pid}" 2>/dev/null || true
     fi
   done
-  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}" "${KEEPWAKE_PID}"; do
+  for pid in ${MODULE_PIDS[@]+"${MODULE_PIDS[@]}"} ${LOCAL_LLM_PIDS[@]+"${LOCAL_LLM_PIDS[@]}"} "${COMPOSE_PID}" "${PROMPT_MEASURE_PID}" "${DEEP_CHECK_PID}" "${KEEPWAKE_PID}"; do
     if [[ -n "${pid}" ]]; then
       wait "${pid}" 2>/dev/null || true
     fi
@@ -339,6 +344,38 @@ harness_flow_pass() {
 # A flow is the interactive launch's state machine and nothing else. An unattended launch asks
 # nothing, so it has nothing to return to, and starting no flow leaves every step's own numbering,
 # its short-circuits, and its side effects exactly as they were.
+# What this machine can serve, measured once and written where the picker, the resolver and the
+# launch notes all read the same answer. Printed rather than spooled - the modal has not borrowed
+# the screen yet - and never fatal: a host the probe cannot classify is simply a host with no
+# local models, which is the one direction that cannot offer the operator something they cannot
+# run. `harness_flow_work` is not used here because a step it reports on stops the launch.
+python3 tools/host_caps.py summary --runtime-dir "${HARNESS_RUNTIME_DIR}" || true
+
+# Models that run on this machine, if any were selected. The engine is a host process because the
+# GPU is on the host - no container in this stack can address Apple silicon unified memory, which
+# is the same reason the ComfyUI MPS backend runs outside Docker. One supervisor per model, because
+# one engine process serves one model; the supervisor forwards the signal `cleanup` sends, so the
+# weights leave memory when the session ends.
+harness_local_models() {
+  local mode="$1" id state log=${HARNESS_RUNTIME_DIR}/local-model.log
+  local line
+  while read -r line; do
+    id=${line%%$'\t'*}
+    state=${line##*$'\t'}
+    [[ -n "${id}" ]] || continue
+    if [[ "${mode}" == start && "${state}" == "Ready" ]]; then
+      python3 tools/local_llm.py serve "${id}" >>"${log}" 2>&1 &
+      LOCAL_LLM_PIDS+=("$!")
+    elif [[ "${mode}" == provision && "${state}" != "Ready" ]]; then
+      # Chosen while "Not Installed", so it downloads now and its lane goes live mid-session
+      # rather than at the next launch. One line is all the operator needs; the log has the rest.
+      echo "Fetching ${id} in the background - progress: ${log}"
+      python3 tools/local_llm.py provision "${id}" >>"${log}" 2>&1 &
+      LOCAL_LLM_PIDS+=("$!")
+    fi
+  done < <(python3 tools/local_llm.py selected 2>/dev/null || true)
+}
+
 flow_live=false
 if [[ "${non_interactive}" != true ]]; then
   "${flow[@]}" --steps "${flow_steps}" begin
@@ -562,6 +599,9 @@ deep_service_check() {
 }
 
 harness_modules start
+# Before Compose, so a model whose weights are already on disk is answering before the agent's
+# first request rather than during it.
+harness_local_models start
 echo "Instance:  ${HARNESS_INSTANCE_ID}"
 echo "Press Ctrl-C to stop everything."
 echo
@@ -591,6 +631,9 @@ if wait_for_url http://127.0.0.1:5494/api/v1/healthz "" "" 90; then
   # launcher's own stdout open after the launch has finished.
   deep_service_check >/dev/null 2>&1 &
   DEEP_CHECK_PID=$!
+  # The questions are over and the stack is up: this is the point where a selected-but-missing
+  # weight set starts downloading, because nothing before it may wait on a hundred gigabytes.
+  harness_local_models provision
   python3 tools/open_kimi_browser.py docker compose --env-file "${root}/.env" "${HARNESS_COMPOSE_FILES[@]}" || true
 else
   echo "Kimi web did not become ready for workspace registration; inspect the startup logs." >&2

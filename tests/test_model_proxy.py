@@ -10,6 +10,7 @@ moves the expectations instead of breaking them.
 import asyncio
 import contextlib
 import copy
+import dataclasses
 import importlib.util
 import io
 import json
@@ -407,6 +408,73 @@ class RequestValidationTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(payload["model"], SUBAGENT.model)
         self.assertEqual(payload["cache_salt"], CACHE_SALT)
+
+    def test_a_provider_that_does_not_want_the_cache_salt_gets_none(self):
+        # The salt exists so a shared gateway cannot key its prompt cache on one operator's
+        # content. A model server on that operator's own machine has no such cache, and an engine
+        # is under no obligation to ignore a field it does not model - so it must not receive one.
+        payload = json.loads(
+            PROXY.rewrite_model(
+                json.dumps({"model": "qwen3-subagent", "messages": []}).encode(),
+                Request(),
+                dataclasses.replace(SUBAGENT, sends_cache_salt=False),
+            )
+        )
+        self.assertNotIn("cache_salt", payload)
+        # Everything else the lane owns still rides along: the flag is about one field, not about
+        # the rewrite.
+        self.assertEqual(payload["model"], SUBAGENT.model)
+        self.assertEqual(payload["max_completion_tokens"], SUBAGENT.output_clamp)
+
+    def test_a_lane_routes_to_its_own_origin_and_otherwise_to_its_providers(self):
+        # Two local models are two engine processes on two ports, and the plan carries that per
+        # lane; a remote model declares nothing per lane and keeps the provider's documented host.
+        entry = {
+            "alias": "qwen27m-subagent",
+            "provider_name": "local_mps-subagent",
+            "provider": "local_mps",
+            "model": "Qwen3.8-27B",
+            "credential": "default",
+            "context_tokens": 16384,
+            "input_tokens": 8192,
+            "output_clamp_tokens": 4096,
+            "counters": [],
+        }
+        providers = {
+            "local_mps": {
+                "base_url": "http://host.docker.internal:8181",
+                "credentials": {"default": {"secret_name": "local_mps__default"}},
+            }
+        }
+        local = PROXY._lane_from_plan("subagent", entry, providers, 8192)
+        self.assertEqual(local.base_url, "http://host.docker.internal:8181")
+        self.assertTrue(local.sends_cache_salt)
+        routed = PROXY._lane_from_plan(
+            "subagent", {**entry, "base_url": "http://host.docker.internal:8182"}, providers, 8192
+        )
+        self.assertEqual(routed.base_url, "http://host.docker.internal:8182")
+
+    def test_an_unusable_lane_origin_is_refused_at_load(self):
+        entry = {
+            "alias": "a",
+            "provider_name": "p",
+            "provider": "local_mps",
+            "model": "m",
+            "credential": "default",
+            "context_tokens": 16384,
+            "input_tokens": 8192,
+            "output_clamp_tokens": 4096,
+            "counters": [],
+            "base_url": "ftp://nowhere",
+        }
+        providers = {
+            "local_mps": {
+                "base_url": "http://host.docker.internal:8181",
+                "credentials": {"default": {"secret_name": "local_mps__default"}},
+            }
+        }
+        with self.assertRaisesRegex(PROXY.PolicyDrift, "no usable endpoint"):
+            PROXY._lane_from_plan("subagent", entry, providers, 8192)
 
     def test_a_body_cannot_ask_for_a_bigger_window_than_its_lane_reserved(self):
         oversized = PROXY.rewrite_model(

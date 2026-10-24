@@ -3,14 +3,22 @@
 
 Two directories describe everything the harness needs to know before it can serve traffic:
 
-* ``providers/<id>/provider.toml``  - endpoint, named credentials, and policy rules.
-* ``models/<id>/model.toml``        - immutable facts about one model, naming a provider.
+* ``providers/<id>/provider.toml``         - endpoint, named credentials, host requirement, rules.
+* ``models/<provider>/<id>/model.toml``  - one model, as that provider serves it.
 
 Neither may appear in ``.env``: model facts change when the served model changes, and policy
 numbers change when the provider republishes its terms. Keeping each in one file means one
 edit tracks one truth. There is no central registry, exactly as with ``modules/``: a directory
 without its manifest is ignored, and an operator adds or removes support by adding or removing
 a directory.
+
+Model definitions sit under the provider that serves them because that pair, not the model
+alone, is what the rest of the harness already treats as one thing: policy keys every counter
+``<provider>/<wire model>``, every secret is ``<provider>__<credential>``, and one model name can
+legitimately be served two ways - a 1M-token window from a cloud gateway and a 262K-token window
+from a server on the operator's own machine are two definitions, not two values in one file. The
+directory name is also what makes removal atomic: deleting ``models/<provider>/`` retires every
+model that provider served, which is the same rule the picker's eligibility filter relies on.
 
 Definitions are host-trusted operator configuration, not a sandbox. Symlinks and non-regular
 files inside a definition tree are still refused, because these files decide which endpoint
@@ -46,6 +54,37 @@ def _no_secret_separator(value: str, where: str) -> str:
 SCHEMA_VERSION = 1
 LANES = ("primary", "long", "subagent")
 CREDENTIAL_LANES = ("primary", "subagent")
+
+#: What a provider may ask of the machine the harness is launching on. A provider names none of
+#: these and is then served from anywhere; ``local_mps`` names ``metal`` and appears only on the
+#: hosts that have it. Unknown names are refused at load rather than read as "never", because a
+#: typo in a capability list silences a whole provider and nothing else would say so.
+HOST_CAPABILITIES = frozenset({"metal", "cuda"})
+
+#: Subdirectory of a model definition that holds downloaded weights, and the tracked manifest
+#: that says what those weights must be. The subtree is data rather than definition: it is
+#: skipped by the safety walk (a downloaded tree can hold anything its publisher chose to put in
+#: it, and that must not be able to fail a launch), ignored by git, and written only by
+#: ``tools/local_llm.py``.
+WEIGHTS_DIR = "weights"
+WEIGHTS_LOCK = "weights.lock.json"
+
+#: Host floors a model may declare for itself. Both are GiB measured against the *host*, since a
+#: local server runs there and inside no container limit. Zero means no floor.
+MODEL_REQUIRE_KEYS = frozenset({"memory_gib", "disk_gib"})
+INSTALL_KEYS = frozenset({"variant", "lock", "sampling", "port"})
+#: Sampling defaults the harness hands to a local engine. They are model facts - the vendor
+#: publishes different ones for thinking and non-thinking modes - and never provider policy.
+SAMPLING_KEYS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "repetition_penalty",
+    }
+)
 
 #: Rule kinds this harness knows how to enforce, with the fields each one requires.
 #: Adding a kind here without adding its enforcer in the proxy is a bug: unknown kinds are
@@ -141,13 +180,35 @@ def _percent(table: dict[str, Any], key: str, where: str) -> int:
     return int(value)
 
 
-def _flag(table: dict[str, Any], key: str, where: str) -> bool:
-    """Read an optional boolean, absent meaning false. Only a real boolean will do: a rule
+def _flag(table: dict[str, Any], key: str, where: str, default: bool = False) -> bool:
+    """Read an optional boolean, absent meaning ``default``. Only a real boolean will do: a rule
     table that accepted ``"true"`` would make a quoting mistake read as a deliberate choice."""
-    value = table.get(key, False)
+    value = table.get(key, default)
     if not isinstance(value, bool):
         raise DefinitionError(f"{where}.{key} must be a boolean")
     return value
+
+
+def _optional_int(table: dict[str, Any], key: str, where: str) -> int:
+    """Read an optional non-negative integer, absent meaning zero."""
+    value = table.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DefinitionError(f"{where}.{key} must be a non-negative integer")
+    return int(value)
+
+
+def _capability_list(document: dict[str, Any], key: str, where: str) -> list[str]:
+    """Read ``requires = [...]`` on a provider: what the host must offer for it to appear."""
+    value = document.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise DefinitionError(f"{where}.{key} must be a list of host capability names")
+    unknown = sorted(set(value) - HOST_CAPABILITIES)
+    if unknown:
+        raise DefinitionError(
+            f"{where}.{key} names {', '.join(unknown)}; this harness can test a host for "
+            f"{', '.join(sorted(HOST_CAPABILITIES))}"
+        )
+    return sorted(set(value))
 
 
 def _text(table: dict[str, Any], key: str, where: str) -> str:
@@ -157,8 +218,18 @@ def _text(table: dict[str, Any], key: str, where: str) -> str:
     return value
 
 
-def _walk_safe(directory: Path, kind: str) -> None:
+def _walk_safe(directory: Path, kind: str, skip: frozenset[str] = frozenset()) -> None:
+    """Refuse anything in a definition tree that is not a plain file or directory.
+
+    ``skip`` names top-level subdirectories exempt from the walk. Downloaded model weights are
+    the only such subtree: their contents belong to whoever published the checkpoint, and a
+    symlink inside a 100 GB weight set must not be able to fail a launch. It is not a licence to
+    *read* anything from there as configuration - only :mod:`local_llm` opens that tree, and it
+    digests every file it finds there.
+    """
     for child in directory.rglob("*"):
+        if skip and child.relative_to(directory).parts[0] in skip:
+            continue
         if child.is_symlink() or not (child.is_file() or child.is_dir()):
             raise DefinitionError(f"Unsafe {kind} definition entry: {child}")
 
@@ -194,12 +265,15 @@ def _parse_provider(provider_id: str, path: Path) -> dict[str, Any]:
             "schema_version",
             "label",
             "policy_url",
+            "requires",
             "endpoint",
             "credential",
             "rule",
             "safety",
         }:
             raise DefinitionError(f"{where} has unknown key {key!r}")
+
+    requires = _capability_list(document, "requires", where)
 
     policy_url = document.get("policy_url", "")
     if policy_url and not re.fullmatch(r"https://[^\s]+", str(policy_url)):
@@ -217,8 +291,13 @@ def _parse_provider(provider_id: str, path: Path) -> dict[str, Any]:
     protocol = _text(endpoint, "protocol", f"{where}.endpoint")
     if protocol not in {"openai", "anthropic"}:
         raise DefinitionError(f"{where}.endpoint.protocol must be openai or anthropic")
+    # Whether this upstream tolerates an unknown field in the request body. The harness adds a
+    # private cache salt to every request so that a shared gateway cannot key its prompt cache on
+    # one operator's content; an engine written by nobody but the operator has no such cache to
+    # protect and no obligation to ignore a key it does not model.
+    sends_cache_salt = _flag(endpoint, "sends_cache_salt", f"{where}.endpoint", default=True)
     for key in endpoint:
-        if key not in {"base_url", "base_url_env", "protocol"}:
+        if key not in {"base_url", "base_url_env", "protocol", "sends_cache_salt"}:
             raise DefinitionError(f"{where}.endpoint has unknown key {key!r}")
 
     credentials = _parse_credentials(document.get("credential"), where, provider_id)
@@ -246,9 +325,11 @@ def _parse_provider(provider_id: str, path: Path) -> dict[str, Any]:
         "path": path,
         "label": label,
         "policy_url": str(policy_url or ""),
+        "requires": requires,
         "base_url": base_url,
         "base_url_env": str(base_url_env or ""),
         "protocol": protocol,
+        "sends_cache_salt": sends_cache_salt,
         "credentials": credentials,
         "rules": rules,
         "context_margin_percent": context_margin,
@@ -271,7 +352,7 @@ def _parse_credentials(raw: Any, where: str, provider_id: str) -> dict[str, dict
         if credential_id in result:
             raise DefinitionError(f"{where} declares credential {credential_id!r} twice")
         for key in item:
-            if key not in {"id", "label", "prompt", "env", "key_url"}:
+            if key not in {"id", "label", "prompt", "env", "key_url", "generate"}:
                 raise DefinitionError(f"{here} has unknown key {key!r}")
         env = item.get("env", "")
         if env and not ENV_VAR.fullmatch(str(env)):
@@ -279,6 +360,20 @@ def _parse_credentials(raw: Any, where: str, provider_id: str) -> dict[str, dict
         key_url = item.get("key_url", "")
         if key_url and not re.fullmatch(r"https://[^\s]+", str(key_url)):
             raise DefinitionError(f"{here}.key_url must be an https URL")
+        # A credential nobody issues. A server on the operator's own machine has no dashboard to
+        # copy a key from, so the launcher mints one per session and hands the same value to the
+        # engine it starts and to the proxy that calls it. `env` stays meaningful beside it as the
+        # operator's own override.
+        generate = _flag(item, "generate", here)
+        if generate and not env:
+            raise DefinitionError(
+                f"{here} generates its own value but names no env variable: the operator needs one "
+                "name to pin a value in .env, or nothing could override the generated token"
+            )
+        if generate and key_url:
+            raise DefinitionError(
+                f"{here} both generates its own value and names a key_url; one of those is a lie"
+            )
         prompt = item.get("prompt")
         if prompt is None:
             prompt = item["label"]
@@ -287,6 +382,7 @@ def _parse_credentials(raw: Any, where: str, provider_id: str) -> dict[str, dict
             "label": _text(item, "label", here),
             "prompt": _text({"prompt": prompt}, "prompt", here),
             "env": str(env or ""),
+            "generate": generate,
             # Where an operator obtains this credential. Provider-specific facts such as a
             # key-issuing dashboard belong in the definition, not in the README.
             "key_url": str(key_url or ""),
@@ -381,7 +477,9 @@ def discover_models(root: Path, providers: dict[str, dict[str, Any]]) -> list[di
     """Return every valid model definition, dropping models whose provider is unavailable.
 
     Dropping (rather than failing) is deliberate: an operator may keep a model directory in
-    place while its provider definition is absent, and ./start.sh must simply not offer it.
+    place while its provider definition is absent, and ./start.sh must simply not offer it. The
+    same rule is what makes provider-level gating free - a provider the host cannot serve is
+    removed from ``providers`` by the caller, and every model under it goes with it.
     """
     directory = root / "models"
     result: list[dict[str, Any]] = []
@@ -389,42 +487,176 @@ def discover_models(root: Path, providers: dict[str, dict[str, Any]]) -> list[di
         return result
     if directory.is_symlink():
         raise DefinitionError("models/ must not be a symlink")
-    for path in sorted(p for p in directory.iterdir() if p.is_dir()):
-        if not (path / "model.toml").is_file():
-            continue
-        model_id = path.name
-        if path.is_symlink() or not ID.fullmatch(model_id):
+    for child in sorted(directory.iterdir()):
+        if (child / "model.toml").is_file():
             raise DefinitionError(
-                f"Model directories must be real directories with lowercase identifiers: {path}"
+                f"{child / 'model.toml'} sits one level too shallow. Model definitions live at "
+                "models/<provider>/<model>/model.toml, because one model name can be served by "
+                f"more than one provider; move {child.name} under a directory named for its "
+                "provider id."
             )
-        _walk_safe(path, "model")
-        parsed = _parse_model(model_id, path)
-        provider = providers.get(parsed["provider"])
-        if provider is None:
-            continue
-        if parsed["key_env"] and parsed["key_env"] in {
-            credential["env"] for credential in provider["credentials"].values()
-        }:
+    for provider_dir in sorted(p for p in directory.iterdir() if p.is_dir()):
+        if provider_dir.is_symlink() or not ID.fullmatch(provider_dir.name):
             raise DefinitionError(
-                f"models/{model_id}.key_env names a variable that a [[credential]] of "
-                f"providers/{parsed['provider']} already names; a model-scoped key must be its "
-                "own variable, or the model should simply name that credential"
+                "models/ holds one directory per provider, each a real directory with a "
+                f"lowercase identifier: {provider_dir}"
             )
-        result.append(parsed)
+        for path in sorted(p for p in provider_dir.iterdir() if p.is_dir()):
+            if not (path / "model.toml").is_file():
+                continue
+            model_id = path.name
+            if path.is_symlink() or not ID.fullmatch(model_id):
+                raise DefinitionError(
+                    f"Model directories must be real directories with lowercase identifiers: {path}"
+                )
+            _walk_safe(path, "model", frozenset({WEIGHTS_DIR}))
+            parsed = _parse_model(provider_dir.name, model_id, path)
+            provider = providers.get(parsed["provider"])
+            if provider is None:
+                continue
+            # The label travels with the model because every human-facing surface that names a
+            # model has to be able to name *which serving of it* - and the picker's Provider
+            # column is that surface. Readers that build model tables by hand may omit it, and
+            # fall back to the id.
+            parsed["provider_label"] = provider["label"]
+            parsed["provider_requires"] = list(provider["requires"])
+            _require_local_serving(parsed, provider)
+            if parsed["key_env"] and parsed["key_env"] in {
+                credential["env"] for credential in provider["credentials"].values()
+            }:
+                raise DefinitionError(
+                    f"{parsed['where']}.key_env names a variable that a [[credential]] of "
+                    f"providers/{parsed['provider']} already names; a model-scoped key must be its "
+                    "own variable, or the model should simply name that credential"
+                )
+            result.append(parsed)
+
+    # One engine process per model, so one port per model: two definitions sharing a listener
+    # produce an engine that fails to bind and a lane that answers nothing, which is a definition
+    # error rather than a runtime one and belongs here.
+    seen_ports: dict[tuple[str, int], str] = {}
+    for model in result:
+        install = model.get("install") or {}
+        port = int(install.get("port") or 0)
+        if not port:
+            continue
+        key = (model["provider"], port)
+        owner = seen_ports.setdefault(key, model["where"])
+        if owner != model["where"]:
+            raise DefinitionError(
+                f"{owner} and {model['where']} both serve on port {port}; one engine per port "
+                "means one model per port"
+            )
 
     seen_slugs: dict[str, str] = {}
     for model in result:
         owner = seen_slugs.setdefault(model["slug"], model["id"])
         if owner != model["id"]:
             raise DefinitionError(
-                f"Models {owner} and {model['id']} share slug {model['slug']!r}, "
+                f"{owner} and {model['where']} share slug {model['slug']!r}, "
                 "which would generate identical Kimi aliases"
             )
     return result
 
 
-def _parse_model(model_id: str, path: Path) -> dict[str, Any]:
-    where = f"models/{model_id}"
+def _require_local_serving(model: dict[str, Any], provider: dict[str, Any]) -> None:
+    """Keep "served on this host" a fact with exactly one spelling.
+
+    A provider that asks something of the host runs its models there, and a model can only be run
+    there if the harness can install its weights: so ``[install]`` is required of it, and it is
+    the one thing every later reader tests - the picker's ``Ready?`` column, the resolver's
+    per-model port, :mod:`local_llm`. A provider that asks nothing of the host serves remotely,
+    where a host floor or a download would be a gate no code evaluates and a step nobody performs;
+    refusing them is what makes "Ready" a fact for a cloud model rather than merely a claim nobody
+    wrote down.
+    """
+    declared = (
+        ("[requires]", any(model["requires"].values())),
+        ("[install]", model["install"] is not None),
+    )
+    named = " and ".join(name for name, present in declared if present)
+    if not provider["requires"]:
+        if named:
+            raise DefinitionError(
+                f"{model['where']} declares {named}, but providers/{provider['id']} asks nothing "
+                "of the host and so serves this model remotely. A host floor and a weight "
+                "download belong on a model whose provider names one in requires."
+            )
+        return
+    if model["install"] is None:
+        raise DefinitionError(
+            f"{model['where']} is served by providers/{provider['id']}, which runs on this "
+            "machine, but declares no [install] block: nothing pins the weights to download, the "
+            "port to serve them on, or what Ready? may claim"
+        )
+
+
+def _parse_requires(raw: Any, where: str) -> dict[str, int]:
+    """``[requires]``: the host floors under which this model stops being offered.
+
+    Absent means no floor, which is the honest answer for anything served by somebody else's
+    datacenter. Values are GiB against the whole machine, measured by ``tools/host_caps.py``.
+    """
+    if raw is None:
+        return {"memory_gib": 0, "disk_gib": 0}
+    if not isinstance(raw, dict):
+        raise DefinitionError(f"{where}.requires must be a table")
+    for key in raw:
+        if key not in MODEL_REQUIRE_KEYS:
+            raise DefinitionError(f"{where}.requires has unknown key {key!r}")
+    return {
+        "memory_gib": _optional_int(raw, "memory_gib", f"{where}.requires"),
+        "disk_gib": _optional_int(raw, "disk_gib", f"{where}.requires"),
+    }
+
+
+def _parse_install(raw: Any, where: str) -> dict[str, Any] | None:
+    """``[install]``: which build the harness downloads for this model, and how it samples.
+
+    ``None`` means there is nothing to install - the answer for every remotely served model, and
+    the reason ``Ready?`` can state a fact instead of a guess. The bytes themselves are described
+    by the lock file this block names; this one says which of a model's builds to take and what
+    defaults to start the engine with.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise DefinitionError(f"{where}.install must be a table")
+    for key in raw:
+        if key not in INSTALL_KEYS:
+            raise DefinitionError(f"{where}.install has unknown key {key!r}")
+    variant = _text(raw, "variant", f"{where}.install")
+    if not BARE.fullmatch(variant):
+        raise DefinitionError(
+            f"{where}.install.variant must be a bare word naming one build of this model"
+        )
+    lock = raw.get("lock", WEIGHTS_LOCK)
+    if not isinstance(lock, str) or "/" in lock or ".." in lock or not lock.endswith(".json"):
+        raise DefinitionError(
+            f"{where}.install.lock must name a .json file inside the model directory, not a path"
+        )
+    sampling = raw.get("sampling", {})
+    if not isinstance(sampling, dict):
+        raise DefinitionError(f"{where}.install.sampling must be a table")
+    for key in sampling:
+        if key not in SAMPLING_KEYS:
+            raise DefinitionError(f"{where}.install.sampling has unknown key {key!r}")
+    numbers: dict[str, float] = {}
+    for key, value in sampling.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise DefinitionError(f"{where}.install.sampling.{key} must be a non-negative number")
+        numbers[key] = float(value)
+    # An engine serves one model per process, so two local models on one host need two
+    # listeners. The port replaces only the port of the provider's origin, which leaves
+    # ``base_url_env`` free to move the host for every model at once.
+    port = _optional_int(raw, "port", f"{where}.install")
+    if port and not 1 <= port <= 65535:
+        raise DefinitionError(f"{where}.install.port must be a usable TCP port")
+    return {"variant": variant, "lock": str(lock), "sampling": numbers, "port": port}
+
+
+def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
+    where = f"models/{provider_id}/{model_id}"
     document = _load_toml(path / "model.toml", "model")
     known = {
         "schema_version",
@@ -439,6 +671,8 @@ def _parse_model(model_id: str, path: Path) -> dict[str, Any]:
         "capabilities",
         "support_efforts",
         "default_effort",
+        "requires",
+        "install",
     }
     for key in document:
         if key not in known:
@@ -448,6 +682,11 @@ def _parse_model(model_id: str, path: Path) -> dict[str, Any]:
     provider = _text(document, "provider", where)
     if not ID.fullmatch(provider):
         raise DefinitionError(f"{where}.provider must be a lowercase provider identifier")
+    if provider != provider_id:
+        raise DefinitionError(
+            f"{where}.provider is {provider!r} but its directory says {provider_id!r}; the "
+            "directory is what retires a model together with its provider, so the two must agree"
+        )
     model_name = _text(document, "model", where)
     slug = _text(document, "slug", where)
     if not SLUG.fullmatch(slug):
@@ -484,8 +723,23 @@ def _parse_model(model_id: str, path: Path) -> dict[str, Any]:
     if advertised is None:
         advertised = max(lane["context_tokens"] for lane in lanes.values())
 
+    requires = _parse_requires(document.get("requires"), where)
+    install = _parse_install(document.get("install"), where)
+    lock_path = path / (install["lock"] if install else WEIGHTS_LOCK)
+    if install is not None and not lock_path.is_file():
+        raise DefinitionError(
+            f"{where}.install names {lock_path.name}, which the model directory does not contain; "
+            "a model with weights to install must also ship the lock that pins them, or ./start.sh "
+            "would offer a row whose download cannot be verified"
+        )
     return {
-        "id": model_id,
+        # The qualified pair is the identifier, because it is the identity: two providers can
+        # serve one model name, and a selection document that stored only the model half would
+        # not say which serving was chosen. The directory keeps its short name (`name`), and every
+        # path in an error message is the `where` below.
+        "id": f"{provider_id}/{model_id}",
+        "name": model_id,
+        "where": where,
         "path": path,
         "label": label,
         "provider": provider,
@@ -498,6 +752,10 @@ def _parse_model(model_id: str, path: Path) -> dict[str, Any]:
         "capabilities": _string_list(document, "capabilities", where),
         "support_efforts": _string_list(document, "support_efforts", where),
         "default_effort": document.get("default_effort", ""),
+        "requires": requires,
+        "install": install,
+        "weights_dir": path / WEIGHTS_DIR,
+        "lock_path": lock_path,
     }
 
 

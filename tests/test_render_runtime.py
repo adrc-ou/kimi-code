@@ -141,13 +141,20 @@ class RenderRuntimeTests(LaunchSteps, unittest.TestCase):
 
     @staticmethod
     def any_primary_model() -> str:
-        """The id of some shipped model that declares both a primary and a long lane."""
-        import definitions
+        """The id of some shipped model this host could launch on both agent lanes.
 
-        _, model_list = definitions.load_definitions(ROOT)
+        Filtered the way the launcher filters, because the fixture hands the result to
+        ``HARNESS_PRIMARY_MODEL`` and a row the panel would never show is refused, not defaulted.
+        A local model is a perfectly good answer here - on the machine that can serve it.
+        """
+        import definitions
+        import host_caps
+
+        providers, model_list = definitions.load_definitions(ROOT)
+        _, usable = host_caps.filter_definitions(providers, model_list, host_caps.caps())
         return next(
             model["id"]
-            for model in model_list
+            for model in usable
             if "primary" in model["lanes"] and "long" in model["lanes"]
         )
 

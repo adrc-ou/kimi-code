@@ -40,6 +40,33 @@ MAX_LABEL_FIELD = 34
 #: Blank cells between the label column and the hint column.
 HINT_GAP = 3
 
+#: Blank cells between two columns of a table. Narrower than :data:`HINT_GAP` because a table has
+#: more seams to pay for, and the whole point of one is to be read across.
+COLUMN_GAP = 2
+
+#: ``(x) `` ahead of every row, table or not.
+MARKER_FIELD = 4
+
+#: A column is not allowed to eat the window: past this its content is clipped and the row is
+#: better read from the status line under the list.
+MAX_COLUMN_FIELD = 28
+
+#: The narrowest a table's first column may be squeezed before the table gives up and falls back
+#: to the two-column form. Below this the name is not a name any more.
+MIN_LABEL_COLUMN = 12
+
+
+@dataclass(frozen=True)
+class Column:
+    """One table column's header.
+
+    Only the header needs saying: width comes from the widest cell the list actually holds, and
+    the columns without a header are the ones whose content is already a whole phrase (``Ready``,
+    ``(last used)``), where a label above would repeat what the row says.
+    """
+
+    header: str = ""
+
 
 @dataclass(frozen=True)
 class Choice:
@@ -61,6 +88,10 @@ class Choice:
     enabled: bool = True
     #: The declared default, which ``previous`` overrides, which ``initial`` overrides.
     checked: bool = False
+    #: One string per :class:`Column`, when the step was given a table to render in. ``label`` and
+    #: ``hint`` stay filled beside them: they are what the row falls back to when the window is too
+    #: narrow for the grid, and a reader with a 60-column terminal deserves the same facts.
+    cells: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -101,11 +132,17 @@ class ListStep(Step):
         head: Sequence[str] = (),
         previous: Sequence[str] = (),
         initial: Sequence[str] | None = None,
+        columns: Sequence[Column] = (),
     ) -> None:
         """
         ``prompt`` is the heading above the list and ``title`` is the frame's top-left label and the
         window title; they are separate because "Modules" and "Choose which modules to load" are
         both useful and neither repeats the other.
+
+        ``columns`` turns the list into a table: one header per entry in :attr:`Choice.cells`, and
+        every row that leaves ``cells`` empty is still drawn the old way. A table is what a list of
+        models needs, because the same model name appears once per provider and once per window and
+        only a column can say which is which without reusing the name as a sentence.
 
         The opening selection is ``initial`` when given, otherwise whatever ``previous`` names,
         otherwise the rows that declare ``checked`` — an answer the user is revisiting beats last
@@ -119,7 +156,13 @@ class ListStep(Step):
         self.mode = mode
         self.prompt = prompt
         self.head = tuple(head)
+        self.columns = tuple(columns)
         self._opening = self._resolve(previous, initial)
+
+    @property
+    def table(self) -> bool:
+        """Whether this step was given columns at all, which is not the same as rows using them."""
+        return bool(self.columns)
 
     # -- opening ---------------------------------------------------------------------------
 
@@ -207,6 +250,53 @@ class ListStep(Step):
         widest = max((self.cells(choice.label) for choice in self.choices), default=0)
         return min(widest, MAX_LABEL_FIELD)
 
+    def _column_widths(self) -> list[int] | None:
+        """One width per column, or ``None`` when the window cannot hold the grid.
+
+        Each column is as wide as its widest cell or its own header, capped at
+        :data:`MAX_COLUMN_FIELD`. When that total overshoots the room, the first column absorbs
+        it: every other column holds a short fixed vocabulary - ``Ready``, ``Not Installed``, a
+        provider label - where the text *is* the information, while a model name is the one cell
+        that still reads after being cut. If squeezing it below :data:`MIN_LABEL_COLUMN` still
+        does not fit, the answer is ``None`` and the rows go back to label-plus-hint, because a
+        table too narrow to align is a wall of text with extra work taken.
+        """
+        if not self.table:
+            return None
+        widths = []
+        for index, column in enumerate(self.columns):
+            widest = self.cells(column.header)
+            for choice in self.choices:
+                if index < len(choice.cells):
+                    widest = max(widest, self.cells(choice.cells[index]))
+            widths.append(min(MAX_COLUMN_FIELD, widest))
+        total = MARKER_FIELD + sum(widths) + COLUMN_GAP * (len(widths) - 1)
+        if total > self.room:
+            widths[0] = max(MIN_LABEL_COLUMN, widths[0] - (total - self.room))
+            total = MARKER_FIELD + sum(widths) + COLUMN_GAP * (len(widths) - 1)
+            if total > self.room:
+                return None
+        return widths
+
+    def describe(self, choice: Choice) -> str:
+        """One line saying which row this is, without the hint.
+
+        The grid splits a row across columns; anything that reads the row as one string - the
+        status line, the recorded summary - has to re-join them. Doing that from the same cells is
+        what keeps the two able to disagree.
+        """
+        parts = choice.cells if self.table else (choice.label,)
+        return "  ".join(part for part in parts if part)
+
+    def _rendering_table(self) -> bool:
+        """Whether the grid fits the window, which is the same question the rows already answered.
+
+        The status line has to know it too: beside a table, repeating the row's hint underneath
+        would print the provider a second time, while in the narrow fallback that hint is the only
+        place the provider appears at all.
+        """
+        return self._column_widths() is not None
+
     def mark(self, choice: Choice, selected: bool) -> str:
         """The selection glyph — always three cells, so labels stay in one column.
 
@@ -231,8 +321,60 @@ class ListStep(Step):
             out.append(Row.heading(Line(Segment(self.prompt, self.tone("title")))))
             out.append(Row.gap())
         field = self._field()
+        widths = self._column_widths()
+        if widths is not None:
+            out.append(self._header_row(widths))
+            out.extend(
+                self._table_row(choice, choice.id in chosen, widths) for choice in self.choices
+            )
+            return out
         out.extend(self._row(choice, choice.id in chosen, field) for choice in self.choices)
         return out
+
+    def _cell(self, text: str, width: int, attr: str, *, fill: bool) -> Line:
+        """One grid cell: cut to ``width``, and filled out to it unless it is the last column.
+
+        Display width is the engine's own arithmetic (:func:`~.layout.padded`), because a model
+        name with a wide character in it is two columns per glyph and a ``ljust`` would move every
+        header off its column. The last cell is not filled: nothing follows it, and trailing
+        spaces are a difference nobody can see.
+        """
+        if self.caps is None:
+            cut = self.clip(text, width)
+            return Line(Segment(cut.ljust(width) if fill else cut, attr))
+        line = Line(Segment(text, attr))
+        return L.padded(line, width, self.caps) if fill else L.fit(line, width, self.caps)
+
+    def _header_row(self, widths: Sequence[int]) -> Row:
+        """The column labels, over the columns rather than beside them.
+
+        The marker field belongs to the row and not to the header: every body row opens with
+        ``( )``, so an unlabelled lead-in of the same width is what puts ``Model`` over the names.
+        """
+        dim = self.tone("dim")
+        last = len(widths) - 1
+        parts = [Segment(" " * MARKER_FIELD, dim)]
+        for index, column in enumerate(self.columns):
+            if index:
+                parts.append(Segment(" " * COLUMN_GAP, dim))
+            parts.extend(self._cell(column.header, widths[index], dim, fill=index != last).segments)
+        return Row.heading(Line(*parts))
+
+    def _table_row(self, choice: Choice, selected: bool, widths: Sequence[int]) -> Row:
+        """One row of the grid. The marker column is shared with the two-column form on purpose."""
+        dim = self.tone("dim")
+        attr = dim if not choice.enabled else ""
+        last = len(widths) - 1
+        marker = self.tone("active") if selected else ""
+        parts = [Segment(f"{self.mark(choice, selected)} ", marker)]
+        for index, width in enumerate(widths):
+            if index:
+                parts.append(Segment(" " * COLUMN_GAP))
+            text = choice.cells[index] if index < len(choice.cells) else ""
+            parts.extend(self._cell(text, width, attr, fill=index != last).segments)
+        if not choice.enabled:
+            return Row(line=Line(*parts), attr=dim)
+        return Row.item(Line(*parts), choice.id)
 
     def _row(self, choice: Choice, selected: bool, field: int) -> Row:
         dim = self.tone("dim")
@@ -258,9 +400,14 @@ class ListStep(Step):
             option = self.picked(state)
             if option is None:
                 return BLANK
+            # Beside a grid the hint would repeat a column the user is already reading - except on
+            # a row the cursor cannot reach, where the hint is the reason it cannot be reached and
+            # the grid has no column for it.
+            show_hint = not self._rendering_table() or not option.enabled
+            hint = option.hint if show_hint else ""
             return Line(
-                Segment(option.label, self.tone("focus")),
-                Segment(f"  {option.hint}" if option.hint else "", self.tone("dim")),
+                Segment(self.describe(option), self.tone("focus")),
+                Segment(f"  {hint}" if hint else "", self.tone("dim")),
             )
         count = len(state.chosen)
         return Line(
@@ -323,7 +470,7 @@ class ListStep(Step):
             option = self.picked(state)
             if option is None:
                 return Result()
-            return Result(value=option.id, summary=option.label)
+            return Result(value=option.id, summary=self.describe(option))
         labels = {choice.id: choice.label for choice in self.choices}
         value = list(self._in_order(set(state.chosen)))
         return Result(value=value, summary=", ".join(labels.get(id_, id_) for id_ in value))

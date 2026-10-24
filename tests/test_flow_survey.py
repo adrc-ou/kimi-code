@@ -91,7 +91,23 @@ class SurveyTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def catalog(self, models):
-        self.patch(flow_survey, "load_definitions", lambda root: ({}, models))
+        """A provider table derived from the models.
+
+        The survey filters the catalog by what the host can serve and then layers ``.env``
+        endpoint overrides onto what survives, so a fixture provider has to carry the keys those
+        two read. ``requires`` empty means "served from anywhere", which is what a cloud provider
+        declares, and ``policy.resolve`` is stubbed in this class so nothing else is reached.
+        """
+        providers = {
+            model["provider"]: {
+                "id": model["provider"],
+                "requires": [],
+                "base_url": f"https://{model['provider']}.invalid",
+                "base_url_env": "",
+            }
+            for model in models
+        }
+        self.patch(flow_survey, "load_definitions", lambda root: (providers, models))
 
     def shelf(self, modules, *, compatible=True):
         self.patch(flow_survey.module_step, "discover", lambda root: modules)

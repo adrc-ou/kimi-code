@@ -76,7 +76,7 @@ from tools.tui.layout import (  # noqa: E402
     visible_window,
     wrap,
 )
-from tools.tui.menu import MULTI, SINGLE, Choice, ListStep  # noqa: E402
+from tools.tui.menu import MULTI, SINGLE, Choice, Column, ListStep  # noqa: E402
 from tools.tui.term import Terminal, TerminalGone  # noqa: E402
 
 _ENV = ("TERM", "COLORTERM", "NO_COLOR", "TERM_PROGRAM", "LANG", "LC_ALL", "LC_CTYPE", "COLUMNS")
@@ -1400,6 +1400,119 @@ class MenuTests(unittest.TestCase):
     def answer(self, step, keys, **changes):
         modal = self.modal(step, keys=[Key(name) for name in keys] + [Key("Enter")], **changes)
         return modal.run()
+
+    # -- the table -------------------------------------------------------------------------
+
+    #: The model screen's shape: three labelled columns and two whose content is its own label.
+    MODEL_COLUMNS = (
+        Column("Model"),
+        Column("Provider"),
+        Column("Lane"),
+        Column(),
+        Column(),
+    )
+
+    def table(self, **changes):
+        options = changes.pop("options", None) or [
+            Choice(
+                "local",
+                "Qwen3.8-27B",
+                cells=("Qwen3.8-27B", "Local (MPS)", "", "Ready", ""),
+            ),
+            Choice(
+                "remote",
+                "Qwen3.8-Flash-Next - Long (queued, 1M window)",
+                "[NRP] (last used)",
+                cells=(
+                    "Qwen3.8-Flash-Next",
+                    "NRP",
+                    "Long (queued, 1M window)",
+                    "Not Installed",
+                    "(last used)",
+                ),
+            ),
+        ]
+        defaults = {
+            "title": "Main agent model",
+            "prompt": "Choose the Main agent model",
+            "mode": SINGLE,
+            "choices": options,
+            "columns": self.MODEL_COLUMNS,
+        }
+        defaults.update(changes)
+        return ListStep(**defaults)
+
+    @staticmethod
+    def at(line: str, needle: str) -> int:
+        """Which column ``needle`` starts at on ``line`` - the whole of what alignment means."""
+        index = line.find(needle)
+        assert index >= 0, f"{needle!r} is not on {line!r}"
+        return index
+
+    @staticmethod
+    def only(lines: list[str], *needles: str) -> str:
+        matches = [line for line in lines if all(needle in line for needle in needles)]
+        assert len(matches) == 1, f"{needles} matched {matches}"
+        return matches[0]
+
+    #: Wide enough that the grid can keep every column's full text. Below its own width the step
+    #: deliberately gives up on the grid rather than ellipsising a model name, so the table tests
+    #: have to ask for a window a table fits.
+    WIDE = Caps(color=NONE, columns=100, rows=24, probe=False)
+
+    def test_each_header_sits_over_its_own_column(self):
+        lines = self.shown(self.modal(self.table(), caps=self.WIDE)).splitlines()
+        header = self.only(lines, "Model", "Provider", "Lane")
+        local = self.only(lines, "( )", "Qwen3.8-27B")
+        remote = self.only(lines, "( )", "Qwen3.8-Flash-Next", "NRP")
+        self.assertEqual(self.at(header, "Model"), self.at(local, "Qwen3.8-27B"))
+        self.assertEqual(self.at(header, "Model"), self.at(remote, "Qwen3.8-Flash-Next"))
+        self.assertEqual(self.at(header, "Provider"), self.at(local, "Local (MPS)"))
+        self.assertEqual(self.at(header, "Lane"), self.at(remote, "Long (queued"))
+
+    def test_the_two_state_columns_need_no_header(self):
+        """``Ready`` and ``(last used)`` already read as themselves; a label would repeat them."""
+        lines = self.shown(self.modal(self.table(), caps=self.WIDE)).splitlines()
+        header = self.only(lines, "Model", "Provider", "Lane")
+        self.assertNotIn("Ready", header)
+        self.assertNotIn("last used", header)
+        local = self.only(lines, "( )", "Qwen3.8-27B")
+        remote = self.only(lines, "( )", "Qwen3.8-Flash-Next", "NRP")
+        # One column, two rows: the flag that differs is still in the same place as its twin.
+        self.assertEqual(self.at(local, "Ready"), self.at(remote, "Not Installed"))
+        self.assertGreater(self.at(remote, "(last used)"), self.at(remote, "Not Installed"))
+
+    def test_the_status_line_under_a_grid_names_the_row_once(self):
+        text = self.shown(self.modal(self.table(), caps=self.WIDE))
+        # The marked row's provider is already a column; saying it again underneath is two
+        # answers to one question, and they are free to disagree.
+        self.assertEqual(text.count("Local (MPS)"), 2)
+        self.assertNotIn("[NRP]", text)
+
+    def test_a_narrow_window_keeps_every_fact_the_old_row_carried(self):
+        # Room for the two-column shape, not for five aligned columns. The row goes back to
+        # label-plus-hint exactly as it read before the grid existed - including the label's own
+        # clip at MAX_LABEL_FIELD, which is why the provider and the mark ride in the hint: they
+        # are the parts that cannot be truncated without losing the answer.
+        narrow = Caps(color=NONE, columns=72, rows=14, probe=False)
+        text = self.shown(self.modal(self.table(), caps=narrow))
+        self.assertNotIn("Provider", text)
+        self.assertNotIn("\n  Model", text)
+        self.assertIn("[NRP] (last used)", text)
+        self.assertIn("Qwen3.8-Flash-Next - Long (queued,", text)
+
+    def test_a_row_the_cursor_cannot_reach_is_marked_as_such(self):
+        blocked = Choice(
+            "off",
+            "Blocked",
+            "not offered here",
+            enabled=False,
+            cells=("Blocked", "NRP", "", "Ready", ""),
+        )
+        lines = self.shown(
+            self.modal(self.table(options=[blocked]), caps=self.WIDE)
+        ).splitlines()
+        self.assertIn("(-)", self.only(lines, "Blocked"))
 
     # -- what opens ------------------------------------------------------------------------
 

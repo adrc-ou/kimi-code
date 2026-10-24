@@ -55,7 +55,7 @@ artifacts owned by root.
 1. Copy `.env.example` to `.env`.
 2. Set an API key for each model you intend to use. The variable names come
    from the definitions, not from a list in this README: each
-   `models/<id>/model.toml` names the `.env` variable holding a key for that
+   `models/<provider>/<id>/model.toml` names the `.env` variable holding a key for that
    model alone in `key_env`, and the provider-scoped key it falls back to in
    `credential`, whose `[[credential]]` table in `providers/*/provider.toml`
    names its own variable and, in `key_url`, where to obtain the key. A
@@ -80,9 +80,9 @@ you are migrating an older `.env`, the launcher prints what it ignored:
 
 | Old variable | Now |
 | --- | --- |
-| `LITELLM_API_KEY` | a model `key_env` in `models/<id>/model.toml`, or `NRP_API_KEY` (named by `providers/nrp/provider.toml`) as the provider-wide fallback |
+| `LITELLM_API_KEY` | a model `key_env` in `models/<provider>/<id>/model.toml`, or `NRP_API_KEY` (named by `providers/nrp/provider.toml`) as the provider-wide fallback |
 | `LITELLM_UPSTREAM_ORIGIN` | `providers/nrp` `[endpoint].base_url`, optionally overridden by `NRP_BASE_URL` |
-| `LITELLM_MODEL_ID` | `models/<id>` `model = "…"` |
+| `LITELLM_MODEL_ID` | `models/<provider>/<id>` `model = "…"` |
 | `NRP_MODEL_CONTEXT`, `NRP_FAIR_USE_PERCENT`, `NRP_PARALLEL_CONTEXT_BUDGET`, `NRP_MODEL_MAX_CONCURRENCY`, `NRP_OUTPUT_TOKENS_PER_MINUTE`, `NRP_OUTPUT_RATE_HEADROOM_PERCENT` | `[[rule]]` / `[safety]` in the provider, and `[context]` / `[lane.*]` in the model |
 | `NRP_{PRIMARY,LONG,SUBAGENT}_MAX_OUTPUT_TOKENS` | `[lane.*].output_clamp_tokens` |
 | `KIMI_SUBAGENT_CONCURRENCY` | derived from the plan; see "Resolved policy enforcement" |
@@ -272,6 +272,65 @@ digests the checkout and workspace paths, so a clone that has moved leaves a
 directory nothing later ever names. The private cache salt is the
 deliberate exception: it persists so cached responses remain isolated across
 restarts, and it is never a provider credential.
+
+## Models that run on your own machine
+
+`providers/local_mps` serves models from the Mac running the launcher, and it
+appears in `./start.sh` only on an arm64 Mac: the launcher measures the host
+before it asks you anything, prints one line about it, and drops any provider
+whose `requires` the machine cannot satisfy — taking its models with it. On any
+other host the picker says nothing about local models, because a thing you cannot
+run is not a choice.
+
+The two model questions are a table. The columns are Model, Provider, Lane, then
+`Ready` or `Not Installed` and the `(last used)` mark, neither of which needs a
+header; the keys are the same as they were. Provider is a column because one
+model name can now be served two ways — `Qwen3.8-Flash-Next` from NRP is a
+1M-token window metered against published fair-use terms, and the same model from
+`Local (MPS)` is 111 GB of weights on your memory. Pick either; they are separate
+definitions under `models/<provider>/`.
+
+**`Not Installed` is a selectable answer.** Choosing it proceeds with the launch
+and the download happens afterwards, in the background, so nothing you are asked
+at startup waits on a transfer; the lane goes live mid-session when the bytes
+finish. Progress and any failure reason go to
+`.local/runtime/<instance>/local-model.log`, which outlives the launch on purpose
+so a download that died at 90% can still be read about afterwards. What makes a
+model ready is not that the files exist but that
+their SHA-256s matched: every local model pins one Hugging Face commit and one
+digest per file in `weights.lock.json`, and nothing unverified is ever recorded.
+Weights land in `models/<provider>/<id>/weights/`, which git and the build context
+both ignore, and re-running the installer verifies bytes you copied in by hand
+without re-downloading them. `HF_TOKEN` in `.env` is what unlocks a gated
+repository; it goes only to `huggingface.co`, never to a mirror, and never into a
+container.
+
+**The two models this ships with, and what they need.** `Qwen3.8-27B` is a dense
+27B at a 17.6 GB 4-bit build, gated at **32 GiB** of unified memory — one notch
+above the publisher's own 24 GiB floor, because this harness's container VM takes
+its memory out of the same pool. `Qwen3.8-Flash-Next` is a 125B MoE with a 51B
+n-gram embedding table; its smallest published build is 72.5 GB, so this one is
+gated at **160 GiB** and a 32 GB Mac cannot run it at any quantisation. Both gates
+come from the pinned arithmetic rather than from a machine, and both models are
+sized (windows, concurrency) for the smallest host that clears them: 27B allows
+two concurrent requests, Flash-Next one, and subagent fan-out falls out of those
+numbers automatically.
+
+**Why the server is a host process.** No container in this stack can address
+Apple silicon's unified memory, so `llama-server` runs beside Docker and the proxy
+reaches it over `host.docker.internal` — the same arrangement the ComfyUI MPS
+backend uses. That means the listener is reachable from the machine's network, not
+just from the VM, and what makes that safe is a token the launcher generates per
+session: the same value is handed to the engine and mounted into the proxy, so
+there is nothing for you to configure and nothing that outlives the run. Set
+`LOCAL_MPS_BIND` to pin it to one interface. The engine binary itself is pinned by
+digest in `dependencies.lock.json`; `LOCAL_MPS_LLAMA_SERVER` points the harness at
+a build of your own instead.
+
+`python3 tools/local_llm.py status` prints what the picker saw, and
+`docs/models-providers.md` ("Local serving") is the contract behind all of it.
+Nothing here changes the request path: local lanes still go through `model-proxy`,
+so prompt logging, lane policy and the drift check apply to them unchanged.
 
 ## Resolved policy enforcement
 

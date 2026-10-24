@@ -1,0 +1,87 @@
+# Model definition: Qwen3.8-Flash-Next, served from this machine.
+#
+# The same model name as models/nrp/qwen3_8_flash_next, and a different definition, because the
+# two are not the same offer: the gateway serves a 1M-token window it meters against published
+# fair-use terms, and this one serves a slice of the checkpoint's 262K native window out of the
+# operator's own memory. Both facts are about the serving, so both live here rather than in one
+# file with a provider-switching flag.
+
+schema_version = 1
+
+label = "Qwen3.8-Flash-Next"
+provider = "local_mps"
+model = "Qwen3.8-Flash-Next"
+
+# Kimi aliases: qwen3m-primary, qwen3m-long, qwen3m-subagent. Distinct from the NRP definition's
+# `qwen3` stem - aliases are the one place two servings of one model have to stay addressable.
+slug = "qwen3m"
+
+credential = "default"
+
+# See the note on the 27B definition: the checkpoint is multimodal, the projection file is not
+# fetched, so image_in is not claimed. Thinking is the model's own default mode and `xhigh` is
+# what the harness asks for on the agent lanes.
+capabilities = ["thinking", "tool_use"]
+support_efforts = ["low", "medium", "xhigh"]
+default_effort = "xhigh"
+
+[context]
+advertised_tokens = 262144
+
+# ------------------------------------------------------------
+# What this machine has to be
+#
+# 111,334,654,784 bytes of quantised weights = 103.7 GiB, and that is the *floor* of this model:
+# its smallest published build (UD-IQ1_S) is 72.5 GB, and Unsloth's own requirement is "at least
+# 75 GB of RAM or unified memory". This definition pins UD-Q4_K_XL because a coding agent should
+# not get the build that only just fits, and because the n-gram (PLE) layers quantise poorly -
+# they are randomly accessed lookup tables, not weights.
+#
+# The gate is set from the arithmetic, not from a machine: 103.7 GiB of resident weights, the
+# macOS Metal working-set ceiling (about three quarters of unified memory, so ~192 GiB on a 256
+# GiB host), KV cache for the widest lane, and the Docker Desktop VM that shares the same pool.
+# 160 GiB clears it on a 256 GiB Ultra and refuses everything below. No Apple silicon Mac under
+# 96 GiB can run this model at any quantisation, so no lowering of this number reaches one.
+[requires]
+memory_gib = 160
+disk_gib = 130
+
+# ------------------------------------------------------------
+# Lanes, sized against the smallest host this is offered on (160 GiB).
+#
+# Flash-Next is a 125B MoE with 6B active parameters, so tokens come out fast enough for the
+# narrow lane to be worth having; what it cannot do is hold many sequences at once, which is why
+# the provider caps this model at one concurrent request and why the subagent lane is generous
+# rather than numerous.
+[lane.primary]
+context_tokens = 65536
+input_tokens = 49152
+output_clamp_tokens = 16384
+
+# The wide lane exists here because this model is offered on hosts that can hold a second
+# resident sequence, and 131,072 of KV is affordable on 160 GiB. It is a fifth of the native
+# window and less than an eighth of what the cloud definition of the same model advertises - the
+# honest cost of the operator's own memory being the only pool.
+[lane.long]
+context_tokens = 131072
+input_tokens = 114688
+output_clamp_tokens = 16384
+
+[lane.subagent]
+context_tokens = 32768
+input_tokens = 24576
+output_clamp_tokens = 8192
+default_effort = "low"
+
+[install]
+variant = "UD-Q4_K_XL"
+lock = "weights.lock.json"
+# The second local engine on the same host. One process per model, so one port each; the host
+# part of the URL still comes from providers/local_mps and LOCAL_MPS_BASE_URL.
+port = 8182
+
+[install.sampling]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0

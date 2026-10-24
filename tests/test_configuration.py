@@ -1,5 +1,6 @@
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ for _directory in (ROOT, ROOT / "tools"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
+import models as model_setup  # noqa: E402
 from tests.helpers import shipped_plan, tracked_files  # noqa: E402
 
 
@@ -143,6 +145,16 @@ class ConfigurationTests(unittest.TestCase):
         self.assertTrue(
             all(re.fullmatch(r"[0-9a-f]{40}", value) for value in lock["sources"].values())
         )
+        # A host binary is the one dependency class no container build fetches, so it is pinned
+        # by digest here or it is not pinned anywhere. Same rule, checked in the same words.
+        for name, entry in lock.get("downloads", {}).items():
+            with self.subTest(download=name):
+                self.assertRegex(entry["digest"], r"^sha256:[0-9a-f]{64}$")
+                self.assertIn(entry["version"], entry["url"])
+                self.assertTrue(
+                    entry["url"].startswith(("https://github.com/", "https://huggingface.co/")),
+                    f"{name} is not fetched from an official upstream host",
+                )
 
     def test_prompts_ask_for_models_before_the_kimi_version(self):
         # Every downstream number - lane sizes, fan-out, the proxy plan - is derived from
@@ -339,11 +351,19 @@ class NoHardcodedModelFactsTests(unittest.TestCase):
         ]
         self.assertEqual(
             assignments,
-            ["NRP_BASE_URL"],
+            # Endpoint overrides only. A second provider adds its own; a key or a token name
+            # belongs to no section of this file, because which ones exist is a fact about the
+            # definitions the operator installed.
+            ["NRP_BASE_URL", "LOCAL_MPS_BASE_URL"],
             "the credentials section may declare an endpoint override but never a key variable",
         )
         self.assertNotIn("_API_KEY", section)
-        for needle in ("key_env", "[[credential]]", "models/<id>/model.toml", "providers/<id>"):
+        for needle in (
+            "key_env",
+            "[[credential]]",
+            "models/<provider>/<id>/model.toml",
+            "providers/<id>",
+        ):
             self.assertIn(needle, section, "the two key scopes are no longer described")
         self.assertIn("grep", section, "the template no longer says how to find the names")
 
@@ -401,12 +421,28 @@ class NoHardcodedModelFactsTests(unittest.TestCase):
         self.assertNotIn("workspace `AGENTS.md`", text)
 
     def test_bootstrap_declares_every_name_the_definitions_read(self):
-        plan = shipped_plan()
-        if str(ROOT / "tools") not in sys.path:
-            sys.path.insert(0, str(ROOT / "tools"))
-        import models as model_setup
+        """Every name in the tree, not only the ones this host happened to select.
 
-        for name in model_setup.bootstrap_names(plan):
+        Reading the resolved plan would make this host-dependent: ``LOCAL_MPS_API_KEY`` is in a
+        plan on a Mac and absent everywhere else, so a missing declaration would pass here and
+        fail the one launch that needed it - which is exactly the failure mode the declaration
+        file exists to prevent. The model-scoped ``key_env`` names are collected the same way,
+        because Compose drops a variable it never declared and the model then silently falls back
+        to the provider key.
+        """
+        names = set(model_setup.HARNESS_BOOTSTRAP_NAMES)
+        for path in sorted((ROOT / "providers").iterdir()):
+            manifest = path / "provider.toml"
+            if not manifest.is_file():
+                continue
+            text = manifest.read_text(encoding="utf-8")
+            names.update(re.findall(r'^env = "(.+)"$', text, re.MULTILINE))
+            names.update(re.findall(r'^base_url_env = "(.+)"$', text, re.MULTILINE))
+        for manifest in sorted((ROOT / "models").glob("*/*/model.toml")):
+            text = manifest.read_text(encoding="utf-8")
+            names.update(re.findall(r'^key_env = "(.+)"$', text, re.MULTILINE))
+        self.assertTrue(names, "no definition reads a variable, which is not a pass")
+        for name in sorted(names):
             self.assertIn(f"{name}:", BOOTSTRAP_SOURCE)
 
     def test_compose_declares_no_provider_credential(self):
@@ -423,6 +459,75 @@ class NoHardcodedModelFactsTests(unittest.TestCase):
                     COMPOSE_SOURCE,
                     f"compose.yaml interpolates {credential} directly; the fragment should own it",
                 )
+
+
+class WeightTreeTests(unittest.TestCase):
+    """Downloaded weights must be invisible to git and to any build context.
+
+    The harness downloads hundreds of gigabytes into the definition that pins it, inside a
+    checkout the operator commits from. One missing pattern would make ``git status`` unreadable
+    and a ``git add -A`` catastrophic, so both halves are checked: the weights tree is ignored,
+    and the lock that describes it is not.
+    """
+
+    MODEL = "models/local_mps/qwen3_8_27b"
+
+    def check_ignore(self, path: str) -> bool:
+        return (
+            subprocess.run(
+                ["git", "-C", str(ROOT), "check-ignore", "-q", path], check=False
+            ).returncode
+            == 0
+        )
+
+    def test_weights_are_ignored(self):
+        for path in (
+            f"{self.MODEL}/weights/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+            f"{self.MODEL}/weights/UD-Q4_K_XL/nested-shard-00002-of-00004.gguf",
+            f"{self.MODEL}/weights/install.json",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(self.check_ignore(path))
+
+    def test_the_lock_that_pins_them_is_not_ignored(self):
+        # A rule broad enough to swallow weights.lock.json would hide the one tracked artifact
+        # that makes the download verifiable - and it would do so silently, on every machine.
+        for path in (f"{self.MODEL}/model.toml", f"{self.MODEL}/weights.lock.json"):
+            with self.subTest(path=path):
+                self.assertFalse(self.check_ignore(path))
+
+    def test_an_appearing_weight_tree_leaves_git_status_silent(self):
+        weights = ROOT / self.MODEL / "weights"
+        weights.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(shutil.rmtree, weights, ignore_errors=True)
+        (weights / "probe.gguf").write_bytes(b"\0" * 1024)
+        status = subprocess.run(
+            [
+                "git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=all",
+                "--", str(weights),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout, "", "git flagged downloaded weights")
+
+    def test_only_definitions_and_locks_are_tracked_under_models(self):
+        tracked = [
+            path
+            for path in (item.relative_to(ROOT) for item in tracked_files())
+            if path.parts[0] == "models"
+        ]
+        self.assertTrue(tracked, "nothing is tracked under models/, which is not a pass")
+        for path in tracked:
+            with self.subTest(path=str(path)):
+                self.assertIn(path.suffix, {".toml", ".json"})
+                self.assertIn(path.name, {"model.toml", "weights.lock.json"})
+
+    def test_dockerignore_excludes_the_same_tree(self):
+        dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+        self.assertIn("/models/*/*/weights/", dockerignore)
+        self.assertIn("/models/*/*/weights/", (ROOT / ".gitignore").read_text(encoding="utf-8"))
 
 
 class ResolvedEnvelopeTests(unittest.TestCase):
@@ -758,7 +863,7 @@ class CountRulePrecedenceTests(unittest.TestCase):
     figure the provider never stated for that model.
     """
 
-    def resolve(self, rules: str, primary: str = "listed", subagent: str = "listed"):
+    def resolve(self, rules: str, primary: str = "counts/listed", subagent: str = "counts/listed"):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             provider = root / "providers" / "counts"
@@ -768,7 +873,9 @@ class CountRulePrecedenceTests(unittest.TestCase):
                 ("listed", "Listed Model", "listed"),
                 ("unlisted", "Unlisted Model", "unlisted"),
             ):
-                model = root / "models" / directory
+                # Filed under the provider's own id: models nest by provider, and the directory
+                # name that remains free is the model id these tests select by.
+                model = root / "models" / "counts" / directory
                 model.mkdir(parents=True)
                 (model / "model.toml").write_text(count_model(wire_name, slug))
             if str(ROOT / "tools") not in sys.path:
@@ -799,7 +906,7 @@ class CountRulePrecedenceTests(unittest.TestCase):
     def test_a_default_applies_only_where_nothing_specific_does(self):
         # One selection, two models: the listed one keeps 16, the unlisted one falls back to 2,
         # so the fallback cannot leak across the table the provider actually published.
-        plan = self.resolve(rule_table(AGGREGATE, LISTED, FALLBACK), subagent="unlisted")
+        plan = self.resolve(rule_table(AGGREGATE, LISTED, FALLBACK), subagent="counts/unlisted")
         by_subject = {c["subject"]: c for c in self.counters(plan, "context")}
         self.assertEqual(by_subject["Listed Model"]["max"], 16)
         self.assertEqual(by_subject["Unlisted Model"]["max"], 2)
@@ -827,7 +934,7 @@ class CountRulePrecedenceTests(unittest.TestCase):
     def test_a_fallback_survives_a_provider_that_publishes_no_context_rule(self):
         # With no aggregate rule there is no context counter to fold a ceiling into, and the
         # fallback would vanish -- leaving an untranscribed model entirely unbounded.
-        plan = self.resolve(rule_table(LISTED, FALLBACK), subagent="unlisted")
+        plan = self.resolve(rule_table(LISTED, FALLBACK), subagent="counts/unlisted")
         self.assertEqual(self.counters(plan, "context"), [])
         by_subject = {c["subject"]: c for c in self.counters(plan, "count")}
         self.assertEqual(by_subject["Unlisted Model"]["max"], 2)
