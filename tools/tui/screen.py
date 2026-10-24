@@ -28,15 +28,18 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
 import sys
 
 if __package__ in (None, ""):  # pragma: no cover - launched as a script, not imported
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+    from tui import busy
     from tui.cells import ALT_OFF, ALT_ON, CLEAR, HIDE_CURSOR, RESET, SHOW_CURSOR
 else:
     # Imported as ``tools.tui.screen`` by the surfaces that ask whether the screen is held, where
     # the repository root -- not ``tools/`` -- is what sits on the path.
+    from . import busy
     from .cells import ALT_OFF, ALT_ON, CLEAR, HIDE_CURSOR, RESET, SHOW_CURSOR
 
 #: The environment variable a launcher sets for the children that share its borrowed screen.
@@ -46,8 +49,8 @@ HELD = "HARNESS_TUI_SCREEN"
 #: The value that means "the screen is already borrowed; do not hand it back".
 HELD_VALUE = "held"
 #: Recorded by ``enter`` so a later ``leave`` knows whether there is anything to give back.
-#: Deliberately inside the instance runtime directory, which the launcher deletes wholesale.
-CLAIM = "screen-claim"
+#: Session material inside the instance runtime directory, cleared by the launcher's sweeper.
+CLAIM = busy.CLAIM
 #: Sentences said while the window belongs to the modal, kept for the launcher to read out when it
 #: hands the window back. Same directory and same reasoning as :data:`CLAIM`.
 NOTES = "launch-notes.log"
@@ -108,8 +111,8 @@ def _claim(runtime_dir: str, on: bool) -> None:
         return
     try:
         if on:
-            with open(claim_path(runtime_dir), "w", encoding="ascii"):
-                pass
+            with open(claim_path(runtime_dir), "w", encoding="ascii") as source:
+                source.write(secrets.token_hex(16))
         else:
             os.unlink(claim_path(runtime_dir))
     except OSError:
@@ -119,8 +122,9 @@ def _claim(runtime_dir: str, on: bool) -> None:
 def main(argv: list[str] | None = None) -> int:
     """Borrow the alternate screen, or hand it back."""
     parser = argparse.ArgumentParser(prog="screen.py", description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("enter", "leave", "held"))
+    parser.add_argument("command", choices=("enter", "leave", "held", "animate"))
     parser.add_argument("--runtime-dir", default="")
+    parser.add_argument("--owner-pid", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     if args.command == "held":
@@ -134,8 +138,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.command == "enter":
-        _write(ALT_ON + CLEAR + HIDE_CURSOR)
-        _claim(args.runtime_dir, True)
+        with busy.rendering(args.runtime_dir):
+            busy.cancel(args.runtime_dir)
+            _write(ALT_ON + CLEAR + HIDE_CURSOR)
+            _claim(args.runtime_dir, True)
+        return 0
+
+    if args.command == "animate":
+        busy.animate(args.runtime_dir, sys.stdout, args.owner_pid)
         return 0
 
     if not _claimed(args.runtime_dir):
@@ -143,8 +153,10 @@ def main(argv: list[str] | None = None) -> int:
         # ALT_OFF blindly would be harmless here and wrong for one case: a launch that never
         # entered the alternate screen but is exiting through the same trap.
         return 0
-    _claim(args.runtime_dir, False)
-    _write(RESET + ALT_OFF + SHOW_CURSOR)
+    with busy.rendering(args.runtime_dir):
+        busy.cancel(args.runtime_dir)
+        _claim(args.runtime_dir, False)
+        _write(RESET + ALT_OFF + SHOW_CURSOR)
     return 0
 
 

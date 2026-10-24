@@ -14,6 +14,7 @@ from pathlib import Path
 
 if __package__:
     from .definitions import ENV_VAR, ID
+    from .mcp_compatibility import load_manifest
     from .private_file import write_private_json
     from .safe_workspace_init import UnsafeWorkspace, components, initialize
     from .tui import flow, screen
@@ -22,6 +23,7 @@ if __package__:
     from .tui.menu import Choice, ListStep
 else:
     from definitions import ENV_VAR, ID
+    from mcp_compatibility import load_manifest
     from private_file import write_private_json
     from safe_workspace_init import UnsafeWorkspace, components, initialize
     from tui import flow, screen
@@ -205,6 +207,7 @@ def assemble(root, runtime, modules, workspace):
         shutil.rmtree(target)
     target.mkdir()
     mcp = {"mcpServers": {}}
+    contracts = {}
     for category in ("skills", "agents", "tools"):
         (target / category).mkdir()
     for source in [root / "runtime", *[m["path"] / "runtime" for m in modules]]:
@@ -232,7 +235,14 @@ def assemble(root, runtime, modules, workspace):
             if entries.keys() & mcp["mcpServers"].keys():
                 raise ValueError("Duplicate MCP server names")
             mcp["mcpServers"].update(entries)
+            owned = load_manifest(source / "mcp-contracts.json", entries)
+            if owned.keys() & contracts.keys():
+                raise ValueError("Duplicate MCP contract ownership")
+            contracts.update(owned)
+        elif (source / "mcp-contracts.json").exists():
+            raise ValueError("MCP contracts require an owning mcp.json")
     write_json(target / "mcp.json", mcp)
+    write_json(target / "mcp-contracts.json", {"schema_version": 1, "servers": contracts})
     for module in modules:
         initialize(workspace, module.get("workspace_directories", []))
     if __package__:

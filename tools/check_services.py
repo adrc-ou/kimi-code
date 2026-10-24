@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -23,7 +24,13 @@ from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 
+if __package__:
+    from . import mcp_compatibility as compatibility
+else:
+    import mcp_compatibility as compatibility
+
 CONFIG = Path("/home/agent/.kimi-code/mcp.json")
+CONTRACTS = Path(__file__).resolve().parent.parent / "mcp-contracts.json"
 # One retry, and only for a timeout. See run_probe.
 PROBE_ATTEMPTS = 2
 SMOKE_CALLS = {
@@ -48,6 +55,21 @@ class NeedsSetup(Exception):
 
 class LanguageServerUnavailable(Exception):
     """Serena answered, but none of the language servers behind its symbol tools are running."""
+
+
+class MissingConfiguredTools(Exception):
+    """A server's public tool catalog no longer satisfies the configured allowlist."""
+
+    def __init__(self, names):
+        # Tool names are untrusted server/configuration data; keep diagnostics bounded.
+        self.names = sorted(
+            name if re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) else "<invalid-name>"
+            for name in names
+        )[:20]
+
+
+class SearchUnavailable(Exception):
+    """The authenticated search path answered without usable results."""
 
 
 LANGUAGE_SERVER_STATUS = re.compile(r"^Language server status: (.*)$", re.MULTILINE)
@@ -104,10 +126,26 @@ def classify_error(error):
         if not results:  # an empty group reports no cause, which is a failure, not a setup
             return "FAIL", "MCP transport failed without reporting a cause"
         return next((result for result in results if result[0] == "SETUP"), results[0])
+    if isinstance(error, compatibility.CatalogError):
+        return "FAIL", (
+            "MCP catalog incomplete, malformed or over its limits; compatibility unverified"
+        )
+    if isinstance(error, compatibility.ContractError):
+        return "FAIL", "invalid staged MCP contract; review source contracts and configuration"
     if isinstance(error, LanguageServerUnavailable):
         return "FAIL", (
             "no language server running, so symbol tools are unavailable; check that the image "
             "builds pyright-langserver and that ls_path in runtime/serena-config.yml names it"
+        )
+    if isinstance(error, MissingConfiguredTools):
+        return "FAIL", (
+            "configured tools missing from server catalog: " + ", ".join(error.names)
+            + "; review the MCP allowlist against the server's current tools"
+        )
+    if isinstance(error, SearchUnavailable):
+        return "FAIL", (
+            "authenticated search returned no results; check SearXNG engine errors, "
+            "CAPTCHAs and rate limits"
         )
     if isinstance(error, UnmountedBearerVariable):
         return "SETUP", (
@@ -126,12 +164,46 @@ def classify_error(error):
 def selected_tools(config, tools):
     names = {tool.name for tool in tools}
     allow = config.get("enabledTools")
-    if allow is not None and set(allow) - names:
-        raise ValueError("configured tool allowlist is missing from server")
-    return (names if allow is None else names & set(allow)) - set(config.get("disabledTools", []))
+    if allow is not None and (missing := set(allow) - names):
+        raise MissingConfiguredTools(missing)
+    return compatibility.selected_names(config, names)
 
 
-async def mcp_probe(name, config, full):
+def bounded_http_client(headers=None, timeout=None, auth=None):
+    """Keep a hostile hosted catalog bounded before the SDK buffers or parses JSON/SSE."""
+    import httpx
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    class LimitedStream(httpx.AsyncByteStream):
+        def __init__(self, stream):
+            self.stream = stream
+
+        async def __aiter__(self):
+            size = 0
+            async for chunk in self.stream:
+                size += len(chunk)
+                if size > compatibility.MAX_CATALOG_BYTES:
+                    raise compatibility.CatalogError("MCP response byte limit exceeded")
+                yield chunk
+
+        async def aclose(self):
+            await self.stream.aclose()
+
+    async def limit_response(response):
+        encoding = response.headers.get("Content-Encoding", "identity").lower()
+        length = response.headers.get("Content-Length")
+        if encoding != "identity" or (length and int(length) > compatibility.MAX_CATALOG_BYTES):
+            await response.aclose()
+            raise compatibility.CatalogError("MCP response encoding or byte limit exceeded")
+        response.stream = LimitedStream(response.stream)
+
+    client = create_mcp_http_client(headers=headers, timeout=timeout, auth=auth)
+    client.headers["Accept-Encoding"] = "identity"
+    client.event_hooks["response"].append(limit_response)
+    return client
+
+
+async def mcp_probe(name, config, full, contract=None, evidence=None, compatibility_only=False):
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
     from mcp.client.stdio import stdio_client
@@ -139,6 +211,10 @@ async def mcp_probe(name, config, full):
 
     # Never print server logs, responses, URLs, headers, or exception messages.
     logging.disable(logging.CRITICAL)
+    evidence = evidence if evidence is not None else {}
+    unmounted = unmounted_bearer_variable(config, os.environ)
+    if unmounted:
+        raise UnmountedBearerVariable(unmounted)
     async with AsyncExitStack() as stack:
         if "command" in config:
             errlog = stack.enter_context(open(os.devnull, "w"))
@@ -154,36 +230,41 @@ async def mcp_probe(name, config, full):
             if token:
                 headers["Authorization"] = f"Bearer {token}"
             transport = sse_client if config.get("transport") == "sse" else streamablehttp_client
-            streams = await stack.enter_async_context(transport(config["url"], headers=headers))
+            streams = await stack.enter_async_context(transport(
+                config["url"], headers=headers, httpx_client_factory=bounded_http_client
+            ))
         session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
         await session.initialize()
-        tools = []
+        catalog = compatibility.Catalog()
         cursor = None
-        for _ in range(50):
+        for _ in range(compatibility.MAX_PAGES):
             page = await session.list_tools(cursor=cursor)
-            tools.extend(page.tools)
+            catalog.add_page(page.tools, page.nextCursor)
             cursor = page.nextCursor
             if not cursor:
                 break
         else:
-            raise ValueError("tool catalog pagination exceeded limit")
-        names = selected_tools(config, tools)
+            raise compatibility.CatalogError("tool catalog pagination exceeded limit")
+        observed = catalog.snapshot(config)
+        result = compatibility.compare(config, contract, observed)
+        evidence.update(result["compatibility"])
+        if result["status"] != "PASS":
+            return result
+        names = set(observed["tools"])
         if not names:
             raise ValueError("no usable tools")
         detail = f"MCP initialized; {len(names)} configured tools discovered"
-        # Discovery above is anonymous, so it only proves the server answers. Kimi applies its own
-        # gate when loading the session, and a server it refuses to mount has no tools to report.
-        unmounted = unmounted_bearer_variable(config, os.environ)
-        if unmounted:
-            raise UnmountedBearerVariable(unmounted)
+        detail += "; " + result["detail"]
         # A server that answers its own tool calls is not yet one that can do its job: Chromium
         # has to actually start, and Serena's language servers have to have come up.
-        call = SMOKE_CALLS.get(name) if full or name in {"chrome-devtools", "serena"} else None
+        call = SMOKE_CALLS.get(name) if not compatibility_only and (
+            full or name in {"chrome-devtools", "serena"}
+        ) else None
         if call and call[0] in names:
-            result = await session.call_tool(*call)
-            if result.isError:
+            tool_result = await session.call_tool(*call)
+            if tool_result.isError:
                 if name == "serena" and any(
-                    "No active project" in getattr(item, "text", "") for item in result.content
+                    "No active project" in getattr(item, "text", "") for item in tool_result.content
                 ):
                     raise NeedsSetup("activate a coding project in Serena before symbol tools")
                 raise ValueError("smoke tool returned an error")
@@ -191,19 +272,20 @@ async def mcp_probe(name, config, full):
                 # get_current_config answers normally even when no language server ever started,
                 # and it is the language servers that every symbol tool depends on.
                 detail += "; language server " + serena_language_server(
-                    "\n".join(getattr(item, "text", "") for item in result.content)
+                    "\n".join(getattr(item, "text", "") for item in tool_result.content)
                 )
             if name == "huggingface":
-                records = (result.structuredContent or {}).get("results", [])
+                records = (tool_result.structuredContent or {}).get("results", [])
                 if not records or not all(
                     record.get("status") == "success" and record.get("result", {}).get("exists")
                     for record in records
                 ):
                     raise ValueError("public Hugging Face fixture not found")
             detail += f"; {call[0]} succeeded"
-        elif full:
+        elif full and not compatibility_only:
             detail += "; no automatic tool-call recipe (verify in Kimi)"
-        return detail
+        result["detail"] = detail
+        return result
 
 
 def service_probe(name, full):
@@ -238,8 +320,10 @@ def service_probe(name, full):
         payload = response.read(8 * 1024 * 1024)
     if name == "search" and full:
         if not json.loads(payload).get("search_results"):
-            raise ValueError("search returned no results")
+            raise SearchUnavailable()
         return "authenticated search returned results through SearXNG"
+    if name == "search":
+        return "adapter HTTP ready; search results checked in full mode"
     if name == "model-proxy":
         # A 200 alone would hide a proxy that has stopped enforcing policy.
         report = json.loads(payload)
@@ -271,7 +355,8 @@ def service_probe(name, full):
     return "HTTP ready"
 
 
-def run_probe(kind, name, full, config_path, timeout):
+def run_probe(kind, name, full, config_path, timeout, contracts_path=CONTRACTS,
+              compatibility_only=False):
     """Run one probe in its own process group, retrying once if it never answers.
 
     A timeout is the one result that cannot be told apart from a cold start: while the stack comes
@@ -281,9 +366,18 @@ def run_probe(kind, name, full, config_path, timeout):
     status or an unusable response is reported the moment it speaks.
     """
     command = [sys.executable, str(Path(__file__).resolve()), "--worker", kind,
-               "--name", name, "--config", str(config_path)]
+               "--name", name, "--config", str(config_path), "--contracts", str(contracts_path)]
     if full:
         command.append("--full")
+    if compatibility_only:
+        command.append("--compatibility-only")
+
+    def failure(detail):
+        result = {"status": "FAIL", "detail": detail}
+        if kind == "mcp":
+            result["compatibility"] = {"verdict": "unverified"}
+        return result
+
     for attempt in range(PROBE_ATTEMPTS):
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -292,15 +386,27 @@ def run_probe(kind, name, full, config_path, timeout):
         try:
             output, _ = process.communicate(timeout=timeout)
             if process.returncode:
-                return "FAIL", "probe process failed; see verification guide"
-            status, detail = json.loads(output)
+                return failure("probe process failed; see verification guide")
+            result = json.loads(output)
+            if not isinstance(result, dict) or result.get("status") not in {
+                "PASS", "FAIL", "SETUP"
+            } or not isinstance(result.get("detail"), str):
+                return failure("invalid probe response")
+            if kind == "mcp":
+                finding = result.get("compatibility")
+                if not isinstance(finding, dict) or finding.get("verdict") not in {
+                    "matched", "not_enrolled", "unbaselined", "unverified", "incompatible", "review"
+                } or (result["status"] == "PASS" and finding["verdict"] not in {
+                    "matched", "not_enrolled"
+                }):
+                    return failure("invalid MCP compatibility response")
             if attempt:
-                detail = f"{detail}; retried after a timeout"
-            return status, detail
+                result["detail"] += "; retried after a timeout"
+            return result
         except subprocess.TimeoutExpired:
             continue
         except (ValueError, TypeError):
-            return "FAIL", "invalid probe response"
+            return failure("invalid probe response")
         finally:
             # Also reap browser/language-server descendants left behind by a probe.
             try:
@@ -308,13 +414,15 @@ def run_probe(kind, name, full, config_path, timeout):
             except ProcessLookupError:
                 pass
             process.wait()
-    return "FAIL", (
+            if process.stdout is not None:
+                process.stdout.close()
+    return failure(
         f"timed out after {timeout}s on each of {PROBE_ATTEMPTS} attempts; "
         "check /mcp and service logs"
     )
 
 
-def write_report(path, mode, results, code):
+def write_report(path, mode, results, code, run_id=None, state="complete"):
     """Record what this pass concluded, so the verdict outlives the terminal that printed it.
 
     The launcher copies this file to the host, which is the only way a result stays readable after
@@ -329,6 +437,8 @@ def write_report(path, mode, results, code):
     write_private_json(path, {
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "mode": mode,
+        "run_id": run_id,
+        "state": state,
         "exit_code": code,
         "counts": dict(Counter(result["status"] for result in results)),
         "checks": sorted(results, key=lambda result: (result["kind"], result["name"])),
@@ -339,62 +449,92 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--config", type=Path, default=CONFIG)
+    parser.add_argument("--contracts", type=Path, default=CONTRACTS)
+    parser.add_argument("--compatibility-only", action="store_true",
+                        help="discover MCP interfaces without calling tools or probing services")
+    parser.add_argument("--server", help="check only this configured MCP server")
+    parser.add_argument("--run-id", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--report", type=Path,
                         help="write a machine-readable summary of this pass to PATH")
     parser.add_argument("--worker", choices=("mcp", "service"), help=argparse.SUPPRESS)
     parser.add_argument("--name", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.full and args.compatibility_only:
+        parser.error("--full and --compatibility-only are mutually exclusive")
+    run_id = args.run_id or secrets.token_hex(16)
     if args.worker:
+        evidence = {"verdict": "unverified"}
         try:
             if args.worker == "mcp":
-                config = json.loads(args.config.read_text())["mcpServers"][args.name]
-                detail = asyncio.run(mcp_probe(args.name, config, args.full))
+                servers = json.loads(args.config.read_text())["mcpServers"]
+                contracts = compatibility.load_manifest(args.contracts, servers)
+                result = asyncio.run(mcp_probe(
+                    args.name, servers[args.name], args.full, contracts.get(args.name),
+                    evidence, args.compatibility_only,
+                ))
             else:
                 detail = service_probe(args.name, args.full)
-            result = ("PASS", detail)
+                result = {"status": "PASS", "detail": detail}
         except (Exception, SystemExit) as error:
-            result = classify_error(error)
+            status, detail = classify_error(error)
+            result = {"status": status, "detail": detail}
+            if args.worker == "mcp":
+                result["compatibility"] = evidence
         print(json.dumps(result))
         return 0
 
     config = json.loads(args.config.read_text())["mcpServers"]
-    jobs = [("service", name) for name in (
+    if args.server and args.server not in config:
+        parser.error("--server must name a configured MCP server")
+    mode = "compatibility" if args.compatibility_only else "full" if args.full else "quick"
+    if args.report:
+        write_report(args.report, mode, [], None, run_id, "pending")
+    jobs = [] if args.compatibility_only or args.server else [("service", name) for name in (
         "kimi-web", "model-proxy", "search", "local-tools"
     )]
-    jobs.extend(("service", path.stem.removeprefix("service_"))
-                for path in Path(__file__).parent.glob("service_*.py"))
-    print("Service check (full)" if args.full else "Service check (quick)", flush=True)
+    if not args.compatibility_only and not args.server:
+        jobs.extend(("service", path.stem.removeprefix("service_"))
+                    for path in Path(__file__).parent.glob("service_*.py"))
+    print(f"Service check ({mode})", flush=True)
     manual = False
     results = []
     for name, server in config.items():
+        if args.server and name != args.server:
+            continue
         if not server.get("enabled", True):
             print(f"SKIP  MCP {name}: disabled", flush=True)
             results.append({"kind": "mcp", "name": name, "status": "SKIP",
-                            "detail": "server is disabled"})
+                            "detail": "server is disabled",
+                            "compatibility": {"verdict": "skipped"}})
         elif server.get("auth") == "oauth" or name == "nvidia-cuda-docs":
             print(f"MANUAL MCP {name}: verify OAuth connection in Kimi /mcp", flush=True)
             manual = True
             results.append({"kind": "mcp", "name": name, "status": "MANUAL",
-                            "detail": "OAuth connection is checked in Kimi"})
+                            "detail": "OAuth connection is checked in Kimi",
+                            "compatibility": {"verdict": "manual"}})
         else:
             jobs.append(("mcp", name))
     failed = False
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
         pending = {
-            pool.submit(run_probe, kind, name, args.full, args.config, 60 if args.full else 25):
+            pool.submit(run_probe, kind, name, args.full, args.config, 60 if args.full else 25,
+                        args.contracts, args.compatibility_only):
             (kind, name) for kind, name in jobs
         }
         for future in concurrent.futures.as_completed(pending):
             kind, name = pending[future]
-            status, detail = future.result()
+            result = future.result()
+            status, detail = result["status"], result["detail"]
             failed |= status == "FAIL"
             manual |= status == "SETUP"
-            results.append({"kind": kind, "name": name, "status": status, "detail": detail})
+            results.append({"kind": kind, "name": name, **result})
             print(f"{status:5} {kind} {name}: {detail}", flush=True)
     print("Scope: harness MCP config only; project/plugin tools + model routing need Kimi checks.")
+    print("Compatibility: hosted contracts checked at discovery; local unenrolled servers use "
+          "discovery only; disabled/OAuth servers are not verified. No permission gate.")
     code = 1 if failed else 2 if manual else 0
     if args.report:
-        write_report(args.report, "full" if args.full else "quick", results, code)
+        write_report(args.report, mode, results, code, run_id)
     return code
 
 

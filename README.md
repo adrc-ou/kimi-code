@@ -5,7 +5,8 @@ provider, enforces that provider's usage policy, provides selected MCP servers
 and local SearXNG search. Optional modules add application services and tools.
 
 The core runs on macOS (Intel or Apple Silicon) and Linux/WSL2 (x86-64 or
-arm64), with Docker and Compose. Modules determine their own host compatibility.
+arm64), with Docker Engine 26+ and Compose 5.0.2+ (volume subpaths are required).
+Modules determine their own host compatibility.
 The included [ComfyUI module](modules/comfyui/README.md) supports Apple Silicon
 MPS and Linux/WSL2 NVIDIA CUDA. Intel Macs can run the core without that module.
 
@@ -34,9 +35,14 @@ the background once the stack settles, recording both in
 described below without starting a session, and reports a prompt file you changed
 without restarting.
 
+Startup discovery also checks enabled hosted MCP tools against reviewed core and
+module interface contracts, reporting missing tools or changed schemas without
+rewriting permissions. See [MCP compatibility at startup](docs/mcp-compatibility.md)
+for focused checks and contract updates.
+
 Hosts need:
 
-- Docker with Docker Compose v5.0.2 or newer (Docker Desktop on macOS/Windows);
+- Docker Engine 26+ with Docker Compose v5.0.2 or newer (Docker Desktop on macOS/Windows);
   older releases omit an explicit `create_host_path: false` from their resolved
   configuration, so the launch hygiene gate cannot read it and the launcher
   refuses the launch rather than misreport it;
@@ -102,8 +108,11 @@ raised per question, so the launch printout never shows between steps. Each step
 human label is the top-left line of the window, with a rail under it reading
 `N of M` so you can see how much launch is left — `M` is fixed for the run and
 counts only the screens you will actually be shown, so a skipped step is never
-enumerated and the first screen you see is always step 1. Content scrolls inside
-its own region when it does not fit, and a footer lists the keys that step answers
+enumerated and the first screen you see is always step 1. After confirmation,
+content below the header dims and a spinner beside the progress bar keeps moving
+while the next step prepares. The next screen stops that animation before drawing.
+List label columns use the available terminal width rather than a fixed short cap.
+Content scrolls inside its own region when it does not fit, and a footer lists the keys that step answers
 — in the order that matters when a narrow window makes it drop some.
 ↑/↓ move the focus marker, which is where `Space` lands: it ticks a checkbox row,
 and on a radio list it moves the mark to the row under the cursor. `Enter` continues
@@ -624,8 +633,15 @@ With the stack stopped, inspect and approve the current exact content:
 ./extensions.sh approve
 ```
 
-Approved content is copied to an operator-owned snapshot and mounted read-only
-for the next session. Stop the stack, edit the extension, review it, approve it
+Approved content is copied to an operator-owned snapshot, verified against the approval,
+and streamed through the Docker API into a named volume by a root-only staging container.
+The agent mounts only the approved volume subpaths read-only; no host snapshot paths
+are bind-mounted. The volume is replaced before each launch and cleared after shutdown.
+Missing extension mountpoints
+are reserved as empty directories or an empty MCP file; existing project files are
+preserved, and empty placeholders do not grant approval. The Kimi image version check
+runs without workspace or extension mounts.
+Stop the stack, edit the extension, review it, approve it
 again, and restart. Revoke all approval with `./extensions.sh revoke`.
 
 ## Version and dependency policy
@@ -635,7 +651,13 @@ the Linux asset matching the host CPU architecture, because Kimi
 itself runs in a Linux container. The SHA-256 digest published with the release
 is verified during the image build.
 
-Base images are digest-pinned, the GitHub MCP source is commit-pinned, and npm
+The launcher also sets every container's build/run platform from that host CPU:
+`linux/arm64` on ARM hosts and `linux/amd64` on Intel/AMD hosts. Base images use
+digest-pinned multi-platform indexes, so Docker selects the corresponding native
+image instead of silently running an Intel image under emulation on Apple Silicon.
+CI checks both service image architectures and runs an import smoke check for each.
+
+The GitHub MCP source is commit-pinned, and npm
 browser tooling is installed with `npm ci` from `container/package-lock.json`.
 Core/module dependency locks, module compatibility catalogs, and vulnerability
 exceptions are checked in CI. No third-party source distribution, model, custom
@@ -956,23 +978,17 @@ and `./prompts.sh --show` describes the prompt.
 Bind sources appear verbatim in `/proc/self/mountinfo`, which is world-readable
 and cannot be hidden from the container that owns the mount, and named-volume
 sources appear as `/docker/volumes/<project>_<name>/_data`. The agent therefore
-always learns the exact `WORKSPACE_PATH`, the Compose project name, and, when the
-workspace has approved project extensions, the extension snapshot paths under
-this checkout. Those paths normally sit below your home directory, so your
-account name is included; keep it out of `WORKSPACE_PATH` and the harness
-checkout location if it must stay private.
+always learns the exact `WORKSPACE_PATH` and the Compose project name. The workspace
+path normally sits below your home directory, so your account name is included;
+choose a workspace path without it if it must stay private. Approved extensions
+appear as named-volume subpaths and do not disclose the harness checkout location.
 
 The agent's own durable state is behind named volumes, and so is everything the
 launcher renders: the rendered configuration, the resolved policy plan, and the
 generated secret filenames under `.local/runtime/` reach no container the agent
-can see. One disclosure is structural rather than accidental. An approved
-extension snapshot has to be staged under the instance directory before it can be
-mounted read-only into the workspace, and a bind source is visible to the
-container that owns it, so approving project extensions does publish the harness
-checkout path and the instance directory name into the agent's mount table.
-Nothing else from that directory travels with it — the snapshot holds only the
-approved agents, skills, and MCP declaration — and `tools/compose_hygiene.py`
-refuses every other agent bind, including any bind in any container that contains
+can see. Approved agents, skills and MCP declarations reach their own named volume
+through a stream rather than a host bind. `tools/compose_hygiene.py`
+refuses every agent bind except the workspace, including any bind in any container that contains
 the credential directory rather than sitting inside it, so an overlay cannot
 acquire that view either.
 The prompt archive and the proxy's log directory are two of those instance-directory paths,

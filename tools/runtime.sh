@@ -24,8 +24,14 @@ harness_platform() {
     Linux:aarch64|Linux:arm64) HARNESS_PLATFORM=linux-arm64; HARNESS_KIMI_ASSET=kimi-code-linux-arm64.tar.gz ;;
     *) harness_die "Unsupported host architecture; use macOS or Linux/WSL2 on arm64 or x86-64." || return ;;
   esac
+  # Containers always run Linux, including on macOS. Pin Compose's build and run target to
+  # the same CPU selected for Kimi, rather than inheriting a builder's default architecture.
+  case "${HARNESS_PLATFORM}" in
+    *-arm64) HARNESS_DOCKER_PLATFORM=linux/arm64 ;;
+    *-x86_64) HARNESS_DOCKER_PLATFORM=linux/amd64 ;;
+  esac
   HARNESS_PLATFORM_LABEL=${HARNESS_PLATFORM}
-  export HARNESS_PLATFORM HARNESS_PLATFORM_LABEL HARNESS_KIMI_ASSET
+  export HARNESS_PLATFORM HARNESS_PLATFORM_LABEL HARNESS_KIMI_ASSET HARNESS_DOCKER_PLATFORM
 }
 
 # The directory this checkout works in, from whatever was asked of it.
@@ -157,9 +163,11 @@ harness_instance() {
 # selection. Deleting any of those at launch is the inverse of the feature.
 HARNESS_SECRET_RESIDUE=(nrp-api-key bridge-token)
 HARNESS_SESSION_RESIDUE=(
+  extension-snapshot extension-snapshot.new extension-snapshot.tar
   proxy-token search-token kimi-config.toml runtime.env session.env module.env
   model-selection.json model-policy.json model.env module-guidance.md
   flow-state.json module-values.json
+  screen-claim screen-wait.json screen-render.lock
   prompt-measure.log service-check.log launch-notes.log
   compose/models.json compose/module-environment.json compose/resolved.json
 )

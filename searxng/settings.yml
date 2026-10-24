@@ -1,4 +1,9 @@
-use_default_settings: true
+# The harness has no Tor proxy. These onion engines cannot initialize without one.
+use_default_settings:
+  engines:
+    remove:
+      - ahmia
+      - torch
 
 general:
   instance_name: "Kimi local search"
@@ -12,4 +17,5 @@ search:
 
 server:
   limiter: false
+  public_instance: false
   image_proxy: false

@@ -1,0 +1,12 @@
+# SearXNG reads this even with server.limiter disabled. Only the authenticated
+# adapter reaches it over the private search-backend network; there is no host port.
+# Trust Docker's private-network proxy and the local health probe, not public peers.
+[botdetection]
+trusted_proxies = [
+  "127.0.0.0/8",
+  "::1/128",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "fc00::/7",
+]

@@ -1,6 +1,5 @@
 """Compose hygiene assertions confine the agent's mounts, ports and credentials."""
 
-import importlib.util
 import io
 import json
 import re
@@ -11,9 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("compose_hygiene", ROOT / "tools/compose_hygiene.py")
-hygiene = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(hygiene)
+from tools import compose_hygiene as hygiene  # noqa: E402
 
 
 def bind(source, target, read_only=True, create_host_path=False):
@@ -91,11 +88,31 @@ class ComposeHygieneTests(unittest.TestCase):
             with self.subTest(check=name):
                 check()
 
-    def test_extension_snapshot_bind_is_allowed(self):
+    def test_extension_snapshot_volume_is_allowed_and_host_binds_are_refused(self):
         snapshot = Path(self.runtime) / "extension-snapshot"
         for relative in (".kimi-code/skills", ".agents/agents", ".kimi-code/mcp.json"):
-            self.agent_volumes().append(bind(snapshot / relative, f"/workspace/{relative}"))
+            self.agent_volumes().append({"type": "volume", "source": "approved-extensions",
+                "target": f"/workspace/{relative}", "read_only": True,
+                "volume": {"nocopy": True, "subpath": relative}})
         self.check_mounts()
+        self.agent_volumes().append(
+            bind(snapshot / ".kimi-code/skills", "/workspace/.kimi-code/skills"))
+        with self.assertRaisesRegex(SystemExit, "exposes host bind"):
+            self.check_mounts()
+
+    def test_extension_volume_cannot_be_writable_or_expose_another_subpath(self):
+        mount = {"type": "volume", "source": "approved-extensions",
+                 "target": "/workspace/.kimi-code/skills", "read_only": True,
+                 "volume": {"nocopy": True, "subpath": ".kimi-code/skills"}}
+        self.agent_volumes().append(mount)
+        for change in ({"read_only": False}, {"volume": {"nocopy": True, "subpath": ".."}},
+                       {"target": "/all-extensions"}, {"source": "other-volume"}):
+            original = mount.copy()
+            mount.update(change)
+            with self.assertRaisesRegex(SystemExit, "unsafe approved extension"):
+                self.check_mounts()
+            mount.clear()
+            mount.update(original)
 
     def test_snapshot_bind_outside_privileged_targets_is_refused(self):
         snapshot = Path(self.runtime) / "extension-snapshot"
@@ -197,7 +214,7 @@ class ComposeHygieneTests(unittest.TestCase):
             with self.subTest(bind=name):
                 services, _, _ = base(self.root)
                 # A sidecar rather than the agent: the agent's own mount guard already refuses any
-                # bind that is not the workspace or an approved snapshot, so only a second service
+                # bind that is not the workspace, so only a second service
                 # can reach this path, and a module overlay is exactly what adds one.
                 services["sidecar"] = {"read_only": True, "volumes": [bind(source, "/run/state")]}
                 with self.assertRaisesRegex(SystemExit, "bind-mounts a credential path"):

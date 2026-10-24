@@ -21,10 +21,15 @@ SPEC.loader.exec_module(ADAPTER)
 
 
 class SearchHandler(BaseHTTPRequestHandler):
+    client_ip = None
+    forwarded_for = None
+
     def log_message(self, _format, *_args):
         return
 
     def do_GET(self):
+        type(self).client_ip = self.headers.get("X-Real-IP")
+        type(self).forwarded_for = self.headers.get("X-Forwarded-For")
         body = json.dumps(
             {
                 "results": [
@@ -139,6 +144,23 @@ class SearchAdapterTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 401)
         finally:
             raised.exception.close()
+
+    def test_upstream_client_ip_comes_from_socket_not_caller_headers(self):
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps({"text_query": "test"}).encode(),
+            headers={
+                "Authorization": "Bearer adapter-test",
+                "Content-Type": "application/json",
+                "X-Real-IP": "203.0.113.7",
+                "X-Forwarded-For": "203.0.113.8",
+            },
+        )
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+            response.read()
+        self.assertEqual(SearchHandler.client_ip, "127.0.0.1")
+        self.assertIsNone(SearchHandler.forwarded_for)
 
 
 class UpstreamStub(BaseHTTPRequestHandler):

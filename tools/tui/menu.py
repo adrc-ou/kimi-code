@@ -33,10 +33,6 @@ MULTI = "multi"
 #: Which one — ``Enter`` chooses the focused row and ends the step.
 SINGLE = "single"
 
-#: Columns of label before the hint column stops being a column. Past this a list is a wall of text
-#: and an aligned hint is worth less than the space it costs.
-MAX_LABEL_FIELD = 34
-
 #: Blank cells between the label column and the hint column.
 HINT_GAP = 3
 
@@ -248,7 +244,11 @@ class ListStep(Step):
         if not any(choice.hint for choice in self.choices):
             return 0
         widest = max((self.cells(choice.label) for choice in self.choices), default=0)
-        return min(widest, MAX_LABEL_FIELD)
+        hint = max((self.cells(choice.hint) for choice in self.choices), default=0)
+        # Fit real labels before padding the hint column. On narrow terminals a long hint
+        # gets at most a third of the row, leaving the identifying label useful too.
+        reserve = min(hint, max(0, self.room // 3))
+        return min(widest, max(1, self.room - 4 - HINT_GAP - reserve))
 
     def _column_widths(self) -> list[int] | None:
         """One width per column, or ``None`` when the window cannot hold the grid.

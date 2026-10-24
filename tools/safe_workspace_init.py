@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Prepare a project workspace for a session without following workspace-controlled links.
 
-Nothing harness-owned is created in the project any more. The agent's scratch memory used to live
+No runtime state is kept in the project. The agent's scratch memory used to live
 in ``.agent-state/`` inside the workspace, where it outlived the session that wrote it and cluttered
 a tree that belongs to somebody else; it is now ``/tmp/agent-state`` in the agent container, staged
 by ``tools/register_workspace.py`` and destroyed with the container. What this module still does is
 the two things that genuinely belong to a launch - create the directories a selected module
 declares, and keep harness droppings out of the project's ``git status`` - plus retire the scratch
-directory from workspaces an older revision left it in.
+directory from workspaces an older revision left it in. ``approve_extensions`` separately reserves
+empty extension mountpoints so Docker need not create project paths as root.
 """
 
 from __future__ import annotations

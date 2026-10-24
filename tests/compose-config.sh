@@ -16,6 +16,8 @@ export COMPOSE_DISABLE_ENV_FILE=1
 # shellcheck disable=SC1091
 source "${root}/tools/runtime.sh"
 harness_require_compose_version || exit 1
+harness_platform
+export HARNESS_DOCKER_PLATFORM=${HARNESS_DOCKER_PLATFORM:?harness_platform must select a target}
 export SEARXNG_SECRET=compose-fixture-only
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/kimi compose.XXXXXX")
 test_project="kimi-cache-test-$(basename "${fixture}" | tr '[:upper:] .' '[:lower:]--')"
@@ -86,20 +88,21 @@ printf '%s\n' \
   "    file: ${fixture}/credentials/nrp__default" >"${fixture}/models.json"
 docker compose "${compose_files[@]}" config --quiet
 
-# Approved project extensions legitimately bind the snapshot the launcher staged for them, so
-# the hygiene assertions below have to cover that generated fragment as well as the checked-in
-# files. The path mirrors what tools/approve_extensions.py actually emits.
-mkdir -p "${fixture}/extension-snapshot/.kimi-code/skills"
-printf '%s\n' \
-  'services:' \
-  '  kimi-agent:' \
-  '    volumes:' \
-  '      - type: bind' \
-  "        source: ${fixture}/extension-snapshot/.kimi-code/skills" \
-  '        target: /workspace/.kimi-code/skills' \
-  '        read_only: true' \
-  '        bind:' \
-  '          create_host_path: false' >"${fixture}/approved.yaml"
+# Both supported CPU families must reach every core service, including one-shot initializers.
+# Resolve only fixture configuration; no build or running stack is involved here.
+for platform in linux/amd64 linux/arm64; do
+  HARNESS_DOCKER_PLATFORM="${platform}" docker compose "${compose_files[@]}" config --format json |
+    python3 -c 'import json, sys
+services = json.load(sys.stdin)["services"]
+for name, service in services.items():
+    assert service["platform"] == sys.argv[1], (name, service["platform"])
+' "${platform}"
+done
+
+# Exercise the actual generated volume-subpath overlay, including its root-only stream receiver.
+python3 "${root}/tools/approve_extensions.py" prepare --workspace "${WORKSPACE_PATH}" \
+  --manifest "${fixture}/approval.json" --state-dir "${fixture}/extension-prepare-state" \
+  --output "${fixture}/approved.yaml"
 
 # Mount, credential and port hygiene of the resolved configuration: the agent container must not
 # be able to read harness or host layout out of its own mount table, a provider credential must
@@ -133,6 +136,79 @@ if [[ "${1:-}" == --runtime ]]; then
     printf 'runtime %s\n' "${label}"
     "$@"
   }
+  extension_test_image=$("${compose[@]}" config --format json |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["searxng"]["image"])')
+  runtime_check "streamed extension volumes work without host snapshot paths" \
+    python3 - "${root}" "${fixture}" "${extension_test_image}" \
+      "${HARNESS_DOCKER_PLATFORM}" "${test_project}" <<'PY'
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from tools.approve_extensions import prepare
+from tools.extension_volume import SERVICE, VOLUME
+
+base, image, platform, project = Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+workspace, state, output = (base / name for name in ("extension-workspace", "extension-state",
+                                                   "extension-approved.yaml"))
+workspace.mkdir()
+(workspace / "project.txt").write_text("preserve")
+probe = '''
+import errno
+from pathlib import Path
+assert Path("/workspace/.kimi-code/agents").is_dir()
+assert Path("/workspace/project.txt").read_text() == "preserve"
+target = Path("/workspace/.kimi-code/mcp.json")
+assert target.read_text() == "{}\\n"
+try:
+    target.write_text("changed")
+except OSError as error:
+    assert error.errno == errno.EROFS
+else:
+    raise AssertionError("extension snapshot was writable")
+'''
+config = base / "extension-volume-test.json"
+compose = ["docker", "compose", "-p", project, "-f", str(config)]
+try:
+    for attempt in range(4):
+        prepare(workspace, base / "extension-approval.json", state, output)
+        fragment = json.loads(output.read_text())
+        receiver = fragment["services"][SERVICE]
+        receiver["image"] = image
+        receiver["entrypoint"][0] = "python"
+        fragment["services"] = {SERVICE: receiver, "extension-test": {
+            "image": image, "platform": platform, "user": "1000:1000", "network_mode": "none",
+            "read_only": True, "cap_drop": ["ALL"], "entrypoint": ["python"],
+            "command": ["-c", probe], "volumes": [
+                {"type": "bind", "source": str(workspace), "target": "/workspace",
+                 "bind": {"create_host_path": False}},
+                *fragment["services"]["kimi-agent"]["volumes"],
+            ],
+        }, "extension-empty-check": {
+            "image": image, "platform": platform, "user": "0:0", "network_mode": "none",
+            "read_only": True, "cap_drop": ["ALL"], "entrypoint": ["python"],
+            "command": ["-c", "from pathlib import Path; assert not list(Path('/extensions').iterdir())"],
+            "volumes": [{"type": "volume", "source": VOLUME, "target": "/extensions",
+                         "read_only": True, "volume": {"nocopy": True}}],
+        }}
+        config.write_text(json.dumps(fragment))
+        with (state / "extension-snapshot.tar").open("rb") as archive:
+            subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", SERVICE],
+                           stdin=archive, check=True)
+        # Delete the host bytes before creating the consumer: no snapshot lookup can succeed.
+        shutil.rmtree(state / "extension-snapshot")
+        (state / "extension-snapshot.tar").unlink()
+        subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", "extension-test"], check=True)
+    subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", SERVICE,
+                    "--gid", "1000", "--clear"], stdin=subprocess.DEVNULL, check=True)
+    subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", "extension-empty-check"], check=True)
+finally:
+    if config.exists():
+        subprocess.run([*compose, "down", "--volumes"], check=True)
+PY
   # Both a fresh cache and one already owned by SearXNG must initialize.
   runtime_check "searxng cache initialises when empty" "${compose[@]}" run --rm --no-deps searxng-init
   # shellcheck disable=SC2016
