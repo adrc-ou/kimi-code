@@ -103,13 +103,14 @@ class CatalogFilterTests(unittest.TestCase):
 
     def test_the_m3_ultra_is_offered_everything(self):
         _, rows = self.rows_for(M3_ULTRA)
-        # Five rows, not six: the local 27B declares no long lane, so it is offered on one agent
-        # window and the plan simply has no wide row to show for it.
+        # Four rows, not six: neither local model declares a long lane, so each is offered on the
+        # one agent window its host can hold and the plan has no wide row to show for them. The
+        # window/overlap trade the two agent lanes exist to make is a metered-provider trade -
+        # locally the only pool is the operator's memory and the provider allows one request.
         self.assertEqual(
             rows,
             [
                 "Qwen3.8-27B - Medium (concurrent)",
-                "Qwen3.8-Flash-Next - Long (queued, 128k window)",
                 "Qwen3.8-Flash-Next - Medium (concurrent)",
                 "Qwen3.8-Flash-Next - Long (queued, 1M window)",
                 "Qwen3.8-Flash-Next - Medium (concurrent)",
@@ -141,10 +142,11 @@ class CatalogFilterTests(unittest.TestCase):
         self.assertEqual({cell[1] for cell in flash}, {"NRP", "Local (MPS)"})
         # Sorted by label then qualified id, so one model's servings sit together and a
         # provider's rows are stable next to each other rather than interleaved by directory.
+        # Two of these rows share both their model and their lane, so the Provider column is the
+        # only thing that tells a 131k local window from a 262k cloud one.
         self.assertEqual(
             flash,
             [
-                ("Qwen3.8-Flash-Next", "Local (MPS)", "Long (queued, 128k window)"),
                 ("Qwen3.8-Flash-Next", "Local (MPS)", "Medium (concurrent)"),
                 ("Qwen3.8-Flash-Next", "NRP", "Long (queued, 1M window)"),
                 ("Qwen3.8-Flash-Next", "NRP", "Medium (concurrent)"),

@@ -12,8 +12,8 @@ label = "Qwen3.8-Flash-Next"
 provider = "local_mps"
 model = "Qwen3.8-Flash-Next"
 
-# Kimi aliases: qwen3m-primary, qwen3m-long, qwen3m-subagent. Distinct from the NRP definition's
-# `qwen3` stem - aliases are the one place two servings of one model have to stay addressable.
+# Kimi aliases: qwen3m-primary, qwen3m-subagent. Distinct from the NRP definition's `qwen3` stem -
+# aliases are the one place two servings of one model have to stay addressable.
 slug = "qwen3m"
 
 credential = "default"
@@ -49,20 +49,17 @@ disk_gib = 130
 # ------------------------------------------------------------
 # Lanes, sized against the smallest host this is offered on (160 GiB).
 #
-# Flash-Next is a 125B MoE with 6B active parameters, so tokens come out fast enough for the
-# narrow lane to be worth having; what it cannot do is hold many sequences at once, which is why
-# the provider caps this model at one concurrent request and why the subagent lane is generous
-# rather than numerous.
+# One agent lane, not two. The primary/long pair exists on a metered provider because the two
+# windows trade context against in-flight overlap: the narrow row leaves the provider's pool room
+# for other requests. Here the only pool is the operator's memory, the provider allows one
+# concurrent request anyway, and nothing is being traded - so the honest shape is the widest
+# window this host can hold, declared once. A model with a single agent lane offers one row on the
+# main screen and launches on it, which is the case docs/models-providers.md already documents.
+#
+# 131,072 is a fifth of the checkpoint's native window and less than an eighth of what the NRP
+# definition of the same model advertises. That gap is the point of the Ready? column: the same
+# model name does not mean the same offer.
 [lane.primary]
-context_tokens = 65536
-input_tokens = 49152
-output_clamp_tokens = 16384
-
-# The wide lane exists here because this model is offered on hosts that can hold a second
-# resident sequence, and 131,072 of KV is affordable on 160 GiB. It is a fifth of the native
-# window and less than an eighth of what the cloud definition of the same model advertises - the
-# honest cost of the operator's own memory being the only pool.
-[lane.long]
 context_tokens = 131072
 input_tokens = 114688
 output_clamp_tokens = 16384

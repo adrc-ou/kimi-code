@@ -386,6 +386,19 @@ apply to a loopback server, and eviction remains off unless the operator turns i
 on - where it still helps, for a different reason, because a re-sent image is KV
 cache the host cannot use for anything else.
 
+**A local model declares one agent lane, and that is deliberate.** The `primary`
+and `long` pair exists on a metered provider because the two windows trade context
+against in-flight overlap: the narrow reservation is what leaves the provider's
+shared pool room for other requests. Locally the pool is the operator's memory, the
+provider's own rule allows one or two concurrent requests, and there is nothing left
+to trade — so the honest shape is the widest window the smallest eligible host can
+hold, declared once as `primary`. A model with a single agent lane offers one row on
+the main screen and launches on it, which is the case this document already
+documents for a model that omits `[lane.long]`. Adding a `long` lane to a local
+definition would not widen anything; it would put a second, larger KV reservation in
+front of the same memory and ask the operator to choose between two promises the
+host cannot both keep.
+
 **`weights.lock.json`.** One tracked file per local model, beside its manifest:
 
 ```json

@@ -1492,8 +1492,9 @@ class MenuTests(unittest.TestCase):
     def test_a_narrow_window_keeps_every_fact_the_old_row_carried(self):
         # Room for the two-column shape, not for five aligned columns. The row goes back to
         # label-plus-hint exactly as it read before the grid existed - including the label's own
-        # clip at MAX_LABEL_FIELD, which is why the provider and the mark ride in the hint: they
-        # are the parts that cannot be truncated without losing the answer.
+        # room-aware clip, which leaves the hint at most a third of the row, and is why the
+        # provider and the mark ride in the hint: they are the parts that cannot be truncated
+        # without losing the answer.
         narrow = Caps(color=NONE, columns=72, rows=14, probe=False)
         text = self.shown(self.modal(self.table(), caps=narrow))
         self.assertNotIn("Provider", text)
