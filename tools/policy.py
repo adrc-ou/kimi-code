@@ -90,6 +90,7 @@ def designated_lane(model: dict[str, Any], wanted: str = "") -> str:
         return str(requested)
     return "primary"
 
+
 #: Which generated guidance a caller may ask for. ``lane`` is what every audience gets - the
 #: numbers that bound it - and ``main`` adds the blocks only the primary agent can act on.
 #: Neither is a lane name, and the two vocabularies stay deliberately separate.
@@ -353,9 +354,7 @@ def _context_counter(
     ceiling = None if percent is None else model["advertised_tokens"] * percent // 100
     exclusive_percent = min((rule["value"] for rule in exclusive), default=None)
     exclusive_at = (
-        None
-        if exclusive_percent is None
-        else model["advertised_tokens"] * exclusive_percent // 100
+        None if exclusive_percent is None else model["advertised_tokens"] * exclusive_percent // 100
     )
     subject = f"{provider['id']}/{model['model']}"
     return {
@@ -470,23 +469,31 @@ def _lane_entry(
     *,
     reserved_context_size: int,
     counters: list[str] | None = None,
+    engine: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     context_cap = _model_context_cap(provider, model)
     output_cap = _model_output_cap(provider, model)
     table = model["lanes"][lane]
-    context = table["context_tokens"]
+    derived = table.get("allocation") == "engine"
+    if derived and engine is None:
+        raise ResolutionError(f"{model['id']} requires a validated engine capacity allocation")
+    context = engine["context_tokens"] if derived else table["context_tokens"]
     if context_cap is not None:
         context = min(context, context_cap)
-    clamp = table["output_clamp_tokens"]
+    clamp = context if derived else table["output_clamp_tokens"]
     if output_cap is not None:
         clamp = min(clamp, output_cap)
-    input_tokens = min(table["input_tokens"], context - clamp)
+    input_tokens = (
+        context - reserved_context_size if derived else min(table["input_tokens"], context - clamp)
+    )
+    if input_tokens <= 0:
+        raise ResolutionError(f"{model['id']} context cannot fit Kimi's reserved context")
     if input_tokens + reserved_context_size > context:
         raise ResolutionError(
             f"{model['id']} lane {lane!r}: {input_tokens} input + {reserved_context_size} "
             f"reserved does not fit {context} context"
         )
-    return {
+    result = {
         "lane": lane,
         "model_id": model["id"],
         "label": model["label"],
@@ -506,13 +513,22 @@ def _lane_entry(
         "context_tokens": context,
         "input_tokens": input_tokens,
         "output_clamp_tokens": clamp,
-        "reservation": input_tokens + clamp,
+        "reservation": context if derived else input_tokens + clamp,
         "capabilities": model["capabilities"],
         "support_efforts": model["support_efforts"],
         "default_effort": table["default_effort"] or model["default_effort"],
         "counters": counters,
         "display_name": f"{model['label']} - {LANE_DISPLAY.get(lane, lane)}",
     }
+    if derived:
+        role_label = "Main agent" if lane != "subagent" else "Subagent (automatic)"
+        result.update(
+            engine_id=model["id"],
+            output_mode="remaining_context",
+            token_accounting="engine",  # noqa: S106 - an accounting strategy, not a credential
+            display_name=f"{model['label']} - {role_label}",
+        )
+    return result
 
 
 def _disambiguate_labels(
@@ -537,9 +553,12 @@ def _disambiguate_labels(
         if len(servers[lane["label"]]) < 2:
             continue
         provider_label = providers[lane["provider"]]["label"]
-        lane["display_name"] = (
-            f"{lane['label']} [{provider_label}] - {LANE_DISPLAY.get(lane['lane'], lane['lane'])}"
+        lane_label = (
+            ("Subagent (automatic)" if lane["lane"] == "subagent" else "Main agent")
+            if lane.get("engine_id")
+            else LANE_DISPLAY.get(lane["lane"], lane["lane"])
         )
+        lane["display_name"] = f"{lane['label']} [{provider_label}] - {lane_label}"
 
 
 def resolve(
@@ -550,6 +569,7 @@ def resolve(
     reserved_context_size: int,
     key_values: dict[str, str] | None = None,
     agent_lane: str = DEFAULT_AGENT_LANE,
+    capacity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the enforcement plan for one primary model and one subagent model.
 
@@ -566,8 +586,7 @@ def resolve(
         raise ResolutionError("reserved_context_size must be positive")
     if agent_lane not in AGENT_LANES:
         raise ResolutionError(
-            f"agent lane {agent_lane!r} is not selectable; choose one of "
-            f"{', '.join(AGENT_LANES)}"
+            f"agent lane {agent_lane!r} is not selectable; choose one of {', '.join(AGENT_LANES)}"
         )
     for role in ("primary", "subagent"):
         if selection.get(role) not in models:
@@ -583,6 +602,8 @@ def resolve(
         (selection["primary"], selection["subagent"]),
         key_values or {},
     )
+
+    engines = _engine_allocations(providers, models, selection, capacity, reserved_context_size)
 
     # Lane membership follows the selection: the long lane exists only when the primary
     # model declares it, so an operator who drops the lane drops the route and the alias.
@@ -605,7 +626,11 @@ def resolve(
                 f"model {model_id} references missing provider {model['provider']!r}"
             )
         selected[lane] = _lane_entry(
-            lane, model, provider, reserved_context_size=reserved_context_size
+            lane,
+            model,
+            provider,
+            reserved_context_size=reserved_context_size,
+            engine=engines.get(model_id),
         )
 
     # The agent lane is a property of the selection, so it is checked after membership: asking
@@ -647,13 +672,29 @@ def resolve(
                     if existing is None:
                         counters[counter["id"]] = counter
                     else:
-                        existing["lanes"] = sorted(
-                            set(existing["lanes"]) | set(counter["lanes"])
-                        )
+                        existing["lanes"] = sorted(set(existing["lanes"]) | set(counter["lanes"]))
                         if "capacity" in counter:
                             existing["capacity"] = min(existing["capacity"], counter["capacity"])
                         if "max" in counter:
                             existing["max"] = min(existing["max"] or counter["max"], counter["max"])
+
+    for engine_id, engine in engines.items():
+        model = models[engine_id]
+        key = f"count:engine:{engine_id}"
+        counters[key] = {
+            "id": key,
+            "family": "count",
+            "kind": "max_concurrent_requests",
+            "scope": "engine",
+            "source": "engine_capacity",
+            "provider": model["provider"],
+            "subject": engine_id,
+            "max": engine["sequences"],
+            "count_basis": "validated engine sequence capacity",
+            "lanes": [
+                name for name, lane in selected.items() if lane.get("engine_id") == engine_id
+            ],
+        }
 
     for lane_name, lane in selected.items():
         lane["counters"] = sorted(
@@ -668,8 +709,8 @@ def resolve(
     _check_budgets(selected, counters)
     limits = _derive_limits(selected, counters)
 
-    return {
-        "schema_version": SCHEMA_VERSION,
+    result = {
+        "schema_version": 3 if engines else SCHEMA_VERSION,
         "reserved_context_size": reserved_context_size,
         "selection": dict(selection),
         "agent_lane": agent_lane,
@@ -711,11 +752,84 @@ def resolve(
         "counters": counters,
         "limits": limits,
     }
+    if engines:
+        result["engines"] = engines
+        for provider_id, entry in result["providers"].items():
+            provider = providers[provider_id]
+            if provider.get("execution"):
+                entry["execution"] = provider["execution"]
+                entry["capacity"] = provider["capacity"]
+    return result
 
 
-def _exclusive_threshold(
-    lane: dict[str, Any], counters: dict[str, dict[str, Any]]
-) -> int | None:
+def _engine_allocations(
+    providers: dict[str, dict[str, Any]],
+    models: dict[str, dict[str, Any]],
+    selection: dict[str, str],
+    capacity: dict[str, Any] | None,
+    reserved_context_size: int,
+) -> dict[str, dict[str, Any]]:
+    """Validate native context and execution slots, independently of physical memory."""
+    wanted = {
+        model_id
+        for model_id in (selection["primary"], selection["subagent"])
+        if providers.get(models[model_id]["provider"], {}).get("execution")
+    }
+    if not wanted:
+        if capacity and capacity.get("engines"):
+            raise ResolutionError("capacity allocation contains engines outside this selection")
+        return {}
+    if not isinstance(capacity, dict):
+        raise ResolutionError("local models require a resolved native engine configuration")
+    if capacity.get("resources"):
+        raise ResolutionError("native context does not use physical resource budgets; relaunch")
+    engines = capacity.get("engines")
+    if not isinstance(engines, dict) or set(engines) != wanted:
+        raise ResolutionError("capacity engines must match the selected local models exactly")
+    result = {}
+    for model_id in sorted(wanted):
+        model = models[model_id]
+        engine = engines[model_id]
+        if not isinstance(engine, dict):
+            raise ResolutionError(f"{model_id} engine allocation must be an object")
+        numbers = {}
+        for key in ("context_tokens", "sequences", "total_context_tokens"):
+            value = engine.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ResolutionError(f"{model_id} engine {key} must be a positive integer")
+            numbers[key] = value
+        context, sequences = numbers["context_tokens"], numbers["sequences"]
+        profile = providers[model["provider"]]["execution"]["profile"]
+        if context != model["native_tokens"] or engine.get("native_context_tokens") != context:
+            raise ResolutionError(f"{model_id} allocation must equal the model's native context")
+        config = providers[model["provider"]]["capacity"]
+        if (
+            engine.get("capacity_strategy") != config["strategy"]
+            or engine.get("memory_management") != "os_managed"
+            or sequences != config["sequence_slots"]
+        ):
+            raise ResolutionError(f"{model_id} engine differs from native context policy")
+        if context <= reserved_context_size:
+            raise ResolutionError(f"{model_id} allocation cannot fit Kimi's reserved context")
+        if context % profile["context_granularity"]:
+            raise ResolutionError(
+                f"{model_id} allocation disagrees with engine context granularity"
+            )
+        if sequences > profile["max_sequences"]:
+            raise ResolutionError(f"{model_id} allocation exceeds the engine sequence ceiling")
+        if numbers["total_context_tokens"] != context * sequences:
+            raise ResolutionError(f"{model_id} total context must cover every full sequence slot")
+        if engine.get("allocation") != profile:
+            raise ResolutionError(f"{model_id} allocation differs from its serving profile")
+        if engine.get("allocations") or engine.get("projection"):
+            raise ResolutionError(
+                f"{model_id} native context must not carry memory admission budgets"
+            )
+        result[model_id] = dict(engine)
+    return result
+
+
+def _exclusive_threshold(lane: dict[str, Any], counters: dict[str, dict[str, Any]]) -> int | None:
     thresholds = [
         counters[counter]["exclusive_at"]
         for counter in lane["counters"]
@@ -748,11 +862,7 @@ def _check_budgets(
                 continue
             ceiling = counter.get("ceiling")
             threshold = counter.get("exclusive_at")
-            if (
-                ceiling is not None
-                and threshold is not None
-                and threshold > ceiling
-            ):
+            if ceiling is not None and threshold is not None and threshold > ceiling:
                 raise ResolutionError(
                     f"counter {counter_id} sets exclusivity at {threshold} tokens, above the "
                     f"{ceiling}-token ceiling its provider publishes for {counter['subject']}. "
@@ -760,8 +870,7 @@ def _check_budgets(
                     "alone, so no lane on this counter is servable."
                 )
             if lane["reservation"] > budget and not (
-                lane["exclusive"]
-                or (ceiling is not None and lane["reservation"] <= ceiling)
+                lane["exclusive"] or (ceiling is not None and lane["reservation"] <= ceiling)
             ):
                 raise ResolutionError(
                     f"{lane['alias']} reserves {lane['reservation']} tokens but counter "
@@ -812,9 +921,11 @@ def _derive_limits(
         limits["subagent_concurrency"] = 1
         limits["subagent_concurrency_basis"] = "each subagent request runs alone"
         return limits
-    candidates = [
-        limits["lane_concurrency"]["subagent"]
-    ] if limits["lane_concurrency"].get("subagent") else []
+    candidates = (
+        [limits["lane_concurrency"]["subagent"]]
+        if limits["lane_concurrency"].get("subagent")
+        else []
+    )
     for counter_id in subagent["counters"]:
         counter = counters.get(counter_id)
         if counter is None or counter.get("budget") is None:
@@ -830,7 +941,11 @@ def _derive_limits(
         limits["subagent_concurrency_basis"] = "harness default; provider states no ceiling"
         return limits
     limits["subagent_concurrency"] = max(1, min(candidates))
-    limits["subagent_concurrency_basis"] = "the tightest provider rule"
+    limits["subagent_concurrency_basis"] = (
+        "validated engine sequence capacity"
+        if any(counters[key].get("source") == "engine_capacity" for key in subagent["counters"])
+        else "the tightest provider rule"
+    )
     return limits
 
 
@@ -867,16 +982,19 @@ def _count_ceiling_line(counter: dict[str, Any]) -> str:
     """
     basis = counter.get("count_basis")
     scoped = counter["family"] == "context" or counter.get("scope") == "model"
-    where = "for" if scoped else "across"
+    where = "for" if scoped or counter.get("scope") == "engine" else "across"
     caveat = "" if basis is None or not basis.startswith("harness") else f" ({basis})"
-    return (
-        f"- At most {counter['max']} concurrent requests {where} `{counter['subject']}`"
-        f"{caveat}."
-    )
+    return f"- At most {counter['max']} concurrent requests {where} `{counter['subject']}`{caveat}."
 
 
 def _lane_order(plan: dict[str, Any]) -> list[str]:
     return [name for name in LANES if name in plan["lanes"]]
+
+
+def _output_allowance(lane: dict[str, Any]) -> str:
+    if lane.get("output_mode") == "remaining_context":
+        return f"remaining context (up to {lane['output_clamp_tokens']:,})"
+    return f"{lane['output_clamp_tokens']:,}"
 
 
 def _lane_limit_lines(plan: dict[str, Any]) -> list[str]:
@@ -920,13 +1038,30 @@ def _lane_limit_lines(plan: dict[str, Any]) -> list[str]:
             f"- Rate: **{counter['capacity']:,} {RATE_UNIT_LABELS.get(unit, unit)}** booked per "
             f"minute against `{counter['subject']}`, measured in the unit the provider meters."
         )
-    lines.append("- Per-lane ceilings, as window / input cap / output clamp:")
+    lines.append(
+        "- Per-lane ceilings, as window / input cap / output allowance:"
+        if plan.get("engines")
+        else "- Per-lane ceilings, as window / input cap / output clamp:"
+    )
     for name in _lane_order(plan):
         lane = plan["lanes"][name]
         lines.append(
             f"  - `{name}` {lane['context_tokens']:,} / {lane['input_tokens']:,} / "
-            f"{lane['output_clamp_tokens']:,}"
+            f"{_output_allowance(lane)}"
         )
+    if plan.get("engines"):
+        lines += [
+            "  Local engines keep these windows for the whole session. Generation may use the",
+            "  context remaining after the actual rendered prompt; "
+            "it has no fixed output partition.",
+            "  Local input figures are Kimi's early-compaction targets; exact engine token",
+            "  counting enforces the hard context boundary independently of that target.",
+        ]
+        for engine_id, engine in plan["engines"].items():
+            lines.append(
+                f"- Local engine `{engine_id}` has {engine['sequences']} full sequence slots, "
+                f"each holding {engine['context_tokens']:,} tokens; excess requests queue."
+            )
     lines += [
         "  Each input cap sits below its own window on purpose: the proxy clamps the response's",
         "  output budget, so a request that filled its window would lose its tail. Compacting a",
@@ -962,19 +1097,25 @@ def _lane_table_lines(plan: dict[str, Any]) -> list[str]:
         "",
     ]
     if agent:
+        agent_label = (
+            "main agent"
+            if agent.get("engine_id")
+            else LANE_DISPLAY.get(agent["lane"], agent["lane"])
+        )
         # Which window the main agent sits in is not retrievable from inside the session, and the
         # rest of this document names the subagent lane as often as any other. Stating the role
         # and the lane up front, in the second person, is the only line in the prompt that says
         # who is reading it; a model that has to infer its own audience gets it wrong sometimes.
         lines += [
             f"You are the main agent of this workspace. You launched on `{agent['alias']}`, "
-            f"the {LANE_DISPLAY.get(agent['lane'], agent['lane'])} lane, a "
+            f"the {agent_label} lane, a "
             f"{agent['context_tokens']:,}-token window. The subagent rows anywhere in this "
             "document describe the children you may delegate to, never you.",
             "",
         ]
+    output_label = "Output allowance" if plan.get("engines") else "Output clamp"
     lines += [
-        "| Lane | Model | Alias | Context | Input cap | Output clamp | Worst-case cost | "
+        f"| Lane | Model | Alias | Context | Input cap | {output_label} | Worst-case cost | "
         "Alone at full size |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
@@ -983,7 +1124,7 @@ def _lane_table_lines(plan: dict[str, Any]) -> list[str]:
         lines.append(
             f"| `{name}` | {lane['label']} | `{lane['alias']}` | "
             f"{lane['context_tokens']:,} | {lane['input_tokens']:,} | "
-            f"{lane['output_clamp_tokens']:,} | {lane['reservation']:,} | "
+            f"{_output_allowance(lane)} | {lane['reservation']:,} | "
             f"{'yes' if lane['exclusive'] else 'no'} |"
         )
     lines += [
@@ -1053,11 +1194,21 @@ def _lane_table_lines(plan: dict[str, Any]) -> list[str]:
         "- Kimi's model picker is the supported way to change lane mid-session, and doing so is",
         "  legitimate: every lane is metered, and the proxy re-prices a request from its own size",
         "  rather than from which route it arrived on.",
-        "- The two agent lanes are peers trading window against overlap: Long (queued) reserves",
-        "  so much context that a full-size request there runs alone and other work queues behind",
-        "  it, while Medium (concurrent) leaves the pool room to overlap requests. Neither is a",
-        "  way to obtain subagent-style concurrency. Let a long run finish instead of trimming",
-        "  the other lanes to make room for it.",
+        *(
+            [
+                "- The two agent lanes are peers trading window against overlap: "
+                "Long (queued) reserves",
+                "  so much context that a full-size request there runs alone "
+                "and other work queues behind",
+                "  it, while Medium (concurrent) leaves the pool room to overlap requests. "
+                "Neither is a",
+                "  way to obtain subagent-style concurrency. Let a long run finish "
+                "instead of trimming",
+                "  the other lanes to make room for it.",
+            ]
+            if "long" in plan["lanes"]
+            else []
+        ),
         "- Backgrounded agents and background Bash share one task-slot pool, separate from these",
         "  lanes, and exceeding it fails outright rather than queueing.",
         "- Subagent and swarm runs have no wall-clock limit, so a long run is bounded by the proxy",
@@ -1110,11 +1261,27 @@ def _parallelism_lines(plan: dict[str, Any]) -> list[str]:
         "",
         "Respect capacity as well as count:",
         "",
-        "- A lane reserves its full window the moment it is admitted, whether or not the prompt is",
-        "  that large, so a wide fan-out holds the whole allowance until it finishes. Let it",
-        "  finish instead of generating alongside it.",
-        "- Prefer concise evidence in a hand-back: every token a child holds is charged against",
-        "  the shared in-flight budget rather than against its own lane alone.",
+        *(
+            [
+                "- Local engines use their native window with OS-managed memory. "
+                "A running request holds",
+                "  one slot until completion; a shorter prompt does not free a second slot.",
+                "- Main and child requests sharing an engine share its slots. "
+                "Queued main requests take",
+                "  priority; requests served remotely retain their provider's independent limits.",
+            ]
+            if plan.get("engines")
+            else [
+                "- A lane reserves its full window the moment it is admitted, "
+                "whether or not the prompt is",
+                "  that large, so a wide fan-out holds the whole allowance "
+                "until it finishes. Let it",
+                "  finish instead of generating alongside it.",
+                "- Prefer concise evidence in a hand-back: every token a child holds "
+                "is charged against",
+                "  the shared in-flight budget rather than against its own lane alone.",
+            ]
+        ),
         "- Waiting for a permit at the proxy is normal pacing, not a failure, and the request is",
         "  not lost. Never dodge a queue with extra connections, lanes, containers or credentials.",
         "",

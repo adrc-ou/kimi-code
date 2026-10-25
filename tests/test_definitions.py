@@ -140,7 +140,7 @@ class ProviderTests(DefinitionFixture):
 
     def test_a_manifest_of_another_schema_version_is_refused(self):
         for name, text in (
-            ("another version", PROVIDER.replace("schema_version = 1", "schema_version = 2")),
+            ("another version", PROVIDER.replace("schema_version = 1", "schema_version = 3")),
             ("no version at all", PROVIDER.replace("schema_version = 1\n", "")),
         ):
             with self.subTest(case=name), self.assertRaises(definitions.DefinitionError):

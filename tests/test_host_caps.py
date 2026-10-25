@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "tools") not in sys.path:
@@ -38,6 +39,19 @@ MAC_24 = dict(M3_ULTRA, memory_gib=24)
 
 
 class CapabilityTests(unittest.TestCase):
+    def test_macos_available_memory_does_not_double_count_purgeable_pages(self):
+        output = (
+            "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+            "Pages free: 10.\nPages inactive: 20.\nPages purgeable: 100.\n"
+        )
+        result = mock.Mock(stdout=output)
+        with mock.patch.object(host_caps.subprocess, "run", return_value=result):
+            self.assertEqual(host_caps.available_memory_bytes("Darwin"), 30 * 16384)
+
+    def test_unavailable_memory_probe_is_unknown_not_total_ram(self):
+        with mock.patch.object(host_caps.subprocess, "run", side_effect=OSError):
+            self.assertEqual(host_caps.available_memory_bytes("Darwin"), 0)
+
     def test_metal_is_apple_silicon_and_nothing_else(self):
         self.assertEqual(host_caps.host_capabilities("Darwin", "arm64"), ["metal"])
         for system, machine in (
@@ -87,9 +101,7 @@ class CatalogFilterTests(unittest.TestCase):
         cls.providers, cls.defined = definitions.load_definitions(ROOT)
 
     def rows_for(self, measured):
-        providers, usable = host_caps.filter_definitions(
-            self.providers, self.defined, measured
-        )
+        providers, usable = host_caps.filter_definitions(self.providers, self.defined, measured)
         return providers, [
             model_step.row_label(row) for row in model_step.lane_rows(usable, "primary")
         ]
@@ -103,29 +115,24 @@ class CatalogFilterTests(unittest.TestCase):
 
     def test_the_m3_ultra_is_offered_everything(self):
         _, rows = self.rows_for(M3_ULTRA)
-        # Four rows, not six: neither local model declares a long lane, so each is offered on the
-        # one agent window its host can hold and the plan has no wide row to show for them. The
-        # window/overlap trade the two agent lanes exist to make is a metered-provider trade -
-        # locally the only pool is the operator's memory and the provider allows one request.
+        # Native local windows do not depend on RAM. NRP keeps its policy labels.
         self.assertEqual(
             rows,
             [
-                "Qwen3.8-27B - Medium (concurrent)",
-                "Qwen3.8-Flash-Next - Medium (concurrent)",
+                "Qwen3.8-27B - Local (native 256k)",
+                "Qwen3.8-Flash-Next - Local (native 256k)",
                 "Qwen3.8-Flash-Next - Long (queued, 1M window)",
                 "Qwen3.8-Flash-Next - Medium (concurrent)",
             ],
         )
 
-    def test_the_m1_max_gets_the_27b_and_not_the_moe(self):
+    def test_the_m1_max_gets_the_27b_and_not_the_local_moe(self):
         _, rows = self.rows_for(M1_MAX)
-        # Three rows: the local 27B on its one window, and both NRP windows. Flash-Next is
-        # missing entirely rather than shown and refused - a 111 GB weight set does not fit in
-        # 32 GB at any quantisation, so offering it would be false hope with a download attached.
+        # Installed-memory eligibility is distinct from available-memory fitting.
         self.assertEqual(
             rows,
             [
-                "Qwen3.8-27B - Medium (concurrent)",
+                "Qwen3.8-27B - Local (native 256k)",
                 "Qwen3.8-Flash-Next - Long (queued, 1M window)",
                 "Qwen3.8-Flash-Next - Medium (concurrent)",
             ],
@@ -143,19 +150,20 @@ class CatalogFilterTests(unittest.TestCase):
         # Sorted by label then qualified id, so one model's servings sit together and a
         # provider's rows are stable next to each other rather than interleaved by directory.
         # Two of these rows share both their model and their lane, so the Provider column is the
-        # only thing that tells a 131k local window from a 262k cloud one.
+        # Local native capacity is provisional; the remote lanes keep their fixed envelopes.
         self.assertEqual(
             flash,
             [
-                ("Qwen3.8-Flash-Next", "Local (MPS)", "Medium (concurrent)"),
+                ("Qwen3.8-Flash-Next", "Local (MPS)", "Local (native 256k)"),
                 ("Qwen3.8-Flash-Next", "NRP", "Long (queued, 1M window)"),
                 ("Qwen3.8-Flash-Next", "NRP", "Medium (concurrent)"),
             ],
         )
 
-    def test_a_machine_at_the_vendors_floor_is_still_refused(self):
+    def test_a_smaller_mac_is_below_both_local_hardware_floors(self):
         _, rows = self.rows_for(MAC_24)
-        self.assertNotIn("Qwen3.8-27B", " ".join(rows))
+        self.assertNotIn("Qwen3.8-27B - Local (native 256k)", rows)
+        self.assertNotIn("Qwen3.8-Flash-Next - Local (native 256k)", rows)
 
     def test_the_cache_salt_and_port_survive_the_filter(self):
         providers, _ = host_caps.filter_definitions(self.providers, self.defined, M3_ULTRA)

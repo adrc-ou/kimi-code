@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Choose the primary and subagent models, resolve provider policy, and publish the plan.
 
-Run from ``start.sh`` before the Kimi Code version selection:
+Run from ``start.sh`` around the launch selections:
 
     tools/models.py select     # two interactive prompts -> model-selection.json
-    tools/models.py resolve    # definitions + selection -> model-policy.json and friends
+    tools/models.py install    # selected local weights, verified before sizing
+    tools/models.py resolve    # definitions + host capacity -> model-policy.json
 
 Everything the rest of the launcher needs about models then comes from ``model-policy.json``,
 which is derived rather than configured: the proxy mounts it as its enforcement input, Kimi's
@@ -20,6 +21,7 @@ non-regular files inside a definition tree are refused rather than sanitised.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import secrets
@@ -30,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
-    from . import host_caps, local_llm, policy
+    from . import capacity, host_caps, local_llm, policy
     from .definitions import LANES, DefinitionError, load_definitions
     from .env_values import read_env_values
     from .private_file import write_private, write_private_json
@@ -39,6 +41,7 @@ if __package__:
     from .tui.input import FieldStep
     from .tui.menu import SINGLE, Choice, Column, ListStep
 else:
+    import capacity
     import host_caps
     import local_llm
     import policy
@@ -98,8 +101,12 @@ def read_json(path: Path, default: Any = None) -> Any:
 def load_plan(runtime: Path) -> dict[str, Any]:
     """Read the resolved plan. ``render_runtime.py`` and the proxy consume the same document."""
     plan = read_json(runtime / POLICY_FILE)
-    if not isinstance(plan, dict) or plan.get("schema_version") != policy.SCHEMA_VERSION:
-        raise DefinitionError(f"{POLICY_FILE} is not a schema {policy.SCHEMA_VERSION} plan")
+    if isinstance(plan, dict) and plan.get("schema_version") == 2:
+        raise DefinitionError(
+            "stale schema 2 local policy; relaunch the harness to resolve native context"
+        )
+    if not isinstance(plan, dict) or plan.get("schema_version") not in (1, 3):
+        raise DefinitionError(f"{POLICY_FILE} is not a supported policy plan")
     return plan
 
 
@@ -188,7 +195,14 @@ def agent_rows(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
             twin["lane_label"] = f"Long (queued{span})"
             rows.append(twin)
         row = dict(model)
-        row["lane_label"] = "Medium (concurrent)"
+        derived = isinstance(model["lanes"], dict) and (
+            model["lanes"].get("primary", {}).get("allocation") == "engine"
+        )
+        row["lane_label"] = (
+            f"Local (native {token_span(model['native_tokens'])})"
+            if derived
+            else "Medium (concurrent)"
+        )
         rows.append(row)
     return rows
 
@@ -292,8 +306,15 @@ def _option(model: dict[str, Any], previous: str, default: str) -> Choice:
     provider = provider_name(model)
     lane = str(model.get("lane_label") or "")
     mark = f"({'; '.join(marks)})" if marks else ""
-    cells = (str(model["label"]), provider, lane, local_llm.status_text(model), mark)
+    readiness = local_llm.status_text(model)
+    native = model.get("native_tokens")
+    model_label = str(model["label"])
+    if native and not lane:
+        model_label += f" (native {token_span(native)})"
+    cells = (model_label, provider, lane, readiness, mark)
     label = row_label(model)
+    if native and not lane:
+        label = model_label
     hint = f"[{provider}]"
     if marks:
         hint = f"{hint} ({'; '.join(marks)})"
@@ -334,9 +355,12 @@ def choose(
             "or pass --non-interactive"
         )
 
+    prompt = f"Choose the {label}"
+    if any(model.get("native_tokens") for model in choices):
+        prompt += "; local windows use native context"
     step = ListStep(
         title=label,
-        prompt=f"Choose the {label}",
+        prompt=prompt,
         mode=SINGLE,
         choices=[_option(model, previous, default) for model in choices],
         previous=[default],
@@ -347,6 +371,8 @@ def choose(
         raise flow.BackRequested(lane)
     if not result.accepted:
         raise SystemExit(result.status)
+    if str(result.value) not in by_id:
+        raise DefinitionError(f"the selected {lane} model is unavailable")
     return str(result.value)
 
 
@@ -464,9 +490,7 @@ def unsupported_reason(
 
 def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
     providers, defined = load_definitions(root)
-    _, models = host_caps.filter_definitions(
-        providers, defined, host_caps.caps(runtime, root)
-    )
+    _, models = host_caps.filter_definitions(providers, defined, host_caps.caps(runtime, root))
     for lane in SELECTABLE:
         if not selectable(models, lane):
             raise DefinitionError(
@@ -517,8 +541,8 @@ def cmd_select(root: Path, runtime: Path, *, non_interactive: bool) -> int:
             if stored in ids:
                 replayed = stored
             else:
-                # A model that stopped being offered mid-launch, which only an edit to ./models
-                # can do. An answer the user cannot give is not an answer to replay.
+                # Definitions can change mid-launch. An
+                # answer the user cannot give is not an answer to replay.
                 state.forget(step)
         if replayed:
             # Replaying leaves the screen count alone: the lane's screens were counted on the pass
@@ -850,6 +874,38 @@ def model_environment(plan: dict[str, Any], values: dict[str, str]) -> dict[str,
     }
 
 
+def cmd_install(root: Path, runtime: Path) -> int:
+    """Finish selected managed downloads before publishing a conversation window."""
+    providers, entries = load_definitions(root)
+    catalog = {entry["id"]: entry for entry in entries}
+    selection = read_json(runtime / SELECTION)
+    if not isinstance(selection, dict):
+        raise DefinitionError(f"{SELECTION} must contain an object")
+    for role in SELECTABLE:
+        if selection.get(role) not in catalog:
+            raise DefinitionError(f"selected {role} model is not available")
+    chosen = []
+    for role in SELECTABLE:
+        model = catalog[selection[role]]
+        if model.get("install") and model not in chosen:
+            chosen.append(model)
+    if chosen:
+        log = runtime / "local-model.log"
+        print(f"Preparing selected local engines; installation log: {log}", flush=True)
+        with log.open("a", encoding="utf-8") as output:
+            os.chmod(log, 0o600)
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                for model in chosen:
+                    if not local_llm.is_ready(model):
+                        local_llm.install(model)
+                    if not local_llm.is_ready(model):
+                        raise DefinitionError(
+                            f"{model['id']}: installation did not verify the selected weights"
+                        )
+                local_llm.engine_binary()
+    return 0
+
+
 def cmd_resolve(root: Path, runtime: Path) -> int:
     providers, defined = load_definitions(root)
     values = bootstrap_values(root)
@@ -877,13 +933,17 @@ def cmd_resolve(root: Path, runtime: Path) -> int:
     agent_lane = str(selection.get("agent_lane") or policy.DEFAULT_AGENT_LANE)
     if selection.get("primary") in models:
         agent_lane = policy.designated_lane(models[str(selection["primary"])], agent_lane)
+    selection_ids = {lane: str(selection.get(lane, "")) for lane in SELECTABLE}
+    reserve = reserved_context_size(root)
+    allocation = capacity.prepare(root, runtime, providers, models, selection_ids, reserve)
     plan = policy.resolve(
         providers,
         models,
-        {lane: str(selection.get(lane, "")) for lane in SELECTABLE},
-        reserved_context_size=reserved_context_size(root),
+        selection_ids,
+        reserved_context_size=reserve,
         key_values=values,
         agent_lane=agent_lane,
+        capacity=allocation,
     )
     require_bootstrap_declarations(root, plan)
     write_json(runtime / POLICY_FILE, plan)
@@ -896,12 +956,18 @@ def cmd_resolve(root: Path, runtime: Path) -> int:
     # The envelope is not published from here: tools/render_runtime.py appends the same rendered
     # text to the staged system prompt, so no launcher step writes inside the workspace.
 
+    agent = plan["lanes"][plan["agent_lane"]]
+    agent_description = (
+        "local capacity"
+        if agent.get("engine_id")
+        else policy.LANE_DISPLAY.get(plan["agent_lane"], plan["agent_lane"])
+    )
     print(
         "Model policy resolved: "
         + " ".join(
             f"{lane}={plan['lanes'][lane]['alias']}" for lane in LANES if lane in plan["lanes"]
         )
-        + f"; main agent on {policy.LANE_DISPLAY.get(plan['agent_lane'], plan['agent_lane'])}"
+        + f"; main agent on {agent_description}"
     )
     for counter in plan["counters"].values():
         if counter["family"] == "context":
@@ -915,13 +981,20 @@ def cmd_resolve(root: Path, runtime: Path) -> int:
                 f"  {counter['subject']}: {counter['capacity']} "
                 f"{policy.RATE_UNIT_LABELS.get(unit, unit)} booked"
             )
+    for engine_id, engine in plan.get("engines", {}).items():
+        print(
+            f"  engine {engine_id}: fixed {engine['context_tokens']:,} tokens per sequence; "
+            f"{engine['sequences']} full slots; {engine['total_context_tokens']:,} total tokens; "
+            "OS-managed memory (no RAM admission limit)"
+        )
+        print(f"    memory qualification: {engine.get('validation_status', 'unknown')}")
     print(f"  subagents: up to {plan['limits'].get('subagent_concurrency')} concurrent")
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["select", "resolve"])
+    parser.add_argument("action", choices=["select", "install", "resolve"])
     parser.add_argument("--non-interactive", action="store_true")
     args = parser.parse_args()
     root = Path(os.environ.get("HARNESS_ROOT", Path(__file__).resolve().parents[1]))
@@ -932,6 +1005,8 @@ def main() -> int:
     runtime.mkdir(parents=True, exist_ok=True)
     if args.action == "select":
         return cmd_select(root, runtime, non_interactive=args.non_interactive)
+    if args.action == "install":
+        return cmd_install(root, runtime)
     return cmd_resolve(root, runtime)
 
 

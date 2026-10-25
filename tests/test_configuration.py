@@ -156,22 +156,27 @@ class ConfigurationTests(unittest.TestCase):
                     f"{name} is not fetched from an official upstream host",
                 )
 
-    def test_prompts_ask_for_models_before_the_kimi_version(self):
-        # Every downstream number - lane sizes, fan-out, the proxy plan - is derived from
-        # the model pair, so the pickers must run before scripts/select_versions.py.
+    def test_final_capacity_is_resolved_after_selection_before_rendering(self):
+        # Local sizing needs the selected workload and verified weights. The
+        # finalized envelope must precede the panel and protected configuration.
         launcher = (ROOT / "start.sh").read_text()
         needles = {
             "select": "tools/models.py select",
             "resolve": "tools/models.py resolve",
             "modules": "tools/modules.py select",
             "version": "select_versions.py",
+            "install": "tools/models.py install",
+            "panel": "panel=(python3 tools/prompt_panel.py",
         }
         for name, needle in needles.items():
             self.assertIn(needle, launcher, f"start.sh no longer invokes {name}")
         positions = {name: launcher.index(needle) for name, needle in needles.items()}
         self.assertLess(positions["select"], positions["resolve"])
-        self.assertLess(positions["resolve"], positions["modules"])
-        self.assertLess(positions["resolve"], positions["version"])
+        self.assertLess(positions["select"], positions["version"])
+        self.assertLess(positions["modules"], positions["install"])
+        self.assertLess(positions["version"], positions["install"])
+        self.assertLess(positions["install"], positions["resolve"])
+        self.assertLess(positions["resolve"], positions["panel"])
 
     def test_a_command_that_can_render_is_never_routed_through_the_notes_spool(self):
         # Half of the print-over-the-modal failure is that the launcher painted over its own
@@ -499,12 +504,15 @@ class WeightTreeTests(unittest.TestCase):
     def test_an_appearing_weight_tree_leaves_git_status_silent(self):
         weights = ROOT / self.MODEL / "weights"
         weights.mkdir(parents=True, exist_ok=True)
-        self.addCleanup(shutil.rmtree, weights, ignore_errors=True)
-        (weights / "probe.gguf").write_bytes(b"\0" * 1024)
+        # This checkout may contain the operator's installed model. Own only a
+        # unique probe subtree; never recursively clean the real weights root.
+        probe = Path(tempfile.mkdtemp(prefix="ignore-probe-", dir=weights))
+        self.addCleanup(shutil.rmtree, probe, ignore_errors=True)
+        (probe / "probe.gguf").write_bytes(b"\0" * 1024)
         status = subprocess.run(
             [
                 "git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=all",
-                "--", str(weights),
+                "--", str(probe),
             ],
             check=True,
             capture_output=True,

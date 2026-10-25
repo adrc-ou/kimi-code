@@ -1,12 +1,12 @@
 # Model definition: Qwen3.8-Flash-Next, served from this machine.
 #
 # The same model name as models/nrp/qwen3_8_flash_next, and a different definition, because the
-# two are not the same offer: the gateway serves a 1M-token window it meters against published
-# fair-use terms, and this one serves a slice of the checkpoint's 262K native window out of the
-# operator's own memory. Both facts are about the serving, so both live here rather than in one
+# two are not the same offer: the gateway meters its advertised window against published
+# fair-use terms, and this one serves its native window with OS-managed memory.
+# Both facts are about the serving, so both live here rather than in one
 # file with a provider-switching flag.
 
-schema_version = 1
+schema_version = 2
 
 label = "Qwen3.8-Flash-Next"
 provider = "local_mps"
@@ -26,48 +26,26 @@ support_efforts = ["low", "medium", "xhigh"]
 default_effort = "xhigh"
 
 [context]
-advertised_tokens = 262144
+native_tokens = 262144
 
 # ------------------------------------------------------------
-# What this machine has to be
-#
-# 111,334,654,784 bytes of quantised weights = 103.7 GiB, and that is the *floor* of this model:
-# its smallest published build (UD-IQ1_S) is 72.5 GB, and Unsloth's own requirement is "at least
-# 75 GB of RAM or unified memory". This definition pins UD-Q4_K_XL because a coding agent should
-# not get the build that only just fits, and because the n-gram (PLE) layers quantise poorly -
-# they are randomly accessed lookup tables, not weights.
-#
-# The gate is set from the arithmetic, not from a machine: 103.7 GiB of resident weights, the
-# macOS Metal working-set ceiling (about three quarters of unified memory, so ~192 GiB on a 256
-# GiB host), KV cache for the widest lane, and the Docker Desktop VM that shares the same pool.
-# 160 GiB clears it on a 256 GiB Ultra and refuses everything below. No Apple silicon Mac under
-# 96 GiB can run this model at any quantisation, so no lowering of this number reaches one.
+# Static host eligibility for the pinned quant, independent of current free RAM.
+# Passing this floor does not shrink native context or promise resident execution.
 [requires]
 memory_gib = 160
 disk_gib = 130
 
 # ------------------------------------------------------------
-# Lanes, sized against the smallest host this is offered on (160 GiB).
-#
-# One agent lane, not two. The primary/long pair exists on a metered provider because the two
-# windows trade context against in-flight overlap: the narrow row leaves the provider's pool room
-# for other requests. Here the only pool is the operator's memory, the provider allows one
-# concurrent request anyway, and nothing is being traded - so the honest shape is the widest
-# window this host can hold, declared once. A model with a single agent lane offers one row on the
-# main screen and launches on it, which is the case docs/models-providers.md already documents.
-#
-# 131,072 is a fifth of the checkpoint's native window and less than an eighth of what the NRP
-# definition of the same model advertises. That gap is the point of the Ready? column: the same
-# model name does not mean the same offer.
+# Both roles use the full declared native window. The provider declares slots;
+# no memory-fit policy shrinks the window or adds concurrency.
+# Output is bounded by actual remaining context rather than a fixed partition.
 [lane.primary]
-context_tokens = 131072
-input_tokens = 114688
-output_clamp_tokens = 16384
+allocation = "engine"
+output_mode = "remaining_context"
 
 [lane.subagent]
-context_tokens = 32768
-input_tokens = 24576
-output_clamp_tokens = 8192
+allocation = "engine"
+output_mode = "remaining_context"
 default_effort = "low"
 
 [install]

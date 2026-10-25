@@ -51,7 +51,9 @@ def _no_secret_separator(value: str, where: str) -> str:
         )
     return value
 
+
 SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSIONS = frozenset({1, 2})
 LANES = ("primary", "long", "subagent")
 CREDENTIAL_LANES = ("primary", "subagent")
 
@@ -161,8 +163,13 @@ def _load_toml(path: Path, kind: str) -> dict[str, Any]:
         raise DefinitionError(f"{kind} manifest {path} is not valid TOML: {exc}") from exc
     if not isinstance(document, dict):
         raise DefinitionError(f"{kind} manifest {path} must be a TOML table")
-    if document.get("schema_version") != SCHEMA_VERSION:
-        raise DefinitionError(f"{kind} manifest {path} must set schema_version = {SCHEMA_VERSION}")
+    version = document.get("schema_version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in MANIFEST_SCHEMA_VERSIONS
+    ):
+        raise DefinitionError(f"{kind} manifest {path} must set schema_version = 1 or 2")
     return document
 
 
@@ -260,17 +267,21 @@ def _parse_provider(provider_id: str, path: Path) -> dict[str, Any]:
     where = f"providers/{provider_id}"
     document = _load_toml(path / "provider.toml", "provider")
     label = _text(document, "label", where)
+    version = document["schema_version"]
+    known = {
+        "schema_version",
+        "label",
+        "policy_url",
+        "requires",
+        "endpoint",
+        "credential",
+        "rule",
+        "safety",
+    }
+    if version == 2:
+        known |= {"execution", "capacity"}
     for key in document:
-        if key not in {
-            "schema_version",
-            "label",
-            "policy_url",
-            "requires",
-            "endpoint",
-            "credential",
-            "rule",
-            "safety",
-        }:
+        if key not in known:
             raise DefinitionError(f"{where} has unknown key {key!r}")
 
     requires = _capability_list(document, "requires", where)
@@ -301,7 +312,20 @@ def _parse_provider(provider_id: str, path: Path) -> dict[str, Any]:
             raise DefinitionError(f"{where}.endpoint has unknown key {key!r}")
 
     credentials = _parse_credentials(document.get("credential"), where, provider_id)
-    rules = _parse_rules(document.get("rule"), where)
+    execution = _parse_execution(document.get("execution"), where) if version == 2 else None
+    capacity = _parse_capacity(document.get("capacity"), where) if version == 2 else None
+    if execution is not None and not requires:
+        raise DefinitionError(f"{where}.execution needs a measured host capability in requires")
+    if execution is not None and protocol != "openai":
+        raise DefinitionError(f"{where}.execution requires the engine's openai protocol")
+    rules = _parse_rules(document.get("rule"), where, allow_empty=version == 2)
+    if execution is not None:
+        unsupported = sorted({rule["kind"] for rule in rules} & PER_REQUEST_RULE_KINDS)
+        if unsupported:
+            raise DefinitionError(
+                f"{where}: engine-derived local envelopes do not support per-request rules "
+                f"{', '.join(unsupported)}; context and generation capacity come from the engine"
+            )
 
     safety = document.get("safety", {})
     if not isinstance(safety, dict):
@@ -321,6 +345,7 @@ def _parse_provider(provider_id: str, path: Path) -> dict[str, Any]:
     )
 
     return {
+        "schema_version": version,
         "id": provider_id,
         "path": path,
         "label": label,
@@ -332,9 +357,82 @@ def _parse_provider(provider_id: str, path: Path) -> dict[str, Any]:
         "sends_cache_salt": sends_cache_salt,
         "credentials": credentials,
         "rules": rules,
+        "execution": execution,
+        "capacity": capacity,
         "context_margin_percent": context_margin,
         "output_rate_margin_percent": rate_margin,
     }
+
+
+def _parse_execution(raw: Any, where: str) -> dict[str, Any]:
+    here = f"{where}.execution"
+    if not isinstance(raw, dict):
+        raise DefinitionError(f"{here} must declare local execution and its engine profile")
+    if set(raw) - {"kind", "engine", "profile"}:
+        raise DefinitionError(f"{here} has unknown key(s)")
+    if raw.get("kind") != "local" or raw.get("engine") != "llama_cpp":
+        raise DefinitionError(f"{here} must select kind = local and engine = llama_cpp")
+    profile = raw.get("profile")
+    if not isinstance(profile, dict):
+        raise DefinitionError(f"{here}.profile must declare the engine allocation settings")
+    integer_keys = {"context_granularity", "max_sequences", "batch_tokens", "microbatch_tokens"}
+    choices = {
+        "cache_type_k": {"f16"},
+        "cache_type_v": {"f16"},
+        "flash_attention": {"auto"},
+        "load_mode": {"auto"},
+        "lazy_mode": {"auto"},
+        "gpu_layers": {"all"},
+    }
+    keys = integer_keys | set(choices) | {"kv_unified", "cache_ram_mib", "context_checkpoints"}
+    if set(profile) != keys:
+        raise DefinitionError(f"{here}.profile must declare exactly {', '.join(sorted(keys))}")
+    result = {key: _positive_int(profile, key, f"{here}.profile") for key in integer_keys}
+    if result["microbatch_tokens"] > result["batch_tokens"]:
+        raise DefinitionError(f"{here}.profile microbatch_tokens exceeds batch_tokens")
+    if result["max_sequences"] > result["microbatch_tokens"]:
+        raise DefinitionError(f"{here}.profile max_sequences exceeds microbatch_tokens")
+    for key, allowed in choices.items():
+        if not isinstance(profile[key], str) or profile[key] not in allowed:
+            raise DefinitionError(
+                f"{here}.profile.{key} must be one of {', '.join(sorted(allowed))}"
+            )
+        result[key] = profile[key]
+    if profile["kv_unified"] is not False:
+        raise DefinitionError(f"{here}.profile requires independent full sequence slots")
+    for key in ("cache_ram_mib", "context_checkpoints"):
+        if isinstance(profile[key], bool) or not isinstance(profile[key], int) or profile[key] != 0:
+            raise DefinitionError(f"{here}.profile.{key} must be zero for accounted full slots")
+        result[key] = 0
+    result["kv_unified"] = False
+    return {"kind": "local", "engine": "llama_cpp", "profile": result}
+
+
+def _parse_capacity(raw: Any, where: str) -> dict[str, Any]:
+    here = f"{where}.capacity"
+    if not isinstance(raw, dict):
+        raise DefinitionError(f"{here} must declare the host allocation policy")
+    known = {
+        "strategy",
+        "sequence_slots",
+        "validation_status",
+        "validation_evidence",
+    }
+    if set(raw) - known:
+        raise DefinitionError(f"{here} has unknown key(s)")
+    if raw.get("strategy") != "native_context":
+        raise DefinitionError(f"{here}.strategy must be native_context")
+    result = {
+        "strategy": "native_context",
+        "sequence_slots": _positive_int(raw, "sequence_slots", here),
+    }
+    status = raw.get("validation_status", "pending_native_validation")
+    evidence = _string_list(raw, "validation_evidence", here)
+    if not isinstance(status, str) or status not in {"pending_native_validation", "validated"}:
+        raise DefinitionError(f"{here}.validation_status is unknown")
+    if status == "validated" and not evidence:
+        raise DefinitionError(f"{here} cannot claim validated without validation_evidence")
+    return {**result, "validation_status": status, "validation_evidence": evidence}
 
 
 def _parse_credentials(raw: Any, where: str, provider_id: str) -> dict[str, dict[str, Any]]:
@@ -393,7 +491,7 @@ def _parse_credentials(raw: Any, where: str, provider_id: str) -> dict[str, dict
     return result
 
 
-def _parse_rules(raw: Any, where: str) -> list[dict[str, Any]]:
+def _parse_rules(raw: Any, where: str, *, allow_empty: bool = False) -> list[dict[str, Any]]:
     """Read one provider's ``[[rule]]`` tables into enforceable rules.
 
     ``default = true`` marks a count rule as a fallback ceiling for models the provider has not
@@ -402,7 +500,7 @@ def _parse_rules(raw: Any, where: str) -> list[dict[str, Any]]:
     is what lets a provider carry its tightest published row as a floor for unknown models
     without capping the models it explicitly allowed more of.
     """
-    if not isinstance(raw, list) or not raw:
+    if not isinstance(raw, list) or (not raw and not allow_empty):
         raise DefinitionError(f"{where} must declare at least one [[rule]] table")
     result: list[dict[str, Any]] = []
     for index, item in enumerate(raw):
@@ -421,11 +519,7 @@ def _parse_rules(raw: Any, where: str) -> list[dict[str, Any]]:
                 f"{here}.scope {scope!r} is unknown; known scopes: {', '.join(sorted(SCOPES))}"
             )
         allowed = next(
-            (
-                permitted
-                for family, permitted in ALLOWED_SCOPES.items()
-                if kind in family
-            ),
+            (permitted for family, permitted in ALLOWED_SCOPES.items() if kind in family),
             frozenset(),
         )
         if scope not in allowed:
@@ -570,6 +664,20 @@ def _require_local_serving(model: dict[str, Any], provider: dict[str, Any]) -> N
     refusing them is what makes "Ready" a fact for a cloud model rather than merely a claim nobody
     wrote down.
     """
+    derived = model.get("schema_version") == 2
+    if derived != bool(provider.get("execution")):
+        raise DefinitionError(
+            f"{model['where']} and providers/{provider['id']} must agree on engine-derived "
+            "local capacity (schema version 2)"
+        )
+    if derived:
+        if (
+            provider["capacity"]["sequence_slots"]
+            > provider["execution"]["profile"]["max_sequences"]
+        ):
+            raise DefinitionError(
+                f"providers/{provider['id']}: sequence_slots exceeds max_sequences"
+            )
     declared = (
         ("[requires]", any(model["requires"].values())),
         ("[install]", model["install"] is not None),
@@ -658,6 +766,7 @@ def _parse_install(raw: Any, where: str) -> dict[str, Any] | None:
 def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
     where = f"models/{provider_id}/{model_id}"
     document = _load_toml(path / "model.toml", "model")
+    version = document["schema_version"]
     known = {
         "schema_version",
         "label",
@@ -705,18 +814,19 @@ def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
     context = document.get("context", {})
     if not isinstance(context, dict):
         raise DefinitionError(f"{where}.context must be a table")
+    context_key = "native_tokens" if version == 2 else "advertised_tokens"
     for key in context:
-        if key != "advertised_tokens":
+        if key != context_key:
             raise DefinitionError(f"{where}.context has unknown key {key!r}")
     advertised = (
-        _positive_int(context, "advertised_tokens", f"{where}.context")
-        if "advertised_tokens" in context
-        else None
+        _positive_int(context, context_key, f"{where}.context") if context_key in context else None
     )
 
-    lanes = _parse_lanes(document.get("lane"), where)
-    largest_lane = max(lane["context_tokens"] for lane in lanes.values())
-    if advertised is not None and advertised < largest_lane:
+    lanes = _parse_lanes(document.get("lane"), where, version=version)
+    largest_lane = max(lane.get("context_tokens", 0) for lane in lanes.values())
+    if version == 2 and advertised is None:
+        raise DefinitionError(f"{where}.context.native_tokens must be declared")
+    if version == 1 and advertised is not None and advertised < largest_lane:
         raise DefinitionError(
             f"{where}.context.advertised_tokens is smaller than a declared lane window"
         )
@@ -733,6 +843,7 @@ def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
             "would offer a row whose download cannot be verified"
         )
     return {
+        "schema_version": version,
         # The qualified pair is the identifier, because it is the identity: two providers can
         # serve one model name, and a selection document that stored only the model half would
         # not say which serving was chosen. The directory keeps its short name (`name`), and every
@@ -748,6 +859,7 @@ def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
         "credential": credential,
         "key_env": str(key_env or ""),
         "advertised_tokens": advertised,
+        "native_tokens": advertised if version == 2 else None,
         "lanes": lanes,
         "capabilities": _string_list(document, "capabilities", where),
         "support_efforts": _string_list(document, "support_efforts", where),
@@ -775,7 +887,7 @@ def _string_list(document: dict[str, Any], key: str, where: str) -> list[str]:
     return list(value)
 
 
-def _parse_lanes(raw: Any, where: str) -> dict[str, dict[str, Any]]:
+def _parse_lanes(raw: Any, where: str, *, version: int = 1) -> dict[str, dict[str, Any]]:
     if not isinstance(raw, dict) or not raw:
         raise DefinitionError(f"{where} must declare at least one [lane.*] table")
     lanes: dict[str, dict[str, Any]] = {}
@@ -787,25 +899,42 @@ def _parse_lanes(raw: Any, where: str) -> dict[str, dict[str, Any]]:
             )
         if not isinstance(table, dict):
             raise DefinitionError(f"{here} must be a table")
-        for key in table:
-            if key not in {
+        keys = (
+            {
                 "context_tokens",
                 "input_tokens",
                 "output_clamp_tokens",
                 "default_effort",
-            }:
+            }
+            if version == 1
+            else {"allocation", "output_mode", "default_effort"}
+        )
+        for key in table:
+            if key not in keys:
                 raise DefinitionError(f"{here} has unknown key {key!r}")
-        context_tokens = _positive_int(table, "context_tokens", here)
-        input_tokens = _positive_int(table, "input_tokens", here)
-        clamp = _positive_int(table, "output_clamp_tokens", here)
         effort = table.get("default_effort", "")
         if effort and (not isinstance(effort, str) or not BARE.fullmatch(effort)):
             raise DefinitionError(f"{here}.default_effort must be a bare lowercase word")
+        if version == 2:
+            if (
+                table.get("allocation") != "engine"
+                or table.get("output_mode") != "remaining_context"
+            ):
+                raise DefinitionError(
+                    f"{here} must use allocation = engine and output_mode = remaining_context"
+                )
+            lanes[name] = {
+                "lane": name,
+                "allocation": "engine",
+                "output_mode": "remaining_context",
+                "default_effort": str(effort or ""),
+            }
+            continue
         lanes[name] = {
             "lane": name,
-            "context_tokens": context_tokens,
-            "input_tokens": input_tokens,
-            "output_clamp_tokens": clamp,
+            "context_tokens": _positive_int(table, "context_tokens", here),
+            "input_tokens": _positive_int(table, "input_tokens", here),
+            "output_clamp_tokens": _positive_int(table, "output_clamp_tokens", here),
             "default_effort": str(effort or ""),
         }
     for required in CREDENTIAL_LANES:

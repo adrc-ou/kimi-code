@@ -1,7 +1,8 @@
-# Model and provider definition contract (schema version 1)
+# Model and provider definition contract
 
 Two operator-owned directories hold every fact the harness needs about *what
-model serves traffic* and *what the provider permits*. Nothing in `.env`
+model serves traffic*, *what the provider permits*, and *what a managed engine
+can allocate*. Nothing in `.env`
 describes either. A model change is a directory choice at startup; a policy
 change is one edit to one file.
 
@@ -19,12 +20,9 @@ Model definitions nest under the provider that serves them, because that pair -
 not the model name - is the unit everything else already treats as one thing:
 policy keys each counter `<provider>/<wire model>`, secrets are
 `<provider>__<credential>`, and one model name can legitimately be served two
-ways. `Qwen3.8-Flash-Next` from NRP is a 1M-token window metered against
-published fair-use terms; the same model from `local_mps` is a 128K slice of the
-operator's own memory with a 111 GB download in front of it. Those are two
-definitions, not one file with a switch in it, and the model's identifier is the
-qualified `local_mps/qwen3_8_flash_next` so a selection document can say which
-serving it recorded. The directory half of that name is also what makes removal
+ways. A hosted serving can have published fair-use terms while a local serving
+allocates the operator's own memory. Those are two definitions, and the qualified
+identifier records which serving was selected. The directory half of that name also makes removal
 atomic: dropping a provider directory, or a host that cannot satisfy its
 `requires`, retires every model it served in one step.
 
@@ -36,6 +34,30 @@ Definitions are host-trusted operator configuration, **not a sandbox**. They are
 still read strictly, because these files decide which endpoint receives an API
 key: a manifest that is a symlink, a definition directory that is a symlink, and
 any non-regular file inside either tree are refused outright.
+
+## Versions and authority
+
+Repository validation and the pending native rollout are recorded in
+[capacity compatibility evidence](capacity-compatibility.md).
+
+Manifest versioning and resolved-plan versioning are separate contracts.
+`schema_version = 1` manifests retain fixed lane envelopes, fixed output clamps
+and their existing provider-rule semantics. NRP's definitions remain version 1;
+their lanes, counters, margins, routing and credential scopes are unchanged.
+
+Version 2 manifests explicitly declare managed execution and capacity-derived
+lanes. A managed provider declares its engine profile and native-context execution
+policy, plus any provider rules that also apply. `rule = []` explicitly means no
+provider fair-use rules for that managed serving. Omitting the rule declaration,
+execution profile or capacity policy is an error; absence never grants unlimited
+operation. Execution slots and provider obligations can both constrain one
+request, and their counter identities stay distinct.
+
+The resolver emits a version 1 plan for a selection using only existing fixed
+envelopes. A selection containing managed engines emits a version 3 plan with
+native windows and explicit engine slots in addition to the ordinary lanes,
+counters and limits. There is one authoritative plan for engine launch, Kimi
+configuration, proxy admission and diagnostics.
 
 Identifiers:
 
@@ -121,7 +143,7 @@ min_p = 0.0
 `schema_version`, `label`, `provider`, `model`, `slug`, `credential` and at
 least one `[lane.*]` table are required; unrecognised keys are refused so a typo
 cannot silently disable a limit. Lane names are exactly `primary`, `long` and
-`subagent`. All three lane numbers are positive integers, and a model must
+`subagent`. In version 1, all three lane numbers are positive integers. A model must
 declare both `primary` and `subagent` to appear in either picker.
 
 `[requires]` and `[install]` are the local half of that contract, and both are
@@ -152,6 +174,41 @@ Three numbers per lane, and what they mean:
 `[context].advertised_tokens` is what fraction-based provider rules are measured
 against, so it is the provider's advertised window even when no single lane is
 that large. It may not be smaller than any declared lane window.
+
+### Version 2 engine-derived model envelopes
+
+Checkpoint, quantization, capabilities, reasoning defaults, installation locks
+and static installed-RAM/disk eligibility remain model facts. These floors gate
+model selection; they do not size context or assert residency. A managed model replaces the
+fixed lane numbers with an engine binding and names its native ceiling:
+
+```toml
+schema_version = 2
+# Existing identity, capabilities, requires and install fields are retained.
+
+[context]
+native_tokens = <checkpoint-native ceiling>
+
+[lane.primary]
+allocation = "engine"
+output_mode = "remaining_context"
+
+[lane.subagent]
+allocation = "engine"
+output_mode = "remaining_context"
+default_effort = "low"         # optional, as for fixed lanes
+```
+
+The placeholder above is an integer from the model's own manifest, not TOML to
+copy literally. Version 2 requires `native_tokens`; it is neither an extended
+YaRN ceiling nor a provider-advertised denominator. Fixed `context_tokens`,
+`input_tokens` and `output_clamp_tokens` are refused in these lane tables. The
+resolver gives every lane bound to an engine the same fixed per-sequence
+context, while preserving separate routes, aliases and reasoning defaults.
+`input_tokens` becomes that window less Kimi's existing compaction reserve.
+That is an early-compaction target, separate from the hard context boundary.
+The absolute output ceiling is the engine window; each request's output
+allowance is its actual remaining context, further bounded by any client maximum.
 
 A model declares **capabilities**, never costs or limits. `capabilities`,
 `support_efforts` and the effort default are copied into the generated Kimi
@@ -199,9 +256,10 @@ context_margin_percent = 95               # optional, 1-100, default 100
 output_rate_margin_percent = 90           # optional, 1-100, default 100
 ```
 
-`label`, `[endpoint]`, at least one `[[credential]]` and at least one `[[rule]]`
-are required. An empty `[[rule]]` list would mean "this provider has no terms",
-which is a claim worth refusing rather than assuming.
+`label`, `[endpoint]` and at least one `[[credential]]` are required. Version 1
+also requires a nonempty `[[rule]]` list. Version 2 requires explicit managed
+execution and capacity declarations; only that version may use an explicit
+empty `rule = []` list. Both versions reject unknown or unenforceable rules.
 
 **Endpoint.** `base_url` is the documented default for the deployment and
 carries no path; the proxy appends its own route per request. `base_url_env`
@@ -349,7 +407,7 @@ expressed by adding a `limit` kind, not by restructuring the resolver.
 Conversely, a provider with *no* concurrency rule at all is legitimate — see
 "greedy resolution" below.
 
-**Safety margins** are the only tunables a provider file carries, and they exist
+**Provider safety margins** exist
 because request cost is estimated before it is known. Each is a percentage of
 the provider's own threshold, applied by the resolver — never a number
 subtracted by hand in `.env`. `_percent()` accepts only an integer from 1 to 100,
@@ -362,42 +420,182 @@ request rather than deadlocking. At the shipped provider the two derived numbers
 are 332,500 in-flight tokens (95% of 350,000) and 180,000 booked output tokens
 per minute (90% of 200,000).
 
-## Local serving: weights, engine, and `Ready?`
+## Managed local execution and capacity
 
-A provider that names a host capability is served by a process on that machine,
-and that adds three things the resolver and the proxy do not otherwise have to
-know about: weights that must be fetched and verified, an engine that must be
-running before a lane answers, and a per-lane origin, because one engine process
-holds one model.
+The version 2 provider declares `[execution]` with `kind = "local"` and
+`engine = "llama_cpp"`, a measured host capability in `requires`, and both tables
+below. Values are provider-owned facts under `providers/`; there are no capacity
+environment variables or separate model-capacity registry.
 
-**Nothing about the request path changes.** The proxy already takes its upstream
-URL from the plan per lane and speaks one wire format, so a local model is a new
-`base_url`, not a new code path. Prompt archiving, failure dumps, lane policy and
-the config-drift check apply to local traffic exactly as they do to cloud traffic,
-and the agent container still has exactly one model egress. The engine therefore
-has to be an OpenAI-compatible chat-completions server - which `llama-server`,
-Ollama, LM Studio, vLLM and SGLang all are - and `local_mps` and a future
-`local_cuda` differ in their engine, not in their contract.
+| Table | Required fields | Meaning |
+| --- | --- | --- |
+| `execution.profile` | `context_granularity`, `max_sequences`, `batch_tokens`, `microbatch_tokens` | Positive integer alignment and engine capability bounds; microbatch cannot exceed batch, and sequence ceiling cannot exceed microbatch |
+| `execution.profile` | `cache_type_k`, `cache_type_v` | The initial adapter accepts `"f16"` for both; it does not change cache precision automatically |
+| `execution.profile` | `flash_attention`, `load_mode`, `lazy_mode`, `gpu_layers` | Initial normalized settings: `"auto"` for the first three, `"all"` for GPU layers |
+| `execution.profile` | `kv_unified`, `cache_ram_mib`, `context_checkpoints` | Independent slots require `false`; extra RAM prompt cache and checkpoints require zero in this profile |
+| `capacity` | `strategy` | `"native_context"`: full model-native windows without available-memory fitting |
+| `capacity` | `sequence_slots` | Explicit positive slot count, bounded by `execution.profile.max_sequences`; the shipped local provider declares one |
+| `capacity` | `validation_status`, `validation_evidence` | Status is `"pending_native_validation"` by default or `"validated"`; validated status requires evidence references |
 
-Image eviction is the one policy knob whose *reason* is cloud-shaped: its
-documented motives are staying inside what a metered gateway accepts, keeping a
-shared cache prefix stable, and not paying tokens for pixels twice. None of those
-apply to a loopback server, and eviction remains off unless the operator turns it
-on - where it still helps, for a different reason, because a re-sent image is KV
-cache the host cannot use for anything else.
+The current adapter supports Metal. Unsupported backends fail explicitly.
+Adding another engine requires an adapter that launches and verifies its model,
+build, fixed context, slots and serving settings.
 
-**A local model declares one agent lane, and that is deliberate.** The `primary`
-and `long` pair exists on a metered provider because the two windows trade context
-against in-flight overlap: the narrow reservation is what leaves the provider's
-shared pool room for other requests. Locally the pool is the operator's memory, the
-provider's own rule allows one or two concurrent requests, and there is nothing left
-to trade — so the honest shape is the widest window the smallest eligible host can
-hold, declared once as `primary`. A model with a single agent lane offers one row on
-the main screen and launches on it, which is the case this document already
-documents for a model that omits `[lane.long]`. Adding a `long` lane to a local
-definition would not widen anything; it would put a second, larger KV reservation in
-front of the same memory and ask the operator to choose between two promises the
-host cannot both keep.
+A managed provider may combine capacity with supported count, rate and context
+rules. Version 2 currently rejects `max_context_tokens` and
+`max_output_tokens_per_request`: fixed per-request caps cannot silently replace
+the declared engine-derived envelope and remaining-context output mode.
+
+### Resolution and launch
+
+The provider explicitly declares `capacity.strategy = "native_context"` and a
+`sequence_slots` count. Each engine receives its model's `context.native_tokens`
+without shrinking or fitting. The window must be engine-aligned and exceed Kimi's
+compaction reserve. Slot counts must fit the declared engine capability, not a
+memory estimate. A model serving both roles is deduplicated; distinct models
+remain separate processes. The generic remote fan-out fallback is never a local
+slot count.
+
+The picker retains backend/platform and quant-specific installed-RAM/disk
+eligibility. Models below their declared static floors are filtered out, including
+explicit overrides. Unknown installed RAM fails a nonzero RAM floor. Current
+available-memory measurements and missing estimators do not disable an otherwise
+eligible choice. `Not Installed`
+models remain selectable; installation and digest verification complete after
+selection and before launch. No unverified weights become `Ready`.
+
+Version 3 engine records declare `capacity_strategy = "native_context"`,
+`memory_management = "os_managed"`, `native_context_tokens`, `context_tokens`,
+`sequences`, and `total_context_tokens = context_tokens × sequences`, together
+with pinned model/build/profile identities and bindings. Physical `resources`,
+projected `allocations`, headroom and process-overhead admission settings are
+absent. Stale version 2 local plans require a relaunch and are never silently
+reinterpreted. Version 1 provider-rule plans retain their existing contract.
+
+After static eligibility passes, available RAM, predicted allocations, RSS and
+Metal's recommended working set do not gate resolution or startup. `host-caps.json` retains optional
+observations for diagnostics; missing available-memory or RSS readings are not fatal. Offline
+projection helpers remain available for explicitly requested diagnostics, but
+launch does not require or call `llama-fit-params`.
+
+Serving preserves FP16 cache, native context, sampling defaults, independent slots,
+zero extra RAM prompt cache and zero context checkpoints. Automatic fitting is
+explicitly off; loading remains automatic memory mapping, without memory locking,
+OS tuning, CPU fallback, YaRN or automatic precision changes. Paging and allocation
+are decided by the OS/backend; removing harness limits cannot make every Metal
+allocation pageable or guarantee its success. In-slot reuse remains available;
+a changed prefix may require additional prompt processing.
+
+The supervised host engine authenticates readiness and verifies model/build,
+per-sequence context, slot count and normalized settings before exposing Kimi.
+Memory observations in readiness records do not establish or enforce a RAM bound.
+An actual allocation/startup failure stops that launch and is logged. It never
+silently changes model, precision or context. Runtime engine failure makes its
+routes unavailable; comprehensive OOM recovery and automatic restarts are deferred.
+
+### Request admission
+
+Local `primary` and `subagent` retain separate routes, aliases and reasoning
+defaults while binding to their engine's fixed window. `agent_lane` remains a
+launch-time designation, and `secondary_model.force = true` remains mandatory.
+Each engine contributes an ordinary count counter named
+`count:engine:<qualified model id>`, with `scope = "engine"` and
+`source = "engine_capacity"`. That identity is separate from provider fair-use
+counters. Requests acquire one full slot through the existing execution gates;
+excess requests queue with queued-main priority. A shared engine permits children
+to use all its slots while the main agent waits.
+
+Preparation is serialized per engine outside execution permits. After model
+binding and existing body transformations, the proxy sends the final payload,
+including tools, thinking settings and chat-template framing, to the authenticated
+`/v1/chat/completions/input_tokens` endpoint. It retains body limits, cancellation
+and bounded queues. Unavailable or malformed counts fail closed, without a
+bytes-per-token fallback. A prompt at or beyond the hard context boundary is
+rejected with a context diagnostic; otherwise the output allowance is the actual
+remaining context, bounded by any explicit client maximum. Kimi's earlier
+compaction target does not shorten this hard boundary.
+
+Execution permits are released on completion, cancellation and failure. Retry
+backoff and rate waits hold no execution permits. Engine failure makes its local
+routes unavailable without resizing ongoing conversations or changing independent
+NRP enforcement. NRP retains its existing token estimation, guards, reservations,
+rate booking, output clamps, exclusivity and aggregate-budget semantics in both
+mixed-provider directions.
+
+### Capacity diagnostics and qualification
+
+The recap and health information report native context, explicit execution slots,
+OS-managed memory, pinned identity and validation status. Request-ID logs identify
+queue and rejection reasons. The single resolved plan remains authoritative;
+there is no separate memory budget, persistent calibration store or policy env var.
+Readiness and optional diagnostic records remain instance-scoped.
+
+The local declarations remain `pending_native_validation`. Fixtures do not prove
+native generation correctness, paging performance or success beyond physical RAM.
+Native evidence may record peak RSS and shutdown allocations; these are observations,
+not admission limits, and no process-overhead allowance is calibrated or enforced.
+
+### Operator native evidence command
+
+`tools/local_capacity_smoke.py` collects synthetic evidence from an existing
+resolved instance. Run it on the host after a normal launch with Kimi idle; the
+test deliberately uses every planned slot on each selected local engine. It
+checks the authenticated model/build/context properties and readiness fingerprint,
+and verifies that the sampled PID is still the recorded supervisor's child. It
+does not install, start, stop or reconfigure a model, and does not change the plan.
+
+```sh
+python3 tools/local_capacity_smoke.py run \
+  --runtime /path/to/harness/.local/runtime/INSTANCE
+```
+
+The tool builds a tokenizer-measured near-window prompt containing tools, Unicode,
+code and thinking settings, observes simultaneous slot occupancy through `/slots`,
+and makes a preparation call while all those executions remain occupied. It
+requires the requested synthetic generation workload to finish and samples only
+that owned engine's RSS. An unavailable count, missed occupancy overlap, identity
+drift, incomplete generation or failed measurement fails the evidence run. The
+CLI output budget and timeout control only the synthetic workload. A larger
+output budget may be needed when generation finishes before overlap is observed.
+
+Results are private files under the instance's `capacity-smoke/` directory. They
+contain normalized engine, profile and weight-lock identity, usage
+counts and measured RSS. They contain no credential,
+synthetic request body or generated response text. Failed attempts also retain
+a partial record. Distinct engines are stressed sequentially with selected
+weights resident; this does not establish a synchronized execution peak across
+different engine processes.
+
+After the operator stops the stack through its normal lifecycle, isolate exactly
+one `fit_memory_breakdown` JSONL shutdown event for the recorded engine into a file
+under the same instance directory. Then attach the allocation observation to that engine's evidence record:
+
+```sh
+python3 tools/local_capacity_smoke.py compare-shutdown \
+  --runtime /path/to/harness/.local/runtime/INSTANCE \
+  --record smoke-RECORD_ID.json --engine provider/model \
+  --event /path/to/harness/.local/runtime/INSTANCE/isolated-shutdown.jsonl
+```
+
+The comparison records rounded core host/device allocations and the event digest.
+Larger allocations do not fail an evidence run or create a RAM admission limit.
+A combined log does not prove which engine emitted an unlabelled event: this
+step records the attribution as operator-provided and requires one isolated
+event. The tool always leaves `native_qualification_complete = false`, including
+after a passing comparison. Both pinned quants, the appropriate multi-engine and
+maximum-context workloads and shutdown attribution still
+require review before declaring the provider profile validated. It never writes
+validation status back into a manifest.
+
+### Weights, engine, and `Ready?`
+
+Local engines run on the host because Docker's macOS VM cannot address Metal or
+the host's unified memory. Each model has its own origin and port. The listener
+must be reachable from the VM, so it is authenticated with a generated session
+token shared only with the proxy; `LOCAL_MPS_BIND` can narrow its host interface.
+The agent container still has one model egress through `model-proxy`. Prompt
+archiving, failure diagnostics and the staged-configuration drift check continue
+to apply to local traffic.
 
 **`weights.lock.json`.** One tracked file per local model, beside its manifest:
 
@@ -437,9 +635,8 @@ commit, the variant, and the digests that were matched, and it is the only thing
 that makes a model report `Ready`. Correctly-sized files with no marker are
 reported `Not Installed` until something has read them once - which
 `install` does in place, without refetching, so hand-copied weights cost a hash
-and not a transfer. The digest is never recomputed at launch: the picker's column
-is marker plus sizes, because hashing 111 GB per screen would be the last thing a
-launch did.
+and not a transfer. The picker's column reads the verification marker and file
+sizes; it does not hash the entire checkpoint again for each screen.
 
 **The engine** is a pinned host binary in `dependencies.lock.json` under
 `downloads`, fetched from the official release and verified against the digest
@@ -450,18 +647,13 @@ the way the Kimi bundle is - the same `sha256:` check
 Extraction refuses any member that would write outside its directory, and keeps
 the versioned dylib symlinks a real macOS release is built from.
 
-**Lifecycle, and why nothing blocks the operator.** The launcher measures the host
-before the questions, so the picker shows only what this machine can run. After
-`./start.sh` commits the answers, a selected model that is not installed is
-provisioned in the background and its lane goes live mid-session - the questions
-are never waiting on a download. A model that *is* installed has its engine
-started before `docker compose up`, so the first request finds a server. Each is
-a host process tracked so shutdown stops it: a model server cannot run in a
-container on macOS, because Docker's VM has no access to the Metal device or to
-unified memory, which is the same reason the ComfyUI MPS backend runs on the
-host. That listener is reachable from the VM (loopback is not - the gateway
-address arrives at the Mac on another interface), so it is bound broadly and
-authenticated by the session token; `LOCAL_MPS_BIND` narrows it.
+**Lifecycle.** After model and module selection, the launcher waits for selected
+weights to be installed and verified, then resolves final capacity. Selected
+engines must pass authenticated startup validation before Kimi becomes available.
+Installation failure, interruption or startup failure leaves no partially ready
+local route exposed. The launcher tracks each host process and stops it on
+shutdown. A selected model never becomes available through a mid-session plan
+rewrite.
 
 ## Resolution
 
@@ -501,11 +693,13 @@ model splits ledgers, it does not enlarge any allowance.
    the generated workspace guidance. Labels are the only thing that map touches;
    the ids stay `primary`/`long`/`subagent` because they name the route, the
    alias, and the provider-scoped policy behind them.
-2. **Lane sizing.** Per-request caps shrink the declared window and clamp;
+2. **Fixed lane sizing.** For version 1, per-request caps shrink the declared window and clamp;
    `input_tokens` is then `min(declared, context - clamp)`. Kimi's
    `loop_control.reserved_context_size` (read from `runtime/config.toml`,
    because it describes how Kimi paces its own compaction rather than what the
-   model is) must fit inside every lane or resolution fails.
+   model is) must fit inside every lane or resolution fails. Managed lanes
+   instead use the already-resolved engine window and remaining-context output
+   mode described under managed execution above.
 3. **Counters.** One context counter per (provider, model) pair, plus rate and
    count counters per admissible scope, each keyed by the scope table above and
    carrying the list of lanes bound to it. A model serving itself with its own
@@ -513,7 +707,8 @@ model splits ledgers, it does not enlarge any allowance.
    credential-scoped rule follows the key actually in use rather than the
    provider that issued it. A model-scoped concurrency limit is
    folded into that model's context counter rather than duplicated, since both
-   describe the same set of in-flight requests.
+   describe the same set of in-flight requests. Each managed engine adds its own
+   engine-scoped count counter for declared execution slots.
 4. **Exclusivity.** A lane is exclusive when its in-flight cost
    (`input + clamp`) reaches the tightest `exclusive_above_context_fraction`
    threshold bound to it.
@@ -522,16 +717,19 @@ model splits ledgers, it does not enlarge any allowance.
    exclusive lane may exceed the budget, because the provider itself permits
    exactly that request to run alone; the proxy admits it only when the counter
    is empty.
-6. **Derived limits.** `subagent_concurrency` is the largest fan-out the rules
+6. **Derived limits.** For fixed provider envelopes, `subagent_concurrency` is the largest fan-out the rules
    allow: `1` when the subagent lane is exclusive, otherwise the minimum of the
    count ceilings and every `budget ÷ reservation` quotient. When the selected
    provider states no ceiling at all, the harness publishes its own default of
    8 and labels it as such — an unconstrained provider is a reason to use the
-   allowance, not a reason to stall the workspace on 1.
+   allowance, not a reason to stall the workspace on 1. For managed children it
+   comes from their selected engine's resolved slots, further constrained by any
+   applicable provider rules. The main model's provider does not determine child
+   concurrency.
 
-The three structural cases a selection can fall into:
+The structural cases a selection can fall into:
 
-- **One model in both lanes** — one `model`-scoped counter, so primary and
+- **One fixed-envelope model in both lanes** — one `model`-scoped counter, so primary and
   subagent traffic contend for the same permits and the aggregate context
   budget spans both lanes. Fan-out is `budget ÷ subagent reservation`.
 - **Two models, one provider** — two model-scoped counters; only
@@ -540,11 +738,16 @@ The three structural cases a selection can fall into:
 - **Two models, two providers** — disjoint key sets. Each provider's rules are
   enforced only against its own traffic, and the derived subagent fan-out comes
   from the subagent's provider alone.
+- **One managed model in both lanes** — one engine allocation and one
+  engine-capacity counter, shared by primary and subagent requests.
+- **Distinct managed engines** — separate processes with full native context and explicit
+  engine-scoped slots; no joint memory-admission check.
 
 ### Greedy, not conservative
 
-Every derived number is the largest the provider's rules allow after the declared
-margin. Under-using a paid allowance buys nothing and costs wall-clock time, so
+Fixed-envelope limits are the largest the provider's rules allow after the declared
+margin. Managed execution uses full native context and declared slots, independently of
+physical-memory measurements. In either case,
 `./start.sh` also derives Kimi's subagent fan-out from the same plan the proxy
 enforces — Kimi fills the envelope exactly instead of hoping two hand-written
 numbers agree. `tools/prompt_context.py enabled_guidance()` turns the plan into
@@ -558,21 +761,27 @@ additions are byte-identical to it, which is what keeps the two from drifting.
 
 ## Artifacts and lifetimes
 
-All generated files live under `.local/runtime/<instance>/` (mode 0600, created
-atomically) and are deleted when the launcher exits:
+Generated launch artifacts live under the harness root's
+`.local/runtime/<instance>/`, never the selected workspace. Private files are
+mode 0600. The session sweep removes plans, rendered credentials and readiness
+records at shutdown and before the next launch; logs and remembered selections
+have their own longer lifetimes.
 
 | File | Written by | Read by | Contents |
 | --- | --- | --- | --- |
 | `model-selection.json` | `models.py select` | `models.py resolve` | `{"primary": id, "subagent": id, "agent_lane": "primary"\|"long"}` — the two lanes the user answered, and the window the primary screen's row carried |
 | `last-model-selection.json` | `start.sh` after a successful launch | `models.py select` | Prior selection, shown as `(last used)` and pre-selected, its `agent_lane` deciding which of a model's two rows was the answer |
-| `model-policy.json` | `models.py resolve` | proxy, `render_runtime.py`, `check_services.py` | The plan: lanes, counters, limits, providers, selection, designated agent lane |
+| `model-policy.json` | `models.py resolve` | proxy, `render_runtime.py`, `check_services.py`, `local_llm.py serve` | The authoritative plan: lanes, counters, limits, providers, selection and agent lane; version 3 also includes native context, execution slots, OS-managed memory and engine identity |
 | `model.env` | `models.py resolve` | `start.sh`, then Compose interpolation | `KIMI_SUBAGENT_CONCURRENCY`, `KIMI_BACKGROUND_TASK_SLOTS` — only the values `compose.yaml` interpolates; lane aliases reach Kimi through the rendered config |
 | `credentials/<provider>__<credential>` | `render_runtime.py` | proxy (via Docker secret) | One key value each, where a model-scoped credential id is the synthesised `<credential>__<slug>`; stale files from deselected models are removed |
 | `compose/models.json` | `models.py resolve` | Compose (`-f`, appended by `tools/runtime.sh`) | Secrets declaration + the proxy service's secret list |
-| `host-caps.json` | `host_caps.py summary`, from `start.sh` | `host_caps.caps()` via `models.py` and `flow_survey.py` | This machine's platform, memory, free disk and accelerator capabilities; the one probe the picker, the resolver and the launch notes all read |
-| `local-model.log` | `local_llm.py serve` / `provision` | the operator | One line per download and the engine's own output. Deliberately not deleted with the rest: it is where a failed 111 GB fetch is explained after the session that started it has ended |
+| `host-caps.json` | `host_caps.py summary`, refreshed by `capacity.prepare` after installation | picker, resolver, launch notes | Platform, disk and accelerator eligibility; optional memory observations do not determine native context or admission |
+| `capacity-projections.jsonl` | optional projection diagnostics | the operator | Optional normalized host/device estimates; never required by launch or used for admission |
+| `local-engines/<provider>__<model>.json` | supervised `local_llm.py serve` | launcher readiness check | Owned process identities bound to the plan fingerprint and resource snapshot; removed on exit and swept as session state |
+| `local-model.log` | `models.py install`, `local_llm.py serve` | the operator | Installation and structured engine output; retained for diagnosing a failed launch |
+| `capacity-smoke/smoke-<id>.json` | operator-invoked `local_capacity_smoke.py` | the operator | Synthetic native workload evidence and optional shutdown comparison; retained instance-scoped, with qualification explicitly pending review |
 
-Two artifacts survive a launch, because deleting either would throw away work
+Two model-installation artifacts survive a launch, because deleting either would throw away work
 that took hours rather than a session: the weights themselves, at
 `models/<provider>/<id>/weights/`, and `weights/install.json` beside them
 recording which digests were matched. Both are git-ignored and
@@ -580,8 +789,8 @@ recording which digests were matched. Both are git-ignored and
 `credentials/local_mps__default` does *not* survive, by design: it is the session
 token a locally-started engine was given, and a new launch starts a new engine.
 
-The plan is a versioned document (`schema_version = 1`); the proxy refuses a plan
-whose version it does not understand. Only lanes present in the plan get routes,
+The plan is independently versioned; the proxy supports the existing version 1
+and native-context version 3 contracts, and refuses unknown versions. Only lanes present in the plan get routes,
 so a model without a `long` lane 404s on `/long/v1/*` rather than serving it.
 
 `compose.bootstrap.yaml` must declare every `.env` name the selected definitions
@@ -646,15 +855,13 @@ prompt" survives upstream.
 
 Delete the directory to remove it. Nothing else references model ids.
 
-A **local** model takes two more steps. Write its `weights.lock.json` with one
+A **managed local** model uses the version 2 envelope and takes two more steps. Write its `weights.lock.json` with one
 pinned commit and the SHA-256 of every file - read them from the hub's own API
 (`paths-info` returns the LFS `oid`, which is the file's SHA-256) rather than
 guessing, and let `python3 scripts/check_locks.py` refuse the shape if it is
-wrong. Then declare `[requires]` from the arithmetic, not from the hardware in
-front of you: the memory floor is the pinned quant's resident size plus KV for
-the widest lane plus what the harness's own container VM takes from the same
-pool, and a floor that has been lowered to fit a machine is a promise the engine
-will break at first use. `[install].port` must be unique within the provider.
+wrong. Declare quant-specific installed-RAM/disk eligibility and backend support.
+These static floors do not imply that native context fits available RAM.
+`[install].port` must be unique within the provider.
 
 ## Adding a provider
 
@@ -671,12 +878,12 @@ step - and it is the same mechanism that removes them on a host that cannot
 satisfy the provider's `requires`, which is why a local provider needs no
 hiding rule of its own.
 
-A provider whose models run on the operator's machine additionally names a
-capability in `requires`, sets `sends_cache_salt = false`, gives its credential
-`generate = true`, and publishes real capacity rules (`max_concurrent_requests`
-per model, plus a provider default for the models nobody transcribed yet). The
-engine it needs is a `downloads` entry in `dependencies.lock.json`, and
-`tools/host_caps.py` is where a new capability gets its measurement.
+A managed provider whose models run on the operator's machine uses version 2,
+names a capability in `requires`, sets `sends_cache_salt = false`, and gives its
+credential `generate = true`. It declares an engine profile, capacity strategy
+and explicit provider-rule list. The engine is pinned by a `downloads` entry in
+`dependencies.lock.json`; `tools/host_caps.py` measures platform resources, and
+the engine adapter verifies authenticated model/build/context readiness.
 
 ## The launcher's model screen
 
@@ -696,24 +903,23 @@ marked row's cells into one sentence, and repeats its hint only when the grid is
 not being drawn - or when the row cannot be selected, where the hint is the reason
 and the grid has no column for it.
 
-`Ready?` is a fact about the host, not a guess: it comes from
-`tools/local_llm.py`, and a model with no `[install]` block is always ready
-because no code here installs anything for it. The column is what the automatic
-download is offered against - selecting a `Not Installed` model proceeds, and
-provisioning happens after the questions end.
+Installation readiness comes from `tools/local_llm.py` and retains digest-based
+verification. A model with no `[install]` block requires no local installation.
+`Not Installed` local choices proceed through the verified installer before serving.
+The picker and read-only forecasts do not estimate memory fit. The resolved recap
+reports the declared native window and slot count, without a physical-fit promise.
 
 ## Kimi's model picker
 
 `render_runtime.py` generates `[providers.*]`, `[models.*]` and
 `[secondary_model]` from the plan, so the harness sets the default model and the
 subagent model automatically. Each `[models.*]` table carries a `display_name`
-built from the model's label and the lane's `LANE_DISPLAY` phrase — for the
-shipped plan, `Qwen3.8-Flash-Next - Long (queued)`,
-`... - Medium (concurrent)` and `... - Subagent (automatic)` — and no provider
-name, with one exception: when a plan serves one model label through two
-providers, every lane carrying that label gains the provider in brackets
-(`Qwen3.8-Flash-Next [Local (MPS)] - Long (queued)`), because two rows of an
-identical name would otherwise be chosen by guessing. One label across two lanes
+built from the model's label and its lane description. Fixed envelopes retain
+the Long/queued, Medium/concurrent and Subagent/automatic descriptions. Managed
+local capacity is described by its fixed engine window and slots. A provider
+name is added only when a plan serves one model label through two providers:
+every lane carrying that label gains its provider in brackets, because otherwise
+identical names would require guessing. One label across two lanes
 of the *same* provider is not that case — those rows already differ by their lane
 phrase — so an ordinary launch reads exactly as it did. Each table still binds
 its own provider with a `provider =` key beside
@@ -749,10 +955,11 @@ snapshot under `/policy/`, which is read-only and outside Kimi's own home;
 `/home/agent/.kimi-code/config.toml`, where an in-session `/model` writes, is
 never opened. A model switch is therefore not policed by name — and could not
 be, since the proxy has no view of it — but it is policed by *price*: whichever
-alias the request arrives under, the proxy resolves that lane's own reservation
-and re-prices the permit from the request's measured size, so a session that
-switched itself onto a wider window still cannot spend more than that window's
-lane is permitted. A wrong turn loses a request, not fair-use compliance. The
+alias the request arrives under, the proxy resolves that lane's own reservation.
+For fixed provider envelopes it re-prices the permit from the request's estimated
+size; managed routes instead enforce exact engine token counts and acquire a full
+slot. A session that switches aliases is still bounded by the chosen route's
+policy and fixed engine allocation. The
 converse is also deliberate: the designations cannot be *enforced* to agree, so
 `agent_lane` is a launch-time statement of which window the session opened in,
 which is why the generated envelope publishes it — an agent cannot otherwise tell

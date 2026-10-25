@@ -8,7 +8,7 @@
 #
 # Copy the directory to add another local model; delete it (weights/ and all) to remove one.
 
-schema_version = 1
+schema_version = 2
 
 label = "Qwen3.8-27B"
 provider = "local_mps"
@@ -37,62 +37,28 @@ default_effort = "xhigh"
 # rule measures against it - the local provider publishes none - so this is documentation with a
 # job: it must not be smaller than any lane below.
 [context]
-advertised_tokens = 262144
+native_tokens = 262144
 
 # ------------------------------------------------------------
-# What this machine has to be
-#
-# The quantised build below is 17,559,178,144 bytes = 16.4 GiB. Unsloth's own floor for a 4-bit
-# build of this model is "a Mac with 24 GB RAM", and 24 GiB is where that gets tight on this
-# harness specifically: the engine runs on the host, outside every container limit, and the
-# Docker Desktop VM that runs the agent takes its memory out of the same unified pool the weights
-# need (plus the macOS wired-buffer ceiling, roughly three quarters of RAM). So the floor here is
-# 32 GiB - one notch above the vendor's, raised for the co-resident VM rather than lowered to fit
-# a machine. A 24 GiB Mac is refused by this definition even though the model would run on it.
-#
-# Disk is the download plus the KV cache file the engine may memory-map, measured in GiB against
-# the filesystem the harness checkout lives on.
+# Static host eligibility for the pinned quant, independent of current free RAM.
+# Passing this floor does not shrink native context or promise resident execution.
 [requires]
 memory_gib = 32
 disk_gib = 24
 
 # ------------------------------------------------------------
-# Lanes, sized for the smallest host this model is offered on.
-#
-# Every lane must satisfy input_tokens + reserved_context_size (8,192 today, from
-# runtime/config.toml) <= context_tokens, and the context the engine is started with has to cover
-# the widest lane sum, because KV cache is the binding constraint on 16 GiB of weights in a
-# 32 GiB machine. That is why these windows are a fraction of the native 262K: this is a working
-# agent's budget, not the model's ceiling.
-#
-# No `long` lane at all. On this host the wide window is not a thing to trade queueing against -
-# there is no second pool of capacity behind it - and a lane that could not be admitted would be
-# a lane the operator could select and never use.
+# Both roles use the full declared native window. The provider declares slots;
+# no memory-fit policy shrinks the window or adds concurrency.
+# Output is bounded by actual remaining context rather than a fixed partition.
 [lane.primary]
-context_tokens = 32768
-input_tokens = 20480
-output_clamp_tokens = 8192
+allocation = "engine"
+output_mode = "remaining_context"
 
-# Subagent lane. The provider's model-scoped rule allows two concurrent requests, so the fan-out
-# the launcher publishes for a local subagent lane is 2, not the 5 a cloud pool supports. Children
-# run narrower and slower here by design; a 27B model answering five children at once on one GPU
-# answers none of them.
 [lane.subagent]
-context_tokens = 16384
-input_tokens = 8192
-output_clamp_tokens = 4096
+allocation = "engine"
+output_mode = "remaining_context"
 default_effort = "low"
 
-# ------------------------------------------------------------
-# Installing and serving this model on the host.
-#
-# `variant` names which build of the quantised repository is fetched - see weights.lock.json
-# beside this file for the commit and the SHA-256 of every byte. `port` is where the engine
-# listens: two local models need two processes, and the provider's origin keeps the host so
-# LOCAL_MPS_BASE_URL can still move it.
-#
-# The sampling defaults are the vendor's published thinking-mode numbers. They go to the engine,
-# not to Kimi: a per-request sampler would be Kimi's choice to make, and it does not make one.
 [install]
 variant = "UD-Q4_K_XL"
 lock = "weights.lock.json"

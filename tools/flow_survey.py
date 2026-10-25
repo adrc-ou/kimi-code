@@ -91,9 +91,8 @@ class Survey:
     def definitions(self) -> tuple[dict, list[dict]] | None:
         """The catalog this host can serve, or ``None`` when it will not load.
 
-        Filtered exactly as :func:`tools.models.cmd_select` filters it: a rail that counted a
-        screen the launcher never shows is the same lying progress bar this survey exists to
-        prevent, and a model hidden by the host is hidden from both.
+        Uses the picker's host eligibility filter, without memory projections or
+        installation. Native local windows do not depend on available RAM.
         """
 
         def produce() -> tuple[dict, list[dict]]:

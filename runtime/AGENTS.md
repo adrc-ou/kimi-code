@@ -168,7 +168,10 @@ Use `git status` and `git diff` frequently.
 
 The numbers move with the model and the provider's published terms, so they are not
 written here. They arrive in the generated sections the launcher appends at startup,
-and the model proxy enforces every one of them independently of this text.
+and the model proxy enforces every one of them independently of this text. For a
+managed local engine, those sections describe its native context and declared
+execution slots rather than a shared provider allowance. Memory is managed by
+the OS/backend; the harness does not promise that allocations fit physical RAM.
 
 What a table cannot state is what not to do:
 
@@ -182,6 +185,10 @@ What a table cannot state is what not to do:
   for a permit costs nothing and holds nothing; the request is not lost.
 - When a task needs more context than its lane offers, narrow the task or let the
   main agent do it in sequence. Do not exceed a shared budget to avoid a pause.
+- Local windows and slots stay fixed; excess requests queue. Keep the generated
+  child limit and engine settings. Local output uses the context left after final
+  templating, within the client's maximum; Kimi compacts earlier. On a context
+  rejection, shorten the prompt. An engine failure disables only its routes.
 - Subagent and swarm runs have no wall-clock limit, so a long run is bounded by the
   proxy and by context instead. A stalled stream is a reason to resume the work, not
   to redesign it.

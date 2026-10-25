@@ -16,6 +16,8 @@ import policy  # noqa: E402
 import prompt_context  # noqa: E402
 import render_runtime  # noqa: E402
 
+from tests.helpers import SHIPPED_MODEL  # noqa: E402
+
 
 class LaunchSteps:
     """The two launch steps that produce Kimi's configuration, driven against the shipped trees.
@@ -46,6 +48,10 @@ class LaunchSteps:
             "HARNESS_RUNTIME_DIR": str(state),
             "HARNESS_WORKSPACE": str(workspace),
             "HARNESS_RESOLVED_BOOTSTRAP": str(resolved),
+            # Rendering/credential tests exercise the hosted definition. Never
+            # select an installed local model or project the operator's weights.
+            "HARNESS_PRIMARY_MODEL": primary or SHIPPED_MODEL,
+            "HARNESS_SUBAGENT_MODEL": SHIPPED_MODEL,
         }
         if primary:
             environment["HARNESS_PRIMARY_MODEL"] = primary

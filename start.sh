@@ -302,8 +302,6 @@ harness_flow_source() {
 harness_flow_pass() {
   # Both model lanes are answered in one process, so Backspace between them never has to leave it.
   harness_flow_step python3 tools/models.py select ${module_args[@]+"${module_args[@]}"} || return
-  harness_flow_work python3 tools/models.py resolve || return
-  harness_flow_source "${HARNESS_RUNTIME_DIR}/model.env" || return
 
   harness_flow_step python3 tools/modules.py select ${module_args[@]+"${module_args[@]}"} || return
   harness_flow_work harness_modules configure || return
@@ -331,6 +329,12 @@ harness_flow_pass() {
   harness_flow_work python3 tools/safe_workspace_init.py "${workspace}" || return
   harness_flow_work python3 tools/resource_check.py "${workspace}" || return
   harness_flow_work python3 tools/modules.py assemble || return
+
+  # Size all selected engines together after module selection. The prompt panel
+  # and immutable Kimi configuration must consume the final, fixed envelope.
+  harness_flow_work python3 tools/models.py install || return
+  harness_flow_work python3 tools/models.py resolve || return
+  harness_flow_source "${HARNESS_RUNTIME_DIR}/model.env" || return
 
   # Both halves of the context decision happen here, after the modules are known and before anything
   # is rendered: the panel is the only place the resolved prompt graph is ever visible, and the file
@@ -373,23 +377,26 @@ python3 tools/host_caps.py summary --runtime-dir "${HARNESS_RUNTIME_DIR}" || tru
 # one engine process serves one model; the supervisor forwards the signal `cleanup` sends, so the
 # weights leave memory when the session ends.
 harness_local_models() {
-  local mode="$1" id state log=${HARNESS_RUNTIME_DIR}/local-model.log
-  local line
+  local mode="$1" id state pid log=${HARNESS_RUNTIME_DIR}/local-model.log
+  local line selected
+  selected=$(python3 tools/local_llm.py selected) || return 1
   while read -r line; do
     id=${line%%$'\t'*}
     state=${line##*$'\t'}
     [[ -n "${id}" ]] || continue
     if [[ "${mode}" == start && "${state}" == "Ready" ]]; then
       python3 tools/local_llm.py serve "${id}" >>"${log}" 2>&1 &
-      LOCAL_LLM_PIDS+=("$!")
-    elif [[ "${mode}" == provision && "${state}" != "Ready" ]]; then
-      # Chosen while "Not Installed", so it downloads now and its lane goes live mid-session
-      # rather than at the next launch. One line is all the operator needs; the log has the rest.
-      echo "Fetching ${id} in the background - progress: ${log}"
-      python3 tools/local_llm.py provision "${id}" >>"${log}" 2>&1 &
-      LOCAL_LLM_PIDS+=("$!")
+      pid=$!
+      LOCAL_LLM_PIDS+=("${pid}")
+      if ! python3 tools/local_llm.py await-ready "${id}" --supervisor-pid "${pid}"; then
+        echo "Local model validation failed for ${id}; inspect ${log}" >&2
+        return 1
+      fi
+    elif [[ "${mode}" == start ]]; then
+      echo "Selected local model ${id} is not verified; restart installation before launch." >&2
+      return 1
     fi
-  done < <(python3 tools/local_llm.py selected 2>/dev/null || true)
+  done <<<"${selected}"
 }
 
 flow_live=false
@@ -665,9 +672,7 @@ if wait_for_url http://127.0.0.1:5494/api/v1/healthz "" "" 90; then
   # launcher's own stdout open after the launch has finished.
   deep_service_check >/dev/null 2>&1 &
   DEEP_CHECK_PID=$!
-  # The questions are over and the stack is up: this is the point where a selected-but-missing
-  # weight set starts downloading, because nothing before it may wait on a hundred gigabytes.
-  harness_local_models provision
+  # Selected local models were installed, sized, and validated before Compose.
   python3 tools/open_kimi_browser.py docker compose --env-file "${root}/.env" "${HARNESS_COMPOSE_FILES[@]}" || true
 else
   echo "Kimi web did not become ready for workspace registration; inspect the startup logs." >&2

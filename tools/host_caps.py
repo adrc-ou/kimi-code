@@ -22,7 +22,9 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -57,8 +59,8 @@ def host_capabilities(system: str, machine: str) -> list[str]:
     return sorted(capabilities)
 
 
-def total_memory_gib() -> int:
-    """Installed memory, rounded down to whole GiB. Zero when the system will not say."""
+def total_memory_bytes() -> int:
+    """Installed physical bytes. Zero when the system will not say."""
     try:
         pages = os.sysconf("SC_PHYS_PAGES")
         size = os.sysconf("SC_PAGE_SIZE")
@@ -66,7 +68,58 @@ def total_memory_gib() -> int:
         return 0
     if not isinstance(pages, int) or not isinstance(size, int) or pages <= 0 or size <= 0:
         return 0
-    return int(pages) * int(size) // GIB
+    return int(pages) * int(size)
+
+
+def total_memory_gib() -> int:
+    """Installed memory, rounded down to whole GiB. Zero when the system will not say."""
+    return total_memory_bytes() // GIB
+
+
+def available_memory_bytes(system: str | None = None) -> int:
+    """Reclaimable physical memory now, never swap or a promise about future availability.
+
+    Linux publishes MemAvailable. On macOS free and inactive pages are a deliberately
+    conservative estimate: compressed and purgeable pages are not added a second time.
+    Unknown is zero and makes local capacity planning refuse rather than guess.
+    """
+    system = system or platform.system()
+    if system == "Linux":
+        try:
+            text = Path("/proc/meminfo").read_text(encoding="utf-8")
+        except OSError:
+            return 0
+        match = re.search(r"^MemAvailable:\s+(\d+)\s+kB$", text, re.MULTILINE)
+        return int(match[1]) * 1024 if match else 0
+    if system == "Darwin":
+        try:
+            result = subprocess.run(
+                ["/usr/bin/vm_stat"], capture_output=True, text=True, check=True, timeout=5
+            )
+        except (OSError, subprocess.SubprocessError):
+            return 0
+        page = re.search(r"page size of (\d+) bytes", result.stdout)
+        free = re.search(r"^Pages free:\s+(\d+)\.", result.stdout, re.MULTILINE)
+        inactive = re.search(r"^Pages inactive:\s+(\d+)\.", result.stdout, re.MULTILINE)
+        if not all((page, free, inactive)):
+            return 0
+        assert page is not None and free is not None and inactive is not None
+        return int(page[1]) * (int(free[1]) + int(inactive[1]))
+    return 0
+
+
+def process_memory_bytes(pid: int) -> int:
+    """Resident bytes for an owned child; zero when the OS cannot report them."""
+    if pid <= 0:
+        return 0
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        return int(result.stdout.strip()) * 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
 
 
 def free_disk_gib(path: Path) -> int:
@@ -96,6 +149,8 @@ def probe(workspace: Path | None = None) -> dict[str, Any]:
         "system": system,
         "arch": machine,
         "memory_gib": total_memory_gib(),
+        "memory_bytes": total_memory_bytes(),
+        "available_memory_bytes": available_memory_bytes(system),
         "free_disk_gib": free_disk_gib(ROOT),
         "capabilities": host_capabilities(system, machine),
         "workspace": str(ROOT if workspace is None else Path(workspace)),

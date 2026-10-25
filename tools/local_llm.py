@@ -55,6 +55,7 @@ if str(ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(ROOT / "tools"))
 
 import definitions  # noqa: E402
+from private_file import write_private_json  # noqa: E402
 
 #: Written beside the weights once every file has been digested and matched. It is the difference
 #: between "the files are there" and "these are the bytes the lock promised", and it is the only
@@ -276,17 +277,24 @@ def selected_models(runtime: Path) -> list[dict[str, Any]]:
     """
     path = Path(runtime) / "model-policy.json"
     if not path.is_file():
-        return []
+        raise EngineError("local engine enumeration requires the resolved policy plan")
     try:
         plan = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+    except (OSError, ValueError) as exc:
+        raise EngineError("the resolved policy plan is unreadable") from exc
+    if not isinstance(plan, dict) or not isinstance(plan.get("lanes"), dict):
+        raise EngineError("the resolved policy plan has no lane bindings")
     catalog = all_models()
     wanted: list[dict[str, Any]] = []
     for entry in (plan.get("lanes") or {}).values():
         model = catalog.get(str(entry.get("model_id", "")))
         if model is not None and model not in wanted:
             wanted.append(model)
+    missing = set(plan.get("engines") or {}) - {model["id"] for model in wanted}
+    if missing:
+        raise EngineError(
+            f"resolved local engine definitions are missing: {', '.join(sorted(missing))}"
+        )
     return wanted
 
 
@@ -298,6 +306,16 @@ def lane_sizes(model: dict[str, Any], plan: dict[str, Any]) -> tuple[int, int]:
     already admitted - the plan is the one document both sides are built from, so the widest lane's
     reservation is the context and the tightest count ceiling is the slot count.
     """
+    engine = (plan.get("engines") or {}).get(model["id"])
+    if engine is not None:
+        if plan.get("schema_version") == 2:
+            raise EngineError(
+                "stale schema 2 local policy; relaunch the harness for native context"
+            )
+        context, sequences = int(engine["context_tokens"]), int(engine["sequences"])
+        if context <= 0 or sequences <= 0 or engine["total_context_tokens"] != context * sequences:
+            raise EngineError("the resolved engine allocation is inconsistent")
+        return context * sequences, sequences
     lanes = [
         entry
         for entry in (plan.get("lanes") or {}).values()
@@ -310,7 +328,10 @@ def lane_sizes(model: dict[str, Any], plan: dict[str, Any]) -> tuple[int, int]:
             counter = (plan.get("counters") or {}).get(counter_id) or {}
             if counter.get("family") == "count" and counter.get("max"):
                 ceiling = counter["max"] if ceiling is None else min(ceiling, counter["max"])
-    return context, int(ceiling or 1)
+    # The legacy static plan also names per-request reservations. llama.cpp's non-unified
+    # context is a total shared between slots, so each promised slot needs a full reservation.
+    sequences = int(ceiling or 1)
+    return context * sequences, sequences
 
 
 # --------------------------------------------------------------------------------------------
@@ -343,13 +364,16 @@ def engine_root() -> Path:
     return ROOT / ".local" / "runtimes" / "llama-cpp"
 
 
-def engine_binary() -> Path:
+def engine_binary(*, install: bool = True) -> Path:
     """The pinned ``llama-server``, extracted and verified, or :class:`EngineError`.
 
     ``LOCAL_MPS_LLAMA_SERVER`` short-circuits all of it for an operator who already has a build -
     a Homebrew install, or a branch compiled for something this harness does not pin. Trusting that
     path is deliberate: the operator is naming the binary, and the digest rule exists for binaries
     the harness fetches by itself.
+
+    With ``install=False``, inspect existing installations only. Picker eligibility
+    must not start a download just to discover whether a choice can fit.
     """
     override = os.environ.get("LOCAL_MPS_LLAMA_SERVER", "").strip()
     if override:
@@ -362,6 +386,8 @@ def engine_binary() -> Path:
     found = next(iter(sorted(directory.rglob(ENGINE_BINARY))), None)
     if found is not None:
         return found
+    if not install:
+        raise EngineError("the pinned inference engine is not installed")
     fetch_engine(entry, directory)
     found = next(iter(sorted(directory.rglob(ENGINE_BINARY))), None)
     if found is None:
@@ -648,7 +674,7 @@ def cmd_install(argv: list[str]) -> int:
 # --------------------------------------------------------------------------------------------
 
 
-def api_token(model: dict[str, Any]) -> str:
+def api_token(model: dict[str, Any], plan: dict[str, Any] | None = None) -> str:
     """The session token for this model's provider, read from the file the launcher wrote.
 
     The same file the proxy mounts as a Docker secret, so the engine and the proxy cannot be told
@@ -658,13 +684,85 @@ def api_token(model: dict[str, Any]) -> str:
     runtime = os.environ.get("HARNESS_RUNTIME_DIR", "")
     if not runtime:
         raise LocalModelError("serving needs HARNESS_RUNTIME_DIR to name the instance directory")
-    path = Path(runtime) / "credentials" / f"{model['provider']}__{model['credential']}"
+    secret = f"{model['provider']}__{model['credential']}"
+    if plan is not None:
+        bindings = {
+            (entry["provider"], entry["credential"])
+            for entry in plan["lanes"].values()
+            if entry["model_id"] == model["id"]
+        }
+        if len(bindings) != 1:
+            raise EngineError("local engine lanes disagree on credential identity")
+        provider, credential = next(iter(bindings))
+        secret = plan["providers"][provider]["credentials"][credential]["secret_name"]
+    path = Path(runtime) / "credentials" / secret
     if not path.is_file():
         raise LocalModelError(f"no credential file for {model['provider']}; run models.py resolve")
     return path.read_text(encoding="utf-8").strip()
 
 
-def engine_args(model: dict[str, Any], context: int, parallel: int, token: str) -> list[str]:
+def engine_environment() -> dict[str, str]:
+    """Do not let ambient llama.cpp overrides compete with the resolved allocation contract."""
+    return {key: value for key, value in os.environ.items() if not key.startswith("LLAMA_ARG_")}
+
+
+def primary_weights_path(model: dict[str, Any]) -> Path:
+    lock = read_lock(Path(model["lock_path"]))
+    paths = [weights_dir(model) / entry["path"] for entry in lock["files"]]
+    return next((path for path in paths if "-00001-of-" in path.name), paths[0]).resolve()
+
+
+def allocation_args(
+    profile: dict[str, Any],
+    total_context: int,
+    sequences: int,
+    *,
+    server: bool,
+) -> list[str]:
+    """The projection and serving commands share every backend allocation setting."""
+    args = [
+        "--offline",
+        "--fit",
+        "off",
+        "--ctx-size",
+        str(total_context),
+        "--parallel",
+        str(sequences),
+        "--n-gpu-layers",
+        str(profile["gpu_layers"]),
+        "--batch-size",
+        str(profile["batch_tokens"]),
+        "--ubatch-size",
+        str(profile["microbatch_tokens"]),
+        "--cache-type-k",
+        profile["cache_type_k"],
+        "--cache-type-v",
+        profile["cache_type_v"],
+        "--flash-attn",
+        profile["flash_attention"],
+        "--load-mode",
+        profile["load_mode"],
+        "--lazy-mode",
+        profile["lazy_mode"],
+    ]
+    if server:
+        args += [
+            "--kv-unified" if profile["kv_unified"] else "--no-kv-unified",
+            "--cache-ram",
+            str(profile["cache_ram_mib"]),
+            "--ctx-checkpoints",
+            str(profile["context_checkpoints"]),
+        ]
+    return args
+
+
+def engine_args(
+    model: dict[str, Any],
+    context: int,
+    parallel: int,
+    token: str,
+    profile: dict[str, Any] | None = None,
+) -> list[str]:
     """The command line one engine process runs with.
 
     Every number is derived: the port from the definition, the context and slot count from the plan
@@ -672,10 +770,7 @@ def engine_args(model: dict[str, Any], context: int, parallel: int, token: str) 
     the wire name the proxy rewrites every request to resolve to this process rather than 404.
     """
     install_block = model["install"]
-    lock = read_lock(Path(model["lock_path"]))
-    paths = [weights_dir(model) / entry["path"] for entry in lock["files"]]
-    # llama.cpp loads a sharded model by naming its first shard and finding the rest by pattern.
-    primary = next((p for p in paths if "-00001-of-" in p.name), paths[0])
+    primary = primary_weights_path(model)
     sampling = install_block.get("sampling") or {}
     args = [
         str(engine_binary()),
@@ -689,14 +784,21 @@ def engine_args(model: dict[str, Any], context: int, parallel: int, token: str) 
         str(int(install_block.get("port") or 0) or 8181),
         "--api-key",
         token,
-        "--ctx-size",
-        str(context),
-        "--parallel",
-        str(parallel),
-        "--n-gpu-layers",
-        "99",
         "--no-webui",
     ]
+    if profile is None:
+        args += [
+            "--ctx-size",
+            str(context),
+            "--parallel",
+            str(parallel),
+            "--n-gpu-layers",
+            "all",
+            "--no-kv-unified",
+        ]
+    else:
+        args += allocation_args(profile, context, parallel, server=True)
+        args += ["--log-jsonl"]
     flags = {
         "temperature": "--temp",
         "top_p": "--top-p",
@@ -725,21 +827,31 @@ def cmd_serve(argv: list[str]) -> int:
     runtime = Path(os.environ.get("HARNESS_RUNTIME_DIR", ""))
     plan = json.loads((runtime / "model-policy.json").read_text(encoding="utf-8"))
     if not is_ready(model):
-        # Not a failure: the installer may still be running in the background, and a lane that
-        # goes live mid-session is exactly what the picker's "Not Installed" row promised.
-        print(f"{model['where']}: weights not installed yet; engine not started")
-        return 3
+        raise EngineError(f"{model['id']}: selected weights are not verified")
     context, parallel = lane_sizes(model, plan)
     if not context:
         print(f"{model['where']}: not part of this launch's plan; nothing to serve")
         return 0
-    args = engine_args(model, context, parallel, api_token(model))
+    engine = (plan.get("engines") or {}).get(model["id"])
+    if engine:
+        validate_launch(model, engine)
+    token = api_token(model, plan)
+    args = engine_args(model, context, parallel, token, engine["allocation"] if engine else None)
     print(
         f"{model['where']}: serving {size_text(total_bytes(read_lock(Path(model['lock_path']))))} "
         f"on port {model['install'].get('port') or 8181} (ctx={context}, slots={parallel})",
         flush=True,
     )
-    child = subprocess.Popen(args)  # noqa: S603 - argv built above from pinned paths, no shell
+    receipt = readiness_path(runtime, model["id"])
+    receipt.unlink(missing_ok=True)
+    bind = os.environ.get("LOCAL_MPS_BIND", "").strip()
+    host = bind if bind and bind != DEFAULT_BIND else "127.0.0.1"
+    port = int(model["install"].get("port") or 8181)
+    if probe_port(port, host):
+        raise EngineError(
+            f"{model['id']}: engine listener is already occupied; stop that listener before launch"
+        )
+    child = subprocess.Popen(args, env=engine_environment())
 
     def forward(signum, _frame):
         if child.poll() is None:
@@ -747,16 +859,175 @@ def cmd_serve(argv: list[str]) -> int:
 
     for signal_number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signal_number, forward)
-    return child.wait()
+    try:
+        if engine:
+            startup = wait_engine_ready(child, model, engine, token)
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            document = {
+                "supervisor_pid": os.getpid(),
+                "engine_pid": child.pid,
+                "fingerprint": engine["fingerprint"],
+                "snapshot_id": engine["snapshot_id"],
+                "startup": startup,
+                "allocation_args": allocation_args(
+                    engine["allocation"], context, parallel, server=True
+                ),
+                "serving_profile_id": engine["serving_profile_id"],
+            }
+            write_private_json(receipt, document)
+            print(
+                f"{model['where']}: engine identity and native context verified, ready", flush=True
+            )
+        return child.wait()
+    except BaseException:
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        raise
+    finally:
+        receipt.unlink(missing_ok=True)
+
+
+def readiness_path(runtime: Path, model_id: str) -> Path:
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+", model_id):
+        raise EngineError("invalid local engine identifier")
+    return runtime / "local-engines" / f"{model_id.replace('/', '__')}.json"
+
+
+def validate_launch(model: dict[str, Any], engine: dict[str, Any]) -> None:
+    """Reject source, weights or binary drift before loading a model into physical memory."""
+    if __package__:
+        from . import capacity
+    else:
+        import capacity
+    providers, _ = definitions.load_definitions(ROOT)
+    profile = providers[model["provider"]]["execution"]["profile"]
+    checks = {
+        "model_alias": model["model"],
+        "model_path": str(primary_weights_path(model)),
+        "model_lock_digest": hashlib.sha256(Path(model["lock_path"]).read_bytes()).hexdigest(),
+        "model_manifest_digest": hashlib.sha256(
+            (Path(model["path"]) / "model.toml").read_bytes()
+        ).hexdigest(),
+        "provider_manifest_digest": hashlib.sha256(
+            (Path(providers[model["provider"]]["path"]) / "provider.toml").read_bytes()
+        ).hexdigest(),
+        "allocation": profile,
+        "capacity_strategy": "native_context",
+        "memory_management": "os_managed",
+        "native_context_tokens": model["native_tokens"],
+        "context_tokens": model["native_tokens"],
+        "sequences": providers[model["provider"]]["capacity"]["sequence_slots"],
+        "total_context_tokens": model["native_tokens"]
+        * providers[model["provider"]]["capacity"]["sequence_slots"],
+    }
+    if any(engine.get(key) != value for key, value in checks.items()):
+        raise EngineError("model or serving profile changed after capacity resolution")
+    try:
+        identity = capacity.engine_identity(engine_binary())
+    except capacity.CapacityError as exc:
+        raise EngineError(str(exc)) from exc
+    if any(engine.get(key) != value for key, value in identity.items()):
+        raise EngineError("engine binary changed after capacity resolution")
+
+
+def validate_properties(props: dict[str, Any], engine: dict[str, Any]) -> None:
+    """Attest the actual server's read-only properties against its resolved allocation."""
+    settings = props.get("default_generation_settings") if isinstance(props, dict) else None
+    if (
+        not isinstance(props, dict)
+        or not isinstance(settings, dict)
+        or props.get("model_alias") != engine["model_alias"]
+        or props.get("model_path") != engine["model_path"]
+        or type(props.get("total_slots")) is not int
+        or props.get("total_slots") != engine["sequences"]
+        or type(settings.get("n_ctx")) is not int
+        or settings.get("n_ctx") != engine["context_tokens"]
+        or engine["build_commit"] not in str(props.get("build_info") or "")
+        or props.get("is_sleeping") is not False
+    ):
+        raise EngineError("the running engine differs from its resolved allocation")
+
+
+def wait_engine_ready(
+    child: Any, model: dict[str, Any], engine: dict[str, Any], token: str
+) -> dict[str, int | None]:
+    """Do not stage Kimi until this owned child has loaded and satisfied its contract."""
+    if __package__:
+        from . import host_caps
+    else:
+        import host_caps
+    port = int(model["install"]["port"])
+    bind = os.environ.get("LOCAL_MPS_BIND", "").strip()
+    host = bind if bind and bind != DEFAULT_BIND else "127.0.0.1"
+    req = urllib.request.Request(
+        f"http://{host}:{port}/props", headers={"Authorization": f"Bearer {token}"}
+    )
+    while child.poll() is None:
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = response.read(65537)
+                if len(data) > 65536:
+                    raise EngineError("engine properties exceed the supported metadata size")
+                props = json.loads(data)
+        except (OSError, ValueError):
+            time.sleep(0.1)
+            continue
+        validate_properties(props, engine)
+        try:
+            footprint = host_caps.process_memory_bytes(child.pid) or None
+            available = host_caps.available_memory_bytes() or None
+        except (OSError, ValueError):
+            footprint, available = None, None
+        if child.poll() is not None:
+            raise EngineError("the owned engine exited during readiness validation")
+        return {
+            "resident_bytes": footprint,
+            "available_host_bytes": available,
+            "context_tokens": engine["context_tokens"],
+            "sequences": engine["sequences"],
+        }
+    raise EngineError(f"{model['id']}: the engine exited before readiness")
+
+
+def cmd_await_ready(argv: list[str], supervisor_pid: int) -> int:
+    """Wait for a readiness receipt from the exact supervisor this launcher started."""
+    if len(argv) != 1 or supervisor_pid <= 0:
+        raise EngineError("await-ready needs one model id and --supervisor-pid")
+    runtime = Path(os.environ.get("HARNESS_RUNTIME_DIR", ""))
+    plan = json.loads((runtime / "model-policy.json").read_text(encoding="utf-8"))
+    engine = (plan.get("engines") or {}).get(argv[0])
+    if engine is None:
+        return 0
+    path = readiness_path(runtime, argv[0])
+    while True:
+        try:
+            os.kill(supervisor_pid, 0)
+        except OSError as exc:
+            raise EngineError(f"{argv[0]}: its owned supervisor exited before readiness") from exc
+        try:
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            receipt = {}
+        if (
+            receipt.get("supervisor_pid") == supervisor_pid
+            and receipt.get("fingerprint") == engine["fingerprint"]
+            and receipt.get("snapshot_id") == engine["snapshot_id"]
+        ):
+            return 0
+        time.sleep(0.1)
 
 
 def cmd_provision(argv: list[str]) -> int:
     """Install what is missing, then serve. One background job per selected local model.
 
-    This is the shape the launcher's promise needs: a model chosen while "Not Installed" is
-    downloaded after the interactive questions end, and its lane becomes live mid-session rather
-    than at the next launch. Serving is the same supervisor :command:`serve` runs, so the process
-    the launcher tracks is the one cleanup kills whether or not a download happened.
+    Retained for direct callers; managed launches verify installation and resolve
+    capacity before serving. Serving is the same supervisor :command:`serve` runs,
+    so its caller tracks one process whether or not a download happened.
     """
     if len(argv) != 1:
         raise LocalModelError("provision takes exactly one model id")
@@ -792,7 +1063,7 @@ def cmd_check(argv: list[str]) -> int:
     return 0
 
 
-def probe_port(port: int) -> bool:
+def probe_port(port: int, host: str = "127.0.0.1") -> bool:
     """Whether something accepts TCP on the port the engine was told to use.
 
     A connect test rather than an HTTP one: the token lives in a file the launcher has no reason
@@ -802,7 +1073,7 @@ def probe_port(port: int) -> bool:
     import socket
 
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=2.0):
+        with socket.create_connection((host, port), timeout=2.0):
             return True
     except OSError:
         return False
@@ -848,9 +1119,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "action",
-        choices=["status", "install", "serve", "provision", "pending", "check", "selected"],
+        choices=[
+            "status",
+            "install",
+            "serve",
+            "provision",
+            "pending",
+            "check",
+            "selected",
+            "await-ready",
+        ],
     )
     parser.add_argument("selector", nargs="*", default=[])
+    parser.add_argument("--supervisor-pid", type=int, default=0)
     args = parser.parse_args(argv)
     actions = {
         "status": cmd_status,
@@ -860,6 +1141,7 @@ def main(argv: list[str] | None = None) -> int:
         "pending": cmd_pending,
         "check": cmd_check,
         "selected": cmd_selected,
+        "await-ready": lambda selectors: cmd_await_ready(selectors, args.supervisor_pid),
     }
     return actions[args.action](list(args.selector))
 

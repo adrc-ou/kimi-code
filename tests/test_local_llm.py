@@ -423,6 +423,17 @@ class InstallTests(InstallFixture):
 
 
 class EngineTests(InstallFixture):
+    def test_inspecting_a_missing_engine_never_fetches_it(self):
+        with (
+            mock.patch.dict(os.environ, {"LOCAL_MPS_LLAMA_SERVER": ""}),
+            mock.patch.object(local_llm, "engine_root", return_value=self.directory / "runtimes"),
+            mock.patch.object(local_llm, "engine_plan", return_value={"version": "missing"}),
+            mock.patch.object(local_llm, "fetch_engine") as fetch,
+        ):
+            with self.assertRaisesRegex(local_llm.EngineError, "not installed"):
+                local_llm.engine_binary(install=False)
+        fetch.assert_not_called()
+
     def test_an_operator_supplied_binary_skips_the_runtime_entirely(self):
         script = self.fake_engine()
         with mock.patch.dict(os.environ, {"LOCAL_MPS_LLAMA_SERVER": str(script)}):
@@ -524,6 +535,215 @@ class EngineTests(InstallFixture):
 
 
 class ServeTests(InstallFixture):
+    def test_ready_engine_is_not_rejected_for_high_or_unknown_memory(self):
+        import host_caps
+
+        self.model["install"]["port"] = 8181
+        engine = {
+            "context_tokens": 4096,
+            "sequences": 1,
+            "model_alias": "fixture",
+            "model_path": "/fixture.gguf",
+            "build_commit": "abcdef0",
+        }
+        props = {
+            "default_generation_settings": {"n_ctx": 4096},
+            "total_slots": 1,
+            "model_alias": "fixture",
+            "model_path": "/fixture.gguf",
+            "build_info": "fixture abcdef0",
+            "is_sleeping": False,
+        }
+        for rss in (0, 1 << 50):
+            child = mock.Mock(pid=4321)
+            child.poll.return_value = None
+            with (
+                self.subTest(rss=rss),
+                mock.patch.object(
+                    local_llm.urllib.request,
+                    "urlopen",
+                    return_value=io.BytesIO(json.dumps(props).encode()),
+                ),
+                mock.patch.object(host_caps, "process_memory_bytes", return_value=rss),
+                mock.patch.object(host_caps, "available_memory_bytes", return_value=0),
+            ):
+                result = local_llm.wait_engine_ready(child, self.model, engine, "fixture-value")
+            self.assertEqual(result["context_tokens"], 4096)
+            self.assertEqual(result["resident_bytes"], rss or None)
+            self.assertIsNone(result["available_host_bytes"])
+
+    def test_stale_memory_sized_engine_plan_requires_relaunch(self):
+        plan = {"schema_version": 2, "engines": {self.model["id"]: {}}}
+        with self.assertRaisesRegex(local_llm.EngineError, "relaunch"):
+            local_llm.lane_sizes(self.model, plan)
+
+    def test_startup_failure_cleans_up_only_its_owned_child_and_never_publishes_ready(self):
+        from tests.test_capacity import PROFILE
+
+        self.write_lock()
+        runtime = self.directory / "runtime"
+        runtime.mkdir()
+        plan = self.plan()
+        plan["engines"] = {
+            self.model["id"]: {
+                "context_tokens": 4096,
+                "sequences": 2,
+                "total_context_tokens": 8192,
+                "allocation": PROFILE,
+            }
+        }
+        (runtime / "model-policy.json").write_text(json.dumps(plan))
+        for occupied in (False, True):
+            child = mock.Mock(pid=4321)
+            child.poll.return_value = None
+            with (
+                self.subTest(occupied=occupied),
+                mock.patch.dict(os.environ, {"HARNESS_RUNTIME_DIR": str(runtime)}),
+                mock.patch.object(local_llm, "require_model", return_value=self.model),
+                mock.patch.object(local_llm, "is_ready", return_value=True),
+                mock.patch.object(local_llm, "validate_launch"),
+                mock.patch.object(local_llm, "api_token", return_value="fixture-value"),
+                mock.patch.object(local_llm, "engine_args", return_value=["fixture-binary"]),
+                mock.patch.object(local_llm, "probe_port", return_value=occupied),
+                mock.patch.object(local_llm.signal, "signal"),
+                mock.patch.object(local_llm.subprocess, "Popen", return_value=child) as spawn,
+                mock.patch.object(
+                    local_llm,
+                    "wait_engine_ready",
+                    side_effect=local_llm.EngineError("fixture mismatch"),
+                ),
+                self.assertRaises(local_llm.EngineError),
+            ):
+                local_llm.cmd_serve([self.model["id"]])
+            if occupied:
+                spawn.assert_not_called()
+                child.terminate.assert_not_called()
+            else:
+                spawn.assert_called_once()
+                child.terminate.assert_called_once()
+            self.assertFalse(local_llm.readiness_path(runtime, self.model["id"]).exists())
+
+    def test_missing_resolved_local_definition_prevents_engine_enumeration(self):
+        runtime = self.directory / "runtime"
+        runtime.mkdir()
+        (runtime / "model-policy.json").write_text(
+            json.dumps(
+                {
+                    "lanes": {"primary": {"model_id": "local_fixture/removed"}},
+                    "engines": {"local_fixture/removed": {}},
+                }
+            )
+        )
+        with (
+            mock.patch.object(local_llm, "all_models", return_value={}),
+            self.assertRaisesRegex(local_llm.EngineError, "missing"),
+        ):
+            local_llm.selected_models(runtime)
+
+    def test_engine_credential_uses_the_plans_resolved_scope(self):
+        runtime = self.directory / "runtime"
+        (runtime / "credentials").mkdir(parents=True)
+        (runtime / "credentials" / "local_fixture__model_scoped").write_text("fixture-value")
+        plan = {
+            "lanes": {
+                "primary": {
+                    "model_id": self.model["id"],
+                    "provider": "local_fixture",
+                    "credential": "scoped",
+                }
+            },
+            "providers": {
+                "local_fixture": {
+                    "credentials": {
+                        "scoped": {"secret_name": "local_fixture__model_scoped"},
+                    }
+                }
+            },
+        }
+        with mock.patch.dict(os.environ, {"HARNESS_RUNTIME_DIR": str(runtime)}):
+            self.assertEqual(local_llm.api_token(self.model, plan), "fixture-value")
+
+    def test_properties_attest_context_slots_model_and_build(self):
+        engine = {
+            "context_tokens": 4096,
+            "sequences": 2,
+            "model_alias": "fixture",
+            "model_path": "/fixture/model.gguf",
+            "build_commit": "abcdef0",
+        }
+        props = {
+            "default_generation_settings": {"n_ctx": 4096},
+            "total_slots": 2,
+            "model_alias": "fixture",
+            "model_path": "/fixture/model.gguf",
+            "build_info": "b1-abcdef0",
+            "is_sleeping": False,
+        }
+        local_llm.validate_properties(props, engine)
+        for field, value in (
+            ("total_slots", 1),
+            ("model_alias", "other"),
+            ("build_info", "b2-1234567"),
+            ("is_sleeping", True),
+            ("default_generation_settings", []),
+            ("total_slots", 2.0),
+        ):
+            with self.subTest(field=field), self.assertRaises(local_llm.EngineError):
+                local_llm.validate_properties(dict(props, **{field: value}), engine)
+
+    def test_projection_and_server_share_the_allocation_arguments(self):
+        from tests.test_capacity import PROFILE
+
+        projection = local_llm.allocation_args(PROFILE, 12288, 3, server=False)
+        server = local_llm.allocation_args(PROFILE, 12288, 3, server=True)
+        self.assertEqual(server[: len(projection)], projection)
+        self.assertEqual(
+            server[len(projection) :],
+            [
+                "--no-kv-unified",
+                "--cache-ram",
+                "0",
+                "--ctx-checkpoints",
+                "0",
+            ],
+        )
+        self.assertIn("--offline", projection)
+        self.assertEqual(projection[projection.index("--ctx-size") + 1], "12288")
+
+    def test_readiness_receipt_is_bound_to_this_resolution_and_owned_supervisor(self):
+        runtime = self.directory / "runtime"
+        runtime.mkdir()
+        engine = {"fingerprint": "current", "snapshot_id": "new-resolution"}
+        (runtime / "model-policy.json").write_text(
+            json.dumps(
+                {
+                    "engines": {self.model["id"]: engine},
+                }
+            )
+        )
+        receipt = local_llm.readiness_path(runtime, self.model["id"])
+        receipt.parent.mkdir()
+        receipt.write_text(
+            json.dumps(
+                {
+                    "fingerprint": "stale",
+                    "snapshot_id": "old-resolution",
+                    "supervisor_pid": 123,
+                }
+            )
+        )
+
+        def publish(_delay):
+            receipt.write_text(json.dumps(dict(engine, supervisor_pid=123)))
+
+        with (
+            mock.patch.dict(os.environ, {"HARNESS_RUNTIME_DIR": str(runtime)}),
+            mock.patch.object(local_llm.os, "kill"),
+            mock.patch.object(local_llm.time, "sleep", side_effect=publish) as sleep,
+        ):
+            self.assertEqual(local_llm.cmd_await_ready([self.model["id"]], 123), 0)
+            sleep.assert_called_once()
+
     def plan(self):
         return {
             "lanes": {
@@ -547,7 +767,36 @@ class ServeTests(InstallFixture):
         context, parallel = local_llm.lane_sizes(self.model, self.plan())
         # The widest lane, and the tightest count ceiling bound to it: the proxy admits requests
         # against the same two numbers, so the engine cannot be smaller than what gets through.
-        self.assertEqual((context, parallel), (28672, 2))
+        self.assertEqual((context, parallel), (57344, 2))
+
+    def test_managed_engine_allocation_names_total_context_for_full_slots(self):
+        plan = self.plan()
+        plan["engines"] = {
+            self.model["id"]: {
+                "context_tokens": 4096,
+                "sequences": 3,
+                "total_context_tokens": 12288,
+            }
+        }
+        self.assertEqual(local_llm.lane_sizes(self.model, plan), (12288, 3))
+
+    def test_managed_engine_inconsistent_total_fails_closed(self):
+        plan = self.plan()
+        plan["engines"] = {
+            self.model["id"]: {
+                "context_tokens": 4096,
+                "sequences": 3,
+                "total_context_tokens": 4096,
+            }
+        }
+        with self.assertRaises(local_llm.EngineError):
+            local_llm.lane_sizes(self.model, plan)
+
+    def test_inherited_llama_settings_cannot_override_the_plan(self):
+        with mock.patch.dict(os.environ, {"LLAMA_ARG_CTX_SIZE": "999", "KEEP_FIXTURE": "yes"}):
+            environment = local_llm.engine_environment()
+        self.assertNotIn("LLAMA_ARG_CTX_SIZE", environment)
+        self.assertEqual(environment["KEEP_FIXTURE"], "yes")
 
     def test_a_model_in_no_counter_gets_one_slot_rather_than_none(self):
         plan = self.plan()

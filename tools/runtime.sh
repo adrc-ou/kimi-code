@@ -165,7 +165,7 @@ HARNESS_SECRET_RESIDUE=(nrp-api-key bridge-token)
 HARNESS_SESSION_RESIDUE=(
   extension-snapshot extension-snapshot.new extension-snapshot.tar
   proxy-token search-token kimi-config.toml runtime.env session.env module.env
-  model-selection.json model-policy.json model.env module-guidance.md
+  model-selection.json model-policy.json model.env module-guidance.md local-engines
   flow-state.json module-values.json
   screen-claim screen-wait.json screen-render.lock
   prompt-measure.log service-check.log launch-notes.log

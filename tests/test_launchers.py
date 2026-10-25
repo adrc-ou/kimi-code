@@ -19,7 +19,7 @@ for _directory in (ROOT, ROOT / "tools"):
 import prompt_context  # noqa: E402
 import workspace_registry  # noqa: E402
 
-from tests.helpers import run_in_pty, tracked_files  # noqa: E402
+from tests.helpers import SHIPPED_MODEL, run_in_pty, tracked_files  # noqa: E402
 
 
 class PlatformTests(unittest.TestCase):
@@ -89,6 +89,9 @@ class LauncherTests(unittest.TestCase):
         # definition trees and every module the resolver imports.
         for relative in (
             "tools/models.py",
+            "tools/capacity.py",
+            "tools/host_caps.py",
+            "tools/local_llm.py",
             "tools/model_config.py",
             "tools/policy.py",
             "tools/definitions.py",
@@ -103,7 +106,9 @@ class LauncherTests(unittest.TestCase):
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / relative, destination)
         for tree in ("models", "providers"):
-            shutil.copytree(ROOT / tree, self.root / tree)
+            shutil.copytree(
+                ROOT / tree, self.root / tree, ignore=shutil.ignore_patterns("weights")
+            )
         # The module picker renders through the shared modal engine, so a launcher fixture has to
         # carry it: tools/modules.py is run as a script, which puts tools/ alone on the path.
         shutil.copytree(
@@ -140,6 +145,8 @@ exit 99
             "PATH": f"{self.bin}:{os.defpath}",
             "HOME": str(self.base),
             "TEST_BOOTSTRAP": str(self.bootstrap),
+            "HARNESS_PRIMARY_MODEL": SHIPPED_MODEL,
+            "HARNESS_SUBAGENT_MODEL": SHIPPED_MODEL,
         }
         self.require_executable_fixtures()
 
@@ -565,7 +572,8 @@ class WorkspaceChoiceTests(unittest.TestCase):
         self.home = self.base / "home"
         self.home.mkdir(parents=True, exist_ok=True)
         self.env = {
-            "PATH": f"{os.defpath}:/bin:/usr/bin",
+            # Use the suite's interpreter; macOS's system Python predates the harness.
+            "PATH": f"{Path(sys.executable).parent}:{os.defpath}:/bin:/usr/bin",
             "HOME": str(self.home),
             "TERM": "xterm-256color",
         }

@@ -101,9 +101,11 @@ outside every container limit, because a Docker VM has no access to the GPU or t
 unified memory — the same reason the ComfyUI MPS backend does — so its origin is
 `host.docker.internal`, its listener must be reachable from the VM rather than
 loopback-bound, and the session credential the proxy mounts is the same token the
-engine is started with. Set a model's `[requires]` floors from its pinned quant's
-arithmetic, not from the machine in front of you; a requirement lowered to fit one
-Mac is a crash on the next one.
+engine is started with. Managed `native_context` models retain quant-specific
+installed-RAM and disk eligibility floors plus backend requirements. These static
+requirements determine which models are offered. Eligible models use full native
+windows and explicit provider-owned slots; available RAM, RSS and projected memory
+must not resize or limit them. Allocation and paging belong to the OS/backend.
 
 When changing model, provider, concurrency, context, or proxy behavior:
 - preserve compliance with every rule the selected providers publish, and keep
@@ -129,9 +131,10 @@ When changing model, provider, concurrency, context, or proxy behavior:
 - keep retries outside scarce permits during backoff;
 - keep rate admission outside permit holds too, so waiting on a rolling ledger
   books neither kind of capacity;
-- derive each lane's reservation from its `max_input_size` plus its own output
-  clamp in the rendered Kimi configuration, and revalidate it per request; a
-  configuration the proxy cannot fit must fail closed rather than pass traffic;
+- derive fixed-envelope reservations from the rendered Kimi input target plus
+  output clamp; native local lanes reserve one engine slot and allow generation
+  within remaining actual context. Revalidate the staged configuration per request
+  and fail closed on drift;
 - never reintroduce a hard-coded subagent or swarm wall-clock timeout in
   `compose.yaml`. Unlimited is expressed only as `timeout_ms = 0` in
   `runtime/config.toml`, where the launcher re-pins it, because those tables are

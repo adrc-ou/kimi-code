@@ -56,7 +56,7 @@ import tomllib
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from logging.handlers import RotatingFileHandler
@@ -64,6 +64,7 @@ from pathlib import Path
 
 from aiohttp import (
     ClientConnectionError,
+    ClientError,
     ClientSession,
     ClientTimeout,
     ServerDisconnectedError,
@@ -88,6 +89,12 @@ def secret(file_variable: str, value_variable: str, *, min_length: int = 32) -> 
 
 #: The plan schema this proxy understands; ``tools/policy.py`` publishes the matching constant.
 PLAN_SCHEMA_VERSION = 1
+SUPPORTED_PLAN_SCHEMAS = frozenset({1, 3})
+
+# Preparation never holds an execution permit. Both endpoints return small JSON objects;
+# their independent deadline and byte bound keep a failed local engine from blocking a lane.
+LOCAL_PREPARATION_TIMEOUT = 30.0
+LOCAL_METADATA_BYTES = 64 * 1024
 
 #: The resolved plan this proxy enforces, and the Kimi configuration that same plan was
 #: rendered into. Both are read on the request path, so a mismatch fails closed.
@@ -216,9 +223,7 @@ IMAGE_EVICTION_ENABLED = os.environ.get("MODEL_PROXY_IMAGE_EVICTION", "0").strip
 
 #: Smaller images stay. Icons and thumbnails are cheap enough that rewriting them trades a
 #: trivial number of bytes for a handle the model then has to reason about.
-IMAGE_EVICTION_MIN_BYTES = int(
-    os.environ.get("MODEL_PROXY_IMAGE_EVICTION_MIN_BYTES", "32768")
-)
+IMAGE_EVICTION_MIN_BYTES = int(os.environ.get("MODEL_PROXY_IMAGE_EVICTION_MIN_BYTES", "32768"))
 
 #: The size backstop, and the reason it is not the main rule. An image is only rewritten once an
 #: assistant turn has followed it, so a body that is large because of images the model has *not*
@@ -242,9 +247,7 @@ IMAGE_PART_FIELD_NAMES = ("image_url", "imageUrl")
 #: A failure dump is a whole request, which for a multimodal body is megabytes, so this
 #: ceiling is what keeps a few of them from outgrowing the host directory they land in. A
 #: request over the cap is still described in the log; only its replay file is skipped.
-LOG_DUMP_MAX_BYTES = int(
-    os.environ.get("MODEL_PROXY_LOG_DUMP_MAX_BYTES", str(64 * 1024 * 1024))
-)
+LOG_DUMP_MAX_BYTES = int(os.environ.get("MODEL_PROXY_LOG_DUMP_MAX_BYTES", str(64 * 1024 * 1024)))
 
 #: How much of an upstream error body one event may carry. A gateway's whole complaint fits;
 #: the bound matters because that body arrives from the network rather than from this plan.
@@ -274,6 +277,9 @@ DEFAULT_LIVE_EVENTS = frozenset(
         "startup_refused",
         "stream_stall",
         "images_evicted",
+        "local_engine_unavailable",
+        "local_context_rejected",
+        "local_capacity",
         "upstream_retry",
         "usage_reporting_unsupported",
     }
@@ -349,9 +355,7 @@ def event(name: str, terse: Sequence[str] = (), /, **fields: object) -> None:
 
     chosen = tuple(terse) or tuple(fields)
     print(
-        " ".join(
-            [name] + [f"{key}={_one_line(fields[key])}" for key in chosen if key in fields]
-        ),
+        " ".join([name] + [f"{key}={_one_line(fields[key])}" for key in chosen if key in fields]),
         flush=True,
     )
 
@@ -429,9 +433,7 @@ def setup_logging() -> str | None:
 #: which is the one worth printing. Unset, the host path is the container path, which is
 #: correct only when nothing was bind-mounted.
 PROMPT_LOG_DIR = Path(os.environ.get("MODEL_PROXY_PROMPT_LOG_DIR", "/prompt-log"))
-PROMPT_LOG_HOST_DIR = Path(
-    os.environ.get("MODEL_PROXY_PROMPT_LOG_HOST_DIR") or str(PROMPT_LOG_DIR)
-)
+PROMPT_LOG_HOST_DIR = Path(os.environ.get("MODEL_PROXY_PROMPT_LOG_HOST_DIR") or str(PROMPT_LOG_DIR))
 
 #: How much of the prompt the stdout line carries. Enough to recognise the turn, short
 #: enough that the line stays one line.
@@ -536,9 +538,7 @@ def write_dump(
     """
     destination = directory or PROMPT_LOG_DIR
     destination.mkdir(parents=True, exist_ok=True)
-    (destination / name).write_text(
-        request_dump(method, url, headers, body), encoding="utf-8"
-    )
+    (destination / name).write_text(request_dump(method, url, headers, body), encoding="utf-8")
 
 
 async def log_prompt(request: web.Request, lane: LanePolicy, body: bytes) -> None:
@@ -641,10 +641,15 @@ class LanePolicy:
     #: content; an engine running on the operator's own machine has no such cache to protect, and
     #: a field it does not model is a field it is free to reject.
     sends_cache_salt: bool = True
+    engine_id: str | None = None
+    output_mode: str = "fixed"
+    token_accounting: str = "estimate"  # noqa: S105 - an accounting strategy, not a credential
 
     @property
     def reservation(self) -> int:
         """Worst-case context this lane occupies while in flight."""
+        if self.output_mode == "remaining_context":
+            return self.context
         return self.max_input + self.output_clamp
 
 
@@ -659,6 +664,7 @@ class RuntimePolicy:
     #: lane whose alias the drift check accepts for it. The plan always carries one; this
     #: default only matches the harness's shipped default lane for a hand-made plan.
     agent_lane: str = "long"
+    engines: dict[str, dict] = field(default_factory=dict)
 
 
 def _positive(entry: dict, key: str, where: str) -> int:
@@ -676,8 +682,22 @@ def load_plan(path: str | None = None) -> dict:
             plan = json.load(source)
     except (OSError, ValueError) as exc:
         raise PolicyDrift(f"cannot read model policy {location}: {exc}") from exc
-    if not isinstance(plan, dict) or plan.get("schema_version") != PLAN_SCHEMA_VERSION:
-        raise PolicyDrift(f"model policy must be schema {PLAN_SCHEMA_VERSION}")
+    if isinstance(plan, dict) and plan.get("schema_version") == 2:
+        raise PolicyDrift("stale schema 2 local policy; relaunch the harness for native context")
+    if (
+        not isinstance(plan, dict)
+        or type(plan.get("schema_version")) is not int
+        or plan["schema_version"] not in SUPPORTED_PLAN_SCHEMAS
+    ):
+        raise PolicyDrift("model policy must be schema 1 or 3")
+    if plan["schema_version"] == 3 and (
+        not isinstance(plan.get("engines"), dict) or not plan["engines"] or plan.get("resources")
+    ):
+        raise PolicyDrift(
+            "schema 3 local policy requires engines without physical resource budgets"
+        )
+    if plan["schema_version"] == 1 and (plan.get("engines") or plan.get("resources")):
+        raise PolicyDrift("local engines require schema 3 model policy")
     if not isinstance(plan.get("lanes"), dict) or not plan["lanes"]:
         raise PolicyDrift("model policy declares no lanes")
     if not isinstance(plan.get("providers"), dict) or not plan["providers"]:
@@ -715,6 +735,12 @@ def verify_credentials(policy: RuntimePolicy) -> None:
 
 
 def _lane_from_plan(name: str, entry: dict, providers: dict, reserved: int) -> LanePolicy:
+    if entry.get("engine_id") is not None and entry.get("engine_id") != entry.get("model_id"):
+        raise PolicyDrift(f"lane {name} engine does not match its qualified model")
+    if entry.get("engine_id") is not None and (
+        entry.get("reservation") != entry.get("context_tokens")
+    ):
+        raise PolicyDrift(f"lane {name} must reserve its complete local context")
     provider = providers.get(entry.get("provider"))
     if not isinstance(provider, dict):
         raise PolicyDrift(
@@ -748,6 +774,9 @@ def _lane_from_plan(name: str, entry: dict, providers: dict, reserved: int) -> L
         reserved=reserved,
         counters=tuple(sorted(entry.get("counters") or ())),
         sends_cache_salt=bool(provider.get("sends_cache_salt", True)),
+        engine_id=entry.get("engine_id"),
+        output_mode=str(entry.get("output_mode", "fixed")),
+        token_accounting=str(entry.get("token_accounting", "estimate")),
     )
 
 
@@ -788,8 +817,7 @@ def enforce_kimi_configuration(policy: RuntimePolicy, config_path: str | None = 
         ):
             if model.get(key) != want:
                 raise PolicyDrift(
-                    f"Kimi sizes {lane.alias}.{key} at {model.get(key)!r}, "
-                    f"the plan enforces {want}"
+                    f"Kimi sizes {lane.alias}.{key} at {model.get(key)!r}, the plan enforces {want}"
                 )
 
     secondary = config.get("secondary_model") or {}
@@ -834,6 +862,7 @@ def load_runtime_policy(config_path: str | None = None) -> RuntimePolicy:
         reserved=reserved,
         providers=tuple(sorted({lane.provider_name for lane in lanes.values()})),
         agent_lane=str(plan.get("agent_lane") or "long"),
+        engines=dict(plan.get("engines") or {}),
     )
     enforce_kimi_configuration(policy, config_path)
     return policy
@@ -906,13 +935,79 @@ def validate_policy(policy: RuntimePolicy | None = None) -> None:
             f"MODEL_PROXY_LOG_DUMP_MAX_BYTES={LOG_DUMP_MAX_BYTES}"
         )
 
+    for engine_id, engine in policy.engines.items():
+        if not isinstance(engine, dict):
+            raise RuntimeError(f"engine {engine_id} must be an object")
+        context = _positive(engine, "context_tokens", f"engine {engine_id}")
+        sequences = _positive(engine, "sequences", f"engine {engine_id}")
+        total = _positive(engine, "total_context_tokens", f"engine {engine_id}")
+        if total != context * sequences:
+            raise RuntimeError(f"engine {engine_id} total context does not match its slots")
+        for key in ("build_commit", "model_alias", "model_path"):
+            if not isinstance(engine.get(key), str) or not engine[key]:
+                raise RuntimeError(f"engine {engine_id}.{key} must be a nonempty string")
+        if (
+            engine.get("capacity_strategy") != "native_context"
+            or engine.get("memory_management") != "os_managed"
+            or _positive(engine, "native_context_tokens", f"engine {engine_id}") != context
+            or engine.get("allocations")
+            or engine.get("projection")
+        ):
+            raise RuntimeError(
+                f"engine {engine_id} does not declare native context with OS-managed memory"
+            )
+        engine_lanes = [lane for lane in policy.lanes.values() if lane.engine_id == engine_id]
+        if not engine_lanes:
+            raise RuntimeError(f"engine {engine_id} is not referenced by any lane")
+        expected_counter = f"count:engine:{engine_id}"
+        counter = policy.counters.get(expected_counter) or {}
+        _positive(counter, "max", f"engine counter {expected_counter}")
+        if (
+            counter.get("family") != "count"
+            or counter.get("scope") != "engine"
+            or counter.get("subject") != engine_id
+            or counter.get("max") != sequences
+            or counter.get("kind") != "max_concurrent_requests"
+            or counter.get("source") != "engine_capacity"
+            or set(counter.get("lanes") or ()) != {lane.name for lane in engine_lanes}
+        ):
+            raise RuntimeError(f"engine {engine_id} has no matching sequence counter")
+        for lane in engine_lanes:
+            if (
+                lane.context != context
+                or lane.model != engine["model_alias"]
+                or expected_counter not in lane.counters
+                or lane.output_mode != "remaining_context"
+                or lane.token_accounting != "engine"  # noqa: S105 - strategy name
+                or lane.output_clamp != context
+                or lane.max_input != context - policy.reserved
+            ):
+                raise RuntimeError(f"lane {lane.name} does not match engine {engine_id}")
+        if len({(lane.base_url, lane.secret_name) for lane in engine_lanes}) != 1:
+            raise RuntimeError(f"engine {engine_id} lanes disagree on origin or credential")
+
+    for counter_id, counter in policy.counters.items():
+        if counter.get("scope") == "engine" and (
+            counter.get("subject") not in policy.engines
+            or counter_id != f"count:engine:{counter.get('subject')}"
+        ):
+            raise RuntimeError(f"counter {counter_id} references an unknown engine")
+
     for lane_name, lane in policy.lanes.items():
+        if lane.engine_id is not None and lane.engine_id not in policy.engines:
+            raise RuntimeError(f"lane {lane_name} references unknown engine {lane.engine_id}")
+        if lane.engine_id is None and (
+            lane.output_mode != "fixed" or lane.token_accounting != "estimate"  # noqa: S105
+        ):
+            raise RuntimeError(f"lane {lane_name} needs an engine for local token accounting")
         if lane.max_input + lane.reserved > lane.context:
             raise RuntimeError(
                 f"{lane.alias} ({lane_name}): {lane.max_input} input + {lane.reserved} reserved "
                 f"does not fit its {lane.context}-token window"
             )
-        if lane.max_input + lane.output_clamp > lane.context:
+        if lane.output_mode != "remaining_context" and (
+            lane.max_input + lane.output_clamp > lane.context
+        ):
             raise RuntimeError(
                 f"{lane.alias} ({lane_name}): {lane.max_input} input + {lane.output_clamp} "
                 f"output clamp does not fit its {lane.context}-token window"
@@ -935,11 +1030,7 @@ def validate_policy(policy: RuntimePolicy | None = None) -> None:
             # no admission rule at all. Providers publish one fraction for both, so agreeing is
             # the normal case; a provider that ever split them this way is a contradiction the
             # harness cannot serve and must refuse to start on.
-            if (
-                ceiling is not None
-                and exclusive_at is not None
-                and exclusive_at > ceiling
-            ):
+            if ceiling is not None and exclusive_at is not None and exclusive_at > ceiling:
                 raise RuntimeError(
                     f"counter {counter_id} sets exclusivity at {exclusive_at} tokens, above the "
                     f"{ceiling}-token aggregate ceiling its provider publishes"
@@ -1024,6 +1115,7 @@ def current_policy() -> RuntimePolicy:
     _policy_cache = (stamp[0], stamp[1], policy)
     # Counter numbers move with the plan; the objects holding live reservations do not.
     enforcement.sync(policy)
+    local_engines.sync(policy)
     return policy
 
 
@@ -1119,6 +1211,176 @@ def rewrite_model(body: bytes, request: web.Request, lane: LanePolicy) -> bytes:
     if lane.sends_cache_salt:
         payload["cache_salt"] = CACHE_SALT
     return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
+
+
+class LocalEngineUnavailable(RuntimeError):
+    """An individual local engine could not prove its serving capacity."""
+
+
+async def local_metadata(
+    session: ClientSession, lane: LanePolicy, path: str, body: bytes | None = None
+) -> dict:
+    """Read authenticated engine metadata with independent time and response bounds."""
+    headers = {
+        "Authorization": f"Bearer {upstream_credential(lane.secret_name)}",
+        "Accept-Encoding": "identity",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.request(
+            "GET" if body is None else "POST",
+            f"{lane.base_url}{path}",
+            data=body,
+            headers=headers,
+            allow_redirects=False,
+            timeout=ClientTimeout(total=LOCAL_PREPARATION_TIMEOUT, connect=5),
+        ) as response:
+            if response.status != 200:
+                raise LocalEngineUnavailable(f"engine {path} returned HTTP {response.status}")
+            if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                raise LocalEngineUnavailable(f"engine {path} returned compressed metadata")
+            if response.content_length is not None and (
+                response.content_length > LOCAL_METADATA_BYTES
+            ):
+                raise LocalEngineUnavailable(f"engine {path} exceeded metadata byte limit")
+            data = bytearray()
+            async for chunk in response.content.iter_chunked(8192):
+                data.extend(chunk)
+                if len(data) > LOCAL_METADATA_BYTES:
+                    raise LocalEngineUnavailable(f"engine {path} exceeded metadata byte limit")
+            payload = json.loads(
+                data,
+                object_pairs_hook=_object_no_duplicates,
+                parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+            )
+            if not isinstance(payload, dict):
+                raise ValueError("metadata must be an object")
+            return payload
+    except (ClientError, TimeoutError, ValueError) as exc:
+        raise LocalEngineUnavailable(f"engine {path} metadata unavailable or malformed") from exc
+
+
+class LocalEngines:
+    """Serialize bounded preparation per engine, apart from inference permits."""
+
+    def __init__(self) -> None:
+        self.preparation: dict[str, asyncio.Semaphore] = {}
+        self.status: dict[str, dict] = {}
+        self.plans: dict[str, str] = {}
+
+    def sync(self, policy: RuntimePolicy) -> None:
+        signatures = {
+            key: json.dumps(engine, sort_keys=True) for key, engine in policy.engines.items()
+        }
+        self.status = {
+            key: value
+            for key, value in self.status.items()
+            if signatures.get(key) == self.plans.get(key)
+        }
+        self.plans = signatures
+
+    def semaphore(self, engine_id: str) -> asyncio.Semaphore:
+        return self.preparation.setdefault(engine_id, asyncio.Semaphore(1))
+
+    async def verify(self, session: ClientSession, lane: LanePolicy, engine: dict) -> None:
+        props = await local_metadata(session, lane, "/props")
+        settings = props.get("default_generation_settings")
+        if not isinstance(settings, dict):
+            raise LocalEngineUnavailable("engine properties omit generation settings")
+        expected = {
+            "model_alias": engine["model_alias"],
+            "model_path": engine["model_path"],
+            "total_slots": engine["sequences"],
+        }
+        for key, value in expected.items():
+            if props.get(key) != value or type(props.get(key)) is not type(value):
+                raise LocalEngineUnavailable(f"engine {key} differs from the resolved plan")
+        if (
+            settings.get("n_ctx") != engine["context_tokens"]
+            or type(settings.get("n_ctx")) is not int
+        ):
+            raise LocalEngineUnavailable("engine per-slot context differs from the resolved plan")
+        if props.get("is_sleeping") is not False:
+            raise LocalEngineUnavailable("engine is not awake")
+        if engine["build_commit"] not in str(props.get("build_info", "")):
+            raise LocalEngineUnavailable("engine build differs from the resolved plan")
+
+    def failed(self, lane: LanePolicy, exc: LocalEngineUnavailable) -> web.HTTPServiceUnavailable:
+        self.status[lane.engine_id] = {"status": "unavailable", "reason": str(exc)}
+        event("local_engine_unavailable", lane=lane.name, engine=lane.engine_id, reason=exc)
+        return web.HTTPServiceUnavailable(
+            text=f"local engine unavailable: {exc}", headers={"Retry-After": "5"}
+        )
+
+    async def prepare(
+        self, request: web.Request, lane: LanePolicy, engine: dict, body: bytes
+    ) -> tuple[bytes, int, int]:
+        queued = time.monotonic()
+        async with self.semaphore(lane.engine_id):
+            event(
+                "local_prepare",
+                lane=lane.name,
+                engine=lane.engine_id,
+                queue_ms=round((time.monotonic() - queued) * 1000),
+            )
+            try:
+                await self.verify(request.app["client"], lane, engine)
+                result = await local_metadata(
+                    request.app["client"], lane, "/v1/chat/completions/input_tokens", body
+                )
+                tokens = result.get("input_tokens")
+                if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+                    raise LocalEngineUnavailable("engine returned an invalid input token count")
+            except LocalEngineUnavailable as exc:
+                raise self.failed(lane, exc) from exc
+            self.status[lane.engine_id] = {
+                "status": "ready",
+                "context_tokens": lane.context,
+                "sequences": engine["sequences"],
+            }
+
+        if tokens >= lane.context:
+            stats.guard_rejections += 1
+            event(
+                "local_context_rejected",
+                lane=lane.name,
+                engine=lane.engine_id,
+                input_tokens=tokens,
+                context_tokens=lane.context,
+            )
+            raise web.HTTPRequestEntityTooLarge(
+                lane.context - 1,
+                tokens,
+                text="local context is full; compact the conversation or shorten the input",
+            )
+        payload = json.loads(body)
+        remaining = lane.context - tokens
+        limits = [key for key in ("max_tokens", "max_completion_tokens") if key in payload]
+        output = min([remaining] + [payload[key] for key in limits])
+        for key in limits:
+            payload[key] = output
+        event(
+            "local_capacity",
+            lane=lane.name,
+            engine=lane.engine_id,
+            input_tokens=tokens,
+            output_tokens=output,
+            context_tokens=lane.context,
+        )
+        return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode(), tokens, output
+
+    async def before_dispatch(self, request: web.Request, lane: LanePolicy) -> None:
+        if lane.engine_id is None:
+            return
+        engine = current_policy().engines[lane.engine_id]
+        async with self.semaphore(lane.engine_id):
+            try:
+                await self.verify(request.app["client"], lane, engine)
+            except LocalEngineUnavailable as exc:
+                raise self.failed(lane, exc) from exc
+
+
+local_engines = LocalEngines()
 
 
 @dataclass
@@ -1265,7 +1527,7 @@ def _eviction_note(mime: str, size: int, payload: str) -> tuple[str, int, str]:
     note = (
         f"[image removed from context after analysis: {size} base64 chars, {mime}, "
         f'handle "{handle}". It may still be on this machine: call the analyze_image tool '
-        f'(named mcp__images__analyze_image wherever tools are namespaced) with '
+        f"(named mcp__images__analyze_image wherever tools are namespaced) with "
         f'handle="{handle}" and prompt=<what you want from it> to see it again, '
         "then continue the task you were working on.]"
     )
@@ -1858,9 +2120,7 @@ class Enforcement:
         return tuple(self.gates[key] for key in lane.counters if key in self.gates)
 
     def ledgers_for(self, lane: LanePolicy) -> tuple[tuple[str, RateLedger], ...]:
-        return tuple(
-            (key, self.ledgers[key]) for key in lane.counters if key in self.ledgers
-        )
+        return tuple((key, self.ledgers[key]) for key in lane.counters if key in self.ledgers)
 
     def book(self, lane: LanePolicy, cost: Cost) -> dict[str, Booking] | None:
         """Reserve usage on every rate counter this lane shares, or on none of them.
@@ -1919,12 +2179,9 @@ class Enforcement:
         return any(gate.runs_alone(reservation) for gate in self.gates_for(lane))
 
     def snapshot(self) -> dict:
-        gates = {
-            counter_id: gate.snapshot() for counter_id, gate in sorted(self.gates.items())
-        }
+        gates = {counter_id: gate.snapshot() for counter_id, gate in sorted(self.gates.items())}
         ledgers = {
-            counter_id: ledger.snapshot()
-            for counter_id, ledger in sorted(self.ledgers.items())
+            counter_id: ledger.snapshot() for counter_id, ledger in sorted(self.ledgers.items())
         }
         return {"counters": gates, "rates": ledgers}
 
@@ -1948,9 +2205,7 @@ async def admission(
 
 enforcement = Enforcement()
 enforcement.sync(BASELINE_POLICY)
-ingress = IngressGate(
-    1 + int(BASELINE_POLICY.limits.get("subagent_concurrency") or 1), MAX_QUEUED
-)
+ingress = IngressGate(1 + int(BASELINE_POLICY.limits.get("subagent_concurrency") or 1), MAX_QUEUED)
 stats = Stats()
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -2145,6 +2400,15 @@ async def health(_request: web.Request) -> web.Response:
                     "reservation": item.reservation,
                     "exclusive": enforcement.is_exclusive(item),
                     "counters": list(item.counters),
+                    **(
+                        {
+                            "engine_id": item.engine_id,
+                            "output_mode": item.output_mode,
+                            "token_accounting": item.token_accounting,
+                        }
+                        if item.engine_id is not None
+                        else {}
+                    ),
                 }
                 for lane, item in policy.lanes.items()
             },
@@ -2164,6 +2428,25 @@ async def health(_request: web.Request) -> web.Response:
             # no wall clock is configured rather than decode a made-up one.
             "max_request_seconds": MAX_REQUEST_SECONDS or None,
             "usage_reporting_supported": USAGE_SUPPORTED,
+            **(
+                {
+                    "engines": {
+                        engine_id: {
+                            "context_tokens": engine["context_tokens"],
+                            "sequences": engine["sequences"],
+                            "capacity_strategy": engine["capacity_strategy"],
+                            "memory_management": engine["memory_management"],
+                            "native_context_tokens": engine["native_context_tokens"],
+                            "serving_profile_id": engine.get("serving_profile_id"),
+                            "validation_status": engine.get("validation_status"),
+                            **local_engines.status.get(engine_id, {"status": "unverified"}),
+                        }
+                        for engine_id, engine in policy.engines.items()
+                    }
+                }
+                if policy.engines
+                else {}
+            ),
             "stats": {
                 "rate_waits": stats.rate_waits,
                 "guard_rejections": stats.guard_rejections,
@@ -2205,9 +2488,7 @@ async def chat(request: web.Request) -> web.StreamResponse:
         raise web.HTTPBadRequest(text="query strings are not supported")
 
     if request.headers.get("Content-Encoding", "identity").lower() != "identity":
-        raise web.HTTPUnsupportedMediaType(
-            text="compressed request bodies are not supported"
-        )
+        raise web.HTTPUnsupportedMediaType(text="compressed request bodies are not supported")
 
     lane_name = request.match_info["lane"]
 
@@ -2267,8 +2548,8 @@ async def chat(request: web.Request) -> web.StreamResponse:
             )
 
         guard = lane.max_input * INPUT_GUARD_PERCENT // 100
-        estimate, media = estimate_input_tokens(outbound_body)
-        if estimate > guard:
+        estimate, media = estimate_input_tokens(outbound_body) if lane.engine_id is None else (0, 0)
+        if lane.engine_id is None and estimate > guard:
             stats.guard_rejections += 1
             # input_bytes stays the live field and keeps meaning "what the client sent", as it
             # did before eviction existed; the post-eviction size is alongside it, because after
@@ -2292,6 +2573,11 @@ async def chat(request: web.Request) -> web.StreamResponse:
             )
 
         outbound_body = rewrite_model(outbound_body, request, lane)
+        output_budget = lane.output_clamp
+        if lane.engine_id is not None:
+            outbound_body, estimate, output_budget = await local_engines.prepare(
+                request, lane, policy.engines[lane.engine_id], outbound_body
+            )
 
         await log_prompt(request, lane, outbound_body)
 
@@ -2306,8 +2592,10 @@ async def chat(request: web.Request) -> web.StreamResponse:
             # The guard's estimate is the best input figure available before the request
             # runs; a ledger that meters input charges itself from it and settles to the
             # prompt tokens the response reports.
-            Cost(input=estimate, output=lane.output_clamp),
-            priced_reservation(lane, estimate),
+            Cost(input=estimate, output=output_budget),
+            min(lane.reservation, estimate + output_budget)
+            if lane.engine_id is not None
+            else priced_reservation(lane, estimate),
         )
 
 
@@ -2379,10 +2667,17 @@ async def stream_attempt(
 ) -> Attempt:
     """Make one attempt, holding every fair-use permit this lane is charged to."""
     url = f"{lane.base_url}/v1/chat/completions"
+    await local_engines.before_dispatch(request, lane)
+    queued_at = time.monotonic()
     async with admission(lane, enforcement, reservation):
-        outbound_headers = filtered_request_headers(
-            request, upstream_credential(lane.secret_name)
-        )
+        if lane.engine_id is not None:
+            event(
+                "local_execution_admitted",
+                lane=lane.name,
+                engine=lane.engine_id,
+                queue_ms=round((time.monotonic() - queued_at) * 1000),
+            )
+        outbound_headers = filtered_request_headers(request, upstream_credential(lane.secret_name))
 
         event(
             "upstream_dispatch",
@@ -2448,10 +2743,7 @@ async def stream_attempt(
                         error_excerpt=_excerpt(error_body),
                     )
 
-            if (
-                response.content_length is not None
-                and response.content_length > MAX_RESPONSE_BYTES
-            ):
+            if response.content_length is not None and response.content_length > MAX_RESPONSE_BYTES:
                 response.close()
                 raise web.HTTPBadGateway(text="upstream response exceeds byte limit")
 
@@ -2543,9 +2835,7 @@ async def stream_attempt(
             response.release()
 
 
-def _attempt_result(
-    downstream: web.StreamResponse, scanner: UsageScanner
-) -> Attempt:
+def _attempt_result(downstream: web.StreamResponse, scanner: UsageScanner) -> Attempt:
     return Attempt(
         response=downstream,
         output_tokens=scanner.completion_tokens,
@@ -2755,6 +3045,11 @@ async def forward_chat(
                 input_bytes=len(body),
                 priced_reservation=cost_of_permit,
             )
+        except BaseException:
+            # Cancellation and a local readiness refusal must refund a booking just as a
+            # transport failure does. Execution permits unwind inside stream_attempt.
+            enforcement.settle(lane, bookings, cost, None)
+            raise
         else:
             if outcome.streamed:
                 book_output(lane, bookings, cost, outcome)

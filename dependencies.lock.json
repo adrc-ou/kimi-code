@@ -16,6 +16,7 @@
   "downloads": {
     "llama-cpp-macos-arm64": {
       "version": "b11846",
+      "commit": "1a24df163920a4744a95373d178d790b72a9bb2f",
       "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11846/llama-b11846-bin-macos-arm64.tar.gz",
       "digest": "sha256:b145e8065883ef6b124d47fa2ff5fc8a046bafe415a7e1db1efb00b0809a2ee1"
     }

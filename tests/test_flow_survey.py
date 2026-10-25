@@ -157,6 +157,15 @@ class SurveyTests(unittest.TestCase):
     def test_a_lane_with_something_to_choose_is_one_screen(self):
         self.assertEqual(self.asked(flow.MODEL), 1)
 
+    def test_native_local_choices_are_forecast_without_projection_or_installation(self):
+        providers = {"acme": {"requires": [], "execution": {"kind": "local"}}}
+        survey = flow_survey.Survey(self.root, self.runtime)
+        survey._memo["definitions"] = (providers, MODELS)
+        with mock.patch.object(flow_survey.model_step.capacity, "project") as checker:
+            self.assertEqual(flow_survey.lane_forecast(survey, "primary"), (True, "big"))
+            self.assertEqual(flow_survey.lane_forecast(survey, "subagent"), (False, "fast"))
+        checker.assert_not_called()
+
     def test_a_lane_with_nothing_to_choose_between_asks_nothing(self):
         # One candidate is not a question, and a step that asks nothing is not a screen - which is
         # how a launch begins at "1 of" rather than at the number of its name in the sequence.

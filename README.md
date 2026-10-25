@@ -170,7 +170,7 @@ subagents. Each picker lists the models defined in `./models` alphabetically by
 label, marks the last-used choice, and pre-selects it; only models whose provider
 exists in `./providers` are offered.
 
-A model with both agent lanes is listed twice on the main-agent screen, because
+A fixed-envelope model with both agent lanes is listed twice on the main-agent screen, because
 how much context the main agent launches with is the operator's decision and it
 is the one decision the two lanes differ on. The two rows are peers, not a
 default and an upgrade, and each says which way it trades:
@@ -191,10 +191,12 @@ model) reuses the previous choice, and `HARNESS_PRIMARY_MODEL` /
 `HARNESS_SUBAGENT_MODEL` override one picker. `HARNESS_PRIMARY_MODEL` also accepts
 the wide row's id, which is the model id with an `@long` suffix.
 
-Both models then resolve against their providers' rules into one enforcement plan,
-and every number downstream — lane sizes, Kimi's model tables, the subagent
-fan-out, the proxy's gates — is derived from that plan. Next the launcher shows
-compatible modules as checkbox rows. Last session's enabled modules appear first
+Managed local rows show native capacity; the picker says their usable windows are
+sized at launch. Their window
+comes from measured resources after installation; they do not inherit the hosted
+provider's lane trade-off.
+
+Next the launcher shows compatible modules as checkbox rows. Last session's enabled modules appear first
 and are checked; each group is alphabetical by label. On the first run all modules
 are unchecked. If none are compatible, this step is skipped.
 
@@ -294,36 +296,52 @@ run is not a choice.
 The two model questions are a table. The columns are Model, Provider, Lane, then
 `Ready` or `Not Installed` and the `(last used)` mark, neither of which needs a
 header; the keys are the same as they were. Provider is a column because one
-model name can now be served two ways — `Qwen3.8-Flash-Next` from NRP is a
-1M-token window metered against published fair-use terms, and the same model from
-`Local (MPS)` is 111 GB of weights on your memory. Pick either; they are separate
-definitions under `models/<provider>/`.
+model name can be served through a metered provider or on your own hardware.
+They are separate definitions under `models/<provider>/`, with separate policy
+and capacity accounting. Local rows show their native window; the final launch
+recap reports that window and the started engine's slot count.
 
-**`Not Installed` is a selectable answer.** Choosing it proceeds with the launch
-and the download happens afterwards, in the background, so nothing you are asked
-at startup waits on a transfer; the lane goes live mid-session when the bytes
-finish. Progress and any failure reason go to
-`.local/runtime/<instance>/local-model.log`, which outlives the launch on purpose
-so a download that died at 90% can still be read about afterwards. What makes a
-model ready is not that the files exist but that
-their SHA-256s matched: every local model pins one Hugging Face commit and one
-digest per file in `weights.lock.json`, and nothing unverified is ever recorded.
+**Local choices retain static host eligibility.** The picker checks backend,
+installed-RAM and disk requirements from each model manifest. Models below those
+floors are hidden, without estimating current available-memory fit. `Not Installed`
+models can be selected: after the questions, the launcher installs missing weights
+and verifies their pinned SHA-256 digests before starting an engine. Installation
+progress and failures are recorded in
+`.local/runtime/<instance>/local-model.log`. `Ready` still means verified bytes,
+not merely files that exist and not a promise that the model fits physical RAM.
 Weights land in `models/<provider>/<id>/weights/`, which git and the build context
 both ignore, and re-running the installer verifies bytes you copied in by hand
 without re-downloading them. `HF_TOKEN` in `.env` is what unlocks a gated
 repository; it goes only to `huggingface.co`, never to a mirror, and never into a
 container.
 
-**The two models this ships with, and what they need.** `Qwen3.8-27B` is a dense
-27B at a 17.6 GB 4-bit build, gated at **32 GiB** of unified memory — one notch
-above the publisher's own 24 GiB floor, because this harness's container VM takes
-its memory out of the same pool. `Qwen3.8-Flash-Next` is a 125B MoE with a 51B
-n-gram embedding table; its smallest published build is 72.5 GB, so this one is
-gated at **160 GiB** and a 32 GB Mac cannot run it at any quantisation. Both gates
-come from the pinned arithmetic rather than from a machine, and both models are
-sized (windows, concurrency) for the smallest host that clears them: 27B allows
-two concurrent requests, Flash-Next one, and subagent fan-out falls out of those
-numbers automatically.
+**Each local engine gets its full native context and one slot.** The context
+comes from the model manifest; `capacity.strategy = "native_context"` and
+`capacity.sequence_slots = 1` come from the local provider manifest. Once static
+eligibility passes, available RAM, projected allocations and Metal's recommended working set do not
+reduce the window or refuse a launch. The OS and backend own allocation and
+paging; this permits oversubscription without guaranteeing that every allocation
+is pageable or will succeed. The harness does not change OS settings or lock memory.
+
+Selecting the same model for both roles shares one engine and one execution slot.
+Distinct models use separate engines. Additional requests queue with main-request
+priority; a child can use the shared slot while the main agent waits. Windows are
+fixed for the launch, and no automatic precision, context or model fallback occurs.
+
+Local input is counted with the pinned engine's authenticated chat-template
+tokenizer, after the proxy's body transformations. Kimi's input target leaves its
+existing compaction reserve; the hard boundary is the engine's fixed window.
+Generation may use the actual context remaining, bounded by an explicit client
+maximum. An unavailable tokenizer or a prompt leaving no output space fails
+with a diagnostic. Local capacity does not impose NRP fair-use partitions, and
+NRP enforcement remains unchanged when either role uses NRP.
+
+The initial serving profile retains FP16 cache precision and native context,
+without YaRN. Independent slots have no extra RAM prompt cache or context
+checkpoints. In-slot reuse remains available, but changing the prompt assigned to
+a slot can require more prompt processing. Hardware validation remains pending;
+repository fixtures are not evidence of native generation correctness or peak
+memory behavior. Available-memory and RSS measurements do not size or limit execution.
 
 **Why the server is a host process.** No container in this stack can address
 Apple silicon's unified memory, so `llama-server` runs beside Docker and the proxy
@@ -334,18 +352,33 @@ session: the same value is handed to the engine and mounted into the proxy, so
 there is nothing for you to configure and nothing that outlives the run. Set
 `LOCAL_MPS_BIND` to pin it to one interface. The engine binary itself is pinned by
 digest in `dependencies.lock.json`; `LOCAL_MPS_LLAMA_SERVER` points the harness at
-a build of your own instead.
+a compatible build of your own instead. The adapter currently supports Metal;
+other backends fail explicitly.
+
+The launcher authenticates readiness and checks the model and build identity,
+per-sequence context, slot count and normalized settings against the resolved plan before exposing Kimi. A mismatch stops that
+launch. An engine crash makes its routes unavailable; it does not resize the
+session or change an independent provider's policy.
 
 `python3 tools/local_llm.py status` prints what the picker saw, and
-`docs/models-providers.md` ("Local serving") is the contract behind all of it.
+`docs/models-providers.md` ("Managed local execution and capacity") is the contract behind all of it.
 Nothing here changes the request path: local lanes still go through `model-proxy`,
-so prompt logging, lane policy and the drift check apply to them unchanged.
+so prompt logging, lane policy and the staged-configuration drift check apply.
+The launch recap, proxy health information and request-ID logs explain fixed
+native windows, engine slots, OS-managed memory and queue or rejection reasons. The plan
+and readiness records remain under the instance runtime directory.
+The operator-only `tools/local_capacity_smoke.py` can collect near-window and
+saturated-slot evidence from an already running instance, then compare an
+isolated shutdown allocation event. See the schema contract's native evidence
+instructions; the tool does not automatically qualify hardware or alter policy.
 
 ## Resolved policy enforcement
 
 `model-proxy` never holds a policy number of its own. At launch
-`tools/models.py resolve` reads the two selected models and the `[[rule]]` tables of
-their providers and writes one plan; the proxy mounts that plan as its enforcement
+`tools/models.py resolve` reads the two selected models, provider rules and any
+managed-engine capacity declarations, then writes one plan. Every downstream
+lane size, Kimi model table, child-concurrency limit and admission gate derives
+from that plan. The proxy mounts the plan as its enforcement
 input and refuses to serve if it cannot honour it. Adding a provider whose terms
 look nothing like NRP's — a token-per-minute ceiling, a hard context cap, no
 concurrency rule at all — is a definition change, not a proxy change.
@@ -368,15 +401,15 @@ minute, and the gateway's own `x-ratelimit-*` header still wins whenever it repo
 less headroom. And NRP does not enforce its concurrency table at all, so
 `max_concurrent_requests` is honoured here or nowhere.
 
-Two numbers in the provider file are deliberate under-use, and they are the only
-tunables: `[safety].context_margin_percent` (95) and
+Two numbers in NRP's provider file are deliberate under-use:
+`[safety].context_margin_percent` (95) and
 `output_rate_margin_percent` (90) multiply the provider's own thresholds, so a
 margin can never push a budget above the published rule. At the shipped
 definition the model advertises 1,000,000 tokens, so the aggregate ceiling is
 350,000 and the in-flight budget is 332,500; the rate ledger books 180,000 output
 tokens per minute.
 
-A lane's worst-case reservation is its input cap plus its output clamp, both from
+A fixed provider lane's worst-case reservation is its input cap plus its output clamp, both from
 `[lane.*]` in the model definition and both revalidated against the rendered Kimi
 configuration the launcher staged for this run — a configuration the proxy cannot
 honour answers HTTP 503 instead of passing unmeasured traffic. How the reservation
