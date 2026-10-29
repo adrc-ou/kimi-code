@@ -20,8 +20,9 @@ A plan carries three counter families, and each counter becomes one live object:
 
 A request holds a slot in every counter its lane names. Counters are always taken in
 sorted counter-id order, so no two requests can pick them up in opposite orders and
-deadlock. Fair-use permits and rate bookings are always released before a backoff sleep,
-so waiting on a provider never consumes capacity.
+deadlock. Execution permits are released and rate bookings settled before a backoff sleep,
+so waiting on a provider never holds an execution permit. Dispatched attempts whose
+usage is unknown retain a conservative rate charge rather than being refunded.
 
 Both the plan and the rendered Kimi configuration that plan was compiled into are re-read
 on the request path: drift stops the affected traffic instead of being served under stale
@@ -47,6 +48,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -65,9 +67,10 @@ from pathlib import Path
 from aiohttp import (
     ClientConnectionError,
     ClientError,
+    ClientPayloadError,
+    ClientResponseError,
     ClientSession,
     ClientTimeout,
-    ServerDisconnectedError,
     web,
 )
 
@@ -132,7 +135,7 @@ REQUEST_USAGE = os.environ.get("MODEL_PROXY_REQUEST_USAGE", "1").strip().lower()
 }
 USAGE_SUPPORTED = True
 
-RETRYABLE = {429, 500, 502, 503, 504}
+RETRYABLE = {408, 409, 429, 500, 502, 503, 504, 529}
 
 SENSITIVE_HEADERS = {
     "authorization",
@@ -281,6 +284,11 @@ DEFAULT_LIVE_EVENTS = frozenset(
         "local_context_rejected",
         "local_capacity",
         "upstream_retry",
+        "request_failed",
+        "recovery_started",
+        "recovery_attempt",
+        "recovery_complete",
+        "recovery_action_required",
         "usage_reporting_unsupported",
     }
 )
@@ -1709,7 +1717,7 @@ class Cost:
         """Measured cost once the response finished.
 
         ``None`` means nothing was measured in that unit, and the pessimistic charge stands
-        for the rest of the window - the safe direction to be wrong in.
+        for a fresh rolling window - the safe direction to be wrong in.
         """
         if unit == "requests":
             return 1
@@ -1721,7 +1729,7 @@ class Cost:
             return outcome.prompt_tokens + outcome.output_tokens
         if outcome.output_tokens is not None:
             return outcome.output_tokens
-        return outcome.estimated_output
+        return None if outcome.failure or outcome.stalled else outcome.estimated_output
 
 
 @dataclass(eq=False)
@@ -1847,7 +1855,9 @@ class RateLedger:
             return
         booking.settled = True
         if actual is None:
-            return  # Keep the pessimistic booking for the rest of the window.
+            # The attempt may have generated output after its initial booking expired.
+            # Unknown usage needs the same fresh window as measured usage, not a refund.
+            actual = booking.amount
         now = self.clock()
         self._prune(now)
         if not booking.pruned:
@@ -2147,9 +2157,9 @@ class Enforcement:
     ) -> None:
         """Settle every booking in the unit its own ledger meters.
 
-        ``outcome`` is None when the attempt never reached the client, which refunds the
+        ``outcome`` is None when no upstream work was dispatched, which refunds the
         charge entirely. Where a response reported nothing measurable in a ledger's unit, the
-        pessimistic charge stands for the rest of the window - the safe direction to be wrong.
+        pessimistic charge starts a fresh rolling window - the safe direction to be wrong.
         """
         for counter_id, booking in (bookings or {}).items():
             ledger = self.ledgers[counter_id]
@@ -2247,7 +2257,7 @@ def filtered_response_headers(headers) -> dict[str, str]:
 
 
 def clamp_retry_delay(seconds: float) -> float:
-    return min(300.0, max(1.0, seconds))
+    return max(1.0, seconds) if math.isfinite(seconds) else 300.0
 
 
 def retry_delay(response, attempt: int) -> float:
@@ -2279,13 +2289,17 @@ def retry_delay(response, attempt: int) -> float:
 # ============================================================
 
 
-class UsageScanner:
-    """Read token usage and generated length from an OpenAI-compatible stream.
+class UpstreamProtocolError(Exception):
+    """A bounded, categorical failure; never include prompt or response text here."""
 
-    Chunks split anywhere, so events are only parsed once their terminating blank
-    line has arrived. The buffer is capped: a parser that cannot keep up degrades
-    to a reservation kept for the whole window, never to unbounded memory.
-    """
+    def __init__(self, category: str = "invalid_response", status: int | None = None):
+        super().__init__(category)
+        self.category = category
+        self.status = status
+
+
+class UsageScanner:
+    """Incrementally validate SSE frames and measure generated text, including tool arguments."""
 
     def __init__(self, *, cap: int = 262144) -> None:
         self.cap = cap
@@ -2294,68 +2308,150 @@ class UsageScanner:
         self.prompt_tokens: int | None = None
         self.text_chars = 0
         self.overflowed = False
+        self.error: UpstreamProtocolError | None = None
+        self.events = 0
+        self.done = False
+        self.choices: set[int] = set()
+        self.finished: dict[int, str] = {}
+        self.useful = False
 
-    def feed(self, chunk: bytes) -> None:
+    def feed(self, chunk: bytes) -> list[bytes]:
         if self.overflowed:
-            return
+            return []
         self.buffer += chunk
-        while True:
-            raw, separator, rest = bytes(self.buffer).partition(b"\n\n")
-            if not separator:
+        frames = []
+        while match := re.search(rb"\r?\n\r?\n", self.buffer):
+            end = match.end()
+            if end > self.cap:
+                self.overflowed = True
                 break
-            self.buffer = bytearray(rest)
-            self._event(raw)
-        if len(self.buffer) > self.cap:
+            frame = bytes(self.buffer[:end])
+            del self.buffer[:end]
+            frames.append(frame)
+            self._event(frame)
+        if len(self.buffer) > self.cap or self.overflowed:
             self.buffer.clear()
             self.overflowed = True
+            self.error = UpstreamProtocolError("response_limit")
+        return frames
 
     def finish(self) -> None:
-        if not self.overflowed and self.buffer:
-            self._event(bytes(self.buffer))
+        # An unterminated event is not evidence of reported usage or completion.
+        if self.buffer.strip():
+            self.error = self.error or UpstreamProtocolError()
         self.buffer.clear()
 
+    def validate(self) -> None:
+        self.finish()
+        if self.error:
+            raise self.error
+        if not self.done or not self.choices or self.choices != self.finished.keys():
+            raise UpstreamProtocolError()
+        if not self.useful and not all(x == "content_filter" for x in self.finished.values()):
+            raise UpstreamProtocolError("empty_response")
+
+    @staticmethod
+    def data(raw: bytes) -> bytes:
+        return b"\n".join(
+            line[5:].removeprefix(b" ") for line in raw.splitlines() if line.startswith(b"data:")
+        )
+
     def _event(self, raw: bytes) -> None:
-        for line in raw.split(b"\n"):
-            line = line.strip()
-            if not line.startswith(b"data:"):
-                continue
-            data = line[5:].strip()
-            if not data or data == b"[DONE]":
-                continue
-            if b'"usage"' not in data and b'"content"' not in data:
-                if b'"reasoning_content"' not in data:
-                    continue
+        data = self.data(raw)
+        if not data:
+            return
+        if self.done:
+            self.error = UpstreamProtocolError()
+            return
+        if data.strip() == b"[DONE]":
+            self.done = True
+            return
+        try:
+            payload = json.loads(data)
+            self.observe(payload)
+        except (ValueError, UnicodeDecodeError, TypeError):
+            self.error = UpstreamProtocolError()
+
+    def observe(self, payload: object, *, streaming: bool = True) -> None:
+        if not isinstance(payload, dict):
+            raise ValueError("response is not an object")
+        if payload.get("error") is not None:
+            error = payload["error"]
+            status = (
+                error.get("code", error.get("status_code")) if isinstance(error, dict) else None
+            )
             try:
-                event = json.loads(data)
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                status = int(status)
+            except (TypeError, ValueError):
+                status = None
+            self.error = UpstreamProtocolError("upstream_error", status)
+            return
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            raise ValueError("missing choices")
+        self.events += 1
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            for source, target in (
+                ("completion_tokens", "completion_tokens"),
+                ("prompt_tokens", "prompt_tokens"),
+            ):
+                value = usage.get(source)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    setattr(self, target, value)
+        for choice in choices:
+            if not isinstance(choice, dict):
+                raise ValueError("invalid choice")
+            index = choice.get("index", 0)
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise ValueError("invalid choice index")
+            self.choices.add(index)
+            reason = choice.get("finish_reason")
+            if reason is not None:
+                if not isinstance(reason, str) or not reason:
+                    raise ValueError("invalid finish reason")
+                if reason not in {
+                    "stop",
+                    "length",
+                    "tool_calls",
+                    "function_call",
+                    "content_filter",
+                }:
+                    raise ValueError("unknown finish reason")
+                self.finished[index] = reason
+            source = choice.get("delta" if streaming else "message")
+            if source is None and reason is not None:
                 continue
-            if not isinstance(event, dict):
-                continue
-            usage = event.get("usage")
-            if isinstance(usage, dict):
-                completion = usage.get("completion_tokens")
-                prompt = usage.get("prompt_tokens")
-                if isinstance(completion, int) and not isinstance(completion, bool):
-                    self.completion_tokens = completion
-                if isinstance(prompt, int) and not isinstance(prompt, bool):
-                    self.prompt_tokens = prompt
-            for choice in event.get("choices") or []:
-                if not isinstance(choice, dict):
-                    continue
-                delta = choice.get("delta")
-                source = delta if isinstance(delta, dict) else choice.get("message")
-                if not isinstance(source, dict):
-                    continue
-                for key in ("content", "reasoning_content"):
-                    value = source.get(key)
+            if not isinstance(source, dict):
+                raise ValueError("missing completion message")
+            for key in ("content", "reasoning_content"):
+                value = source.get(key)
+                if isinstance(value, str):
+                    self.text_chars += len(value)
+                    if key == "content" and value:
+                        self.useful = True
+            calls = source.get("tool_calls") or []
+            if not isinstance(calls, list):
+                raise ValueError("invalid tool calls")
+            if any(not isinstance(call, dict) for call in calls):
+                raise ValueError("invalid tool call fragment")
+            legacy = source.get("function_call")
+            # A valid streaming fragment may carry only the tool id/index; its name
+            # and argument fragments can arrive in later events.
+            functions = [call["function"] for call in calls if call.get("function") is not None]
+            if legacy is not None:
+                functions.append(legacy)
+            for function in functions:
+                if not isinstance(function, dict):
+                    raise ValueError("invalid function")
+                for key in ("name", "arguments"):
+                    value = function.get(key)
                     if isinstance(value, str):
                         self.text_chars += len(value)
+                        self.useful = self.useful or bool(value)
 
     def estimated_output(self) -> int | None:
-        """Character-derived fallback for when the gateway reports no usage."""
-        if self.completion_tokens is not None:
-            return None
-        if not self.text_chars and self.overflowed:
+        if self.completion_tokens is not None or self.overflowed:
             return None
         return (self.text_chars + 3) // 4
 
@@ -2428,6 +2524,7 @@ async def health(_request: web.Request) -> web.Response:
             # no wall clock is configured rather than decode a made-up one.
             "max_request_seconds": MAX_REQUEST_SECONDS or None,
             "usage_reporting_supported": USAGE_SUPPORTED,
+            "recovery": recovery.snapshot(),
             **(
                 {
                     "engines": {
@@ -2610,9 +2707,9 @@ class _HeaderBag:
 class Attempt:
     """Outcome of one permitted upstream attempt.
 
-    ``response`` is set as soon as anything has reached the client. From that
-    point the request cannot be retried, because its status line is already sent,
-    so a stall has to end the attempt instead of looping.
+    ``response`` carries a complete buffered reply or an already-prepared stream.
+    A failure on that stream has to end the attempt instead of appending a new
+    generation. Before preparation, the proxy can still retry transparently.
 
     ``status`` and ``error_excerpt`` carry what the gateway actually said. They matter most on
     the paths that hand the client nothing - a retryable status, a usage rejection - where the
@@ -2628,7 +2725,11 @@ class Attempt:
     estimated_output: int | None = None
     stalled: bool = False
     status: int | None = None
+    error_status: int | None = None
     error_excerpt: str | None = None
+    dispatched: bool = False
+    failure: str | None = None
+    permanent: bool = False
 
     @property
     def streamed(self) -> bool:
@@ -2657,6 +2758,195 @@ def _quota_headers(headers) -> dict[str, str]:
     return {name: headers[name] for name in wanted if name in headers}
 
 
+@dataclass
+class RecoveryEntry:
+    lane: str
+    recovery_id: str = field(default_factory=lambda: secrets.token_hex(8))
+    failures: int = 0
+    failure: str | None = None
+    next_attempt: float = 0.0
+    last_used: float = 0.0
+    last_completed: float | None = None
+    users: int = 0
+    in_flight: int = 0
+    permanent_status: int | None = None
+    dumped: bool = False
+
+
+class RecoveryActionRequired(Exception):
+    def __init__(self, status: int, recovery_id: str):
+        self.status = status
+        self.recovery_id = recovery_id
+
+
+class RecoveryTracker:
+    """Bounded failure history shared across reconnects, never a response cache."""
+
+    def __init__(self, *, clock=time.monotonic, capacity=1024, idle_seconds=1800):
+        self.clock = clock
+        self.capacity = capacity
+        self.idle_seconds = idle_seconds
+        self.entries: OrderedDict[bytes, RecoveryEntry] = OrderedDict()
+
+    def acquire(self, lane: LanePolicy, body: bytes) -> RecoveryEntry:
+        payload = json.loads(body)
+        if isinstance(payload, dict):
+            # Usage negotiation changes the wire shape, not the generation being retried.
+            payload.pop("stream_options", None)
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        credential = upstream_credential(lane.secret_name)
+        revision = Path(POLICY_PATH).read_bytes()
+        material = b"\0".join(
+            (repr(lane).encode(), credential.encode(), revision, canonical.encode())
+        )
+        fingerprint = hmac.digest(CACHE_SALT.encode(), material, "sha256")
+        now = self.clock()
+        self.prune(now)
+        entry = self.entries.get(fingerprint)
+        if entry is None:
+            if len(self.entries) >= self.capacity:
+                victim = next((k for k, v in self.entries.items() if not v.users), None)
+                if victim is None:
+                    raise web.HTTPServiceUnavailable(
+                        text="recovery tracker is busy", headers={"Retry-After": "1"}
+                    )
+                del self.entries[victim]
+            entry = RecoveryEntry(lane=lane.name, last_used=now)
+            self.entries[fingerprint] = entry
+        self.entries.move_to_end(fingerprint)
+        entry.users += 1
+        entry.last_used = now
+        return entry
+
+    def release(self, entry: RecoveryEntry) -> None:
+        entry.users -= 1
+        entry.last_used = self.clock()
+
+    def prune(self, now: float) -> None:
+        for key, entry in list(self.entries.items()):
+            if not entry.users and now - entry.last_used >= self.idle_seconds:
+                del self.entries[key]
+
+    async def admit(self, entry: RecoveryEntry) -> None:
+        while True:
+            if entry.permanent_status is not None:
+                raise RecoveryActionRequired(entry.permanent_status, entry.recovery_id)
+            now = self.clock()
+            delay = max(0.0, entry.next_attempt - now)
+            if not delay and (entry.failures < 3 or not entry.in_flight):
+                entry.in_flight += 1
+                if entry.failures >= 3:
+                    event(
+                        "recovery_attempt",
+                        lane=entry.lane,
+                        recovery=entry.recovery_id,
+                        failures=entry.failures,
+                    )
+                return
+            await asyncio.sleep(min(delay, 1.0) if delay else 0.1)
+
+    def end_attempt(self, entry: RecoveryEntry) -> None:
+        entry.in_flight = max(0, entry.in_flight - 1)
+
+    def fail(self, entry: RecoveryEntry, outcome: Attempt) -> None:
+        entry.failures += 1
+        entry.failure = outcome.failure or "upstream_error"
+        entry.last_used = self.clock()
+        if outcome.permanent:
+            first = entry.permanent_status is None
+            entry.permanent_status = outcome.error_status or outcome.status or 502
+            if first:
+                event(
+                    "recovery_action_required",
+                    lane=entry.lane,
+                    recovery=entry.recovery_id,
+                    status=entry.permanent_status,
+                    failure=entry.failure,
+                )
+        elif entry.failures >= 3:
+            cooldown = min(300.0, 30.0 * 2 ** min(entry.failures - 3, 4))
+            cooldown = min(300.0, cooldown * secrets.SystemRandom().uniform(1.0, 1.1))
+            delay = max(cooldown, outcome.retry_after or 0.0)
+            entry.next_attempt = max(entry.next_attempt, self.clock() + delay)
+            if entry.failures == 3:
+                event(
+                    "recovery_started",
+                    lane=entry.lane,
+                    recovery=entry.recovery_id,
+                    failures=entry.failures,
+                    failure=entry.failure,
+                    retry_seconds=round(delay, 1),
+                )
+
+    def succeed(self, entry: RecoveryEntry) -> None:
+        if entry.failures:
+            event(
+                "recovery_complete",
+                lane=entry.lane,
+                recovery=entry.recovery_id,
+                failures=entry.failures,
+            )
+        entry.failures = 0
+        entry.failure = None
+        entry.next_attempt = 0.0
+        entry.permanent_status = None
+        entry.dumped = False
+        entry.last_completed = time.time()
+
+    def snapshot(self) -> dict:
+        self.prune(self.clock())
+        return {
+            "capacity": self.capacity,
+            "idle_seconds": self.idle_seconds,
+            "tracked": len(self.entries),
+            "last_completed_at": max(
+                (e.last_completed for e in self.entries.values() if e.last_completed is not None),
+                default=None,
+            ),
+            "requests": [
+                {
+                    "id": e.recovery_id,
+                    "lane": e.lane,
+                    "state": "action_required"
+                    if e.permanent_status
+                    else "recovering"
+                    if e.failures
+                    else "ready",
+                    "failures": e.failures,
+                    "in_flight": e.in_flight,
+                    "failure": e.failure,
+                    "next_attempt_seconds": round(max(0.0, e.next_attempt - self.clock()), 1),
+                    "last_completed_at": e.last_completed,
+                }
+                for e in self.entries.values()
+                if e.failures or e.users
+            ],
+        }
+
+
+recovery = RecoveryTracker()
+ACTIVE_ATTEMPT: ContextVar[Attempt | None] = ContextVar("attempt", default=None)
+PERMANENT_STATUSES = frozenset({400, 401, 403, 404, 405, 410, 413, 415, 422})
+TRANSPORT_ERRORS = (TimeoutError, ClientConnectionError, ClientPayloadError)
+
+
+async def read_bounded(content, limit: int) -> bytes:
+    body = bytearray()
+    async for chunk in content.iter_any():
+        body.extend(chunk)
+        if len(body) > limit:
+            raise UpstreamProtocolError("response_limit")
+    return bytes(body)
+
+
+async def watch_disconnect(request: web.Request, owner: asyncio.Task) -> None:
+    while True:
+        if request.transport is None or request.transport.is_closing():
+            owner.cancel()
+            return
+        await asyncio.sleep(0.1)
+
+
 async def stream_attempt(
     request: web.Request,
     session: ClientSession,
@@ -2665,8 +2955,20 @@ async def stream_attempt(
     attempt: int,
     reservation: int,
 ) -> Attempt:
-    """Make one attempt, holding every fair-use permit this lane is charged to."""
-    url = f"{lane.base_url}/v1/chat/completions"
+    """Deliver one generation; failures before delivery are safe to retry here."""
+    outcome = ACTIVE_ATTEMPT.get() or Attempt()
+    response = None
+    scanner = UsageScanner()
+    downstream = None
+    sent = time.monotonic()
+    header_ms = 0
+    output_bytes = 0
+
+    def measure() -> None:
+        outcome.output_tokens = scanner.completion_tokens
+        outcome.prompt_tokens = scanner.prompt_tokens
+        outcome.estimated_output = scanner.estimated_output()
+
     await local_engines.before_dispatch(request, lane)
     queued_at = time.monotonic()
     async with admission(lane, enforcement, reservation):
@@ -2677,8 +2979,8 @@ async def stream_attempt(
                 engine=lane.engine_id,
                 queue_ms=round((time.monotonic() - queued_at) * 1000),
             )
-        outbound_headers = filtered_request_headers(request, upstream_credential(lane.secret_name))
-
+        headers = filtered_request_headers(request, upstream_credential(lane.secret_name))
+        headers["Accept-Encoding"] = "identity"
         event(
             "upstream_dispatch",
             lane=lane.name,
@@ -2688,165 +2990,167 @@ async def stream_attempt(
             lane_reservation=lane.reservation,
             runs_alone=enforcement.price_runs_alone(lane, reservation),
         )
-
         sent = time.monotonic()
-        response = await session.post(
-            url,
-            data=body,
-            headers=outbound_headers,
-            allow_redirects=False,
-        )
-        header_ms = round((time.monotonic() - sent) * 1000)
-
         try:
+            outcome.dispatched = True
+            response = await session.post(
+                f"{lane.base_url}/v1/chat/completions",
+                data=body,
+                headers=headers,
+                allow_redirects=False,
+            )
+            header_ms = round((time.monotonic() - sent) * 1000)
+            outcome.status = response.status
             for _counter_id, ledger in enforcement.ledgers_for(lane):
                 ledger.note_server(response.headers)
-
-            if response.status in RETRYABLE or response.status == 400:
-                error_body = await response.content.read(MAX_ERROR_BYTES + 1)
-
-                if response.status in RETRYABLE:
-                    response.close()
-                    # The whole answer goes to the file and only its existence to the terminal:
-                    # this is the line the operator already watches, and the reason behind it is
-                    # precisely what a retry loop used to discard.
-                    event(
-                        "upstream_rejected",
-                        lane=lane.name,
-                        attempt=attempt,
-                        status=response.status,
-                        header_ms=header_ms,
-                        input_bytes=len(body),
-                        priced_reservation=reservation,
-                        headers=_quota_headers(response.headers),
-                        body=_excerpt(error_body),
-                    )
-                    return Attempt(
-                        retry_after=retry_delay(response, attempt),
-                        status=response.status,
-                        error_excerpt=_excerpt(error_body),
-                    )
-
+            if response.status >= 400:
+                error_body = await read_bounded(response.content, MAX_ERROR_BYTES)
+                outcome.error_excerpt = _excerpt(error_body)
                 if body_rejects_stream_usage(response.status, error_body):
-                    response.close()
+                    outcome.rejected_usage = True
+                    outcome.retry_after = 0.0
                     event(
                         "usage_rejected",
                         lane=lane.name,
-                        attempt=attempt,
                         status=response.status,
-                        body=_excerpt(error_body),
+                        body=outcome.error_excerpt,
                     )
-                    return Attempt(
-                        retry_after=0.0,
-                        rejected_usage=True,
-                        status=response.status,
-                        error_excerpt=_excerpt(error_body),
-                    )
-
-            if response.content_length is not None and response.content_length > MAX_RESPONSE_BYTES:
-                response.close()
-                raise web.HTTPBadGateway(text="upstream response exceeds byte limit")
-
-            scanner = UsageScanner()
-            downstream = web.StreamResponse(
-                status=response.status,
-                headers=filtered_response_headers(response.headers),
-            )
-            await downstream.prepare(request)
-
-            output_bytes = 0
-            # A status the client will read as a refusal is copied into the file while it is
-            # forwarded, because the forwarded copy is the only record of it that survives.
-            peek = bytearray()
-
-            try:
-                async for chunk in response.content.iter_any():
-                    output_bytes += len(chunk)
-                    scanner.feed(chunk)
-
-                    if response.status >= 400 and len(peek) < LOG_ERROR_EXCERPT_BYTES:
-                        peek += chunk[: LOG_ERROR_EXCERPT_BYTES - len(peek)]
-
-                    if output_bytes > MAX_RESPONSE_BYTES:
-                        response.close()
-                        scanner.finish()
-                        event(
-                            "response_limit",
-                            ("lane", "input_bytes", "output_bytes"),
-                            lane=lane.name,
-                            input_bytes=len(body),
-                            output_bytes=output_bytes,
-                            status=response.status,
-                            attempt=attempt,
-                        )
-                        if request.transport is not None:
-                            request.transport.close()
-                        return _attempt_result(downstream, scanner)
-
-                    await downstream.write(chunk)
-
-            except (TimeoutError, ClientConnectionError, ServerDisconnectedError):
-                # Part of this response is already with the client, so the only
-                # honest outcome is a dropped connection. The permit is released by
-                # the surrounding context manager either way.
-                stats.stream_stalls += 1
-                scanner.finish()
-                response.close()
+                    return outcome
+                outcome.failure = "upstream_error"
+                outcome.retry_after = retry_delay(response, attempt)
                 event(
-                    "stream_stall",
-                    ("lane", "attempt", "bytes"),
-                    lane=lane.name,
-                    attempt=attempt,
-                    bytes=output_bytes,
-                    status=response.status,
-                    header_ms=header_ms,
-                    elapsed_ms=round((time.monotonic() - sent) * 1000),
-                )
-                if request.transport is not None:
-                    request.transport.close()
-                return Attempt(
-                    response=downstream,
-                    output_tokens=scanner.completion_tokens,
-                    prompt_tokens=scanner.prompt_tokens,
-                    estimated_output=scanner.estimated_output(),
-                    stalled=True,
-                    status=response.status,
-                )
-
-            scanner.finish()
-            await downstream.write_eof()
-
-            if response.status >= 400:
-                event(
-                    "upstream_error",
+                    "upstream_rejected" if response.status in RETRYABLE else "upstream_error",
                     lane=lane.name,
                     attempt=attempt,
                     status=response.status,
                     header_ms=header_ms,
                     input_bytes=len(body),
-                    output_bytes=output_bytes,
+                    priced_reservation=reservation,
                     headers=_quota_headers(response.headers),
-                    body=_excerpt(bytes(peek)),
+                    body=outcome.error_excerpt,
                 )
+                if response.status in RETRYABLE:
+                    return outcome
+                outcome.permanent = response.status in PERMANENT_STATUSES
+                downstream = web.Response(
+                    status=response.status,
+                    body=error_body,
+                    headers=filtered_response_headers(response.headers),
+                )
+                outcome.response = downstream
+                return outcome
+            if response.status != 200:
+                raise UpstreamProtocolError()
+            if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                raise UpstreamProtocolError()
+            if response.content_length is not None and response.content_length > MAX_RESPONSE_BYTES:
+                raise UpstreamProtocolError("response_limit")
+            if json.loads(body).get("stream") is not True:
+                raw = await read_bounded(response.content, MAX_RESPONSE_BYTES)
+                try:
+                    scanner.observe(json.loads(raw), streaming=False)
+                except (ValueError, UnicodeDecodeError, TypeError) as exc:
+                    raise UpstreamProtocolError() from exc
+                scanner.done = True
+                measure()
+                scanner.validate()
+                outcome.response = web.Response(
+                    body=raw, headers=filtered_response_headers(response.headers)
+                )
+                return outcome
 
-            return _attempt_result(downstream, scanner)
-
+            prelude = bytearray()
+            terminal = bytearray()
+            async for chunk in response.content.iter_any():
+                output_bytes += len(chunk)
+                if output_bytes > MAX_RESPONSE_BYTES:
+                    raise UpstreamProtocolError("response_limit")
+                frames = scanner.feed(chunk)
+                measure()
+                if scanner.error:
+                    raise scanner.error
+                # Frame validation precedes delivery. Keep only a bounded comment prelude;
+                # the complete generation continues streaming rather than being buffered.
+                ready_frames = []
+                for frame in frames:
+                    # Keep the semantic commit marker until HTTP framing has also
+                    # completed. A client must not execute tools on [DONE] and then
+                    # discover that this same response had a truncated HTTP body.
+                    if terminal or scanner.data(frame).strip() == b"[DONE]":
+                        terminal.extend(frame)
+                        if len(terminal) > scanner.cap:
+                            raise UpstreamProtocolError("response_limit")
+                    else:
+                        ready_frames.append(frame)
+                ready = b"".join(ready_frames)
+                if downstream is None:
+                    prelude.extend(ready)
+                    if len(prelude) > scanner.cap:
+                        raise UpstreamProtocolError("response_limit")
+                    if not scanner.events:
+                        continue
+                    downstream = web.StreamResponse(
+                        status=200, headers=filtered_response_headers(response.headers)
+                    )
+                    await downstream.prepare(request)
+                    outcome.response = downstream
+                    ready = bytes(prelude)
+                    prelude.clear()
+                if ready:
+                    await downstream.write(ready)
+            scanner.validate()
+            measure()
+            if downstream is None:
+                raise UpstreamProtocolError()
+            await downstream.write(bytes(terminal))
+            await downstream.write_eof()
+            return outcome
+        except ClientResponseError as exc:
+            # aiohttp can reject malformed HTTP/chunk framing while reading headers,
+            # before session.post returns a response. Its parser's 400 is not an
+            # upstream refusal and must not permanently latch this request.
+            outcome.failure = "invalid_response"
+            outcome.error_excerpt = type(exc).__name__
+        except TRANSPORT_ERRORS as exc:
+            outcome.failure = "interrupted" if downstream is not None else "transport_error"
+            outcome.error_excerpt = type(exc).__name__
+        except UpstreamProtocolError as exc:
+            outcome.failure = exc.category
+            if exc.status is not None:
+                outcome.error_status = exc.status
+                outcome.permanent = exc.status in PERMANENT_STATUSES
+            outcome.error_excerpt = exc.category
+        except asyncio.CancelledError:
+            outcome.failure = "client_cancelled"
+            raise
         finally:
-            response.release()
+            measure()
+            if response is not None:
+                response.close()
+            if outcome.failure and downstream is not None and downstream.prepared:
+                if request.transport is not None:
+                    request.transport.close()
 
-
-def _attempt_result(downstream: web.StreamResponse, scanner: UsageScanner) -> Attempt:
-    return Attempt(
-        response=downstream,
-        output_tokens=scanner.completion_tokens,
-        prompt_tokens=scanner.prompt_tokens,
-        estimated_output=scanner.estimated_output(),
-        status=downstream.status,
-    )
+        outcome.stalled = downstream is not None
+        outcome.retry_after = retry_delay(response or _HeaderBag({}), attempt)
+        if outcome.stalled:
+            stats.stream_stalls += 1
+            event(
+                "stream_stall",
+                ("lane", "attempt", "bytes", "failure"),
+                lane=lane.name,
+                attempt=attempt,
+                bytes=output_bytes,
+                failure=outcome.failure,
+                status=outcome.status,
+                header_ms=header_ms,
+                elapsed_ms=round((time.monotonic() - sent) * 1000),
+            )
+        return outcome
 
 
 def book_output(
-    lane: LanePolicy, bookings: dict[str, Booking] | None, cost: Cost, outcome: Attempt
+    lane: LanePolicy, bookings: dict[str, Booking] | None, cost: Cost, outcome: Attempt | None
 ) -> None:
     """Settle this attempt's rate bookings against what it actually produced."""
     enforcement.settle(lane, bookings, cost, outcome)
@@ -2909,7 +3213,7 @@ def purge_failure_dumps() -> int:
 
 
 async def dump_failure_body(
-    request: web.Request, lane: LanePolicy, body: bytes, attempt: int
+    request: web.Request, lane: LanePolicy, body: bytes, attempt: int, *, dump_id: str | None = None
 ) -> None:
     """Archive the request a retry loop is stuck on, once per client request.
 
@@ -2918,7 +3222,7 @@ async def dump_failure_body(
     Credentials go through the same redaction as every other dump, and the render runs off the
     loop for the same reason the prompt archive's does: a multimodal body is megabytes.
     """
-    request_id = REQUEST_ID.get()
+    request_id = dump_id or REQUEST_ID.get()
     if not request_id:
         return
     if len(body) > LOG_DUMP_MAX_BYTES:
@@ -2969,146 +3273,182 @@ async def forward_chat(
     cost: Cost,
     reservation: int | None = None,
 ) -> web.StreamResponse:
-    """Retry an upstream request until it finishes or the client goes away.
+    """Keep retries cancellable and correlated without holding execution capacity in backoff."""
+    if request.transport is None or request.transport.is_closing():
+        event("client_cancelled", lane=lane.name, attempts=0)
+        raise asyncio.CancelledError
+    entry = recovery.acquire(lane, body)
+    watcher = asyncio.create_task(watch_disconnect(request, asyncio.current_task()))
+    try:
+        return await _forward_chat(
+            request, lane, body, started, inbound_body, cost, reservation, entry
+        )
+    except RecoveryActionRequired as exc:
+        return web.json_response(
+            {
+                "error": {
+                    "message": "Unchanged upstream request requires operator action; "
+                    f"see recovery {exc.recovery_id} in harness diagnostics.",
+                    "type": "upstream_action_required",
+                    "code": exc.status,
+                }
+            },
+            status=exc.status,
+        )
+    except asyncio.CancelledError:
+        event(
+            "client_cancelled",
+            lane=lane.name,
+            recovery=entry.recovery_id,
+            elapsed_seconds=round(time.monotonic() - started, 3),
+        )
+        raise
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+        recovery.release(entry)
 
-    Every sleep happens with no fair-use permit held and no rate booking outstanding,
-    so provider backpressure never occupies capacity that other requests could use.
 
-    ``reservation`` is what the caller priced this request at, and every attempt holds exactly
-    that. Omitting it charges the lane's worst case, which is the correct reading of a caller
-    that has not measured anything.
-    """
+async def _forward_chat(request, lane, body, started, inbound_body, cost, reservation, entry):
     global USAGE_SUPPORTED
-
     cost_of_permit = lane.reservation if reservation is None else reservation
     attempt_number = 0
-    session: ClientSession = request.app["client"]
-
+    session = request.app["client"]
     while True:
-        attempt_number += 1
-
         if request.transport is None or request.transport.is_closing():
-            # Silent until now. This is the only record that a client gave up on a request the
-            # proxy was still willing to retry, and without it an abandoned request and a
-            # request the proxy never received look identical from the outside.
-            event(
-                "client_cancelled",
-                lane=lane.name,
-                attempts=attempt_number - 1,
-                elapsed_seconds=round(time.monotonic() - started, 3),
-            )
             raise asyncio.CancelledError
-
         elapsed = time.monotonic() - started
         if MAX_REQUEST_SECONDS and elapsed > MAX_REQUEST_SECONDS:
             stats.deadline_stops += 1
             event(
                 "request_deadline",
-                ("lane", "attempts", "elapsed_seconds"),
                 lane=lane.name,
                 attempts=attempt_number,
-                elapsed_seconds=f"{elapsed:.1f}",
+                elapsed_seconds=round(elapsed, 1),
             )
             raise web.HTTPBadGateway(
                 text="upstream did not complete within the policy request limit"
             )
-
+        await recovery.admit(entry)
         bookings = enforcement.book(lane, cost)
         if bookings is None:
+            recovery.end_attempt(entry)
             stats.rate_waits += 1
             delay = enforcement.wait_seconds(lane)
             event(
                 "rate_wait",
                 ("lane", "attempt", "delay"),
                 lane=lane.name,
-                attempt=attempt_number,
+                attempt=attempt_number + 1,
                 delay=f"{delay:.1f}s",
             )
             await asyncio.sleep(delay)
             continue
-
+        attempt_number += 1
+        progress = Attempt()
+        token = ACTIVE_ATTEMPT.set(progress)
         try:
             outcome = await stream_attempt(
                 request, session, lane, body, attempt_number, cost_of_permit
             )
-        except (TimeoutError, ClientConnectionError, ServerDisconnectedError) as exc:
-            enforcement.settle(lane, bookings, cost, None)
-            delay = retry_delay(_HeaderBag({}), attempt_number)
-            event(
-                "upstream_retry",
-                ("lane", "attempt", "error", "delay"),
-                lane=lane.name,
-                attempt=attempt_number,
-                error=type(exc).__name__,
-                delay=f"{delay:.1f}s",
-                elapsed_seconds=round(elapsed, 1),
-                input_bytes=len(body),
-                priced_reservation=cost_of_permit,
-            )
+        except TRANSPORT_ERRORS as exc:
+            # Also cover a failure before stream_attempt obtained a response object.
+            progress.failure = "transport_error"
+            progress.error_excerpt = type(exc).__name__
+            progress.retry_after = retry_delay(_HeaderBag({}), attempt_number)
+            outcome = progress
         except BaseException:
-            # Cancellation and a local readiness refusal must refund a booking just as a
-            # transport failure does. Execution permits unwind inside stream_attempt.
-            enforcement.settle(lane, bookings, cost, None)
+            progress.failure = progress.failure or "interrupted"
+            enforcement.settle(lane, bookings, cost, progress if progress.dispatched else None)
+            recovery.end_attempt(entry)
             raise
-        else:
-            if outcome.streamed:
-                book_output(lane, bookings, cost, outcome)
-                # The priced permit beside the pre-request estimate, so the gap between what
-                # a permit cost and what the request turned out to use is readable from the
-                # log rather than something an operator has to trust the estimator about.
-                event(
-                    "request_complete",
-                    (
-                        "lane",
-                        "input_bytes",
-                        "attempts",
-                        "prompt_tokens",
-                        "output_tokens",
-                        "estimated_output",
-                        "priced_reservation",
-                        "lane_reservation",
-                        "estimated_input",
-                        "stalled",
-                        "elapsed_seconds",
-                    ),
-                    lane=lane.name,
-                    input_bytes=len(body),
-                    attempts=attempt_number,
-                    status=outcome.status,
-                    prompt_tokens=outcome.prompt_tokens,
-                    output_tokens=outcome.output_tokens,
-                    estimated_output=outcome.estimated_output,
-                    priced_reservation=cost_of_permit,
-                    lane_reservation=lane.reservation,
-                    estimated_input=cost.input,
-                    stalled=outcome.stalled,
-                    elapsed_seconds=f"{time.monotonic() - started:.3f}",
-                )
-                return outcome.response
+        finally:
+            ACTIVE_ATTEMPT.reset(token)
 
-            if outcome.rejected_usage and USAGE_SUPPORTED:
-                USAGE_SUPPORTED = False
-                stats.usage_unsupported += 1
-                body = rewrite_model(inbound_body, request, lane)
-                event("usage_reporting_unsupported", note="retrying without stream_options")
-
-            enforcement.settle(lane, bookings, cost, None)
-            delay = outcome.retry_after if outcome.retry_after is not None else 1.0
+        book_output(
+            lane, bookings, cost, outcome if outcome.dispatched or outcome.streamed else None
+        )
+        recovery.end_attempt(entry)
+        if outcome.rejected_usage and USAGE_SUPPORTED:
+            USAGE_SUPPORTED = False
+            stats.usage_unsupported += 1
+            body = rewrite_model(inbound_body, request, lane)
+            event("usage_reporting_unsupported", note="retrying without stream_options")
+            continue
+        failed = (
+            outcome.failure
+            or outcome.stalled
+            or (outcome.status is not None and outcome.status >= 400)
+        )
+        if not failed and outcome.streamed:
+            recovery.succeed(entry)
             event(
-                "upstream_retry",
-                ("lane", "attempt", "delay"),
+                "request_complete",
+                (
+                    "lane",
+                    "input_bytes",
+                    "attempts",
+                    "prompt_tokens",
+                    "output_tokens",
+                    "estimated_output",
+                    "priced_reservation",
+                    "lane_reservation",
+                    "estimated_input",
+                    "stalled",
+                    "elapsed_seconds",
+                ),
                 lane=lane.name,
-                attempt=attempt_number,
-                delay=f"{delay:.1f}s",
-                status=outcome.status,
-                elapsed_seconds=round(elapsed, 1),
                 input_bytes=len(body),
+                attempts=attempt_number,
+                status=outcome.status,
+                prompt_tokens=outcome.prompt_tokens,
+                output_tokens=outcome.output_tokens,
+                estimated_output=outcome.estimated_output,
                 priced_reservation=cost_of_permit,
-                body=outcome.error_excerpt,
+                lane_reservation=lane.reservation,
+                estimated_input=cost.input,
+                stalled=False,
+                elapsed_seconds=f"{time.monotonic() - started:.3f}",
+                recovery=entry.recovery_id,
             )
-            if attempt_number >= FAILURE_DUMP_ATTEMPT:
-                await dump_failure_body(request, lane, body, attempt_number)
+            return outcome.response
 
+        if outcome.failure is None:
+            outcome.failure = "upstream_error"
+        recovery.fail(entry, outcome)
+        event(
+            "request_failed",
+            lane=lane.name,
+            recovery=entry.recovery_id,
+            failure=outcome.failure,
+            failures=entry.failures,
+            status=outcome.status,
+            error_status=outcome.error_status,
+            delivered=outcome.streamed,
+            error=outcome.error_excerpt,
+            elapsed_seconds=round(time.monotonic() - started, 3),
+        )
+        if entry.failures >= FAILURE_DUMP_ATTEMPT and not entry.dumped:
+            await dump_failure_body(request, lane, body, entry.failures, dump_id=entry.recovery_id)
+            entry.dumped = True
+        if outcome.streamed:
+            return outcome.response
+        delay = outcome.retry_after if outcome.retry_after is not None else 1.0
+        event(
+            "upstream_retry",
+            ("lane", "attempt", "delay"),
+            lane=lane.name,
+            attempt=attempt_number,
+            delay=f"{delay:.1f}s",
+            status=outcome.status,
+            recovery=entry.recovery_id,
+            failure=outcome.failure,
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            input_bytes=len(body),
+            priced_reservation=cost_of_permit,
+            body=outcome.error_excerpt,
+        )
         await asyncio.sleep(delay)
 
 
@@ -3209,7 +3549,13 @@ def main() -> None:
             file=f"{LOG_HOST_DIR}/{LOG_FILE_NAME}",
             live="all" if LIVE_ALL else "default",
         )
-    web.run_app(create_app(), host="0.0.0.0", port=8080, access_log=None)  # noqa: S104
+    web.run_app(
+        create_app(),
+        host="0.0.0.0",  # noqa: S104
+        port=8080,
+        access_log=None,
+        handler_cancellation=True,
+    )
 
 
 if __name__ == "__main__":

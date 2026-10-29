@@ -202,6 +202,17 @@ jobs:
             -w /src \
             adrc-kimi-agent:ci -m unittest -v tests.test_mcp_probe
 
+      - name: Check interrupted streaming tool calls against unmodified Kimi
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          window=$(python3 -c 'from tests.helpers import shipped_plan; print(max(lane["context_tokens"] for lane in shipped_plan()["lanes"].values()))')
+          docker run --rm -i --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --tmpfs /home/agent/.kimi-code:rw,nosuid,nodev,mode=1777,size=256m \
+            --entrypoint python3 adrc-kimi-agent:ci - "${window}" \
+            < tests/fixtures/native_stream_recovery.py
+
   build-modules:
     runs-on: ubuntu-latest
     steps:

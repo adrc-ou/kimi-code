@@ -467,8 +467,9 @@ no request wall clock either — `MODEL_PROXY_MAX_REQUEST_SECONDS` defaults to 0
 the knob's own spelling of "never give up", matching the provider's advice to retry
 indefinitely with a growing interval. A client request therefore ends when it completes,
 when `MODEL_PROXY_SOCK_READ_TIMEOUT` fires on a stalled upstream read, or when the user
-cancels it in the UI; only the stall timeout releases a scarce fair-use permit on the
-proxy's own initiative. None of these is a task-length limit.
+cancels it in the UI. A truncated or invalid response also ends that attempt and releases
+its execution permit; none of these is a task-length limit. The harness keeps Kimi's
+infinite retries enabled, so a persistent upstream fault can still wait indefinitely.
 `docs/verification.md` shows how to read the policy currently in force.
 
 The proxy also archives the prompts it forwards, always on. A request qualifies only
@@ -519,8 +520,8 @@ The file rotates in place, and unlike the prompt archive it is **not** swept whe
 stops, because the launch that just ended is exactly the one whose failure you are most likely
 to be reading afterwards — and it holds only numbers and short status lines, not conversation.
 
-A request that a retry loop keeps refusing is additionally archived whole, once per client
-request, as `failed-<rid>.txt` beside the log: the prompt archive holds only requests that
+A generation that keeps failing is additionally archived whole, once per recovery ID,
+as `failed-<recovery-id>.txt` beside the log: the prompt archive holds only requests that
 introduce a new prompt, so without this a turn that dies 143 steps in leaves nothing that can
 be replayed. Those dumps **are** conversation, so they follow the prompt archive's rule and are
 cleared at both ends of a launch, and while the stack is up they roll by total size — oldest
@@ -531,6 +532,38 @@ log directory can grow without bound.
 opened. It deliberately does not name that directory's path on the host: the endpoint is
 reachable from the agent container, and the directory can hold request bodies. See
 `docs/verification.md` for reading the policy in force.
+
+### Recovery across interrupted streams
+
+The proxy waits for the first valid response event before beginning downstream delivery.
+Failures before delivery can retry transparently. Once model output has reached Kimi, an
+interrupted response is closed without a successful EOF; Kimi discards that failed generation
+and retries. The proxy never appends another generation to partial output. SSE completion
+markers, finish reasons, JSON responses and embedded errors are validated: an HTTP 200 alone
+is not a completed model answer. Legitimate output-limit and content-filter outcomes retain
+their meaning.
+
+A private, keyed request fingerprint correlates failures across client reconnects without
+exposing prompts, credentials or the salt. A random `recovery=` ID links the public diagnostics.
+After three consecutive failures, that request enters a cooldown starting at 30 seconds and
+doubling to five minutes with jitter; a longer upstream Retry-After wins. Only one matching
+recovery attempt runs after cooldown. Waiting holds no execution permit and books no new
+rate capacity. Output already generated is still charged: unknown dispatched usage retains
+its conservative reservation for a fresh rolling window rather than being refunded.
+
+`recovery_started`, `recovery_attempt`, `recovery_complete` and
+`recovery_action_required` reach the launch terminal. `request_failed` records the outcome
+instead of labeling a broken HTTP-200 response complete. `/healthz` adds a `recovery` section
+with failure counts, categories, the next eligible attempt and the last valid completion;
+policy health stays independent of upstream availability. An unchanged permanent upstream
+rejection is answered locally with its status and recovery ID until the request, policy or
+credential changes. Kimi can keep retrying that local error; operator action is still needed.
+
+Tracking is process-local, bounded to 1,024 entries, and expires after 30 idle minutes.
+Active entries are retained; inactive entries may be evicted at capacity. A restart, expiry or
+eviction therefore forgets that failure history, without storing conversation text in a new
+persistent database. There is no response cache or cross-session tool deduplication here.
+Subagent output-limit continuation is best-effort guidance to the parent, not a new scheduler.
 
 ## Images in long sessions
 

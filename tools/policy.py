@@ -1259,6 +1259,12 @@ def _parallelism_lines(plan: dict[str, Any]) -> list[str]:
         "- Investigate in parallel, write serially. Many agents may read; only one may touch a",
         "  given set of files at a time.",
         "",
+        "Keep completed reports; resume only unfinished children. On `max_tokens`, use",
+        '`Agent(description="Finish handoff", resume="<id>", prompt="Finish concisely")`',
+        "without `subagent_type`. After two unsuccessful continuation turns, take over using",
+        "saved findings or report the gap. Keep findings and checkpoints concise; do not repeat",
+        "broad inventories.",
+        "",
         "Respect capacity as well as count:",
         "",
         *(

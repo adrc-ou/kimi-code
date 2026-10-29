@@ -14,6 +14,7 @@ import dataclasses
 import importlib.util
 import io
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -22,7 +23,7 @@ import tomllib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 # The repository root as well as tools/: unittest only puts the start directory on the path, not
@@ -192,6 +193,7 @@ def reset_policy_state() -> None:
 def clean_counters() -> None:
     """Return the shared enforcement objects to a known-empty state."""
     PROXY.enforcement.sync(POLICY)
+    PROXY.recovery = PROXY.RecoveryTracker()
     for ledger in PROXY.enforcement.ledgers.values():
         ledger.bookings.clear()
         ledger.committed = 0
@@ -555,8 +557,8 @@ class RequestValidationTests(unittest.TestCase):
 
 
 class RetryDelayTests(unittest.TestCase):
-    def test_numeric_retry_after_is_clamped(self):
-        self.assertEqual(PROXY.retry_delay(Response({"Retry-After": "900"}), 1), 300)
+    def test_numeric_retry_after_is_not_shortened(self):
+        self.assertEqual(PROXY.retry_delay(Response({"Retry-After": "900"}), 1), 900)
 
     def test_http_date_retry_after(self):
         with patch.object(PROXY.time, "time", return_value=1_000.0):
@@ -1532,7 +1534,8 @@ class ForwardChatTests(unittest.IsolatedAsyncioTestCase):
         real_sleep = asyncio.sleep
 
         async def watchful_sleep(delay, *_args, **_kwargs):
-            observations.append(("sleep", self.gate.active, self.ledger.committed))
+            if delay != 0.1:  # The disconnect watcher also sleeps while a request is active.
+                observations.append(("sleep", self.gate.active, self.ledger.committed))
             return await real_sleep(0)
 
         with (
@@ -1602,7 +1605,10 @@ class ForwardChatTests(unittest.IsolatedAsyncioTestCase):
             return PROXY.Attempt(retry_after=0.0)
 
         before = PROXY.stats.deadline_stops
-        with patch.object(PROXY, "stream_attempt", keep_retrying):
+        with (
+            patch.object(PROXY, "stream_attempt", keep_retrying),
+            patch.object(PROXY.recovery, "admit", AsyncMock()),
+        ):
             with self.assertRaises(asyncio.CancelledError):
                 await PROXY.forward_chat(
                     request, self.lane, b"{}", time.monotonic(), b"{}", self.cost()
@@ -2159,11 +2165,17 @@ class ProxyLogTests(unittest.IsolatedAsyncioTestCase):
     """The file is the whole record; the terminal keeps exactly the lines it always had."""
 
     def setUp(self):
+        disabled = logging.root.manager.disable
+        logging.disable(logging.NOTSET)
+        self.addCleanup(logging.disable, disabled)
         reset_policy_state()
         clean_counters()
         self.addCleanup(clean_counters)
         self.policy = PROXY.current_policy()
         self.lane = self.policy.lanes["subagent"]
+        admission = patch.object(PROXY.recovery, "admit", AsyncMock())
+        admission.start()
+        self.addCleanup(admission.stop)
 
         storage = tempfile.TemporaryDirectory()
         self.addCleanup(storage.cleanup)
@@ -2216,6 +2228,9 @@ class ProxyLogTests(unittest.IsolatedAsyncioTestCase):
 
         async def read(self, _limit: int) -> bytes:
             return self.body
+
+        async def iter_any(self):
+            yield self.body
 
     def request(self) -> SimpleNamespace:
         return SimpleNamespace(
@@ -2287,11 +2302,11 @@ class ProxyLogTests(unittest.IsolatedAsyncioTestCase):
                 1000,
             )
 
-        self.assertIn("request_complete", self.logged)
+        self.assertIn("request_failed", self.logged)
         self.assertIn("status=400", self.logged)
         terminal = self.captured.getvalue()
-        self.assertIn("request_complete lane=subagent", terminal)
-        self.assertNotIn("status=400", terminal, "the live line gained no field")
+        self.assertIn("request_failed lane=subagent", terminal)
+        self.assertIn("status=400", terminal)
 
     async def test_a_client_that_gives_up_leaves_a_record(self):
         """An abandoned request and one that never arrived were previously indistinguishable."""
