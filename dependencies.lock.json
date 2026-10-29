@@ -11,7 +11,9 @@
     "anchore/grype:v0.99.1": "sha256:aeaded256cc61f162774b1c0e19f44e1787d0ae7cdc8e8917e9ea2528375090e"
   },
   "sources": {
-    "github/github-mcp-server": "7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d"
+    "github/github-mcp-server": "7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d",
+    "ml-explore/mlx-lm": "4cfc6478473b0668ede3eb0cc93f2a9181a15052",
+    "ml-explore/mlx": "56c2bf9236d929097f61e2c6e55be4e4bb6da249"
   },
   "downloads": {
     "llama-cpp-macos-arm64": {
@@ -19,13 +21,21 @@
       "commit": "1a24df163920a4744a95373d178d790b72a9bb2f",
       "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11846/llama-b11846-bin-macos-arm64.tar.gz",
       "digest": "sha256:b145e8065883ef6b124d47fa2ff5fc8a046bafe415a7e1db1efb00b0809a2ee1"
+    },
+    "cpython-macos-aarch64": {
+      "version": "3.12.11+20250723",
+      "commit": "",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250723/cpython-3.12.11+20250723-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "digest": "sha256:ba814d8d611898aee3c6daed53a535a93345a6b4984ebe62f9aa38646255a5bf"
     }
   },
   "files": {
     "proxy/requirements.lock": "sha256:476e040b96fd0542472a586a144c094c2136ae724ad4d5e8951b0f1293e61810",
     "container/package-lock.json": "sha256:7488f388ed9b9ba3e57a177c493fce73ef735fbb0b1b030a03efb82a8cbd1a8f",
     "container/serena.lock": "sha256:cb1f3d408c0a91f34c8b3701cba1e789312f91e8f72880b42bf5dd1d197e1001",
-    "proxy/Dockerfile": "sha256:46ecde5af2ae2d2e5a0dfcceeb3a1ea760da1d594ba0a5dd151a8e0266fdb6f0",
-    "search-adapter/Dockerfile": "sha256:5d9faade02ae659211d07995a026d8dc6b36fa247381145aa42a368407925e7d"
+    "proxy/Dockerfile": "sha256:99512e5189c0f6b9836789f4349eb20cbda161ebd0791d6c8c9f0c1207ef229b",
+    "search-adapter/Dockerfile": "sha256:5d9faade02ae659211d07995a026d8dc6b36fa247381145aa42a368407925e7d",
+    "providers/local_mps/requirements-mlx.lock": "sha256:e10be444ae8444c729989e952de278bc0c411c755cea51ffefc547c29aa9e218",
+    "providers/local_mps/requirements-mlx.in": "sha256:f9a648b373798cc4e874494964ac1423b1ec70171b050e5b4cbed0e0fd89b530"
   }
 }

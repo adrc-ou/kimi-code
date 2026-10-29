@@ -422,24 +422,56 @@ per minute (90% of 200,000).
 
 ## Managed local execution and capacity
 
-The version 2 provider declares `[execution]` with `kind = "local"` and
-`engine = "llama_cpp"`, a measured host capability in `requires`, and both tables
-below. Values are provider-owned facts under `providers/`; there are no capacity
-environment variables or separate model-capacity registry.
+A version 2 provider declares `[execution]` with `kind = "local"` and
+`engine = "llama_cpp"` plus a single `execution.profile`. A version 3 provider
+replaces that with one or more named `[execution.profiles.<id>]` tables and an
+optional `[execution.memory]`, and a version 3 model selects exactly one of them
+with `[serving] profile`. Both kinds declare a measured host capability in
+`requires`. Values are provider-owned facts under `providers/`; there are no
+capacity environment variables or separate model-capacity registry.
+
+Named profiles exist because a provider can legitimately serve two models with
+two engines at once - which is exactly the migration state this provider is in -
+and a single provider-wide profile cannot describe that. Every profile declares
+its own `engine`, and a profile's settings are validated against that engine's
+own table, so a key belonging to one engine cannot silently name a different
+setting on another. Unknown keys, unknown settings, missing profiles, artifacts
+the selected engine cannot load, and ambiguous implicit defaults are all
+refused. A provider declaring more than one profile declares **no** default: a
+model that omits `[serving]` fails to parse rather than receiving whichever
+profile sorted first.
 
 | Table | Required fields | Meaning |
 | --- | --- | --- |
-| `execution.profile` | `context_granularity`, `max_sequences`, `batch_tokens`, `microbatch_tokens` | Positive integer alignment and engine capability bounds; microbatch cannot exceed batch, and sequence ceiling cannot exceed microbatch |
-| `execution.profile` | `cache_type_k`, `cache_type_v` | The initial adapter accepts `"f16"` for both; it does not change cache precision automatically |
-| `execution.profile` | `flash_attention`, `load_mode`, `lazy_mode`, `gpu_layers` | Initial normalized settings: `"auto"` for the first three, `"all"` for GPU layers |
-| `execution.profile` | `kv_unified`, `cache_ram_mib`, `context_checkpoints` | Independent slots require `false`; extra RAM prompt cache and checkpoints require zero in this profile |
+| `execution.profiles.<id>` | `engine` | `llama_cpp` or `mlx_lm`; selects which settings table the rest of the profile is validated against |
+| any profile | `context_granularity`, `max_sequences` | Positive integer alignment and engine capability bounds. Per-profile, not per-provider: these are statements about the engine, and the shipped `sequence_slots` is checked against the profile each model actually named |
+| `llama_cpp` profile | `batch_tokens`, `microbatch_tokens` | Microbatch cannot exceed batch, and the sequence ceiling cannot exceed microbatch |
+| `llama_cpp` profile | `cache_type_k`, `cache_type_v` | `"f16"` only; the adapter does not change cache precision automatically |
+| `llama_cpp` profile | `flash_attention`, `load_mode`, `lazy_mode`, `gpu_layers` | Normalised to `"auto"` for the first three and `"all"` for GPU layers |
+| `llama_cpp` profile | `kv_unified`, `cache_ram_mib`, `context_checkpoints` | Independent slots require `false`; extra RAM prompt cache and checkpoints require zero |
+| `mlx_lm` profile | `kv_allocation` | `"growing"`: cache storage is committed as tokens are consumed, not at the native maximum |
+| `mlx_lm` profile | `cache_type_k`, `cache_type_v` | `"f16"` or `"bf16"`, subject to native qualification; a quantised cache is not offered |
+| `mlx_lm` profile | `prefill_chunk_tokens`, `prefill_chunk_candidates` | The selected chunk must be one of the declared candidates, so a tuned value cannot arrive without the benchmark that justified it |
+| `mlx_lm` profile | `allocator_cache_bytes` | Free device buffers retained by the allocator. Zero is meaningful and declarable: it retains none |
+| `mlx_lm` profile | `prefix_cache` | `"continuation_only"` or `"none"` |
+| `execution.memory` | `strategy`, `target`, `distribution`, `unknown_measurements` | How deliberately-wired bytes are chosen. Bounds residency only; it is never an admission test and cannot resize a window or a slot count. `unknown_measurements = "unwired"` means an unavailable reading disables deliberate wiring rather than inventing a size |
 | `capacity` | `strategy` | `"native_context"`: full model-native windows without available-memory fitting |
-| `capacity` | `sequence_slots` | Explicit positive slot count, bounded by `execution.profile.max_sequences`; the shipped local provider declares one |
-| `capacity` | `validation_status`, `validation_evidence` | Status is `"pending_native_validation"` by default or `"validated"`; validated status requires evidence references |
+| `capacity` | `sequence_slots` | Explicit positive slot count, bounded by the `max_sequences` of the profile each model named |
+| `capacity` | `validation_status`, `validation_evidence` | `"pending_native_validation"` by default or `"validated"`; validated status requires evidence references |
 
-The current adapter supports Metal. Unsupported backends fail explicitly.
-Adding another engine requires an adapter that launches and verifies its model,
-build, fixed context, slots and serving settings.
+`models/<provider>/<model>/model.toml` at version 3 adds `[serving] profile` and
+is otherwise unchanged; the artifact format it installs is declared by its
+`weights.lock.json`, not by the model.
+
+Adapters live in `tools/local_engines/` and are dispatched by the declared
+`engine` kind, never by provider or model name. An adapter owns seven
+operations - provision, identity, artifact validation, launch, status
+normalisation, status verification and the compute canary - and owns no policy.
+Unsupported backends fail explicitly. A status document is normalised per
+engine: llama.cpp answers `/props` and is *not* asked to implement a harness
+endpoint, while the harness-written MLX worker answers
+`/v1/harness/status`. Both must satisfy one comparison, which is the part the
+engine kind selects rather than the part the engine implements.
 
 A managed provider may combine capacity with supported count, rate and context
 rules. Version 2 currently rejects `max_context_tokens` and
@@ -464,13 +496,22 @@ eligible choice. `Not Installed`
 models remain selectable; installation and digest verification complete after
 selection and before launch. No unverified weights become `Ready`.
 
-Version 3 engine records declare `capacity_strategy = "native_context"`,
+Version 4 engine records declare `capacity_strategy = "native_context"`,
 `memory_management = "os_managed"`, `native_context_tokens`, `context_tokens`,
 `sequences`, and `total_context_tokens = context_tokens × sequences`, together
-with pinned model/build/profile identities and bindings. Physical `resources`,
-projected `allocations`, headroom and process-overhead admission settings are
-absent. Stale version 2 local plans require a relaunch and are never silently
-reinterpreted. Version 1 provider-rule plans retain their existing contract.
+with pinned model/build/profile identities and bindings. Version 4 adds the
+engine-kind fields the adapter dispatch needs: `engine_kind`, `serving_profile`,
+`protocol_version`, `artifact_format`, `cache_allocation`, `runtime_identity`,
+the structured `identity` record, and the resolved `wiring` decision.
+`build_commit` became optional rather than assumed, because a Python library
+resolved from a lock reports a version and a source revision and has no build
+number at all. Physical `resources`, projected `allocations`, headroom and
+process-overhead admission settings are absent. Stale version 2 and version 3
+local plans require a relaunch and are never silently reinterpreted; each is
+refused with a message naming its own version. Version 1 provider-rule plans
+retain their existing contract and are emitted byte for byte, which
+`tools/capture_local_inference_references.py --check` enforces in CI against
+complete captured plans and guidance blocks rather than against selected fields.
 
 After static eligibility passes, available RAM, predicted allocations, RSS and
 Metal's recommended working set do not gate resolution or startup. `host-caps.json` retains optional
@@ -521,6 +562,49 @@ routes unavailable without resizing ongoing conversations or changing independen
 NRP enforcement. NRP retains its existing token estimation, guards, reservations,
 rate booking, output clamps, exclusivity and aggregate-budget semantics in both
 mixed-provider directions.
+
+### Readiness is computation, and completion is not success
+
+Metadata readiness was the original defect: a backend whose Metal allocations had
+failed kept answering `/props`, so the launcher published a receipt, Kimi staged
+against it, and every later request failed while the session retried forever. Two
+rules replace that.
+
+An engine publishes readiness only after an authenticated generation has produced
+content. A model declaring `tool_use` must additionally return a tool call for a
+forced one, which is what makes the declared capability a checked property rather
+than a claim: a server that accepts a `tools` array and parses with its built-in
+template answers with prose, and at the transport layer that is a perfectly
+successful completion. The canary asserts no specific answer string, because
+proving compute works and proving a quant reproduces one particular completion are
+different claims and only the first is being made.
+
+`proxy/local_engine_contract.py` defines one vocabulary for what a completion
+amounted to — content, tool-only, reasoning-only, truncated, empty, error-object,
+framing-failure, unknown — and it is pure standard library because the launcher,
+the proxy and the engine worker all read it while only the proxy may have aiohttp.
+Authority is split rather than given to one observer, because the recorded failure
+was one observer trusted about a signal it could not see. The proxy decides whether
+the client received a usable completion; the engine decides whether it is fatally
+broken, and only the engine may clear that. A healthy metadata read never resets a
+latched failure. Where the two disagree the request is not usable and the engine is
+not latched either: two reporters contradicting each other is a contract defect, not
+evidence about a device.
+
+A latched engine is refused before the wire, so no further request can pay for a
+prefill that cannot complete, and the terminal refusal carries no `Retry-After` —
+withholding the retry hint is the one lever available against a client configured
+to retry indefinitely. Two bounds exist for a local lane that neither a latch nor a
+status code can reach: a progress lease measured on generated content rather than
+bytes on the wire (a keepalive is not progress), and a dispatch attempt count. Both
+default to `0`, which preserves the previous unbounded behaviour, because no
+measurement of worst-case native-context prefill on the affected host exists yet.
+They are armed from `tools/local_native_probe.py` and `tools/local_qualification.py`
+evidence, never from a guess, and a too-tight value would turn the slowest and
+largest requests into failures.
+
+Whether Kimi's own retry loop terminates on that refusal is unresolved (U1) and is
+an actual-client measurement, not something this document claims.
 
 ### Capacity diagnostics and qualification
 
@@ -613,6 +697,44 @@ to apply to local traffic.
   "files": [{"path": "one-file.gguf", "sha256": "<64-hex>", "size": 17559178144}]
 }
 ```
+
+Schema 2 exists for artifacts that are a directory rather than a file. It adds one
+required `artifact` block and changes nothing else:
+
+```json
+{
+  "schema_version": 2,
+  "artifact": {
+    "format": "mlx",
+    "variant": "4bit",
+    "directory": "mlx-4bit"
+  },
+  "source": {"repo": "…", "revision": "<40-hex commit>"},
+  "files": [
+    {"path": "mlx-4bit/config.json", "sha256": "<64-hex>", "size": 1200},
+    {"path": "mlx-4bit/model.safetensors.index.json", "sha256": "<64-hex>", "size": 40000},
+    {"path": "mlx-4bit/model-00001-of-00003.safetensors", "sha256": "<64-hex>", "size": 4990000000}
+  ]
+}
+```
+
+`artifact.format` is `gguf` or `mlx` and `artifact.variant` names the quantised
+build. The block is required, not optional, because the two formats cannot be told
+apart from their filenames and the loader that must be used is not otherwise a
+derivable fact: an MLX shard is named `model-00001-of-00003.safetensors` and
+carries no quant label at all, so the version-1 rule that matched the variant name
+inside a path would reject a correctly pinned artifact. `artifact.directory` keeps
+a multi-file artifact beneath `weights/` without colliding with a retained GGUF,
+and is validated against traversal.
+
+Schema-1 locks keep their exact meaning. An MLX lock pins **every file the load
+consumes** — configuration, tokenizer sources, chat template, the weight index and
+each shard it names — because a valid shard proves nothing about a config file that
+drifted beside it. The index's `weight_map` is checked against the pinned set, so a
+shard the lock does not describe is refused rather than discovered by a loader that
+would happily read it. Tensor-storage totals come from reading verified shard
+headers, never from a declared byte count; they are what the bounded-wiring split is
+proportional to, so an invented weight size would invent a residency budget too.
 
 HuggingFace is the source of record and the revision is a commit, never a branch:
 `main` would let a publisher change a hundred gigabytes underneath a definition

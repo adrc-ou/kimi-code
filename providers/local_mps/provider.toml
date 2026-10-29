@@ -9,7 +9,7 @@
 # memory, on memory the rest of the machine is also spending, so the concurrency rules below are
 # statements about the hardware rather than about a policy someone published.
 
-schema_version = 2
+schema_version = 3
 label = "Local (MPS)"
 
 # The host gate. `metal` is answered by tools/host_caps.py, which reports it only for Darwin on
@@ -24,13 +24,19 @@ requires = ["metal"]
 # Native windows and explicit slots are independent of physical-memory observations.
 rule = []
 
+# Named serving profiles, one per engine. A model selects exactly one with
+# `[serving] profile = <id>`; nothing chooses an engine at runtime, and a provider offering more
+# than one profile therefore has no default - the choice is always written down.
+#
+# Both profiles repeat `context_granularity` and `max_sequences` because those are engine
+# *capabilities*, not policy: the resolver refuses a native window the serving engine cannot
+# express, and one slot count per provider would be a claim about whichever engine happened to
+# be described first.
 [execution]
 kind = "local"
-engine = "llama_cpp"
 
-# Facts about the pinned engine's supported allocation envelope. Keep projection
-# and serving arguments identical; independent full slots preserve live windows.
-[execution.profile]
+[execution.profiles.llama_cpp_q4]
+engine = "llama_cpp"
 context_granularity = 256
 max_sequences = 256
 batch_tokens = 2048
@@ -44,6 +50,35 @@ gpu_layers = "all"
 kv_unified = false
 cache_ram_mib = 0
 context_checkpoints = 0
+
+# The MLX serving of the 27B. Numeric values are the ones selected by the native qualification
+# recorded in docs/capacity-compatibility.md; a profile may not carry a placeholder, because the
+# engine fingerprint hashes these bytes and a placeholder would pin an engine to a value nobody
+# measured. `prefill_chunk_tokens` must be one of the declared candidates, which is what stops a
+# tuned number from arriving without the benchmark that justified it.
+#
+# `allocator_cache_bytes = 0` retains no free buffers for the engine's allocator. It is a residency
+# knob and not a context knob: it never resizes a window and never gates a launch.
+[execution.profiles.mlx_lm]
+engine = "mlx_lm"
+context_granularity = 256
+max_sequences = 1
+kv_allocation = "growing"
+cache_type_k = "f16"
+cache_type_v = "f16"
+prefill_chunk_tokens = 2048
+prefill_chunk_candidates = [512, 1024, 2048, 4096]
+allocator_cache_bytes = 0
+prefix_cache = "continuation_only"
+
+# How deliberately-wired bytes are chosen. This bounds residency; it is not an admission test and
+# it cannot resize a context window or a slot count. `unknown_measurements = "unwired"` means a
+# measurement the host will not give turns deliberate residency off rather than inventing a number.
+[execution.memory]
+strategy = "bounded_wiring"
+target = "min_available_and_recommended"
+distribution = "verified_weight_bytes"
+unknown_measurements = "unwired"
 
 [capacity]
 strategy = "native_context"

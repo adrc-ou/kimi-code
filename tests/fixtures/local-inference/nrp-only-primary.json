@@ -1,0 +1,241 @@
+{
+  "guidance": {
+    "lane": "## Model usage limits (generated at launch)\n\nThe harness derived these numbers from the selected model definitions and their\nproviders' policy rules at every start, and the model proxy enforces every one of them\nindependently of this text. Nothing in this section is maintained by hand.\n\n- Provider **NRP** (`providers/nrp`): https://nrp.ai/documentation/userdocs/ai/llm-managed/fair-use\n- Every request spends one shared in-flight context budget: **332,500 tokens** for `Qwen3.8 Flash Next`. The provider's own threshold is 350,000 and the declared safety margin is 95%. A request you delegate spends that budget exactly as your own does.\n- A single request at or above 350,000 tokens runs alone: the proxy admits it only when nothing else is in flight and holds every other request queued until it finishes.\n- Rate: **180,000 output tokens/minute** booked per minute against `nrp/default__qwen3/Qwen3.8 Flash Next`, measured in the unit the provider meters.\n- Per-lane ceilings, as window / input cap / output clamp:\n  - `primary` 262,144 / 196,608 / 65,536\n  - `long` 1,000,000 / 900,000 / 65,536\n  - `subagent` 66,500 / 55,808 / 10,692\n  Each input cap sits below its own window on purpose: the proxy clamps the response's\n  output budget, so a request that filled its window would lose its tail. Compacting a\n  little early is the intended response, not a truncation.\n- Queueing is normal operation. A permit you are waiting for belongs to a request that\n  will still run, and the proxy holds it while it waits.\n- HTTP 429 and provider server errors are backpressure, not a licence to widen\n  concurrency. Never answer them by opening extra connections, containers, credentials\n  or sessions, and never call a provider endpoint around the proxy: each spends\n  capacity the proxy cannot see.\n- Only the main agent in this workspace has a subagent-spawning tool; a child inherits\n  both its work and the lane serving it from the harness and chooses neither. Your own\n  tool list is the test of which you are - this document is not, and no sentence in it\n  is evidence about who is reading it.\n",
+    "main": "## Model runtime envelope (generated at launch)\n\nThe per-lane shape of this session's capacity. The proxy enforces every number below and\nthe launcher configures Kimi's own dispatch limit to match, so the two cannot disagree.\n\nYou are the main agent of this workspace. You launched on `qwen3-primary`, the Medium (concurrent) lane, a 262,144-token window. The subagent rows anywhere in this document describe the children you may delegate to, never you.\n\n| Lane | Model | Alias | Context | Input cap | Output clamp | Worst-case cost | Alone at full size |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n| `primary` | Qwen3.8-Flash-Next | `qwen3-primary` | 262,144 | 196,608 | 65,536 | 262,144 | no |\n| `long` | Qwen3.8-Flash-Next | `qwen3-long` | 1,000,000 | 900,000 | 65,536 | 965,536 | yes |\n| `subagent` | Qwen3.8-Flash-Next | `qwen3-subagent` | 66,500 | 55,808 | 10,692 | 66,500 | no |\n\nWhat that capacity is drawn from, so the table reads on its own:\n\n- Provider **NRP** serves `Qwen3.8 Flash Next` under `providers/nrp`.\n- The `Qwen3.8 Flash Next` pool that every one of those rows reserves against holds **332,500 tokens** in flight in total, not per lane. Opening a lane is a reservation against it, and closing a request is what releases it.\n- The **Alone at full size** column is decided by one figure: a request priced at or above 350,000 tokens is admitted only when the pool is otherwise empty, so a short request on a wide lane overlaps normally and only a large one runs alone. The proxy prices a request from its own input, capped by its lane's worst-case cost.\n- The pool is also metered by time: **180,000 output tokens/minute** against `nrp/default__qwen3/Qwen3.8 Flash Next`, booked before a request runs and settled against what it used.\n- At most 16 concurrent requests for `Qwen3.8 Flash Next`.\n- Per-lane request ceiling: `primary` 16, `long` 16, `subagent` 16.\n- Kimi may run **up to 5 subagents concurrently** (the tightest provider rule); one more than that simply queues at the proxy rather than failing.\n- Keep the default model as launched. A main-agent request must never be deliberately\n  routed through the subagent lane, and the subagent model is bound by the harness rather\n  than chosen per call.\n- Kimi's model picker is the supported way to change lane mid-session, and doing so is\n  legitimate: every lane is metered, and the proxy re-prices a request from its own size\n  rather than from which route it arrived on.\n- The two agent lanes are peers trading window against overlap: Long (queued) reserves\n  so much context that a full-size request there runs alone and other work queues behind\n  it, while Medium (concurrent) leaves the pool room to overlap requests. Neither is a\n  way to obtain subagent-style concurrency. Let a long run finish instead of trimming\n  the other lanes to make room for it.\n- Backgrounded agents and background Bash share one task-slot pool, separate from these\n  lanes, and exceeding it fails outright rather than queueing.\n- Subagent and swarm runs have no wall-clock limit, so a long run is bounded by the proxy\n  and by context instead. A request the proxy is retrying is not a stuck request: there\n  is no request deadline, and cancelling in the UI is the user's decision to make.\n- Provider terms change and model windows differ. To alter any number here, edit the\n  definitions in `./models` and `./providers`, then restart the stack - never `.env`.\n  This section states the limits and changes none.\n- Queueing at the proxy is normal, so never retry around a queue you are waiting on.\n\n## Parallel work\n\nThis session may run up to 5 subagents at once - the tightest provider rule - and the model proxy enforces that same ceiling, so it is capacity that has already been paid for. Treat 5 as the default fan-out for any step that splits into independent parts, and read running below it as a cost rather than as caution.\n\nChoosing the shape of the work:\n\n- Three or more independent lookups, reads, searches, or investigations belong in one\n  `AgentSwarm` call rather than several narrower ones. Each call ramps its own launches\n  up, so splitting a fan-out across calls pays that ramp repeatedly.\n- Delegate work whose bulk output this context would otherwise absorb. Several children\n  that each hand back a short conclusion are cheaper than one search that returns its\n  raw results here.\n- Do not delegate a read whose path is already known, or a step that depends on reasoning\n  this turn is still holding. Handoff has a price; pay it when the child does the work,\n  not when it carries it.\n- Investigate in parallel, write serially. Many agents may read; only one may touch a\n  given set of files at a time.\n\nKeep completed reports; resume only unfinished children. On `max_tokens`, use\n`Agent(description=\"Finish handoff\", resume=\"<id>\", prompt=\"Finish concisely\")`\nwithout `subagent_type`. After two unsuccessful continuation turns, take over using\nsaved findings or report the gap. Keep findings and checkpoints concise; do not repeat\nbroad inventories.\n\nRespect capacity as well as count:\n\n- A lane reserves its full window the moment it is admitted, whether or not the prompt is\n  that large, so a wide fan-out holds the whole allowance until it finishes. Let it\n  finish instead of generating alongside it.\n- Prefer concise evidence in a hand-back: every token a child holds is charged against\n  the shared in-flight budget rather than against its own lane alone.\n- Waiting for a permit at the proxy is normal pacing, not a failure, and the request is\n  not lost. Never dodge a queue with extra connections, lanes, containers or credentials.\n\nBefore starting one agent, ask how many things could be true at the same time. That\nnumber, not the number of questions you happen to have written down, is the fan-out to\nuse.\n"
+  },
+  "plan": {
+    "agent_lane": "primary",
+    "counters": {
+      "context:nrp/Qwen3.8 Flash Next": {
+        "advertised_tokens": 1000000,
+        "budget": 332500,
+        "ceiling": 350000,
+        "count_basis": "the provider's own rule for this model",
+        "exclusive_at": 350000,
+        "family": "context",
+        "id": "context:nrp/Qwen3.8 Flash Next",
+        "lanes": [
+          "primary",
+          "long",
+          "subagent"
+        ],
+        "max": 16,
+        "provider": "nrp",
+        "subject": "Qwen3.8 Flash Next"
+      },
+      "rate:output_tokens_per_minute:credential_model:nrp/default__qwen3/Qwen3.8 Flash Next": {
+        "capacity": 180000,
+        "family": "rate",
+        "id": "rate:output_tokens_per_minute:credential_model:nrp/default__qwen3/Qwen3.8 Flash Next",
+        "kind": "output_tokens_per_minute",
+        "lanes": [
+          "primary",
+          "long",
+          "subagent"
+        ],
+        "provider": "nrp",
+        "scope": "credential_model",
+        "subject": "nrp/default__qwen3/Qwen3.8 Flash Next",
+        "unit": "output_tokens"
+      }
+    },
+    "lanes": {
+      "long": {
+        "alias": "qwen3-long",
+        "base_url": "https://litellm.lib.ou.edu",
+        "capabilities": [
+          "thinking",
+          "image_in",
+          "video_in",
+          "tool_use"
+        ],
+        "context_tokens": 1000000,
+        "counters": [
+          "context:nrp/Qwen3.8 Flash Next",
+          "rate:output_tokens_per_minute:credential_model:nrp/default__qwen3/Qwen3.8 Flash Next"
+        ],
+        "credential": "default__qwen3",
+        "default_effort": "xhigh",
+        "display_name": "Qwen3.8-Flash-Next - Long (queued)",
+        "exclusive": true,
+        "exclusive_at": 350000,
+        "input_tokens": 900000,
+        "key_env": "QWEN3_API_KEY",
+        "label": "Qwen3.8-Flash-Next",
+        "lane": "long",
+        "model": "Qwen3.8 Flash Next",
+        "model_id": "nrp/qwen3_8_flash_next",
+        "output_clamp_tokens": 65536,
+        "provider": "nrp",
+        "provider_name": "nrp-long",
+        "reservation": 965536,
+        "route": "/long/v1",
+        "support_efforts": [
+          "low",
+          "medium",
+          "xhigh"
+        ]
+      },
+      "primary": {
+        "alias": "qwen3-primary",
+        "base_url": "https://litellm.lib.ou.edu",
+        "capabilities": [
+          "thinking",
+          "image_in",
+          "video_in",
+          "tool_use"
+        ],
+        "context_tokens": 262144,
+        "counters": [
+          "context:nrp/Qwen3.8 Flash Next",
+          "rate:output_tokens_per_minute:credential_model:nrp/default__qwen3/Qwen3.8 Flash Next"
+        ],
+        "credential": "default__qwen3",
+        "default_effort": "xhigh",
+        "display_name": "Qwen3.8-Flash-Next - Medium (concurrent)",
+        "exclusive": false,
+        "exclusive_at": 350000,
+        "input_tokens": 196608,
+        "key_env": "QWEN3_API_KEY",
+        "label": "Qwen3.8-Flash-Next",
+        "lane": "primary",
+        "model": "Qwen3.8 Flash Next",
+        "model_id": "nrp/qwen3_8_flash_next",
+        "output_clamp_tokens": 65536,
+        "provider": "nrp",
+        "provider_name": "nrp-primary",
+        "reservation": 262144,
+        "route": "/primary/v1",
+        "support_efforts": [
+          "low",
+          "medium",
+          "xhigh"
+        ]
+      },
+      "subagent": {
+        "alias": "qwen3-subagent",
+        "base_url": "https://litellm.lib.ou.edu",
+        "capabilities": [
+          "thinking",
+          "image_in",
+          "video_in",
+          "tool_use"
+        ],
+        "context_tokens": 66500,
+        "counters": [
+          "context:nrp/Qwen3.8 Flash Next",
+          "rate:output_tokens_per_minute:credential_model:nrp/default__qwen3/Qwen3.8 Flash Next"
+        ],
+        "credential": "default__qwen3",
+        "default_effort": "low",
+        "display_name": "Qwen3.8-Flash-Next - Subagent (automatic)",
+        "exclusive": false,
+        "exclusive_at": 350000,
+        "input_tokens": 55808,
+        "key_env": "QWEN3_API_KEY",
+        "label": "Qwen3.8-Flash-Next",
+        "lane": "subagent",
+        "model": "Qwen3.8 Flash Next",
+        "model_id": "nrp/qwen3_8_flash_next",
+        "output_clamp_tokens": 10692,
+        "provider": "nrp",
+        "provider_name": "nrp-subagent",
+        "reservation": 66500,
+        "route": "/subagent/v1",
+        "support_efforts": [
+          "low",
+          "medium",
+          "xhigh"
+        ]
+      }
+    },
+    "limits": {
+      "lane_concurrency": {
+        "long": 16,
+        "primary": 16,
+        "subagent": 16
+      },
+      "shared_context_counters": true,
+      "subagent_concurrency": 5,
+      "subagent_concurrency_basis": "the tightest provider rule"
+    },
+    "providers": {
+      "nrp": {
+        "base_url": "https://litellm.lib.ou.edu",
+        "base_url_env": "NRP_BASE_URL",
+        "context_margin_percent": 95,
+        "credentials": {
+          "default": {
+            "env": "NRP_API_KEY",
+            "fallback_env": "",
+            "generate": false,
+            "key_url": "https://litellm.lib.ou.edu/ui/?page=api-keys",
+            "label": "NRP managed-LLM API token",
+            "prompt": "NRP API token",
+            "secret_name": "nrp__default"
+          },
+          "default__qwen3": {
+            "env": "QWEN3_API_KEY",
+            "fallback_env": "NRP_API_KEY",
+            "generate": false,
+            "key_url": "https://litellm.lib.ou.edu/ui/?page=api-keys",
+            "label": "Qwen3.8-Flash-Next API key",
+            "prompt": "API key for Qwen3.8-Flash-Next",
+            "secret_name": "nrp__default__qwen3"
+          }
+        },
+        "label": "NRP",
+        "output_rate_margin_percent": 90,
+        "policy_url": "https://nrp.ai/documentation/userdocs/ai/llm-managed/fair-use",
+        "protocol": "openai",
+        "requires": [],
+        "rules": [
+          {
+            "default": false,
+            "kind": "output_tokens_per_minute",
+            "models": null,
+            "scope": "credential_model",
+            "value": 200000
+          },
+          {
+            "default": false,
+            "kind": "exclusive_above_context_fraction",
+            "models": null,
+            "scope": "model",
+            "value": 35
+          },
+          {
+            "default": false,
+            "kind": "max_concurrent_requests",
+            "models": [
+              "Qwen3.8 Flash Next"
+            ],
+            "scope": "model",
+            "value": 16
+          },
+          {
+            "default": false,
+            "kind": "aggregate_context_fraction",
+            "models": null,
+            "scope": "model",
+            "value": 35
+          },
+          {
+            "default": true,
+            "kind": "max_concurrent_requests",
+            "models": null,
+            "scope": "provider",
+            "value": 2
+          }
+        ],
+        "sends_cache_salt": true
+      }
+    },
+    "reserved_context_size": 8192,
+    "schema_version": 1,
+    "selection": {
+      "primary": "nrp/qwen3_8_flash_next",
+      "subagent": "nrp/qwen3_8_flash_next"
+    }
+  }
+}

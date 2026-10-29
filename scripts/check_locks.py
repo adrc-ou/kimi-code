@@ -32,6 +32,7 @@ def main() -> None:
             raise SystemExit(f"locked file digest is stale: {relative}")
     for model in locked_models():
         check_weights_lock(model)
+    check_native_ml_lock()
     for module in sorted((ROOT / "modules").glob("*/check_locks.py")):
         subprocess.run(["python3", str(module)], check=True)
     exceptions = json.loads((ROOT / "vulnerability-exceptions.json").read_text())
@@ -102,7 +103,18 @@ def check_weights_lock(model) -> None:
     except local_llm.LocalModelError as error:
         raise SystemExit(str(error)) from error
     variant = model["install"]["variant"]
-    if not any(variant in entry["path"] for entry in lock["files"]):
+    artifact = lock.get("artifact")
+    if isinstance(artifact, dict):
+        # A schema-2 lock states its variant, so the old filename-substring match is replaced by
+        # the declaration it was always standing in for. An MLX shard is named model-00001-of-
+        # 00003.safetensors and carries no quant label at all, so substring matching would reject a
+        # correctly pinned artifact.
+        if str(artifact.get("variant", "")) != variant:
+            raise SystemExit(
+                f"{model['where']}: weights.lock.json pins variant "
+                f"{artifact.get('variant')!r} but [install].variant says {variant!r}"
+            )
+    elif not any(variant in entry["path"] for entry in lock["files"]):
         raise SystemExit(
             f"{model['where']}: weights.lock.json pins no file named for variant {variant!r}"
         )
@@ -117,6 +129,53 @@ def check_weights_lock(model) -> None:
             f"{model['where']}: [requires].disk_gib={model['requires']['disk_gib']} does not "
             f"cover the {total} bytes its lock pins"
         )
+
+
+#: The native runtime a managed MLX engine is provisioned into, and the lock that pins it.
+MLX_LOCK_FILE = "providers/local_mps/requirements-mlx.lock"
+MLX_REQUIREMENTS_FILE = "providers/local_mps/requirements-mlx.in"
+
+
+def check_native_ml_lock() -> None:
+    """The MLX dependency lock must be present, hash-pinned, and complete for its own inputs.
+
+    This is the one dependency set the build never resolves: it is installed on the operator's host
+    by ``tools/local_mlx_runtime.py``, outside any image and any package manager CI has. A lock that
+    drifted from its ``.in`` would therefore install cleanly and be wrong.
+    """
+    import re
+
+    lock_path = ROOT / MLX_LOCK_FILE
+    if not lock_path.is_file():
+        raise SystemExit(f"{MLX_LOCK_FILE} is missing; an MLX profile cannot be provisioned")
+    text = lock_path.read_text(encoding="utf-8")
+    # Split on the top-level pin lines rather than matching across them: a pin owns every
+    # ``--hash=`` line that follows it until the next pin.
+    blocks = re.split(r"\n(?=[A-Za-z0-9._-]+==)", text)
+    pins: dict[str, tuple[str, set[str]]] = {}
+    for block in blocks:
+        head = re.match(r"([A-Za-z0-9._-]+)==([^\s]+)", block)
+        if head:
+            pins[head.group(1).lower()] = (
+                head.group(2),
+                set(re.findall(r"--hash=sha256:([0-9a-f]{64})", block)),
+            )
+    if not pins:
+        raise SystemExit(f"{MLX_LOCK_FILE} pins no packages")
+    for name, (version, digests) in pins.items():
+        if not digests:
+            raise SystemExit(f"{MLX_LOCK_FILE}: {name}=={version} is not hash-pinned")
+    for raw in (ROOT / MLX_REQUIREMENTS_FILE).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, _, version = line.partition("==")
+        pinned = pins.get(name.strip().lower())
+        if pinned is None or pinned[0] != version.strip():
+            raise SystemExit(
+                f"{MLX_LOCK_FILE} does not pin {line} from {MLX_REQUIREMENTS_FILE}; the lock was "
+                "compiled from different input than the requirements file describes"
+            )
 
 
 if __name__ == "__main__":

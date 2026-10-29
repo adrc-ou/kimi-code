@@ -1,6 +1,7 @@
 # Native local inference compatibility evidence
 
-Implementation verification recorded on 2026-10-24. The pre-refactor reference is
+Implementation verification recorded on 2026-10-24 and extended on 2026-10-29 with
+the local completion semantics below. The pre-refactor reference is
 commit `0cc5d51aad49c7e201c2eb1c641ed85b59611bba`. This record covers repository
 verification, not native generation correctness or paging performance.
 
@@ -42,6 +43,43 @@ maxima, counting failure, preparation serialization and cancellation. Existing
 execution-gate tests cover queue priority and permit release. Supervisor fixtures
 cover occupied listeners, startup failure cleanup and identity readiness; proxy
 fixtures keep failed local routes unavailable without changing NRP enforcement.
+
+## Local completion semantics
+
+Readiness and failure are now decided by computation rather than by metadata. A
+local engine publishes its readiness receipt only after an authenticated
+generation has produced content, and a model that declares `tool_use` must also
+return a tool call for a forced one, so the capability is proved at launch rather
+than assumed. An engine that answers metadata and cannot compute fails the launch
+instead of serving a session that retries forever.
+
+`proxy/local_engine_contract.py` holds the one vocabulary for this and is pure
+standard library, because the launcher, the proxy and an engine worker all read
+it and only the proxy has aiohttp. Authority is split rather than centralised: the
+proxy decides whether the client received a usable completion, the engine decides
+whether it is fatally broken, and a healthy metadata read never clears a latched
+failure. A disagreement between the two is reported as unusable and does not latch,
+because two reporters contradicting each other is a contract defect and not
+evidence about the device.
+
+A latched engine is refused before the wire, so no further request can pay for a
+prefill that cannot complete. The terminal refusal carries no `Retry-After`, which
+is the only lever the proxy controls against a client configured to retry
+indefinitely; whether that ends the client's loop is an actual-client question and
+is not claimed here. Two knobs bound a local request that neither a latch nor a
+status code can reach: a progress lease measured on generated content rather than
+bytes on the wire, and a dispatch attempt bound. Both default to zero, which
+preserves the previous unbounded behaviour, because no measurement of worst-case
+native-context prefill on the affected host exists yet; they are armed from native
+evidence, not from a guess.
+
+Engine metadata is bounded at 1 MiB rather than 64 KiB in both readers. `/props`
+embeds the model's entire chat template, so a large template previously made a
+healthy engine report "exceeded metadata byte limit" and refuse traffic.
+
+Fixtures for all of the above run without aiohttp where they describe the shared
+vocabulary, so the launcher side is not silently skipped on a host that has only
+the proxy's dependencies.
 
 The operator evidence helper records synthetic usage, owned-process peak RSS and
 attributed shutdown allocations. These observations never enforce a RAM envelope

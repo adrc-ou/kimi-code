@@ -6,9 +6,18 @@ line-length = 100
 select = ["E", "F", "I", "B", "UP", "S"]
 ignore = ["S101", "S310", "S603", "S607"]
 
+# The proxy and the launcher share one local-engine vocabulary that lives beside the proxy, so
+# `model_proxy.py` has to name its own directory on sys.path before importing it. That makes the
+# import block intentionally not the first thing in the file, and sorts it after a third-party
+# import isort cannot resolve from the filesystem either way; the alternative is a runtime-only
+# failure that surfaces when the image is built rather than when the lint runs.
+[tool.ruff.lint.isort]
+known-first-party = ["local_engine_contract"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106"]
 "modules/*/tests/*" = ["S105", "S106"]
+"proxy/model_proxy.py" = ["E402", "I001"]
 
 # Serena keeps a pyright language server alive for this project, and pyright answers to
 # `pyrightconfig.json` or this section — never to `.gitignore`, which is why ruff needs nothing

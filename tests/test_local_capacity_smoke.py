@@ -166,7 +166,7 @@ class ArtifactTests(unittest.TestCase):
             (runtime / "credentials").mkdir()
             (runtime / "credentials" / "local__default").write_text("fixture-private-token")
             plan = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "engines": {"local/a": engine()},
                 "resources": {},
                 "lanes": {
@@ -252,7 +252,7 @@ class ArtifactTests(unittest.TestCase):
             (runtime / "credentials").mkdir()
             (runtime / "credentials" / "local__default").write_text("fixture-private-token")
             plan = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "engines": {"local/a": engine()},
                 "resources": {},
                 "lanes": {

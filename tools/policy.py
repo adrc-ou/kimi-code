@@ -710,7 +710,7 @@ def resolve(
     limits = _derive_limits(selected, counters)
 
     result = {
-        "schema_version": 3 if engines else SCHEMA_VERSION,
+        "schema_version": 4 if engines else SCHEMA_VERSION,
         "reserved_context_size": reserved_context_size,
         "selection": dict(selection),
         "agent_lane": agent_lane,
@@ -762,6 +762,19 @@ def resolve(
     return result
 
 
+def execution_is_single_profile(execution: dict) -> bool:
+    """Whether a provider declares exactly one serving profile.
+
+    Only a single-profile provider can have an engine record that predates the ``serving_profile``
+    field read unambiguously: with one profile there is no wrong answer to "which one", and with
+    several there is no safe default to fall back to.
+    """
+    profiles = execution.get("profiles")
+    if profiles:
+        return len(profiles) == 1
+    return execution.get("profile") is not None
+
+
 def _engine_allocations(
     providers: dict[str, dict[str, Any]],
     models: dict[str, dict[str, Any]],
@@ -799,7 +812,13 @@ def _engine_allocations(
                 raise ResolutionError(f"{model_id} engine {key} must be a positive integer")
             numbers[key] = value
         context, sequences = numbers["context_tokens"], numbers["sequences"]
-        profile = providers[model["provider"]]["execution"]["profile"]
+        # The profile is the one the *model* named, read from the engine record the resolver just
+        # validated. Reaching through the provider for a singular profile worked only while a
+        # provider could have exactly one; a schema-3 provider has none there by design, so this
+        # comparison would have read None.
+        profile = engine.get("allocation")
+        if not isinstance(profile, dict):
+            raise ResolutionError(f"{model_id} engine carries no serving profile")
         if context != model["native_tokens"] or engine.get("native_context_tokens") != context:
             raise ResolutionError(f"{model_id} allocation must equal the model's native context")
         config = providers[model["provider"]]["capacity"]
@@ -819,7 +838,45 @@ def _engine_allocations(
             raise ResolutionError(f"{model_id} allocation exceeds the engine sequence ceiling")
         if numbers["total_context_tokens"] != context * sequences:
             raise ResolutionError(f"{model_id} total context must cover every full sequence slot")
-        if engine.get("allocation") != profile:
+        # The engine record must still agree with the manifest it was built from. Comparing
+        # ``engine["allocation"]`` to itself would be a tautology, so this re-reads the provider's
+        # declaration for the profile the model named - the one place a stale plan can be caught
+        # after a manifest edit but before an engine is launched with it.
+        declared = providers[model["provider"]]["execution"]
+        named = engine.get("serving_profile")
+        if named is None:
+            # A single-profile provider cannot have picked the wrong name, so an engine record
+            # predating the field is read as "the one there is". Multi-profile providers are strict:
+            # there is no correct default to fall back to, and guessing one is the bug.
+            if not execution_is_single_profile(declared):
+                raise ResolutionError(
+                    f"{model_id} engine record names no serving profile and the provider offers "
+                    "more than one"
+                )
+            named = declared.get("default_profile")
+        if declared.get("profiles"):
+            profiles = declared["profiles"]
+            if named not in profiles:
+                raise ResolutionError(
+                    f"{model_id} names serving profile {named!r}, which the provider does not "
+                    "declare"
+                )
+            selected = profiles[named]
+        else:
+            # A version-2 provider has no named profiles at all: its single profile is the
+            # declaration, and an engine record that invented a name for it is the drift.
+            if named not in (None, declared.get("default_profile")):
+                raise ResolutionError(
+                    f"{model_id} names serving profile {named!r}, but providers/"
+                    f"{model['provider']} declares a single unnamed profile"
+                )
+            selected = {"engine": declared["engine"], "settings": declared["profile"]}
+        if engine.get("engine_kind") not in (None, selected["engine"]):
+            raise ResolutionError(
+                f"{model_id} engine kind {engine.get('engine_kind')!r} differs from its serving "
+                f"profile {named!r}, which declares {selected['engine']!r}"
+            )
+        if profile != selected["settings"]:
             raise ResolutionError(f"{model_id} allocation differs from its serving profile")
         if engine.get("allocations") or engine.get("projection"):
             raise ResolutionError(
@@ -1127,6 +1184,30 @@ def _lane_table_lines(plan: dict[str, Any]) -> list[str]:
             f"{_output_allowance(lane)} | {lane['reservation']:,} | "
             f"{'yes' if lane['exclusive'] else 'no'} |"
         )
+    # Which engine is actually serving, and how it stores context. A model on a growing cache and
+    # one on a preallocated cache behave differently under memory pressure while their advertised
+    # windows are identical, so an operator reading only the table above could not tell a paging
+    # slowdown from a regression. Stated per engine, because a mixed launch really does have two.
+    if plan.get("engines"):
+        lines += [
+            "",
+            "| Engine | Backend | Context | Slots | Cache allocation | Memory behaviour | "
+            "Verified |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for engine_id, engine in sorted(plan["engines"].items()):
+            wired = int((engine.get("wiring") or {}).get("wired_bytes") or 0)
+            memory = (
+                f"deliberate wiring bounded to {wired:,} bytes"
+                if wired
+                else "OS paging permitted"
+            )
+            lines.append(
+                f"| `{engine_id}` | {engine.get('engine_kind', '?')} | "
+                f"{engine['context_tokens']:,} | {engine['sequences']} | "
+                f"{engine.get('cache_allocation', 'preallocated')} | {memory} | "
+                f"{engine.get('validation_status', 'unknown')} |"
+            )
     lines += [
         "",
         "What that capacity is drawn from, so the table reads on its own:",

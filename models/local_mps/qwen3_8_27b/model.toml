@@ -8,7 +8,7 @@
 #
 # Copy the directory to add another local model; delete it (weights/ and all) to remove one.
 
-schema_version = 2
+schema_version = 3
 
 label = "Qwen3.8-27B"
 provider = "local_mps"
@@ -69,3 +69,10 @@ temperature = 1.0
 top_p = 0.95
 top_k = 20
 min_p = 0.0
+
+# ------------------------------------------------------------
+# Which of providers/local_mps' named serving profiles runs this model. Retained on llama.cpp
+# until the MLX candidate clears native qualification; flipping this one line to "mlx_lm" is the
+# promotion, and the engine, its settings and its artifact all follow it.
+[serving]
+profile = "llama_cpp_q4"

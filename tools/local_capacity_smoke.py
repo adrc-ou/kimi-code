@@ -39,6 +39,12 @@ METADATA_BYTES = 65536
 RESPONSE_BYTES = 8 * 1024**2
 RECORD_DIRECTORY = "capacity-smoke"
 
+#: Mirrored from ``proxy/model_proxy.py``, which cannot be imported here: the proxy needs aiohttp
+#: and this tool runs on the host's own interpreter. A drift between the two is caught by
+#: ``tests/test_local_capacity_smoke``, which feeds both the same stale plan.
+PLAN_SCHEMA_VERSION_LOCAL = 4
+STALE_LOCAL_PLAN_SCHEMAS = frozenset({2, 3})
+
 
 class SmokeError(ValueError):
     """Qualification preparation or synthetic execution failed safely."""
@@ -340,10 +346,15 @@ def checked_runtime(value: str) -> Path:
 def run_smoke(runtime: Path, output_tokens: int, timeout: float) -> Path:
     plan_bytes = (runtime / "model-policy.json").read_bytes()
     plan = json.loads(plan_bytes)
-    if plan.get("schema_version") == 2:
-        raise SmokeError("stale schema 2 local policy; relaunch the harness for native context")
+    if plan.get("schema_version") in STALE_LOCAL_PLAN_SCHEMAS:
+        raise SmokeError(
+            f"stale schema {plan['schema_version']} local policy; "
+            "relaunch the harness for the current engine contract"
+        )
     engines = plan.get("engines")
-    if plan.get("schema_version") != 3 or not isinstance(engines, dict) or not engines:
+    if plan.get("schema_version") != PLAN_SCHEMA_VERSION_LOCAL or (
+        not isinstance(engines, dict) or not engines
+    ):
         raise SmokeError("the resolved plan has no managed local engines")
     record = {
         "schema_version": 1,

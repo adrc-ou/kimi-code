@@ -17,7 +17,7 @@ ENGINE_COUNTER = f"count:engine:{ENGINE_ID}"
 
 def local_plan():
     plan = fixtures.mutated()
-    plan["schema_version"] = 3
+    plan["schema_version"] = 4
     plan["providers"]["fixture"] = {
         "base_url": "http://fixture.invalid",
         "protocol": "openai",
@@ -123,7 +123,7 @@ class MetadataSession:
 class LocalPlanTests(unittest.TestCase):
     def test_stale_physical_capacity_plan_requires_relaunch(self):
         plan = local_plan()
-        plan["schema_version"] = 2
+        plan["schema_version"] = 3
         with self.assertRaisesRegex(P.PolicyDrift, "relaunch"):
             fixtures.loaded_policy(plan)
 
@@ -324,6 +324,317 @@ class LocalPreparationTests(unittest.IsolatedAsyncioTestCase):
             await first
         self.assertEqual(self.manager.semaphore(ENGINE_ID)._value, 1)
         self.assertTrue(self.session.response.closed)
+
+
+class FatalLatchTests(unittest.TestCase):
+    """A latched engine stays latched, and a liveness observation is not evidence otherwise.
+
+    The recorded incident was a backend that could no longer compute while `/props` kept answering.
+    Every test here is one way an unhealthy engine could otherwise be read back as healthy.
+    """
+
+    def setUp(self):
+        self.addCleanup(fixtures.clean_counters)
+        self.plan = local_plan()
+        mounted = fixtures.live(self.plan)
+        mounted.__enter__()
+        self.addCleanup(mounted.__exit__, None, None, None)
+        self.policy = P.current_policy()
+        self.lane = self.policy.lanes["subagent"]
+        self.engine = self.policy.engines[ENGINE_ID]
+        self.manager = P.LocalEngines()
+        self.manager.sync(self.policy)
+        patcher = patch.object(P, "current_policy", return_value=self.policy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        credentials = patch.object(P, "upstream_credential", return_value="fixture-key")
+        credentials.start()
+        self.addCleanup(credentials.stop)
+
+    def latch(self, reason="metal could not allocate"):
+        self.manager.latch_fatal(self.policy, ENGINE_ID, reason)
+
+    def test_metadata_success_does_not_clear_the_latch(self):
+        # This is the exact hole in the previous behaviour: prepare() wrote status "ready" after a
+        # healthy /props, and a healthy /props is the one thing a dead backend still provides.
+        self.latch()
+        asyncio.run(self.manager.verify(MetadataSession(), self.lane, self.engine))
+        self.manager.sync(self.policy)
+        self.assertIsNotNone(self.manager.is_fatal(self.policy, ENGINE_ID))
+
+    def test_a_policy_refresh_for_the_same_engine_is_not_a_relaunch(self):
+        self.latch()
+        refreshed = copy.deepcopy(self.policy)
+        self.manager.sync(refreshed)
+        self.assertIsNotNone(self.manager.is_fatal(self.policy, ENGINE_ID))
+
+    def test_a_genuine_relaunch_with_new_identity_clears_the_latch(self):
+        # The latch must not outlive the process that earned it, or one bad launch poisons the host.
+        self.latch()
+        relaunched = copy.deepcopy(self.policy)
+        relaunched.engines[ENGINE_ID] = dict(relaunched.engines[ENGINE_ID], fingerprint="new")
+        self.manager.sync(P.RuntimePolicy(**{**vars(self.policy), "engines": relaunched.engines}))
+        self.assertIsNone(
+            self.manager.is_fatal(
+                P.RuntimePolicy(**{**vars(self.policy), "engines": relaunched.engines}), ENGINE_ID
+            )
+        )
+
+    def test_a_latched_engine_is_refused_before_the_wire(self):
+        self.latch()
+        session = MetadataSession()
+        with patch.object(self.manager, "verify", AsyncMock()) as verify:
+            with self.assertRaises(P.web.HTTPServiceUnavailable):
+                asyncio.run(
+                    self.manager.prepare(
+                        SimpleNamespace(app={"client": session}),
+                        self.lane,
+                        self.engine,
+                        b'{"messages":[]}',
+                    )
+                )
+        verify.assert_not_called()
+        self.assertEqual(session.calls, [], "a latched engine must not be contacted at all")
+
+    def test_the_terminal_refusal_withholds_the_retry_hint(self):
+        # A Retry-After header is an instruction to keep looping; the plan refuses to assume that
+        # wording alone ends a client configured to retry forever.
+        self.manager.latch_fatal(self.policy, ENGINE_ID, "dead")
+        terminal = self.manager.refusal(
+            self.lane, "local engine failed permanently", retryable=False
+        )
+        self.assertNotIn("Retry-After", terminal.headers)
+        temporary = self.manager.refusal(self.lane, "local engine unavailable", retryable=True)
+        self.assertIn("Retry-After", temporary.headers)
+
+    def test_an_unavailability_report_never_demotes_a_fatal_record(self):
+        self.latch("metal could not allocate")
+        self.manager.failed(self.lane, P.LocalEngineUnavailable("props timed out"))
+        self.assertEqual(self.manager.status[ENGINE_ID]["status"], "fatal")
+
+    def test_a_hang_only_latches_once_the_evidence_accumulates(self):
+        # One timeout is a slow engine. Latching on the first would make a long prefill fatal,
+        # which is the opposite mistake in a different costume.
+        self.assertFalse(
+            asyncio.run(self.manager.note_suspected_hang(self.policy, ENGINE_ID, "no headers", 3))
+        )
+        self.assertIsNone(self.manager.is_fatal(self.policy, ENGINE_ID))
+        asyncio.run(self.manager.note_suspected_hang(self.policy, ENGINE_ID, "no headers", 3))
+        self.assertTrue(
+            asyncio.run(self.manager.note_suspected_hang(self.policy, ENGINE_ID, "no headers", 3))
+        )
+        self.assertIsNotNone(self.manager.is_fatal(self.policy, ENGINE_ID))
+
+    def test_a_completion_resets_suspicion_but_never_the_latch(self):
+        self.manager.suspect[ENGINE_ID] = 2
+        self.latch()
+        self.manager.note_computed(ENGINE_ID)
+        self.assertNotIn(ENGINE_ID, self.manager.suspect)
+        self.assertIsNotNone(self.manager.is_fatal(self.policy, ENGINE_ID))
+
+    def test_attempt_exhaustion_latches_and_names_the_engine(self):
+        # terminal_local_failure is module level and drives the shared manager, which is the object
+        # the request path actually consults, so that is the latch under test here.
+        with patch.object(P, "local_engines", self.manager):
+            raised = P.terminal_local_failure(self.lane, 4)
+        self.assertIs(type(raised), P.web.HTTPServiceUnavailable)
+        self.assertNotIn("Retry-After", raised.headers)
+        self.assertIn(ENGINE_ID, raised.text)
+        self.assertIsNotNone(self.manager.is_fatal(self.policy, ENGINE_ID))
+
+
+    def test_default_configuration_never_latches_on_a_single_timeout(self):
+        # The two bounds default to zero, which must mean "behave as before", not "fail the engine
+        # on the first blip". A latched engine is refused for the rest of the session, so an
+        # over-eager default would turn a slow prefill into a dead local lane.
+        self.assertEqual(P.LOCAL_DISPATCH_ATTEMPTS, 0)
+        self.assertEqual(P.LOCAL_PROGRESS_LEASE_SECONDS, 0.0)
+        self.assertGreater(P.LOCAL_HANG_OBSERVATIONS, 1)
+        latch = AsyncMock()
+        with patch.object(self.manager, "latch_fatal", latch):
+            for _ in range(P.LOCAL_HANG_OBSERVATIONS - 1):
+                asyncio.run(
+                    self.manager.note_suspected_hang(self.policy, ENGINE_ID, "no headers", 3)
+                )
+        latch.assert_not_called()
+
+    def test_the_latch_needs_the_stated_number_of_observations(self):
+        with patch.object(P, "LOCAL_HANG_OBSERVATIONS", 2):
+            asyncio.run(self.manager.note_suspected_hang(self.policy, ENGINE_ID, "no headers", 2))
+            self.assertIsNone(self.manager.is_fatal(self.policy, ENGINE_ID))
+            asyncio.run(self.manager.note_suspected_hang(self.policy, ENGINE_ID, "no headers", 2))
+        self.assertIsNotNone(self.manager.is_fatal(self.policy, ENGINE_ID))
+
+    def test_health_reports_liveness_alongside_last_preparation(self):
+        report = self.manager.liveness(ENGINE_ID)
+        self.assertEqual(report["active_permits"], 0)
+        self.assertIsNone(
+            report["seconds_since_last_completion"],
+            "an engine that has served nothing must not look freshly healthy",
+        )
+        self.assertFalse(report["fatal"])
+        self.manager.note_computed(ENGINE_ID)
+        self.assertIsNotNone(self.manager.liveness(ENGINE_ID)["seconds_since_last_completion"])
+
+
+class ScannerOutcomeTests(unittest.TestCase):
+    """The stream reader has to distinguish an answer from a response.
+
+    Upstream's ``UsageScanner`` is the single parser: it validates framing, in-band error
+    objects and emptiness, and raises before anything unusable is delivered. ``local_outcome``
+    then names that verdict in the vocabulary the launcher and the worker also speak. These
+    cases assert the pair, because the classification is what the fatal latch and the progress
+    lease are built on.
+    """
+
+    DONE = b"data: [DONE]\n\n"
+
+    @staticmethod
+    def sse(payload):
+        return b"data: " + json.dumps(payload).encode() + b"\n\n"
+
+    @staticmethod
+    def delta(**fields):
+        return {"choices": [{"delta": fields}]}
+
+    @classmethod
+    def scan(cls, chunks, **kwargs):
+        scanner = P.UsageScanner(**kwargs)
+        for chunk in chunks:
+            scanner.feed(chunk)
+        scanner.finish()
+        return scanner
+
+    @classmethod
+    def classify(cls, chunks, **kwargs):
+        return P.local_outcome(cls.scan(chunks, **kwargs))
+
+    def test_an_error_object_in_a_200_stream_is_damage_not_success(self):
+        # Before this the event carried neither usage nor content and was skipped, so a stream
+        # that said nothing but "error" read as a completed request.
+        scanner = self.scan([self.sse({"error": {"message": "metal out of memory"}})])
+        self.assertIsNotNone(scanner.error)
+        self.assertEqual(P.local_outcome(scanner), P.Outcome.ERROR_OBJECT)
+        self.assertEqual(
+            P.partition_for_outcome(P.Outcome.ERROR_OBJECT), P.EngineFailureClass.FATAL
+        )
+
+    def test_a_tool_only_completion_is_usable(self):
+        scanner = self.scan(
+            [
+                self.sse(
+                    self.delta(
+                        tool_calls=[
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "function": {"name": "read_file", "arguments": "{\"p\":\"a\"}"},
+                            }
+                        ]
+                    )
+                ),
+                self.sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                self.DONE,
+            ]
+        )
+        scanner.validate()
+        self.assertEqual(P.local_outcome(scanner), P.Outcome.TOOL_ONLY)
+        self.assertTrue(P.is_usable_completion(P.Outcome.TOOL_ONLY))
+
+    def test_prose_and_tools_together_are_still_an_answer(self):
+        scanner = self.scan(
+            [
+                self.sse(self.delta(content="sure", tool_calls=[{"index": 0}])),
+                self.sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                self.DONE,
+            ]
+        )
+        self.assertEqual(P.local_outcome(scanner), P.Outcome.CONTENT)
+
+    def test_thinking_with_no_answer_behind_it_is_not_usable(self):
+        scanner = self.scan(
+            [
+                self.sse(self.delta(reasoning_content="hmm")),
+                self.sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                self.DONE,
+            ]
+        )
+        self.assertEqual(P.local_outcome(scanner), P.Outcome.REASONING_ONLY)
+        self.assertFalse(P.is_usable_completion(P.Outcome.REASONING_ONLY))
+
+    def test_an_empty_completion_is_reported_apart_from_damage(self):
+        # An immediate end of stream is a model behaviour, not proof the device broke. Latching
+        # on it would turn a bad prompt into a dead session.
+        scanner = self.scan(
+            [self.sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}), self.DONE]
+        )
+        self.assertEqual(P.local_outcome(scanner), P.Outcome.EMPTY)
+        self.assertIsNone(P.partition_for_outcome(P.Outcome.EMPTY))
+
+    def test_truncation_at_the_output_bound_is_named_as_such(self):
+        scanner = self.scan(
+            [
+                self.sse(self.delta(content="partial")),
+                self.sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+                self.DONE,
+            ]
+        )
+        self.assertEqual(P.local_outcome(scanner), P.Outcome.TRUNCATED)
+        self.assertFalse(P.is_usable_completion(P.Outcome.TRUNCATED))
+
+    def test_keepalives_are_progress_on_the_wire_and_not_from_the_model(self):
+        # The distinction the progress lease exists to make: a wedged engine keeps emitting
+        # comments, and a byte-idle timeout cannot tell that from work.
+        live = self.scan([self.sse(self.delta(content="hi")), self.DONE])
+        quiet = self.scan([b": keepalive\n\n", b"\n"])
+        self.assertGreater(live.events, 0)
+        self.assertEqual(
+            quiet.events, 0, "a comment frame must not register as a model event"
+        )
+
+    def test_a_stream_that_never_completed_is_never_reported_as_content(self):
+        # The case worth guarding: content arrived, then the connection ended with no finish
+        # reason and no [DONE]. A client that acted on this could be obeying a truncated tool
+        # call, so it must not be classified as a completed answer.
+        scanner = self.scan(
+            [
+                self.sse(self.delta(content="half a sentence")),
+                self.sse({"choices": [{"index": 0, "delta": {}, "finish_reason": None}]}),
+            ]
+        )
+        self.assertEqual(P.local_outcome(scanner), P.Outcome.TRUNCATED)
+        self.assertFalse(P.is_usable_completion(P.Outcome.TRUNCATED))
+
+    def test_a_non_streaming_body_is_a_completion_when_read_as_one(self):
+        scanner = P.UsageScanner()
+        scanner.observe(
+            {"choices": [{"index": 0, "message": {"content": "hi"}, "finish_reason": "stop"}]},
+            streaming=False,
+        )
+        scanner.done = True
+        self.assertEqual(P.local_outcome(scanner), P.Outcome.CONTENT)
+
+    def test_unparseable_frame_is_a_framing_failure(self):
+        scanner = self.scan([b"data: {\"choices\": [oops\n\n"])
+        with self.assertRaises(P.UpstreamProtocolError):
+            scanner.validate()
+        self.assertEqual(P.local_outcome(scanner), P.Outcome.FRAMING_FAILURE)
+
+    def test_overflowing_the_buffer_is_a_framing_failure(self):
+        scanner = P.UsageScanner(cap=16)
+        scanner.feed(b"data: " + b"x" * 200)
+        scanner.finish()
+        self.assertEqual(P.local_outcome(scanner), P.Outcome.FRAMING_FAILURE)
+
+    def test_remote_lanes_never_receive_a_local_outcome(self):
+        # The classification exists because HTTP 200 was proven meaningless for a local engine.
+        # Applying it to a remote lane would change what is booked against a provider allowance.
+        self.assertIsNone(P.Attempt().outcome)
+        self.assertFalse(P.Attempt().unusable_local_completion)
+        # An unusable *local* outcome is what the property reports; a remote attempt has no
+        # outcome at all and so is never flagged.
+        self.assertTrue(P.Attempt(outcome=P.Outcome.EMPTY).unusable_local_completion)
+        self.assertFalse(P.Attempt(outcome=P.Outcome.CONTENT).unusable_local_completion)
 
 
 if __name__ == "__main__":

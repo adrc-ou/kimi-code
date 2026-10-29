@@ -53,6 +53,7 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import time
 import tomllib
 from collections import OrderedDict, deque
@@ -63,6 +64,16 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
+
+#: The local-engine vocabulary lives beside this file rather than inside it, because the launcher
+#: and the engine worker have to speak the same words and neither can import this module: this file
+#: pulls aiohttp at module scope, and the host tools must not gain it. In the image this file is
+#: ``/app/model_proxy.py``, so the sibling resolves through ``sys.path[0]``; loaded by path from a
+#: test it does not, so the containing directory is named explicitly.
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from aiohttp import (
     ClientConnectionError,
@@ -72,6 +83,13 @@ from aiohttp import (
     ClientSession,
     ClientTimeout,
     web,
+)
+
+from local_engine_contract import (  # noqa: E402
+    FailureClass as EngineFailureClass,
+    Outcome,
+    is_usable_completion,
+    partition_for_outcome,
 )
 
 RATE_WINDOW_SECONDS = 60.0
@@ -92,12 +110,45 @@ def secret(file_variable: str, value_variable: str, *, min_length: int = 32) -> 
 
 #: The plan schema this proxy understands; ``tools/policy.py`` publishes the matching constant.
 PLAN_SCHEMA_VERSION = 1
-SUPPORTED_PLAN_SCHEMAS = frozenset({1, 3})
+#: A plan carrying managed local engines. Version 4 added the engine-kind, runtime-identity,
+#: protocol, serving-profile and artifact fields; versions 2 and 3 are retired rather than
+#: upgraded in place, because reinterpreting an on-disk plan is how a stale launch silently
+#: mis-serves. Version 1 stays supported: it is what every remote-only selection emits today,
+#: byte for byte, and the NRP reference fixtures in CI are what hold that line.
+PLAN_SCHEMA_VERSION_LOCAL = 4
+SUPPORTED_PLAN_SCHEMAS = frozenset({1, PLAN_SCHEMA_VERSION_LOCAL})
+STALE_LOCAL_PLAN_SCHEMAS = frozenset({2, 3})
 
 # Preparation never holds an execution permit. Both endpoints return small JSON objects;
 # their independent deadline and byte bound keep a failed local engine from blocking a lane.
 LOCAL_PREPARATION_TIMEOUT = 30.0
-LOCAL_METADATA_BYTES = 64 * 1024
+#: What one engine metadata response may weigh. ``/props`` embeds the model's entire chat template,
+#: so this has to clear the largest plausible template rather than a round number: at the previous
+#: 64 KiB a healthy engine with a large tools template reported "exceeded metadata byte limit" and
+#: refused all traffic. Still bounded, because the value is read into memory on the request path
+#: from a process this harness started but does not control. Kept in step with LOCAL_PROPS_BYTES in
+#: tools/local_llm.py, which reads the same document from the launcher.
+LOCAL_METADATA_BYTES = 1024 * 1024
+
+#: How long a local generation may hold an execution slot while producing nothing the model
+#: actually made. Measured on generated content rather than bytes on the wire: an engine wedged
+#: inside a Metal call keeps emitting SSE keepalives, and a timeout that resets on those converts a
+#: permanently stuck worker into an indefinitely healthy one - the failure this addresses. Zero
+#: disables the lease, which is the default until native measurement picks a real number.
+LOCAL_PROGRESS_LEASE_SECONDS = float(
+    os.environ.get("MODEL_PROXY_LOCAL_PROGRESS_LEASE_SECONDS", "0")
+)
+
+#: How many times one client request may reach a local engine before the answer is called terminal
+#: rather than retried. This bounds the case the recovery tracker cannot: a worker that hangs
+#: before producing any header looks exactly like a network blip. Zero leaves the loop unbounded.
+LOCAL_DISPATCH_ATTEMPTS = int(os.environ.get("MODEL_PROXY_LOCAL_DISPATCH_ATTEMPTS", "0"))
+
+#: How many lease expiries or header-less dispatches accumulate before an engine is latched. Above
+#: one deliberately: a single idle window inside a native-context prefill is expected behaviour on
+#: deliberately oversubscribed unified memory, and treating that as a dead device is the opposite
+#: error to the one being fixed.
+LOCAL_HANG_OBSERVATIONS = int(os.environ.get("MODEL_PROXY_LOCAL_HANG_OBSERVATIONS", "3"))
 
 #: The resolved plan this proxy enforces, and the Kimi configuration that same plan was
 #: rendered into. Both are read on the request path, so a mismatch fails closed.
@@ -690,22 +741,33 @@ def load_plan(path: str | None = None) -> dict:
             plan = json.load(source)
     except (OSError, ValueError) as exc:
         raise PolicyDrift(f"cannot read model policy {location}: {exc}") from exc
-    if isinstance(plan, dict) and plan.get("schema_version") == 2:
-        raise PolicyDrift("stale schema 2 local policy; relaunch the harness for native context")
+    if isinstance(plan, dict) and plan.get("schema_version") in STALE_LOCAL_PLAN_SCHEMAS:
+        # Each retired local schema gets its own message naming its version. A stale plan is the
+        # ordinary state after an upgrade - it is a file on disk from the previous launch - and the
+        # operator's only actionable next step is a relaunch, which a bare version number does not
+        # say.
+        raise PolicyDrift(
+            f"stale schema {plan['schema_version']} local policy; "
+            "relaunch the harness for the current engine contract"
+        )
     if (
         not isinstance(plan, dict)
         or type(plan.get("schema_version")) is not int
         or plan["schema_version"] not in SUPPORTED_PLAN_SCHEMAS
     ):
-        raise PolicyDrift("model policy must be schema 1 or 3")
-    if plan["schema_version"] == 3 and (
+        supported = " or ".join(str(value) for value in sorted(SUPPORTED_PLAN_SCHEMAS))
+        raise PolicyDrift(f"model policy must be schema {supported}")
+    if plan["schema_version"] == PLAN_SCHEMA_VERSION_LOCAL and (
         not isinstance(plan.get("engines"), dict) or not plan["engines"] or plan.get("resources")
     ):
         raise PolicyDrift(
-            "schema 3 local policy requires engines without physical resource budgets"
+            f"schema {PLAN_SCHEMA_VERSION_LOCAL} local policy requires engines without physical "
+            "resource budgets"
         )
     if plan["schema_version"] == 1 and (plan.get("engines") or plan.get("resources")):
-        raise PolicyDrift("local engines require schema 3 model policy")
+        raise PolicyDrift(
+            f"local engines require schema {PLAN_SCHEMA_VERSION_LOCAL} model policy"
+        )
     if not isinstance(plan.get("lanes"), dict) or not plan["lanes"]:
         raise PolicyDrift("model policy declares no lanes")
     if not isinstance(plan.get("providers"), dict) or not plan["providers"]:
@@ -1221,6 +1283,95 @@ def rewrite_model(body: bytes, request: web.Request, lane: LanePolicy) -> bytes:
     return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
 
 
+class _Missing:
+    """Sentinel distinguishing "the engine said nothing" from "the engine said ``None``"."""
+
+
+_MISSING = _Missing()
+
+
+@dataclass(frozen=True)
+class EngineStatusReader:
+    """How one engine protocol reports the facts the plan must be re-checked against.
+
+    ``expected`` returns (key, wanted) pairs and ``locate`` says where this engine puts that key,
+    because llama.cpp nests the context length under ``default_generation_settings`` while the
+    harness worker reports it flat. Everything else - byte bounds, the type-identity comparison, the
+    awake test - is shared, and that shared part is the reason this is a table and not two methods.
+    """
+
+    path: str
+    expected: Any
+    locate: Any = staticmethod(lambda props, key: props.get(key, _MISSING))
+    is_sleeping: Any = staticmethod(lambda props: props.get("is_sleeping") is not False)
+    is_stale_build: Any = staticmethod(
+        lambda props, engine: str(engine.get("build_commit") or "")
+        not in str(props.get("build_info", ""))
+    )
+
+
+def _llama_expected(props: dict, engine: dict) -> list[tuple[str, Any]]:
+    settings = props.get("default_generation_settings")
+    if not isinstance(settings, dict):
+        raise LocalEngineUnavailable("engine properties omit generation settings")
+    return [
+        ("model_alias", engine["model_alias"]),
+        ("model_path", engine["model_path"]),
+        ("total_slots", engine["sequences"]),
+        ("context_tokens", engine["context_tokens"]),
+    ]
+
+
+def _worker_expected(props: dict, engine: dict) -> list[tuple[str, Any]]:
+    if not isinstance(props.get("settings"), dict):
+        raise LocalEngineUnavailable("engine status omits its effective settings")
+    pairs = [
+        ("model", engine["model_alias"]),
+        ("model_path", engine["model_path"]),
+        ("sequences", engine["sequences"]),
+        ("context_tokens", engine["context_tokens"]),
+        ("fingerprint", engine["fingerprint"]),
+        ("launch_identity", engine["snapshot_id"]),
+    ]
+    # Identity fields the plan may or may not carry, depending on manifest schema. Only compare a
+    # field both sides have: an engine that predates tokenizer identity reporting is not made
+    # wrong by the plan asking for a number it never published.
+    for key in ("protocol_version", "artifact_format", "tokenizer_identity", "template_identity"):
+        want = engine.get(key)
+        if want is not None and key in props:
+            pairs.append((key, want))
+    return pairs
+
+
+#: Engine kind -> how to read its status. A kind absent here cannot serve traffic.
+ENGINE_STATUS_READERS: dict[str, EngineStatusReader] = {
+    "llama_cpp": EngineStatusReader(
+        path="/props",
+        expected=_llama_expected,
+        # llama.cpp keeps the enforced per-slot context in its generation-settings block.
+        locate=staticmethod(
+            lambda props, key: (
+                (props.get("default_generation_settings") or {}).get("n_ctx", _MISSING)
+                if key == "context_tokens"
+                else props.get(key, _MISSING)
+            )
+        ),
+    ),
+    "mlx_lm": EngineStatusReader(
+        path="/v1/harness/status",
+        expected=_worker_expected,
+        # A worker with no sleep mode reports ``ready``; absence of the key must not read as asleep.
+        is_sleeping=staticmethod(lambda props: props.get("ready") is False),
+        is_stale_build=staticmethod(
+            lambda props, engine: (
+                engine.get("runtime_identity") is not None
+                and props.get("runtime_identity") != engine.get("runtime_identity")
+            )
+        ),
+    ),
+}
+
+
 class LocalEngineUnavailable(RuntimeError):
     """An individual local engine could not prove its serving capacity."""
 
@@ -1269,12 +1420,29 @@ async def local_metadata(
 
 
 class LocalEngines:
-    """Serialize bounded preparation per engine, apart from inference permits."""
+    """Serialize bounded preparation per engine, apart from inference permits.
+
+    Also the owner of the fatal latch. A poisoned backend keeps answering ``/props`` after it can no
+    longer compute, so a liveness-shaped observation must never be able to un-fail it: the latch is
+    keyed on the engine's resolved fingerprint plus the launch's snapshot id, and the only thing
+    that clears it is a *different* engine record - a genuine relaunch - rather than a healthy
+    metadata read from this one.
+    """
 
     def __init__(self) -> None:
         self.preparation: dict[str, asyncio.Semaphore] = {}
         self.status: dict[str, dict] = {}
         self.plans: dict[str, str] = {}
+        #: engine_id -> the identity record this failure was latched against.
+        self.fatal: dict[str, dict] = {}
+        #: engine_id -> monotonically increasing counter of observations that said "unusable".
+        #: Kept apart from :attr:`fatal` because a hang has to accumulate evidence before it earns
+        #: a latch, and a latch is not reversible once set.
+        self.suspect: dict[str, int] = {}
+        #: engine_id -> when a generation on this engine last produced real content.
+        self.progress_at: dict[str, float] = {}
+        #: engine_id -> executions holding a permit right now, so health can name a saturated slot.
+        self.active: dict[str, int] = {}
 
     def sync(self, policy: RuntimePolicy) -> None:
         signatures = {
@@ -1285,46 +1453,169 @@ class LocalEngines:
             for key, value in self.status.items()
             if signatures.get(key) == self.plans.get(key)
         }
+        # A re-rendered plan for the *same* engine is a policy refresh, not a restart, so the latch
+        # has to survive it; only an engine whose identity actually changed is a new process worth
+        # trusting again. Comparing the identity fields rather than the whole signature is
+        # deliberate - the plan dict also carries observations, which change on every poll.
+        self.fatal = {
+            key: value
+            for key, value in self.fatal.items()
+            if key in signatures and value == self.identity_of(policy, key)
+        }
+        self.suspect = {key: count for key, count in self.suspect.items() if key in signatures}
         self.plans = signatures
+
+    @staticmethod
+    def identity_of(policy: RuntimePolicy, engine_id: str) -> dict:
+        """The fields that identify this engine *process*, as opposed to how it is configured."""
+        engine = policy.engines.get(engine_id) or {}
+        return {
+            "fingerprint": engine.get("fingerprint"),
+            "snapshot_id": engine.get("snapshot_id"),
+        }
+
+    def is_fatal(self, policy: RuntimePolicy, engine_id: str) -> dict | None:
+        """The latch record for this engine, or ``None`` when it is not latched.
+
+        Checked against the live plan every time rather than cached, so an engine that was replaced
+        under a relaunch stops being fatal because its identity changed, not because anything
+        re-decided the earlier failure was wrong.
+        """
+        record = self.fatal.get(engine_id)
+        if record is None:
+            return None
+        return None if record != self.identity_of(policy, engine_id) else record
+
+    def latch_fatal(self, policy: RuntimePolicy, engine_id: str, reason: str) -> None:
+        """Declare this engine incapable of computation until it is genuinely replaced."""
+        self.fatal[engine_id] = self.identity_of(policy, engine_id)
+        self.status[engine_id] = {"status": "fatal", "reason": reason}
+        event("local_engine_fatal", lane="*", engine=engine_id, reason=reason)
+
+    async def note_suspected_hang(
+        self, policy: RuntimePolicy, engine_id: str, reason: str, limit: int
+    ) -> bool:
+        """Count one pre-header hang, and latch once the evidence is past the bound.
+
+        One timeout is a slow engine; the recorded incident was the same request refused over and
+        over while metadata stayed polite, and only a count distinguishes them. Latching on the
+        first would make a long prefill fatal, which is the opposite error.
+        """
+        count = self.suspect.get(engine_id, 0) + 1
+        self.suspect[engine_id] = count
+        if count < limit:
+            event(
+                "local_engine_suspect",
+                engine=engine_id,
+                reason=reason,
+                count=count,
+                limit=limit,
+            )
+            return False
+        self.latch_fatal(policy, engine_id, f"{reason} (after {count} attempts)")
+        return True
+
+    def note_computed(self, engine_id: str) -> None:
+        """A generation genuinely produced something, so the hang tally starts over.
+
+        This resets suspicion and *only* suspicion. Clearing a latch here would reintroduce the
+        exact defect: it is a liveness-shaped observation, and liveness is not what was in doubt.
+        """
+        self.progress_at[engine_id] = time.monotonic()
+        if self.suspect.pop(engine_id, None) is not None:
+            event("local_engine_suspect_cleared", engine=engine_id)
+
+    def liveness(self, engine_id: str) -> dict:
+        """What this engine is doing now, as far as the proxy can see.
+
+        Deliberately reports ``None`` rather than a guess when nothing has been observed: a health
+        endpoint that invents a timestamp turns "we have not asked this engine anything yet" into
+        "this engine is fine", which is the class of false reassurance this whole change set is a
+        rejection of.
+        """
+        last = self.progress_at.get(engine_id)
+        return {
+            "active_permits": self.active.get(engine_id, 0),
+            "seconds_since_last_completion": (
+                round(time.monotonic() - last, 1) if last is not None else None
+            ),
+            "hang_observations": self.suspect.get(engine_id, 0),
+            "fatal": engine_id in self.fatal,
+        }
 
     def semaphore(self, engine_id: str) -> asyncio.Semaphore:
         return self.preparation.setdefault(engine_id, asyncio.Semaphore(1))
 
     async def verify(self, session: ClientSession, lane: LanePolicy, engine: dict) -> None:
-        props = await local_metadata(session, lane, "/props")
-        settings = props.get("default_generation_settings")
-        if not isinstance(settings, dict):
-            raise LocalEngineUnavailable("engine properties omit generation settings")
-        expected = {
-            "model_alias": engine["model_alias"],
-            "model_path": engine["model_path"],
-            "total_slots": engine["sequences"],
-        }
-        for key, value in expected.items():
-            if props.get(key) != value or type(props.get(key)) is not type(value):
+        """Attest the running engine against the plan, through the normalizer its protocol names.
+
+        The status path and the field mapping are chosen by the engine kind recorded in the plan, so
+        adding an engine means adding a reader here rather than a branch inside this comparison.
+        llama.cpp answers ``/props`` and nothing is invented for it; the harness worker answers its
+        own status document, which is why neither engine has to implement the other's surface.
+        """
+        kind = str(engine.get("engine_kind") or "llama_cpp")
+        reader = ENGINE_STATUS_READERS.get(kind)
+        if reader is None:
+            # An engine kind this proxy has never heard of is not an engine that is healthy. A
+            # silently-defaulted comparison would attest nothing at all.
+            raise LocalEngineUnavailable(f"no status reader for engine kind {kind!r}")
+        props = await local_metadata(session, lane, reader.path)
+        pairs = reader.expected(props, engine)
+        for key, value in pairs:
+            actual = reader.locate(props, key)
+            if actual is _MISSING:
+                raise LocalEngineUnavailable(f"engine omits {key}")
+            if actual != value or type(actual) is not type(value):
                 raise LocalEngineUnavailable(f"engine {key} differs from the resolved plan")
-        if (
-            settings.get("n_ctx") != engine["context_tokens"]
-            or type(settings.get("n_ctx")) is not int
-        ):
-            raise LocalEngineUnavailable("engine per-slot context differs from the resolved plan")
-        if props.get("is_sleeping") is not False:
+        if reader.is_sleeping(props):
             raise LocalEngineUnavailable("engine is not awake")
-        if engine["build_commit"] not in str(props.get("build_info", "")):
+        if reader.is_stale_build(props, engine):
             raise LocalEngineUnavailable("engine build differs from the resolved plan")
 
-    def failed(self, lane: LanePolicy, exc: LocalEngineUnavailable) -> web.HTTPServiceUnavailable:
-        self.status[lane.engine_id] = {"status": "unavailable", "reason": str(exc)}
+    def refusal(self, lane: LanePolicy, reason: str, *, retryable: bool) -> web.HTTPException:
+        """Fail one local request, with or without an invitation to try again.
+
+        ``retryable`` is the whole difference between this method and a plain 503. The recorded
+        incident was an endless loop, and a ``Retry-After`` header is precisely what a client
+        configured to retry forever needs in order to keep going, so a terminal verdict has to
+        withhold it rather than merely word the text differently.
+        """
+        headers = {"Retry-After": "5"} if retryable else {}
+        return web.HTTPServiceUnavailable(text=reason, headers=headers)
+
+    def failed(
+        self, lane: LanePolicy, exc: LocalEngineUnavailable, *, retryable: bool = True
+    ) -> web.HTTPServiceUnavailable:
+        # Report the degradation without ever overwriting a latch: "unavailable" is a state an
+        # operator (and the retry loop) reads as temporary, and a latched engine is not that.
+        if self.status.get(lane.engine_id, {}).get("status") != "fatal":
+            self.status[lane.engine_id] = {"status": "unavailable", "reason": str(exc)}
         event("local_engine_unavailable", lane=lane.name, engine=lane.engine_id, reason=exc)
-        return web.HTTPServiceUnavailable(
-            text=f"local engine unavailable: {exc}", headers={"Retry-After": "5"}
-        )
+        return self.refusal(lane, f"local engine unavailable: {exc}", retryable=retryable)
+
+    def refuse_if_fatal(self, request: web.Request, lane: LanePolicy) -> None:
+        """Stop a latched engine from being re-dispatched, by any caller, at any point.
+
+        Called before every engine contact rather than only once per request, because the plan's
+        own lesson is that the cheap probe keeps succeeding: an engine that is latched will happily
+        answer ``/props`` and hand back a token count for a request it cannot possibly serve.
+        """
+        policy = current_policy()
+        record = self.is_fatal(policy, lane.engine_id) if lane.engine_id else None
+        if record is None:
+            return
+        reason = str(self.status.get(lane.engine_id, {}).get("reason", "engine latched fatal"))
+        raise self.refusal(lane, f"local engine failed permanently: {reason}", retryable=False)
 
     async def prepare(
         self, request: web.Request, lane: LanePolicy, engine: dict, body: bytes
     ) -> tuple[bytes, int, int]:
         queued = time.monotonic()
         async with self.semaphore(lane.engine_id):
+            # Inside the semaphore and before anything else: a queued request that was admitted
+            # while the engine was still healthy must not reach the wire after the latch closed.
+            self.refuse_if_fatal(request, lane)
             event(
                 "local_prepare",
                 lane=lane.name,
@@ -1341,11 +1632,12 @@ class LocalEngines:
                     raise LocalEngineUnavailable("engine returned an invalid input token count")
             except LocalEngineUnavailable as exc:
                 raise self.failed(lane, exc) from exc
-            self.status[lane.engine_id] = {
-                "status": "ready",
-                "context_tokens": lane.context,
-                "sequences": engine["sequences"],
-            }
+            if self.status.get(lane.engine_id, {}).get("status") != "fatal":
+                self.status[lane.engine_id] = {
+                    "status": "ready",
+                    "context_tokens": lane.context,
+                    "sequences": engine["sequences"],
+                }
 
         if tokens >= lane.context:
             stats.guard_rejections += 1
@@ -1382,6 +1674,16 @@ class LocalEngines:
             return
         engine = current_policy().engines[lane.engine_id]
         async with self.semaphore(lane.engine_id):
+            # Runs after queue admission and before the wire, which is exactly where a latch closed
+            # during the wait has to be caught: a request admitted while the engine still worked
+            # must not spend a scarce execution slot discovering otherwise.
+            self.refuse_if_fatal(request, lane)
+            # The second attestation per request is deliberate and not folded into the first.
+            # Preparation and dispatch are separated in time by a queue wait that can be long, and
+            # the resource behind this check is a local process the operator can restart under us;
+            # an engine that came back with a different slot count is a different engine. Caching
+            # the first result would trade a real restart-detection guarantee for one round trip on
+            # a path that is already serialized per engine and bounded by LOCAL_PREPARATION_TIMEOUT.
             try:
                 await self.verify(request.app["client"], lane, engine)
             except LocalEngineUnavailable as exc:
@@ -2063,6 +2365,13 @@ class Stats:
     images_evicted: int = 0
     images_forced: int = 0
     image_bytes_freed: int = 0
+    #: Local generations that held a slot past their progress lease. Read beside the counters
+    #: above, a nonzero count is what separates "the engine is slow" from "the engine is gone" -
+    #: a distinction that did not exist anywhere in the log before.
+    local_lease_expired: int = 0
+    #: Local completions that carried a status the transport was happy with and no answer in
+    #: them. This is the class the recorded incident reported as success.
+    local_unusable_completions: int = 0
 
 
 class Enforcement:
@@ -2314,6 +2623,13 @@ class UsageScanner:
         self.choices: set[int] = set()
         self.finished: dict[int, str] = {}
         self.useful = False
+        # Reporting only. The validator decides pass/fail from useful, done and finished;
+        # these three exist so a local completion can be named in the shared vocabulary
+        # (content vs. reasoning-only vs. tool-only) without a second parser being written
+        # beside this one - the drift the shared module exists to prevent.
+        self.content_chars = 0
+        self.reasoning_chars = 0
+        self.tool_argument_chars = 0
 
     def feed(self, chunk: bytes) -> list[bytes]:
         if self.overflowed:
@@ -2428,6 +2744,10 @@ class UsageScanner:
                 value = source.get(key)
                 if isinstance(value, str):
                     self.text_chars += len(value)
+                    if key == "content":
+                        self.content_chars += len(value)
+                    else:
+                        self.reasoning_chars += len(value)
                     if key == "content" and value:
                         self.useful = True
             calls = source.get("tool_calls") or []
@@ -2448,6 +2768,7 @@ class UsageScanner:
                     value = function.get(key)
                     if isinstance(value, str):
                         self.text_chars += len(value)
+                        self.tool_argument_chars += len(value)
                         self.useful = self.useful or bool(value)
 
     def estimated_output(self) -> int | None:
@@ -2537,6 +2858,13 @@ async def health(_request: web.Request) -> web.Response:
                             "serving_profile_id": engine.get("serving_profile_id"),
                             "validation_status": engine.get("validation_status"),
                             **local_engines.status.get(engine_id, {"status": "unverified"}),
+                            # Reported beside the status rather than inside it, because they answer
+                            # different questions and conflating them was the defect: ``status`` is
+                            # what the last preparation found, this is what the engine is doing now.
+                            # An engine can be "ready" from an hour ago while holding every slot
+                            # with nothing arriving, and the Compose healthcheck asks this endpoint
+                            # on a timer.
+                            **local_engines.liveness(engine_id),
                         }
                         for engine_id, engine in policy.engines.items()
                     }
@@ -2551,6 +2879,8 @@ async def health(_request: web.Request) -> web.Response:
                 "usage_unsupported": stats.usage_unsupported,
                 "deadline_stops": stats.deadline_stops,
                 "stream_stalls": stats.stream_stalls,
+                "local_lease_expired": stats.local_lease_expired,
+                "local_unusable_completions": stats.local_unusable_completions,
                 "policy_errors": stats.policy_errors,
                 "images_seen": stats.images_seen,
                 "images_pending": stats.images_pending,
@@ -2730,10 +3060,23 @@ class Attempt:
     dispatched: bool = False
     failure: str | None = None
     permanent: bool = False
+    #: What a *local* completion amounted to, in the shared vocabulary. ``None`` on every
+    #: remote lane and on every local attempt that never reached a body, because there was no
+    #: completion observed to classify - it is not a slot to put a guess in.
+    outcome: Outcome | None = None
 
     @property
     def streamed(self) -> bool:
         return self.response is not None
+
+    @property
+    def unusable_local_completion(self) -> bool:
+        """A local response that arrived intact but produced nothing the caller can act on.
+
+        The half of the recorded failure a status code cannot express: the request completed,
+        the transport was fine, and the answer was not there.
+        """
+        return self.outcome is not None and not is_usable_completion(self.outcome)
 
 
 def _excerpt(body: bytes, limit: int = LOG_ERROR_EXCERPT_BYTES) -> str:
@@ -2756,6 +3099,42 @@ def _quota_headers(headers) -> dict[str, str]:
     """
     wanted = ("retry-after", "x-ratelimit-remaining", "x-ratelimit-reset")
     return {name: headers[name] for name in wanted if name in headers}
+
+
+def local_outcome(scanner: UsageScanner) -> Outcome:
+    """Name what a local completion amounted to, from the one scanner's state.
+
+    Deliberately a mapping rather than a second parser. ``UsageScanner`` is the authority on
+    whether a response is well formed and whether it produced anything; this only translates
+    that verdict into the vocabulary the launcher and the worker also speak, so a statement
+    about a completion means the same thing in all three processes.
+    """
+    error = scanner.error
+    if error is not None:
+        category = getattr(error, "category", "") or ""
+        if category == "upstream_error":
+            return Outcome.ERROR_OBJECT
+        if category == "empty_response":
+            return Outcome.REASONING_ONLY if scanner.reasoning_chars else Outcome.EMPTY
+        # A torn frame, a response over the cap, or a stream that never terminated: the
+        # bytes themselves stopped being interpretable.
+        return Outcome.FRAMING_FAILURE
+    reasons = set(scanner.finished.values())
+    if "length" in reasons:
+        return Outcome.TRUNCATED
+    # Reached without a completion marker is not a completed generation, however much arrived:
+    # a client that executed tools from this output could be acting on a truncated call.
+    if not scanner.done or (scanner.choices and scanner.choices != scanner.finished.keys()):
+        if scanner.content_chars or scanner.tool_argument_chars:
+            return Outcome.TRUNCATED
+        return Outcome.FRAMING_FAILURE
+    if scanner.content_chars:
+        return Outcome.CONTENT
+    if scanner.tool_argument_chars:
+        return Outcome.TOOL_ONLY
+    if scanner.reasoning_chars:
+        return Outcome.REASONING_ONLY
+    return Outcome.EMPTY
 
 
 @dataclass
@@ -3054,6 +3433,8 @@ async def stream_attempt(
                 scanner.done = True
                 measure()
                 scanner.validate()
+                if lane.engine_id is not None:
+                    outcome.outcome = local_outcome(scanner)
                 outcome.response = web.Response(
                     body=raw, headers=filtered_response_headers(response.headers)
                 )
@@ -3061,12 +3442,43 @@ async def stream_attempt(
 
             prelude = bytearray()
             terminal = bytearray()
+            lease_started = time.monotonic()
+            lease_events = 0
             async for chunk in response.content.iter_any():
                 output_bytes += len(chunk)
                 if output_bytes > MAX_RESPONSE_BYTES:
                     raise UpstreamProtocolError("response_limit")
                 frames = scanner.feed(chunk)
                 measure()
+                if LOCAL_PROGRESS_LEASE_SECONDS and lane.engine_id is not None:
+                    # Measured on scanner events, i.e. on framing the engine completed and
+                    # content the model produced. An SSE keepalive is a comment: it advances
+                    # bytes on the wire and nothing else, which is precisely the case a
+                    # byte-idle timeout cannot see and a poisoned backend relies on.
+                    if scanner.events != lease_events:
+                        lease_events = scanner.events
+                        lease_started = time.monotonic()
+                    elif time.monotonic() - lease_started > LOCAL_PROGRESS_LEASE_SECONDS:
+                        stats.local_lease_expired += 1
+                        event(
+                            "local_progress_lease_expired",
+                            ("lane", "engine", "attempt", "bytes", "idle_seconds"),
+                            lane=lane.name,
+                            engine=lane.engine_id,
+                            attempt=attempt,
+                            bytes=output_bytes,
+                            idle_seconds=round(
+                                time.monotonic() - lease_started, 1
+                            ),
+                        )
+                        await local_engines.note_suspected_hang(
+                            current_policy(),
+                            lane.engine_id,
+                            f"no generated content for "
+                            f"{LOCAL_PROGRESS_LEASE_SECONDS:.0f}s",
+                            max(2, LOCAL_HANG_OBSERVATIONS),
+                        )
+                        raise UpstreamProtocolError("local_progress_lease")
                 if scanner.error:
                     raise scanner.error
                 # Frame validation precedes delivery. Keep only a bounded comment prelude;
@@ -3104,6 +3516,10 @@ async def stream_attempt(
                 raise UpstreamProtocolError()
             await downstream.write(bytes(terminal))
             await downstream.write_eof()
+            # Named only for a local lane. A remote completion's classification is the
+            # provider's own business, and the plan forbids disturbing NRP accounting.
+            if lane.engine_id is not None:
+                outcome.outcome = local_outcome(scanner)
             return outcome
         except ClientResponseError as exc:
             # aiohttp can reject malformed HTTP/chunk framing while reading headers,
@@ -3114,12 +3530,37 @@ async def stream_attempt(
         except TRANSPORT_ERRORS as exc:
             outcome.failure = "interrupted" if downstream is not None else "transport_error"
             outcome.error_excerpt = type(exc).__name__
+            # A local engine that produced no headers at all is the case no status document
+            # can reach: it answered /props moments ago and is dead in the generation path,
+            # and every signal here is indistinguishable from a network blip. Gated on the
+            # bound being armed, because one timeout is a slow engine, not a dead one.
+            if (
+                lane.engine_id is not None
+                and downstream is None
+                and LOCAL_DISPATCH_ATTEMPTS > 1
+            ):
+                await local_engines.note_suspected_hang(
+                    current_policy(),
+                    lane.engine_id,
+                    f"engine raised no response headers ({type(exc).__name__})",
+                    LOCAL_DISPATCH_ATTEMPTS,
+                )
         except UpstreamProtocolError as exc:
             outcome.failure = exc.category
             if exc.status is not None:
                 outcome.error_status = exc.status
                 outcome.permanent = exc.status in PERMANENT_STATUSES
             outcome.error_excerpt = exc.category
+            if lane.engine_id is not None:
+                outcome.outcome = local_outcome(scanner)
+                # An in-band error object or an unparseable frame is evidence about the
+                # device, not the request: the engine was healthy enough to accept the body
+                # and could not produce a completion. Marking it permanent makes the recovery
+                # tracker stop retrying *this* request; the engine latch below is what stops
+                # the *next one*, which carries a different fingerprint and would otherwise
+                # pay for a full prefill against a dead backend.
+                if partition_for_outcome(outcome.outcome) is EngineFailureClass.FATAL:
+                    outcome.permanent = True
         except asyncio.CancelledError:
             outcome.failure = "client_cancelled"
             raise
@@ -3264,6 +3705,28 @@ async def dump_failure_body(
     )
 
 
+def terminal_local_failure(lane: LanePolicy, failures: int) -> web.HTTPServiceUnavailable:
+    """A local refusal the client must not retry, and that says why.
+
+    Withholding ``Retry-After`` is the operative part. The plan is explicit that a generic 503
+    plus a retry hint was never proven to end this loop, so the terminal shape is asserted by
+    omitting the hint rather than by re-wording the body, and the reason and failure count
+    travel with it so the operator reads a diagnosis and not a timeout.
+
+    U1 is the honest limit on this: what Kimi does with a 503 that carries no ``Retry-After``
+    is an actual-client measurement, not something asserted here. Latching the engine is what
+    guarantees the loop stops even if the client retries, because every later attempt is
+    refused before it can reach the wire and cost another prefill.
+    """
+    reason = (
+        f"local engine {lane.engine_id} failed {failures} time(s) without producing a "
+        "completion; not retrying this request"
+    )
+    if lane.engine_id:
+        local_engines.latch_fatal(current_policy(), lane.engine_id, reason)
+    return web.HTTPServiceUnavailable(text=reason)
+
+
 async def forward_chat(
     request: web.Request,
     lane: LanePolicy,
@@ -3383,6 +3846,27 @@ async def _forward_chat(request, lane, body, started, inbound_body, cost, reserv
         )
         if not failed and outcome.streamed:
             recovery.succeed(entry)
+            if lane.engine_id is not None:
+                if is_usable_completion(outcome.outcome):
+                    # Real content: the hang tally resets. A usable completion is the only
+                    # observation that earns a reset, and it never clears a latch.
+                    local_engines.note_computed(lane.engine_id)
+                elif outcome.unusable_local_completion:
+                    stats.local_unusable_completions += 1
+                    # Recorded apart from request_complete so a response that merely happened
+                    # to return 200 is not counted as an answer anywhere downstream. Headers
+                    # are already out, so this cannot change the client's status; it can
+                    # refuse to certify it.
+                    event(
+                        "local_completion_unusable",
+                        ("lane", "engine", "attempt", "outcome", "status", "recovery"),
+                        lane=lane.name,
+                        engine=lane.engine_id,
+                        attempt=attempt_number,
+                        outcome=str(outcome.outcome),
+                        status=outcome.status,
+                        recovery=entry.recovery_id,
+                    )
             event(
                 "request_complete",
                 (
@@ -3417,6 +3901,18 @@ async def _forward_chat(request, lane, body, started, inbound_body, cost, reserv
         if outcome.failure is None:
             outcome.failure = "upstream_error"
         recovery.fail(entry, outcome)
+        if lane.engine_id is not None and partition_for_outcome(outcome.outcome) is (
+            EngineFailureClass.FATAL
+        ):
+            # The recovery tracker keys on a request fingerprint, so it can only stop *this*
+            # request. A dead engine serves the next one a different fingerprint and would
+            # pay for another full prefill; the latch is per-engine and refuses before the
+            # wire, which is what actually protects the operator's GPU.
+            local_engines.latch_fatal(
+                current_policy(),
+                lane.engine_id,
+                f"engine reported {outcome.outcome} on a local completion",
+            )
         event(
             "request_failed",
             lane=lane.name,
@@ -3434,6 +3930,27 @@ async def _forward_chat(request, lane, body, started, inbound_body, cost, reserv
             entry.dumped = True
         if outcome.streamed:
             return outcome.response
+        if (
+            lane.engine_id is not None
+            and LOCAL_DISPATCH_ATTEMPTS > 1
+            and entry.failures >= LOCAL_DISPATCH_ATTEMPTS
+        ):
+            # Bounded for local lanes because the scarce thing is the operator's own GPU
+            # slot rather than a remote allowance, and because a local failure has no
+            # upstream operator to fix it between attempts - retrying it forever is waiting
+            # for nothing. Remote lanes are untouched: their indefinite retry is a deliberate
+            # response to a provider that comes back.
+            stats.deadline_stops += 1
+            event(
+                "local_attempt_budget_exhausted",
+                ("lane", "engine", "failures", "elapsed_seconds", "recovery"),
+                lane=lane.name,
+                engine=lane.engine_id,
+                failures=entry.failures,
+                elapsed_seconds=round(elapsed, 1),
+                recovery=entry.recovery_id,
+            )
+            raise terminal_local_failure(lane, entry.failures)
         delay = outcome.retry_after if outcome.retry_after is not None else 1.0
         event(
             "upstream_retry",

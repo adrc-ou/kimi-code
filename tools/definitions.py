@@ -53,7 +53,7 @@ def _no_secret_separator(value: str, where: str) -> str:
 
 
 SCHEMA_VERSION = 1
-MANIFEST_SCHEMA_VERSIONS = frozenset({1, 2})
+MANIFEST_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 LANES = ("primary", "long", "subagent")
 CREDENTIAL_LANES = ("primary", "subagent")
 
@@ -169,7 +169,10 @@ def _load_toml(path: Path, kind: str) -> dict[str, Any]:
         or not isinstance(version, int)
         or version not in MANIFEST_SCHEMA_VERSIONS
     ):
-        raise DefinitionError(f"{kind} manifest {path} must set schema_version = 1 or 2")
+        raise DefinitionError(
+            f"{kind} manifest {path} must set schema_version to one of "
+            + ", ".join(str(value) for value in sorted(MANIFEST_SCHEMA_VERSIONS))
+        )
     return document
 
 
@@ -278,7 +281,7 @@ def _parse_provider(provider_id: str, path: Path) -> dict[str, Any]:
         "rule",
         "safety",
     }
-    if version == 2:
+    if version in (2, 3):
         known |= {"execution", "capacity"}
     for key in document:
         if key not in known:
@@ -312,13 +315,17 @@ def _parse_provider(provider_id: str, path: Path) -> dict[str, Any]:
             raise DefinitionError(f"{where}.endpoint has unknown key {key!r}")
 
     credentials = _parse_credentials(document.get("credential"), where, provider_id)
-    execution = _parse_execution(document.get("execution"), where) if version == 2 else None
-    capacity = _parse_capacity(document.get("capacity"), where) if version == 2 else None
+    execution = (
+        _parse_execution(document.get("execution"), where, version)
+        if version in (2, 3)
+        else None
+    )
+    capacity = _parse_capacity(document.get("capacity"), where) if version in (2, 3) else None
     if execution is not None and not requires:
         raise DefinitionError(f"{where}.execution needs a measured host capability in requires")
     if execution is not None and protocol != "openai":
         raise DefinitionError(f"{where}.execution requires the engine's openai protocol")
-    rules = _parse_rules(document.get("rule"), where, allow_empty=version == 2)
+    rules = _parse_rules(document.get("rule"), where, allow_empty=version in (2, 3))
     if execution is not None:
         unsupported = sorted({rule["kind"] for rule in rules} & PER_REQUEST_RULE_KINDS)
         if unsupported:
@@ -364,48 +371,235 @@ def _parse_provider(provider_id: str, path: Path) -> dict[str, Any]:
     }
 
 
-def _parse_execution(raw: Any, where: str) -> dict[str, Any]:
+#: Engine settings a profile may declare, by engine kind. A profile is validated against its own
+#: engine's table, so a key belonging to one engine cannot silently name a different setting on
+#: another, and an engine cannot acquire a knob its adapter does not honour.
+_PROFILE_KEYS: dict[str, dict[str, Any]] = {
+    "llama_cpp": {
+        "integer": {
+            "context_granularity",
+            "max_sequences",
+            "batch_tokens",
+            "microbatch_tokens",
+        },
+        "choice": {
+            "cache_type_k": {"f16"},
+            "cache_type_v": {"f16"},
+            "flash_attention": {"auto"},
+            "load_mode": {"auto"},
+            "lazy_mode": {"auto"},
+            "gpu_layers": {"all"},
+        },
+        "fixed": {"kv_unified": False, "cache_ram_mib": 0, "context_checkpoints": 0},
+    },
+    "mlx_lm": {
+        "integer": {
+            # MLX aligns nothing the way a GGML context does, but the resolver still refuses a
+            # native window it cannot express, so granularity is declared rather than assumed.
+            "context_granularity",
+            "max_sequences",
+            "prefill_chunk_tokens",
+        },
+        # Zero is a meaningful value here, not a missing one: it means the engine retains no free
+        # device buffers. A positive-integer check would make the disabled setting undeclarable.
+        "nonnegative": {"allocator_cache_bytes"},
+        "choice": {
+            "cache_type_k": {"f16", "bf16"},
+            "cache_type_v": {"f16", "bf16"},
+            "kv_allocation": {"growing"},
+            "prefix_cache": {"continuation_only", "none"},
+        },
+        "list": {"prefill_chunk_candidates"},
+        "fixed": {},
+    },
+}
+
+
+def _parse_profile(settings: Any, engine: str, where: str) -> dict[str, Any]:
+    """Validate one serving profile against the settings its engine actually supports."""
+    here = f"{where}.profile"
+    schema = _PROFILE_KEYS.get(engine)
+    if schema is None:  # pragma: no cover - the caller refuses unknown kinds first
+        raise DefinitionError(f"{here} names engine {engine!r}, which has no settings table")
+    if not isinstance(settings, dict):
+        raise DefinitionError(f"{here} must declare the engine allocation settings")
+    integer = set(schema["integer"])
+    nonnegative = set(schema.get("nonnegative", ()))
+    choices = schema["choice"]
+    listed = set(schema.get("list", ()))
+    fixed = schema["fixed"]
+    keys = integer | nonnegative | set(choices) | listed | set(fixed)
+    if set(settings) != keys:
+        raise DefinitionError(f"{here} must declare exactly {', '.join(sorted(keys))}")
+    result = {name: _positive_int(settings, name, here) for name in sorted(integer)}
+    for name in sorted(nonnegative):
+        value = settings[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise DefinitionError(f"{here}.{name} must be a non-negative integer")
+        result[name] = value
+    if "microbatch_tokens" in result and result["microbatch_tokens"] > result["batch_tokens"]:
+        raise DefinitionError(f"{here} microbatch_tokens exceeds batch_tokens")
+    if "max_sequences" in result and "microbatch_tokens" in result:
+        if result["max_sequences"] > result["microbatch_tokens"]:
+            raise DefinitionError(f"{here} max_sequences exceeds microbatch_tokens")
+    if "prefill_chunk_tokens" in result and "prefill_chunk_candidates" in settings:
+        candidates = settings["prefill_chunk_candidates"]
+        if result["prefill_chunk_tokens"] not in candidates:
+            raise DefinitionError(
+                f"{here}.prefill_chunk_tokens must be one of the declared "
+                "prefill_chunk_candidates: shipping a value no benchmark measured is how a "
+                "placeholder reaches production"
+            )
+    for name, allowed in choices.items():
+        value = settings[name]
+        if not isinstance(value, str) or value not in allowed:
+            raise DefinitionError(
+                f"{here}.{name} must be one of {', '.join(sorted(allowed))}"
+            )
+        result[name] = value
+    for name, wanted in fixed.items():
+        if settings[name] is not wanted:
+            raise DefinitionError(
+                f"{here}.{name} must be {wanted!r} for accounted full sequence slots"
+            )
+        result[name] = wanted
+    for name in listed:
+        values = settings[name]
+        if not isinstance(values, list) or not values:
+            raise DefinitionError(f"{here}.{name} must list at least one positive integer")
+        clean: list[int] = []
+        for item in values:
+            if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+                raise DefinitionError(f"{here}.{name} holds a non-positive or repeated value")
+            if item in clean:
+                raise DefinitionError(f"{here}.{name} lists {item} twice")
+            clean.append(item)
+        result[name] = sorted(clean)
+    return result
+
+
+def _parse_memory(raw: Any, where: str) -> dict[str, Any]:
+    """``[execution.memory]``: how deliberately-resident bytes are chosen, never how much context.
+
+    These fields bound *wiring*. They are not an admission test and cannot resize a window; the rule
+    that keeps RAM observations out of capacity lives in the resolver, and this parser's job is to
+    refuse a memory block that would smuggle a budget in.
+    """
+    here = f"{where}.execution.memory"
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise DefinitionError(f"{here} must be a table")
+    known = {"strategy", "target", "distribution", "unknown_measurements"}
+    if set(raw) - known:
+        raise DefinitionError(f"{here} has unknown key(s)")
+    strategy = raw.get("strategy")
+    if strategy not in {"bounded_wiring", "uncontrolled"}:
+        raise DefinitionError(f"{here}.strategy must be bounded_wiring or uncontrolled")
+    target = raw.get("target")
+    if target not in {"min_available_and_recommended", "none"}:
+        raise DefinitionError(f"{here}.target is unknown")
+    distribution = raw.get("distribution")
+    if distribution not in {"verified_weight_bytes", "equal"}:
+        raise DefinitionError(f"{here}.distribution is unknown")
+    unknown = raw.get("unknown_measurements")
+    if unknown not in {"unwired", "refuse"}:
+        raise DefinitionError(
+            f"{here}.unknown_measurements must be unwired or refuse: an unavailable measurement "
+            "has to either disable deliberate residency or stop the launch, never invent a size"
+        )
+    if strategy == "bounded_wiring" and target == "none":
+        raise DefinitionError(
+            f"{here} bounds wiring but names no target; say what the bound is the minimum of, or "
+            "declare strategy = uncontrolled"
+        )
+    return {
+        "strategy": str(strategy),
+        "target": str(target),
+        "distribution": str(distribution),
+        "unknown_measurements": str(unknown),
+    }
+
+
+def _select_default_profile(profiles: dict[str, Any], where: str, version: int) -> str:
+    """Which profile a model that names none should get.
+
+    A version-2 manifest has exactly one, so "default" is a fact rather than a guess. A version-3
+    provider offering several must not have one chosen by dictionary order: an implicit default
+    would pick an engine from a key nobody wrote down, which is why every version-3 model names its
+    profile and ambiguity here is a parse error.
+    """
+    if len(profiles) == 1:
+        return next(iter(profiles))
+    raise DefinitionError(
+        f"{where}.execution declares {len(profiles)} profiles, so a model must name one: no "
+        "implicit default may select an engine"
+    )
+
+
+def _parse_execution(raw: Any, where: str, version: int) -> dict[str, Any]:
     here = f"{where}.execution"
     if not isinstance(raw, dict):
         raise DefinitionError(f"{here} must declare local execution and its engine profile")
-    if set(raw) - {"kind", "engine", "profile"}:
+    allowed = {"kind", "engine", "profile"} if version == 2 else {"kind", "profiles", "memory"}
+    if set(raw) - allowed:
         raise DefinitionError(f"{here} has unknown key(s)")
-    if raw.get("kind") != "local" or raw.get("engine") != "llama_cpp":
-        raise DefinitionError(f"{here} must select kind = local and engine = llama_cpp")
-    profile = raw.get("profile")
-    if not isinstance(profile, dict):
-        raise DefinitionError(f"{here}.profile must declare the engine allocation settings")
-    integer_keys = {"context_granularity", "max_sequences", "batch_tokens", "microbatch_tokens"}
-    choices = {
-        "cache_type_k": {"f16"},
-        "cache_type_v": {"f16"},
-        "flash_attention": {"auto"},
-        "load_mode": {"auto"},
-        "lazy_mode": {"auto"},
-        "gpu_layers": {"all"},
-    }
-    keys = integer_keys | set(choices) | {"kv_unified", "cache_ram_mib", "context_checkpoints"}
-    if set(profile) != keys:
-        raise DefinitionError(f"{here}.profile must declare exactly {', '.join(sorted(keys))}")
-    result = {key: _positive_int(profile, key, f"{here}.profile") for key in integer_keys}
-    if result["microbatch_tokens"] > result["batch_tokens"]:
-        raise DefinitionError(f"{here}.profile microbatch_tokens exceeds batch_tokens")
-    if result["max_sequences"] > result["microbatch_tokens"]:
-        raise DefinitionError(f"{here}.profile max_sequences exceeds microbatch_tokens")
-    for key, allowed in choices.items():
-        if not isinstance(profile[key], str) or profile[key] not in allowed:
+    if raw.get("kind") != "local":
+        raise DefinitionError(f"{here} must select kind = local")
+    if version == 2:
+        if raw.get("engine") != "llama_cpp":
+            raise DefinitionError(f"{here} must select kind = local and engine = llama_cpp")
+        declared = {"default": {"engine": "llama_cpp", "settings": raw.get("profile")}}
+        memory: dict[str, Any] = {}
+    else:
+        declared = raw.get("profiles")
+        if not isinstance(declared, dict) or not declared:
             raise DefinitionError(
-                f"{here}.profile.{key} must be one of {', '.join(sorted(allowed))}"
+                f"{here}.profiles must declare at least one [execution.profiles.<id>] table"
             )
-        result[key] = profile[key]
-    if profile["kv_unified"] is not False:
-        raise DefinitionError(f"{here}.profile requires independent full sequence slots")
-    for key in ("cache_ram_mib", "context_checkpoints"):
-        if isinstance(profile[key], bool) or not isinstance(profile[key], int) or profile[key] != 0:
-            raise DefinitionError(f"{here}.profile.{key} must be zero for accounted full slots")
-        result[key] = 0
-    result["kv_unified"] = False
-    return {"kind": "local", "engine": "llama_cpp", "profile": result}
+        declared = {str(name): body for name, body in declared.items()}
+        memory = _parse_memory(raw.get("memory"), where)
+    engines: dict[str, str] = {}
+    settings: dict[str, Any] = {}
+    for name, body in declared.items():
+        place = f"{here}.profiles.{name}" if version == 3 else here
+        if not ID.fullmatch(name):
+            raise DefinitionError(f"{here} profile id {name!r} must be a lowercase identifier")
+        if not isinstance(body, dict):
+            raise DefinitionError(f"{place} must be a table")
+        if version == 3:
+            engine = body.get("engine")
+            payload = {key: value for key, value in body.items() if key != "engine"}
+        else:
+            engine = raw.get("engine")
+            payload = body["settings"]
+        if engine not in _PROFILE_KEYS:
+            raise DefinitionError(
+                f"{place}.engine must be one of {', '.join(sorted(_PROFILE_KEYS))}"
+            )
+        engines[name] = str(engine)
+        settings[name] = _parse_profile(payload, str(engine), place)
+    if not engines:
+        raise DefinitionError(f"{here} declares no profile")
+    # A version-2 provider has one profile, so the singular keys below are simply that profile and
+    # every existing reader keeps working unchanged. A version-3 provider deliberately leaves them
+    # empty: choosing an engine by dictionary order would decide which runtime serves a model from a
+    # key nobody wrote down, so a v3 reader must go through the model's bound serving profile and a
+    # provider that offers several cannot be served by a reader that does not.
+    selected = _select_default_profile(engines, where, version) if version == 2 else None
+    # ``profile`` and ``engine`` stay populated for readers that predate named profiles. Normalising
+    # here instead of at each call site is what keeps a version-2 provider and a version-3 one
+    # indistinguishable to ``capacity.py``, so the schema bump carries no resolver blast radius.
+    return {
+        "kind": "local",
+        "engine": engines[selected] if selected else None,
+        "profile": settings[selected] if selected else None,
+        "profiles": {
+            name: {"engine": engines[name], "settings": settings[name]} for name in sorted(engines)
+        },
+        "default_profile": selected,
+        "memory": memory,
+    }
 
 
 def _parse_capacity(raw: Any, where: str) -> dict[str, Any]:
@@ -653,6 +847,58 @@ def discover_models(root: Path, providers: dict[str, dict[str, Any]]) -> list[di
     return result
 
 
+def _parse_serving(raw: Any, where: str, version: int) -> dict[str, Any] | None:
+    """``[serving]``: which of the provider's named profiles this model is served by.
+
+    Only version 3 has a choice to make. A version-2 model is served by its provider's single
+    profile, and inventing a ``[serving]`` table there would let a manifest claim a profile that
+    the provider cannot describe.
+    """
+    if version != 3:
+        if raw is not None:
+            raise DefinitionError(
+                f"{where}.serving names a serving profile, which only a schema version 3 model "
+                "has: a version 2 provider declares exactly one profile and cannot be chosen among"
+            )
+        return None
+    if not isinstance(raw, dict):
+        raise DefinitionError(f"{where} must declare [serving] profile = <id>")
+    if set(raw) - {"profile"}:
+        raise DefinitionError(f"{where}.serving has unknown key(s)")
+    return {"profile": _text(raw, "profile", f"{where}.serving")}
+
+
+def _bind_serving_profile(
+    model: dict[str, Any], provider: dict[str, Any], version: int
+) -> None:
+    """Resolve which of the provider's named profiles serves this model, and bind it.
+
+    A version-3 model must name one. Leaving it implicit would let the dictionary order of a TOML
+    table decide which engine serves a model, and the two engines do not agree about anything the
+    plan later multiplies.
+    """
+    execution = provider["execution"]
+    profiles = execution["profiles"]
+    profile_id = (model.get("serving") or {}).get("profile")
+    if version == 3:
+        if profile_id not in profiles:
+            raise DefinitionError(
+                f"{model['where']}.serving.profile is {profile_id!r}, which providers/"
+                f"{provider['id']} does not declare; declared: {', '.join(sorted(profiles))}"
+            )
+    else:
+        profile_id = execution["default_profile"]
+    selected = profiles[profile_id]
+    model["serving_profile"] = profile_id
+    model["serving_engine"] = selected["engine"]
+    model["serving_settings"] = selected["settings"]
+    if provider["capacity"]["sequence_slots"] > selected["settings"]["max_sequences"]:
+        raise DefinitionError(
+            f"providers/{provider['id']}: sequence_slots exceeds the max_sequences of serving "
+            f"profile {profile_id!r}"
+        )
+
+
 def _require_local_serving(model: dict[str, Any], provider: dict[str, Any]) -> None:
     """Keep "served on this host" a fact with exactly one spelling.
 
@@ -664,20 +910,15 @@ def _require_local_serving(model: dict[str, Any], provider: dict[str, Any]) -> N
     refusing them is what makes "Ready" a fact for a cloud model rather than merely a claim nobody
     wrote down.
     """
-    derived = model.get("schema_version") == 2
+    version = model.get("schema_version")
+    derived = version in (2, 3)
     if derived != bool(provider.get("execution")):
         raise DefinitionError(
             f"{model['where']} and providers/{provider['id']} must agree on engine-derived "
-            "local capacity (schema version 2)"
+            "local capacity (schema version 2 or 3)"
         )
     if derived:
-        if (
-            provider["capacity"]["sequence_slots"]
-            > provider["execution"]["profile"]["max_sequences"]
-        ):
-            raise DefinitionError(
-                f"providers/{provider['id']}: sequence_slots exceeds max_sequences"
-            )
+        _bind_serving_profile(model, provider, version)
     declared = (
         ("[requires]", any(model["requires"].values())),
         ("[install]", model["install"] is not None),
@@ -783,6 +1024,8 @@ def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
         "requires",
         "install",
     }
+    if version == 3:
+        known |= {"serving"}
     for key in document:
         if key not in known:
             raise DefinitionError(f"{where} has unknown key {key!r}")
@@ -814,7 +1057,7 @@ def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
     context = document.get("context", {})
     if not isinstance(context, dict):
         raise DefinitionError(f"{where}.context must be a table")
-    context_key = "native_tokens" if version == 2 else "advertised_tokens"
+    context_key = "native_tokens" if version in (2, 3) else "advertised_tokens"
     for key in context:
         if key != context_key:
             raise DefinitionError(f"{where}.context has unknown key {key!r}")
@@ -824,7 +1067,7 @@ def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
 
     lanes = _parse_lanes(document.get("lane"), where, version=version)
     largest_lane = max(lane.get("context_tokens", 0) for lane in lanes.values())
-    if version == 2 and advertised is None:
+    if version in (2, 3) and advertised is None:
         raise DefinitionError(f"{where}.context.native_tokens must be declared")
     if version == 1 and advertised is not None and advertised < largest_lane:
         raise DefinitionError(
@@ -834,6 +1077,7 @@ def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
         advertised = max(lane["context_tokens"] for lane in lanes.values())
 
     requires = _parse_requires(document.get("requires"), where)
+    serving = _parse_serving(document.get("serving"), where, version)
     install = _parse_install(document.get("install"), where)
     lock_path = path / (install["lock"] if install else WEIGHTS_LOCK)
     if install is not None and not lock_path.is_file():
@@ -859,13 +1103,14 @@ def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
         "credential": credential,
         "key_env": str(key_env or ""),
         "advertised_tokens": advertised,
-        "native_tokens": advertised if version == 2 else None,
+        "native_tokens": advertised if version in (2, 3) else None,
         "lanes": lanes,
         "capabilities": _string_list(document, "capabilities", where),
         "support_efforts": _string_list(document, "support_efforts", where),
         "default_effort": document.get("default_effort", ""),
         "requires": requires,
         "install": install,
+        "serving": serving,
         "weights_dir": path / WEIGHTS_DIR,
         "lock_path": lock_path,
     }
@@ -915,7 +1160,7 @@ def _parse_lanes(raw: Any, where: str, *, version: int = 1) -> dict[str, dict[st
         effort = table.get("default_effort", "")
         if effort and (not isinstance(effort, str) or not BARE.fullmatch(effort)):
             raise DefinitionError(f"{here}.default_effort must be a bare lowercase word")
-        if version == 2:
+        if version in (2, 3):
             if (
                 table.get("allocation") != "engine"
                 or table.get("output_mode") != "remaining_context"

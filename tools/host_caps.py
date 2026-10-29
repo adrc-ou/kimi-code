@@ -135,6 +135,102 @@ def free_disk_gib(path: Path) -> int:
         return 0
 
 
+def _count(value: Any, *, positive: bool = False) -> int | None:
+    """A reported integer, or ``None``. Rejects the bool-that-pretends-to-be-an-int case."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return None if positive and value <= 0 else value
+
+
+def metal_observations() -> dict[str, Any]:
+    """Device-level Metal facts, as distinct measurements rather than one usable total.
+
+    Read on the host by the launcher, never by the proxy image, and never as an admission test: a
+    recommended working set is Apple's *performance* guidance, not a physical ceiling, and treating
+    it as one would reintroduce the RAM-derived context sizing this harness removed on purpose. The
+    value is that it lets a residency target be explained instead of invented.
+
+    Every field is ``None`` when the host will not say. Unknown is not zero: zero bytes of available
+    memory would be a measurement, and a wire that reports residency disabled is a different fact
+    from one that reports residency of zero bytes.
+    """
+    unknown: dict[str, Any] = {
+        "device_count": None,
+        "recommended_working_set_bytes": None,
+        "presentation_model": None,
+        "low_power_mode": None,
+        "source": None,
+    }
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        return {**unknown, "source": "not apple silicon"}
+    # There is no stable syscall for this. ``system_profiler`` reports the SP_DisplayData card
+    # fields, and ``sysctl`` knows nothing about a device working set, so the observation is taken
+    # from a one-shot helper the engine runtime already has bindings for. Absent that helper - which
+    # is the case on every Linux test host and on a Mac without the provisioned MLX runtime - the
+    # answer is unknown, and the caller disables deliberate wiring rather than guessing.
+    helper = os.environ.get("LOCAL_MPS_METAL_PROBE", "").strip()
+    if not helper or not Path(helper).is_file():
+        return {**unknown, "source": "no metal probe available"}
+    try:
+        result = subprocess.run(
+            [sys.executable, helper],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        document = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {**unknown, "source": "probe failed"}
+    if not isinstance(document, dict):
+        return {**unknown, "source": "probe malformed"}
+    working_set = document.get("recommended_max_working_set_size")
+    count = document.get("device_count")
+    return {
+        "device_count": _count(count),
+        "recommended_working_set_bytes": _count(working_set, positive=True),
+        "presentation_model": document.get("presentation_model"),
+        "low_power_mode": document.get("low_power_mode"),
+        "source": "probe",
+    }
+
+
+def swap_activity() -> dict[str, Any]:
+    """Cumulative compressor and swap counters, as deltas waiting to be taken.
+
+    Split out from :func:`metal_observations` because they answer a different question and change at
+    a different rate: a working set is a property of the device, these are a property of the moment.
+    High swap occupancy alone does not establish thrashing - only the movement between two samples
+    does, which is why this returns counters and no verdict.
+    """
+    blank = {"swap_used_bytes": None, "swap_capacity_bytes": None, "compressed_bytes": None}
+    if platform.system() != "Darwin":
+        return {**blank, "source": "not darwin"}
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "vm.swapusage", "vm.page_free_count"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {**blank, "source": "sysctl unavailable"}
+    lines = result.stdout.strip().splitlines()
+    values = dict(blank)
+    if lines:
+        # ``total = 1024.00M used = 512.00M free = 512.00M`` is the documented shape; a parser that
+        # cannot read it says unknown rather than guessing a scale factor.
+        used = re.search(r"used\s*=\s*([\d.]+)\s*([KMG])", lines[0])
+        total = re.search(r"total\s*=\s*([\d.]+)\s*([KMG])", lines[0])
+        scale = {"K": 1024, "M": 1024**2, "G": 1024**3}
+        if used:
+            values["swap_used_bytes"] = int(float(used[1]) * scale[used[2]])
+        if total:
+            values["swap_capacity_bytes"] = int(float(total[1]) * scale[total[2]])
+    return {**values, "source": "sysctl"}
+
+
 def probe(workspace: Path | None = None) -> dict[str, Any]:
     """One measurement of the machine running this process.
 
@@ -144,8 +240,11 @@ def probe(workspace: Path | None = None) -> dict[str, Any]:
     """
     system = platform.system()
     machine = platform.machine()
+    # Distinct keys, deliberately never summed. Host memory, available memory, GPU allocations,
+    # process RSS and swap are different quantities that overlap on unified memory, and adding any
+    # two of them produces a number that describes nothing.
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "system": system,
         "arch": machine,
         "memory_gib": total_memory_gib(),
@@ -154,6 +253,8 @@ def probe(workspace: Path | None = None) -> dict[str, Any]:
         "free_disk_gib": free_disk_gib(ROOT),
         "capabilities": host_capabilities(system, machine),
         "workspace": str(ROOT if workspace is None else Path(workspace)),
+        "metal": metal_observations(),
+        "swap": swap_activity(),
     }
 
 
@@ -168,7 +269,7 @@ def read(runtime_dir: Path | None) -> dict[str, Any] | None:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(document, dict) or document.get("schema_version") != 1:
+    if not isinstance(document, dict) or document.get("schema_version") not in (1, 2):
         return None
     if not isinstance(document.get("capabilities"), list):
         return None

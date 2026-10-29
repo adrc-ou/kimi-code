@@ -29,6 +29,12 @@ jobs:
       - run: ruff check .
       - run: python scripts/check_locks.py
       - run: python scripts/check_mcp_contracts.py
+      # The local-engine work must not move a byte of an NRP-only plan or its generated guidance.
+      # Checked as complete captured documents rather than as field assertions, so a plan cannot
+      # keep every named field while gaining a counter or losing a route. Regenerating a reference
+      # is a deliberate act with a reviewable diff; CI only reports the drift.
+      - name: Verify NRP plan and guidance references are unchanged
+        run: python tools/capture_local_inference_references.py --check
       # apt's shellcheck on the runner image is two major releases behind, and the linters differ
       # between them, so this gate would report a different set of defects depending on which image
       # the job landed on -- and change again when ubuntu-latest moves. Pin the published release
@@ -222,6 +228,42 @@ jobs:
           for build in modules/*/tests/build.sh; do
             [ ! -f "$build" ] || bash "$build"
           done
+
+  # A separate job, because nothing here can run on ubuntu-latest: the MLX wheels are macOS/arm64
+  # only and Metal is absent from every hosted Linux runner. The job asserts the *absence* of a
+  # host dependency (the Linux suite must import the launcher and proxy without MLX installed) and
+  # gates the native probe and qualification behind an explicit operator dispatch, so a green
+  # ubuntu run can never be read as native evidence.
+  local-mac:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e3a63bd5f65534435c # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r proxy/requirements.in ruff==0.13.2
+      - run: python -m unittest discover -s tests
+      # The host floor the MLX wheels impose. Every published mlx wheel is tagged macosx_14_0 or
+      # newer, so this is a property of the dependency set and not a preference; a runner below it
+      # would fail to resolve rather than silently install something else.
+      - name: Report the host and the macOS deployment floor
+        run: |
+          sw_vers
+          python3 -c "import platform; print(platform.machine(), platform.mac_ver())"
+      # Hardware-qualified steps. A GitHub-hosted Mac has Metal but not the operator's chip, RAM,
+      # or model artifact, so this run produces no promotion evidence by design.
+      - name: Native feasibility probe
+        continue-on-error: true
+        run: python tools/local_native_probe.py --output /tmp/probe.json
+      - name: Report what the probe concluded
+        when: always()
+        run: |
+          if [ -f /tmp/probe.json ]; then
+            python -c "import json;d=json.load(open('/tmp/probe.json'));print(json.dumps(d,indent=2))"
+          else
+            echo "no probe result written; native feasibility is UNVERIFIED"
+          fi
 
   security:
     runs-on: ubuntu-latest

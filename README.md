@@ -343,22 +343,68 @@ a slot can require more prompt processing. Hardware validation remains pending;
 repository fixtures are not evidence of native generation correctness or peak
 memory behavior. Available-memory and RSS measurements do not size or limit execution.
 
+**Two engines, selected in the manifest, never at runtime.** Each model names one
+`[serving] profile` in `providers/local_mps/provider.toml`; nothing chooses an
+engine while a session is running, and there is no automatic fallback between them.
+The 27B currently names the retained llama.cpp profile. Moving it to MLX is one
+line, and the old GGUF and its verification record are kept beside the new artifact
+so rollback is the same one-line edit on your next launch. Retaining both formats
+roughly doubles that model's disk use; the manifest's `disk_gib` covers the artifact
+being installed, so check free space before switching.
+
+Two commands produce the evidence a switch is supposed to rest on, and both must run
+on the Mac that will serve the model — `./start.sh` and this repository's test suite
+can exercise everything except the Metal path:
+
+- `python3 tools/local_native_probe.py` answers, in about half an hour and against a
+  small model, whether generation executes on this chip and macOS version, whether a
+  harness-set memory wiring limit survives a generation call, and whether context
+  storage grows instead of being committed upfront. Run it before building on those
+  assumptions; its output is the input to the runtime pin.
+- `python3 tools/local_qualification.py` qualifies the real artifact for the workload
+  class that actually failed, escalating from a short prompt to a tool-heavy
+  near-ceiling request and ending with a cancellation that must free the slot. It
+  writes JSON and exits non-zero rather than permitting promotion.
+
+Neither reports peak memory against a threshold invented in the harness. Growing
+caches are permitted to page, and an observation about swap or memory pressure is
+not a failure; an allocation error, a malformed outcome, identity drift or a
+cancellation that did not release the slot is.
+
 **Why the server is a host process.** No container in this stack can address
-Apple silicon's unified memory, so `llama-server` runs beside Docker and the proxy
+Apple silicon's unified memory, so the engine runs beside Docker and the proxy
 reaches it over `host.docker.internal` — the same arrangement the ComfyUI MPS
 backend uses. That means the listener is reachable from the machine's network, not
 just from the VM, and what makes that safe is a token the launcher generates per
 session: the same value is handed to the engine and mounted into the proxy, so
 there is nothing for you to configure and nothing that outlives the run. Set
-`LOCAL_MPS_BIND` to pin it to one interface. The engine binary itself is pinned by
+`LOCAL_MPS_BIND` to pin it to one interface. The llama.cpp binary is pinned by
 digest in `dependencies.lock.json`; `LOCAL_MPS_LLAMA_SERVER` points the harness at
-a compatible build of your own instead. The adapter currently supports Metal;
-other backends fail explicitly.
+a compatible build of your own instead. The MLX runtime is a private Python
+environment provisioned from `providers/local_mps/requirements-mlx.lock` into
+`.local/runtimes/mlx/<identity>/`, keyed on interpreter, platform and lock digest,
+installed only with `--require-hashes`, and never into your own Python. The adapter
+supports Metal; other backends fail explicitly.
 
-The launcher authenticates readiness and checks the model and build identity,
-per-sequence context, slot count and normalized settings against the resolved plan before exposing Kimi. A mismatch stops that
-launch. An engine crash makes its routes unavailable; it does not resize the
-session or change an independent provider's policy.
+Every published MLX wheel is tagged `macosx_14_0` or newer, so an MLX serving
+profile needs macOS 14 or later. That is a floor of the dependency set, not a
+preference.
+
+**Readiness means it computed.** Before the launcher exposes Kimi it authenticates
+to the engine, checks model and build identity, per-sequence context, slot count
+and normalised settings against the resolved plan, and then asks the model to
+produce a token. A model declaring `tool_use` is additionally asked to make a tool
+call. A backend that answers questions about itself but cannot compute no longer
+passes: the launch fails and says so, instead of staging a session that retries an
+empty answer forever. Your own `python3 tools/local_llm.py status` line is
+unchanged; `--check` on the runtime tells you whether an MLX environment is
+provisioned.
+
+After a launch, an engine that reports a device-level failure is latched and every
+later request for it is refused before it can reach the wire, because a retry
+against that engine costs a full prefill. Nothing restarts or replaces an engine
+automatically; recovery is a relaunch. A response that arrives cleanly but contains
+no usable answer is recorded as such rather than as a success.
 
 `python3 tools/local_llm.py status` prints what the picker saw, and
 `docs/models-providers.md` ("Managed local execution and capacity") is the contract behind all of it.

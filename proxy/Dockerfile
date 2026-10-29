@@ -11,6 +11,10 @@ COPY requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir --require-hashes --requirement /app/requirements.lock
 
 COPY model_proxy.py /app/model_proxy.py
+# The local-engine vocabulary is imported by the launcher and the engine worker as well as here, so
+# it is one file shared three ways rather than a copy per consumer. Its directory is sys.path[0] at
+# runtime, which is what makes a plain sibling import resolve inside the image.
+COPY local_engine_contract.py /app/local_engine_contract.py
 
 USER 65532:65532
 

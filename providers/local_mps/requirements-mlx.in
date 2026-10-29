@@ -1,0 +1,19 @@
+# Native MLX serving of a local model, on Apple silicon.
+#
+# Compiled to requirements-mlx.lock with:
+#    uv pip compile providers/local_mps/requirements-mlx.in \
+#        --generate-hashes --python-platform aarch64-apple-darwin --output-file \
+#        providers/local_mps/requirements-mlx.lock
+#
+# and installed with `--require-hashes` into a private runtime under
+# ${HARNESS_ROOT}/.local/runtimes/mlx/<identity>/. It is never installed into the operator's global
+# Python, never into a Linux container, and never resolved at launch: the lock's digest is recorded
+# in dependencies.lock.json, so a changed dependency set has to be a deliberate commit.
+#
+# Only the engine library and its own transcriptive deps are listed. The HTTP frontend is served
+# from the standard library (`http.server` + `threading`), because adding a framework to the host
+# runtime to move bytes between two processes the harness writes itself would be a second
+# dependency surface for no capability the platform does not already provide.
+
+mlx==0.32.4
+mlx-lm==0.32.2

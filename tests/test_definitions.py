@@ -748,7 +748,17 @@ top_k = 20
 """
 
 #: The shape is what discovery checks; :mod:`local_llm` is what reads the digests inside it.
-LOCAL_LOCK = '{"schema_version": 1, "source": {}, "files": []}\n'
+#: A complete, valid schema-1 lock. It used to be an empty stub because only the digest of the file
+#: mattered to the resolver; ``prepare()`` now parses it through an adapter, so a fixture that will
+#: not survive ``read_lock`` describes a tree no launcher could install from.
+#: Tests that need a *broken* lock pass one explicitly via ``local_tree(lock=...)``.
+_LOCAL_REVISION = "0" * 40
+_LOCAL_DIGEST = "a" * 64
+LOCAL_LOCK = (
+    '{"schema_version": 1, '
+    f'"source": {{"repo": "fixture/Model-GGUF", "revision": "{_LOCAL_REVISION}"}}, '
+    f'"files": [{{"path": "fixture-Q4.gguf", "sha256": "{_LOCAL_DIGEST}", "size": 4096}}]}}\n'
+)
 
 
 def local_tree(

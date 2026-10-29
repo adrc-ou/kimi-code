@@ -68,8 +68,22 @@ class WeightFixture(unittest.TestCase):
         }
 
     def write_lock(self, **changes):
+        """Write a lock and return it. ``artifact=None`` drops the block entirely.
+
+        A schema-2 lock is only valid with an ``[artifact]`` table, so the fixture supplies the
+        minimum truthful one rather than every test restating it; the tests that prove that rule
+        need a way to leave it out, which is what the sentinel is for.
+        """
         document = json.loads(json.dumps(LOCK))
+        absent = object()
+        explicit_artifact = changes.pop("artifact", absent)
+        if changes.get("schema_version") == 2 and explicit_artifact is absent:
+            document["artifact"] = {"format": "gguf", "variant": "Q4", "directory": ""}
         document.update(changes)
+        if explicit_artifact is None:
+            document.pop("artifact", None)
+        elif explicit_artifact is not absent:
+            document["artifact"] = explicit_artifact
         self.model["lock_path"].write_text(json.dumps(document))
         return document
 
@@ -137,8 +151,48 @@ class LockTests(WeightFixture):
         with self.assertRaises(local_llm.LocalModelError):
             local_llm.read_lock(self.directory / "absent.json")
 
-    def test_a_second_schema_version_is_refused(self):
-        self.assertIn("schema_version", self._refused(schema_version=2))
+    def test_an_unknown_lock_schema_version_is_refused(self):
+        for schema_version in (0, 3, "2"):
+            with self.subTest(schema_version=schema_version):
+                self.assertIn("schema_version", self._refused(schema_version=schema_version))
+
+    def test_schema_two_needs_the_artifact_it_claims_to_pin(self):
+        # A schema-2 lock exists to say which loader can consume these bytes. Without the block it
+        # is a schema-1 lock wearing a higher number, and readiness would be indistinguishable.
+        self.assertIn("artifact", self._refused(schema_version=2, artifact=None))
+
+    def test_the_artifact_format_is_the_only_thing_separating_two_containers_of_one_quant(self):
+        lock = self.write_lock(schema_version=2)
+        for kind in ("safetensors", "bin", "GGUF", ""):
+            artifact = {**lock["artifact"], "format": kind}
+            with self.subTest(format=kind):
+                self.assertIn(
+                    "artifact.format",
+                    self._refused(
+                        schema_version=2,
+                        artifact=artifact,
+                        source=lock["source"],
+                        files=lock["files"],
+                    ),
+                )
+
+    def test_the_artifact_directory_cannot_escape_the_weights_tree(self):
+        lock = self.write_lock(schema_version=2)
+        for directory in ("../outside", "/absOLUTE", "a/../../b"):
+            with self.subTest(directory=directory):
+                self.assertIn(
+                    "artifact.directory",
+                    self._refused(
+                        schema_version=2,
+                        artifact={**lock["artifact"], "directory": directory},
+                        source=lock["source"],
+                        files=lock["files"],
+                    ),
+                )
+
+    def test_schema_two_with_a_valid_artifact_loads(self):
+        lock = self.write_lock(schema_version=2)
+        self.assertEqual(lock["artifact"]["format"], "gguf")
 
 
 class StateTests(WeightFixture):
@@ -169,6 +223,15 @@ class StateTests(WeightFixture):
         self.write_weights(lock)
         self.write_marker(lock, revision="f" * 40)
         self.assertFalse(local_llm.verified(self.model, lock))
+
+    def test_a_different_artifact_format_invalidates_the_marker(self):
+        # One model, one variant name, two containers: the marker must not cross between them.
+        lock = self.write_lock()
+        self.write_weights(lock)
+        local_llm.record(self.model, lock)
+        self.assertTrue(local_llm.verified(self.model, lock))
+        mlx = {**lock, "schema_version": 2, "artifact": {"format": "mlx", "variant": "Q4"}}
+        self.assertFalse(local_llm.verified(self.model, mlx))
 
     def test_a_different_variant_invalidates_the_marker(self):
         lock = self.write_lock()
@@ -534,7 +597,104 @@ class EngineTests(InstallFixture):
         self.assertFalse(target.exists())
 
 
+class _ChunkedStream:
+    """A streamed HTTP response body, as :func:`urllib.request.urlopen` hands one back.
+
+    The canary reads in fixed blocks, so the fixture has to support ``read(n)`` until it returns
+    empty, plus the context-manager protocol ``wait_engine_ready`` enters.
+    """
+
+    def __init__(self, payload: bytes, status: int = 200) -> None:
+        self._body = io.BytesIO(payload)
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self._body.close()
+        return False
+
+    def read(self, size: int = -1) -> bytes:
+        return self._body.read(size)
+
+
+class _StubLaunch:
+    def __init__(self, argv):
+        self.argv = tuple(argv)
+        self.environment = {}
+        self.host = "127.0.0.1"
+        self.port = 8181
+        self.secret_argument_indices = ()
+
+
+class _StubAdapter:
+    """Stands in for the engine adapter so a serve test does not provision or download."""
+
+    def validate_artifact(self, model, lock):
+        return type(
+            "A", (), {"primary": Path(model["lock_path"]).parent / "fixture.gguf"}
+        )()
+
+    def provision(self, *, install=True):
+        return type(
+            "R",
+            (),
+            {
+                "identity": "stub",
+                "directory": Path(tempfile.gettempdir()),
+                "executable": Path(sys.executable),
+                "details": {},
+            },
+        )()
+
+    def launch(self, model, artifact, runtime, engine, token):
+        return _StubLaunch(
+            local_llm.engine_args(model, 8192, 2, token, dict(engine["allocation"]))
+        )
+
+
+def _stub_adapter(_kind):
+    return _StubAdapter()
+
+
 class ServeTests(InstallFixture):
+    @staticmethod
+    def transport(props: dict, *, canary: str = "content") -> mock.Mock:
+        """Answer ``/props`` and the compute canary the way a real engine does.
+
+        Readiness is now a generation, not a metadata read, so a fixture that only serves ``/props``
+        describes the buggy contract. ``canary`` picks what generation does, which is how the tests
+        below cover the poisoned-backend case: metadata healthy, compute producing nothing.
+        """
+        tools_events = [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+        events = {
+            "content": [
+                b'data: {"choices":[{"delta":{"content":"ready"}}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+            "empty": [b"data: [DONE]\n\n"],
+            "error": [b'data: {"error":{"message":"metal could not allocate"}}\n\n'],
+            "reasoning": [
+                b'data: {"choices":[{"delta":{"reasoning_content":"hmm"}}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+        }[canary]
+
+        def urlopen(request, timeout=None):
+            url = getattr(request, "full_url", str(request))
+            if url.endswith("/props"):
+                return io.BytesIO(json.dumps(props).encode())
+            body = json.loads(getattr(request, "data", b"{}") or b"{}")
+            if "tools" in body:
+                return _ChunkedStream(b"".join(tools_events))
+            return _ChunkedStream(b"".join(events))
+
+        return mock.Mock(side_effect=urlopen)
+
     def test_ready_engine_is_not_rejected_for_high_or_unknown_memory(self):
         import host_caps
 
@@ -560,9 +720,7 @@ class ServeTests(InstallFixture):
             with (
                 self.subTest(rss=rss),
                 mock.patch.object(
-                    local_llm.urllib.request,
-                    "urlopen",
-                    return_value=io.BytesIO(json.dumps(props).encode()),
+                    local_llm.urllib.request, "urlopen", self.transport(props)
                 ),
                 mock.patch.object(host_caps, "process_memory_bytes", return_value=rss),
                 mock.patch.object(host_caps, "available_memory_bytes", return_value=0),
@@ -571,6 +729,159 @@ class ServeTests(InstallFixture):
             self.assertEqual(result["context_tokens"], 4096)
             self.assertEqual(result["resident_bytes"], rss or None)
             self.assertIsNone(result["available_host_bytes"])
+            self.assertEqual(result["canary_outcome"], "content")
+
+    def test_metadata_readiness_alone_never_publishes_ready(self):
+        # The recorded incident: /props answered perfectly while Metal could no longer compute.
+        # An engine that produces no content is a failed launch, not a healthy one.
+        import host_caps
+
+        self.model["install"]["port"] = 8181
+        engine = {
+            "context_tokens": 4096,
+            "sequences": 1,
+            "model_alias": "fixture",
+            "model_path": "/fixture.gguf",
+            "build_commit": "abcdef0",
+        }
+        props = {
+            "default_generation_settings": {"n_ctx": 4096},
+            "total_slots": 1,
+            "model_alias": "fixture",
+            "model_path": "/fixture.gguf",
+            "build_info": "fixture abcdef0",
+            "is_sleeping": False,
+        }
+        for canary in ("empty", "error", "reasoning"):
+            child = mock.Mock(pid=4321)
+            child.poll.return_value = None
+            with (
+                self.subTest(canary=canary),
+                mock.patch.object(
+                    local_llm.urllib.request, "urlopen", self.transport(props, canary=canary)
+                ),
+                mock.patch.object(host_caps, "process_memory_bytes", return_value=0),
+                mock.patch.object(host_caps, "available_memory_bytes", return_value=0),
+            ):
+                with self.assertRaisesRegex(local_llm.EngineError, "canary"):
+                    local_llm.wait_engine_ready(child, self.model, engine, "fixture-value")
+
+    def test_the_canary_is_authenticated_and_asks_for_little(self):
+        # A canary that asks for a long completion would itself be the memory spike that fails.
+        canary = local_llm.LocalModelCanary("127.0.0.1", 8181, "fixture-value", self.model)
+        request = canary.request()
+        self.assertEqual(request.get_header("Authorization"), "Bearer fixture-value")
+        payload = json.loads(request.data)
+        self.assertLessEqual(payload["max_tokens"], 16)
+        self.assertTrue(payload["stream"], "a non-streaming canary cannot observe an empty answer")
+
+    def test_a_canary_answer_of_any_word_still_passes(self):
+        # The canary proves compute works; it must not prove the quant reproduces one completion.
+        self.model["install"]["port"] = 8181
+        for text in ("ready", "Ready.", "I am ready and standing by"):
+            with self.subTest(text=text):
+                events = (
+                    b'data: {"choices":[{"delta":{"content":"' + text.encode() + b'"}}]}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                stream = _ChunkedStream(events)
+                with mock.patch.object(
+                    local_llm.urllib.request, "urlopen", return_value=stream
+                ):
+                    record = local_llm.LocalModelCanary(
+                        "127.0.0.1", 8181, "fixture-value", self.model
+                    ).run()
+                self.assertEqual(record["outcome"], "content")
+
+    def _engine_record(self):
+        return {
+            "context_tokens": 4096,
+            "sequences": 1,
+            "model_alias": "fixture",
+            "model_path": "/fixture.gguf",
+            "build_commit": "abcdef0",
+        }
+
+    def _props(self):
+        return {
+            "default_generation_settings": {"n_ctx": 4096},
+            "total_slots": 1,
+            "model_alias": "fixture",
+            "model_path": "/fixture.gguf",
+            "build_info": "fixture abcdef0",
+            "is_sleeping": False,
+        }
+
+    def test_a_declared_tool_capability_is_proved_at_readiness(self):
+        # Declaring tool_use without the template applied yields prose where the agent expected a
+        # function call, which looks like a healthy completion at the transport layer.
+        import host_caps
+
+        self.model["install"]["port"] = 8181
+        self.model["capabilities"] = ["thinking", "tool_use"]
+        child = mock.Mock(pid=4321)
+        child.poll.return_value = None
+        with (
+            mock.patch.object(
+                local_llm.urllib.request, "urlopen", self.transport(self._props())
+            ),
+            mock.patch.object(host_caps, "process_memory_bytes", return_value=0),
+            mock.patch.object(host_caps, "available_memory_bytes", return_value=0),
+        ):
+            result = local_llm.wait_engine_ready(
+                child, self.model, self._engine_record(), "fixture-value"
+            )
+        self.assertEqual(result["canary_outcome"], "content")
+        self.assertEqual(result["tool_canary"], "tool_only")
+
+    def test_a_declared_tool_capability_fails_the_launch_when_prose_comes_back(self):
+        import host_caps
+
+        self.model["install"]["port"] = 8181
+        self.model["capabilities"] = ["tool_use"]
+        props = self._props()
+
+        def urlopen(request, timeout=None):
+            url = getattr(request, "full_url", str(request))
+            if url.endswith("/props"):
+                return io.BytesIO(json.dumps(props).encode())
+            body = json.loads(getattr(request, "data", b"{}") or b"{}")
+            if "tools" in body:
+                # The shape a server returns when it accepted the tools array and parsed with its
+                # built-in template: a perfectly successful completion with no call in it.
+                return _ChunkedStream(
+                    b'data: {"choices":[{"delta":{"content":"7"}}]}\n\ndata: [DONE]\n\n'
+                )
+            return _ChunkedStream(
+                b'data: {"choices":[{"delta":{"content":"ready"}}]}\n\ndata: [DONE]\n\n'
+            )
+
+        child = mock.Mock(pid=4321)
+        child.poll.return_value = None
+        with (
+            mock.patch.object(local_llm.urllib.request, "urlopen", mock.Mock(side_effect=urlopen)),
+            mock.patch.object(host_caps, "process_memory_bytes", return_value=0),
+            mock.patch.object(host_caps, "available_memory_bytes", return_value=0),
+        ):
+            with self.assertRaisesRegex(local_llm.EngineError, "tool_use"):
+                local_llm.wait_engine_ready(
+                    child, self.model, self._engine_record(), "fixture-value"
+                )
+
+    def test_the_template_flag_follows_the_declared_capability(self):
+        from tests.test_capacity import PROFILE
+
+        self.write_lock()
+        without = local_llm.engine_args(self.model, 8192, 2, "t", dict(PROFILE))
+        declared = dict(self.model, capabilities=["thinking", "tool_use"])
+        with_tools = local_llm.engine_args(declared, 8192, 2, "t", dict(PROFILE))
+        self.assertNotIn("--jinja", without)
+        self.assertIn("--jinja", with_tools)
+
+    def test_the_canary_shares_the_proxys_vocabulary(self):
+        # Two definitions of "usable" is the drift this change set exists to remove.
+        source = (ROOT / "tools" / "local_llm.py").read_text(encoding="utf-8")
+        self.assertIn("from local_engine_contract import", source)
 
     def test_stale_memory_sized_engine_plan_requires_relaunch(self):
         plan = {"schema_version": 2, "engines": {self.model["id"]: {}}}
@@ -590,6 +901,18 @@ class ServeTests(InstallFixture):
                 "sequences": 2,
                 "total_context_tokens": 8192,
                 "allocation": PROFILE,
+                # Every field a schema-4 plan carries for an engine. A fixture that omits them is
+                # describing a plan the resolver cannot emit.
+                "engine_kind": "llama_cpp",
+                "serving_profile": "default",
+                "protocol_version": 1,
+                "capacity_strategy": "native_context",
+                "memory_management": "os_managed",
+                "native_context_tokens": 4096,
+                "artifact_format": "gguf",
+                "serving_profile_id": "f" * 64,
+                "fingerprint": "e" * 64,
+                "snapshot_id": "d" * 32,
             }
         }
         (runtime / "model-policy.json").write_text(json.dumps(plan))
@@ -602,6 +925,7 @@ class ServeTests(InstallFixture):
                 mock.patch.object(local_llm, "require_model", return_value=self.model),
                 mock.patch.object(local_llm, "is_ready", return_value=True),
                 mock.patch.object(local_llm, "validate_launch"),
+                mock.patch.object(local_llm, "capacity_adapter", _stub_adapter),
                 mock.patch.object(local_llm, "api_token", return_value="fixture-value"),
                 mock.patch.object(local_llm, "engine_args", return_value=["fixture-binary"]),
                 mock.patch.object(local_llm, "probe_port", return_value=occupied),

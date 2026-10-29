@@ -101,11 +101,11 @@ def read_json(path: Path, default: Any = None) -> Any:
 def load_plan(runtime: Path) -> dict[str, Any]:
     """Read the resolved plan. ``render_runtime.py`` and the proxy consume the same document."""
     plan = read_json(runtime / POLICY_FILE)
-    if isinstance(plan, dict) and plan.get("schema_version") == 2:
+    if isinstance(plan, dict) and plan.get("schema_version") in (2, 3):
         raise DefinitionError(
             "stale schema 2 local policy; relaunch the harness to resolve native context"
         )
-    if not isinstance(plan, dict) or plan.get("schema_version") not in (1, 3):
+    if not isinstance(plan, dict) or plan.get("schema_version") not in (1, 4):
         raise DefinitionError(f"{POLICY_FILE} is not a supported policy plan")
     return plan
 

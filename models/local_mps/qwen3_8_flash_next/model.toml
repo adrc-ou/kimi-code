@@ -6,7 +6,7 @@
 # Both facts are about the serving, so both live here rather than in one
 # file with a provider-switching flag.
 
-schema_version = 2
+schema_version = 3
 
 label = "Qwen3.8-Flash-Next"
 provider = "local_mps"
@@ -60,3 +60,9 @@ temperature = 1.0
 top_p = 0.95
 top_k = 20
 min_p = 0.0
+
+# ------------------------------------------------------------
+# Served by the retained llama.cpp profile. Its lookup tables, sparse attention and cache state
+# are not qualified under any other engine, so this line is a decision and not a default.
+[serving]
+profile = "llama_cpp_q4"

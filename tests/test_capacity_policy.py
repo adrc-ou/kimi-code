@@ -235,7 +235,7 @@ percent = 75
 class CapacityResolutionTests(CapacityFixture):
     def test_same_model_has_one_engine_and_one_shared_slot_gate(self):
         plan = self.resolve(capacity=self.allocation())
-        self.assertEqual(plan["schema_version"], 3)
+        self.assertEqual(plan["schema_version"], 4)
         self.assertNotIn("resources", plan)
         self.assertEqual(len(plan["engines"]), 1)
         counters = list(plan["counters"].values())

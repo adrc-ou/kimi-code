@@ -53,9 +53,16 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(ROOT / "tools"))
+# The shared local-engine vocabulary lives beside the proxy, because the proxy is its other reader.
+# Importing across that boundary is deliberate and is the direction the plan names: one file, three
+# readers (launcher, proxy, worker), so an outcome means the same thing in all of them.
+if str(ROOT / "proxy") not in sys.path:
+    sys.path.insert(0, str(ROOT / "proxy"))
 
 import definitions  # noqa: E402
 from private_file import write_private_json  # noqa: E402
+
+from local_engine_contract import StreamEvidence, classify  # noqa: E402
 
 #: Written beside the weights once every file has been digested and matched. It is the difference
 #: between "the files are there" and "these are the bytes the lock promised", and it is the only
@@ -100,9 +107,10 @@ def read_lock(path: Path) -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         raise LocalModelError(f"cannot read {path}: {exc}") from exc
     _require(isinstance(document, dict), f"{path} must hold one JSON object")
+    schema = document.get("schema_version")
     _require(
-        document.get("schema_version") == 1,
-        f"{path} must set schema_version = 1",
+        schema in (1, 2),
+        f"{path} must set schema_version = 1 or 2",
     )
     source = document.get("source")
     _require(isinstance(source, dict), f"{path} needs a source table")
@@ -134,6 +142,32 @@ def read_lock(path: Path) -> dict[str, Any]:
             isinstance(size, int) and not isinstance(size, bool) and size > 0,
             f"{path}: {name} needs a positive size in bytes",
         )
+    if schema == 2:
+        # Schema 2 says *what* the bytes are, not only that they hash right. A GGUF and an MLX
+        # directory can carry the same model at the same variant, and the loader that must be used
+        # is not inferable from a filename any more.
+        artifact = document.get("artifact")
+        _require(isinstance(artifact, dict), f"{path} schema 2 needs an [artifact] table")
+        if set(artifact) - {"format", "variant", "directory"}:
+            raise LocalModelError(f"{path}.artifact has unknown key(s)")
+        kind = artifact.get("format")
+        _require(
+            kind in {"gguf", "mlx"},
+            f"{path}.artifact.format must be gguf or mlx",
+        )
+        variant = str(artifact.get("variant", ""))
+        _require(bool(variant), f"{path}.artifact.variant must name the quantised build")
+        directory = artifact.get("directory", "")
+        _require(
+            isinstance(directory, str)
+            and not directory.startswith("/")
+            and ".." not in Path(str(directory)).parts,
+            f"{path}.artifact.directory must stay inside the weights directory",
+        )
+        _require(
+            not any(Path(entry["path"]).is_absolute() for entry in files),
+            f"{path}: schema 2 file paths stay relative to the weights directory",
+        )
     return document
 
 
@@ -159,7 +193,44 @@ def download_url(source: dict[str, Any], name: str) -> str:
 
 
 def weights_dir(model: dict[str, Any]) -> Path:
-    return Path(model["weights_dir"])
+    """Where this model's verified bytes live.
+
+    Schema-1 locks put the files directly under ``weights/``, which is how the GGUF trees already
+    on disk are laid out, so that stays the default. Schema 2 may name a subdirectory, which is what
+    lets an MLX artifact and a retained GGUF coexist under one model without either loader
+    discovering the other's files.
+    """
+    base = Path(model["weights_dir"])
+    artifact = artifact_of(model)
+    directory = str((artifact or {}).get("directory") or "")
+    if not directory:
+        return base
+    path = base / directory
+    # Resolve-and-contain, not a string check: the lock is validated on read, but this is the one
+    # place a path from it becomes a filesystem root for downloads and hashing.
+    root = base.resolve()
+    if not path.resolve().is_relative_to(root):
+        raise LocalModelError(f"{model['where']}: artifact.directory escapes weights/")
+    return path
+
+
+def artifact_of(model: dict[str, Any]) -> dict[str, Any] | None:
+    """The ``[artifact]`` block of this model's lock, or ``None`` for a schema-1 lock.
+
+    Read through :func:`read_lock` rather than cached on the model, so a lock edited after
+    discovery cannot disagree with the bytes the installer hashes.
+    """
+    path = model.get("lock_path")
+    if not path:
+        return None
+    try:
+        lock = read_lock(Path(path))
+    except LocalModelError:
+        # Status reporting treats an unreadable lock as "not installed", and says so; it is not
+        # this function's job to decide that twice.
+        return None
+    artifact = lock.get("artifact")
+    return dict(artifact) if isinstance(artifact, dict) else None
 
 
 def read_state(model: dict[str, Any]) -> dict[str, Any] | None:
@@ -204,6 +275,12 @@ def verified(model: dict[str, Any], lock: dict[str, Any]) -> bool:
     if state.get("revision") != lock["source"]["revision"]:
         return False
     if install and state.get("variant") != install.get("variant"):
+        return False
+    # The artifact format is compared too. Two formats of one model share a variant name (the
+    # publisher's quant label describes the weights, not the container), so without this a marker
+    # written for a GGUF could vouch for an MLX directory of the same model at the same quant.
+    expected_format = str((lock.get("artifact") or {}).get("format") or "gguf")
+    if str(state.get("format") or "gguf") != expected_format:
         return False
     recorded = {
         entry.get("path"): entry.get("sha256")
@@ -308,9 +385,10 @@ def lane_sizes(model: dict[str, Any], plan: dict[str, Any]) -> tuple[int, int]:
     """
     engine = (plan.get("engines") or {}).get(model["id"])
     if engine is not None:
-        if plan.get("schema_version") == 2:
+        if plan.get("schema_version") in (2, 3):
             raise EngineError(
-                "stale schema 2 local policy; relaunch the harness for native context"
+                f"stale schema {plan.get('schema_version')} local policy; "
+                "relaunch the harness for the current engine contract"
             )
         context, sequences = int(engine["context_tokens"]), int(engine["sequences"])
         if context <= 0 or sequences <= 0 or engine["total_context_tokens"] != context * sequences:
@@ -344,6 +422,24 @@ DEPENDENCIES_LOCK = "dependencies.lock.json"
 ENGINE_NAME = "llama-cpp-macos-arm64"
 ENGINE_BINARY = "llama-server"
 DEFAULT_BIND = "0.0.0.0"  # noqa: S104 - see the bind note in start.sh: loopback is unreachable from the VM
+#: The listener port a model that declares none is served on. One constant because three readers
+#: (arg construction, the occupied-listener probe, and the launcher's ``check`` line) have to agree.
+DEFAULT_PORT = 8181
+
+
+def engine_host() -> str:
+    """The address to *reach* the engine on, as distinct from the address it binds.
+
+    The server binds every interface because a container cannot reach the host's loopback, but the
+    launcher and the proxy connect over localhost. Deriving one from the other in three places is
+    how a probe ends up pointed somewhere the engine never listened.
+    """
+    bind = os.environ.get("LOCAL_MPS_BIND", "").strip()
+    return bind if bind and bind != DEFAULT_BIND else "127.0.0.1"
+
+
+def engine_port(model: dict[str, Any]) -> int:
+    return int((model.get("install") or {}).get("port") or DEFAULT_PORT)
 REQUEST_TIMEOUT = 60.0
 
 
@@ -613,6 +709,9 @@ def record(model: dict[str, Any], lock: dict[str, Any]) -> None:
         "schema_version": 1,
         "revision": lock["source"]["revision"],
         "variant": (model.get("install") or {}).get("variant", ""),
+        # Recorded so a later format change invalidates this marker instead of inheriting it.
+        "format": str((lock.get("artifact") or {}).get("format") or "gguf"),
+        "artifact": lock.get("artifact") or {"format": "gguf", "directory": ""},
         "installed_at": int(time.time()),
         "files": [
             {"path": entry["path"], "sha256": entry["sha256"], "size": entry["size"]}
@@ -781,7 +880,7 @@ def engine_args(
         "--host",
         os.environ.get("LOCAL_MPS_BIND", "").strip() or DEFAULT_BIND,
         "--port",
-        str(int(install_block.get("port") or 0) or 8181),
+        str(int(install_block.get("port") or 0) or DEFAULT_PORT),
         "--api-key",
         token,
         "--no-webui",
@@ -811,7 +910,27 @@ def engine_args(
         if key in sampling:
             value = sampling[key]
             args += [flag, str(int(value)) if float(value).is_integer() else str(value)]
+    # Tool calling is served by the checkpoint's own chat template, and llama.cpp only applies it
+    # when asked: without this the server accepts a `tools` array, parses with its legacy built-in
+    # parser, and the declared capability is a claim nothing enforces. It is added here rather than
+    # in allocation_args because that list is hashed into the engine fingerprint and shared with the
+    # offline projection, which has no template to apply.
+    #
+    # This makes an engine that cannot load the embedded template fail at readiness instead of
+    # failing at the first tool call, because the canary below is asked to prove the capability.
+    if "tool_use" in (model.get("capabilities") or []):
+        args += ["--jinja"]
     return args
+
+
+#: The descriptor number an engine is told to read its session credential from. Agreed with the
+#: frontend's own ``--token-fd`` argument rather than discovered, and documented in both places.
+_TOKEN_DESCRIPTOR = 3
+
+
+def _wants_token_descriptor(args: list[str]) -> bool:
+    """Whether this engine was told to read its credential from a descriptor."""
+    return "--token-fd" in args
 
 
 def cmd_serve(argv: list[str]) -> int:
@@ -832,26 +951,71 @@ def cmd_serve(argv: list[str]) -> int:
     if not context:
         print(f"{model['where']}: not part of this launch's plan; nothing to serve")
         return 0
+
     engine = (plan.get("engines") or {}).get(model["id"])
     if engine:
         validate_launch(model, engine)
     token = api_token(model, plan)
-    args = engine_args(model, context, parallel, token, engine["allocation"] if engine else None)
+    if engine:
+        # Command construction belongs to the adapter: llama.cpp is a downloaded binary taking
+        # GGML flags, MLX is an interpreter running a frontend that supervises a worker. Everything
+        # after this point - the listener probe, the signal-forwarding supervisor, the receipt - is
+        # identical for both, which is the reason the split is worth having.
+        adapter = capacity_adapter(engine["engine_kind"])
+        artifact = adapter.validate_artifact(model, read_lock(Path(model["lock_path"])))
+        runtime_description = adapter.provision(install=True)
+        launch = adapter.launch(model, artifact, runtime_description, engine, token)
+        args = list(launch.argv)
+        environment = dict(launch.environment)
+        host, port = launch.host, launch.port
+        secret_indices = set(launch.secret_argument_indices)
+    else:
+        context, parallel = lane_sizes(model, plan)
+        args = engine_args(
+            model, context, parallel, token, engine["allocation"] if engine else None
+        )
+        environment = engine_environment()
+        host, port = engine_host(), engine_port(model)
+        secret_indices = {args.index("--api-key") + 1} if "--api-key" in args else set()
     print(
         f"{model['where']}: serving {size_text(total_bytes(read_lock(Path(model['lock_path']))))} "
-        f"on port {model['install'].get('port') or 8181} (ctx={context}, slots={parallel})",
+        f"on port {port} (ctx={context}, slots={parallel})",
         flush=True,
     )
     receipt = readiness_path(runtime, model["id"])
     receipt.unlink(missing_ok=True)
-    bind = os.environ.get("LOCAL_MPS_BIND", "").strip()
-    host = bind if bind and bind != DEFAULT_BIND else "127.0.0.1"
-    port = int(model["install"].get("port") or 8181)
     if probe_port(port, host):
         raise EngineError(
             f"{model['id']}: engine listener is already occupied; stop that listener before launch"
         )
-    child = subprocess.Popen(args, env=engine_environment())
+    # Engines that name a token descriptor get one; llama.cpp only understands --api-key, so the
+    # existing behaviour is preserved there rather than silently changed under a working engine.
+    credential_pipe: tuple[int, int] | None = None
+    if _wants_token_descriptor(args):
+        credential_pipe = os.pipe()
+        os.set_inheritable(credential_pipe[0], True)
+        with os.fdopen(credential_pipe[1], "w", closefd=True) as sink:
+            sink.write(token + "\n")
+        # The write end is closed here, so the child reads the value and then EOF: a credential
+        # that stays open on a pipe would keep the child waiting on a descriptor the parent has
+        # finished with.
+        token = ""
+    if credential_pipe is not None:
+        read_fd = credential_pipe[0]
+
+        def _move_credential() -> None:  # pragma: no cover - runs between fork and exec
+            # preexec_fn executes in the child only. Renumbering here rather than in the parent is
+            # the difference between handing the engine fd 3 and hijacking the supervisor's own.
+            os.dup2(read_fd, _TOKEN_DESCRIPTOR)
+            if read_fd != _TOKEN_DESCRIPTOR:
+                os.close(read_fd)
+
+        child = subprocess.Popen(
+            args, env=environment, pass_fds=(read_fd,), preexec_fn=_move_credential
+        )
+        os.close(read_fd)
+    else:
+        child = subprocess.Popen(args, env=environment)
 
     def forward(signum, _frame):
         if child.poll() is None:
@@ -869,9 +1033,12 @@ def cmd_serve(argv: list[str]) -> int:
                 "fingerprint": engine["fingerprint"],
                 "snapshot_id": engine["snapshot_id"],
                 "startup": startup,
-                "allocation_args": allocation_args(
-                    engine["allocation"], context, parallel, server=True
-                ),
+                # The exact argv, redacted where the adapter said a secret sits. A receipt that
+                # replayed a credential would be a credential on disk.
+                "allocation_args": [
+                    "<redacted>" if index in secret_indices else value
+                    for index, value in enumerate(args)
+                ],
                 "serving_profile_id": engine["serving_profile_id"],
             }
             write_private_json(receipt, document)
@@ -896,6 +1063,33 @@ def readiness_path(runtime: Path, model_id: str) -> Path:
     if not re.fullmatch(r"[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+", model_id):
         raise EngineError("invalid local engine identifier")
     return runtime / "local-engines" / f"{model_id.replace('/', '__')}.json"
+
+
+def capacity_adapter(kind: str):
+    """The adapter for one engine kind, reached through the resolver's registry.
+
+    Imported inside the function because :mod:`capacity` imports this module at module scope; a
+    top-level import here would be a cycle, and the cycle is the price of one shared registry.
+    """
+    if __package__:
+        from . import capacity
+    else:
+        import capacity
+    return capacity.adapter_for(kind)
+
+
+def capacity_identity(binary: Path) -> dict[str, Any]:
+    """The pinned engine's self-reported identity, for the adapter and the resolver alike.
+
+    Reached through :mod:`capacity` on purpose: parsing ``--version`` output is the resolver's
+    existing job, and an adapter that re-implemented the regex would be a second opinion on what
+    "same build" means.
+    """
+    if __package__:
+        from . import capacity
+    else:
+        import capacity
+    return capacity.engine_identity(binary)
 
 
 def validate_launch(model: dict[str, Any], engine: dict[str, Any]) -> None:
@@ -953,44 +1147,302 @@ def validate_properties(props: dict[str, Any], engine: dict[str, Any]) -> None:
         raise EngineError("the running engine differs from its resolved allocation")
 
 
+#: What a ``/props`` body may weigh. This used to be a bare 65536 repeated at the read and the
+#: comparison, and it is too small to be safe: ``/props`` embeds the model's entire chat template,
+#: so a template large enough to cross this bound makes a perfectly healthy engine report
+#: "exceeds the supported metadata size" and refuse to start. Raised well clear of any real
+#: template, still bounded so a runaway response cannot exhaust the launcher's memory.
+LOCAL_PROPS_BYTES = 1024 * 1024
+
+
+class StreamingCanaryScanner:
+    """The minimum SSE reader the canary needs, reporting through the shared vocabulary.
+
+    Deliberately not a copy of the proxy's ``UsageScanner``: the launcher has no aiohttp and must
+    not gain one. What the two share is the *classification*, which is the entire point of
+    ``local_engine_contract`` - a canary that invented its own idea of "usable" would reproduce the
+    drift this change set exists to remove.
+    """
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.content_chars = 0
+        self.reasoning_chars = 0
+        self.tool_calls = 0
+        self.terminated = False
+        self.saw_error_object = False
+        self.saw_framing_failure = False
+        self.overflowed = False
+
+    def feed(self, chunk: bytes) -> None:
+        self.buffer += chunk
+        if len(self.buffer) > LOCAL_PROPS_BYTES:
+            self.buffer.clear()
+            self.overflowed = True
+            self.saw_framing_failure = True
+            return
+        while True:
+            raw, separator, rest = bytes(self.buffer).partition(b"\n\n")
+            if not separator:
+                return
+            self.buffer = bytearray(rest)
+            self._event(raw)
+
+    def finish(self) -> None:
+        if not self.overflowed and self.buffer:
+            self._event(bytes(self.buffer))
+        self.buffer.clear()
+
+    def _event(self, raw: bytes) -> None:
+        for line in raw.split(b"\n"):
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if not data:
+                continue
+            if data == b"[DONE]":
+                self.terminated = True
+                continue
+            try:
+                event = json.loads(data)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.saw_framing_failure = True
+                continue
+            if not isinstance(event, dict):
+                self.saw_framing_failure = True
+                continue
+            if event.get("error") is not None:
+                self.saw_error_object = True
+            for choice in event.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                source = delta if isinstance(delta, dict) else choice.get("message")
+                if not isinstance(source, dict):
+                    continue
+                content = source.get("content")
+                if isinstance(content, str):
+                    self.content_chars += len(content)
+                reasoning = source.get("reasoning_content")
+                if isinstance(reasoning, str):
+                    self.reasoning_chars += len(reasoning)
+                calls = source.get("tool_calls")
+                if isinstance(calls, list):
+                    self.tool_calls += sum(1 for item in calls if isinstance(item, dict))
+
+    def outcome(self) -> str:
+        return str(
+            classify(
+                StreamEvidence(
+                    content_chars=self.content_chars,
+                    reasoning_chars=self.reasoning_chars,
+                    tool_calls=self.tool_calls,
+                    terminated=self.terminated,
+                    saw_error_object=self.saw_error_object,
+                    saw_framing_failure=self.saw_framing_failure,
+                )
+            )
+        )
+
+
+#: A synthetic prompt for the compute canary. Public and synthetic on purpose: it has to be the same
+#: bytes on every launch so a pass means "this engine computed", not "this prompt happened to work".
+CANARY_PROMPT = "Reply with exactly the word: ready"
+CANARY_OUTPUT_TOKENS = 8
+#: How long the canary may take before the launch is treated as failed. Loading a multi-gigabyte
+#: model and running one short generation on unified memory that may already be oversubscribed is
+#: slow work, so this bounds a hang rather than a slow start.
+CANARY_TIMEOUT_SECONDS = float(os.environ.get("LOCAL_MPS_CANARY_TIMEOUT_SECONDS", "120"))
+
+
+class LocalModelCanary:
+    """One authenticated generation, run before readiness is announced.
+
+    Metadata readiness was the bug. ``/props`` answers from the HTTP layer, so a backend whose Metal
+    allocations had already failed still reported a model, a context length, and a slot count - and
+    the launcher published a receipt, Kimi staged against it, and every subsequent request failed
+    while the session retried forever. Nothing short of asking the model to produce a token
+    distinguishes those two states.
+
+    The canary deliberately does not assert an answer string. What is being tested is that compute
+    works, not that the quant reproduces a particular completion, and a pinned expected string
+    would fail launches for reasons that have nothing to do with the engine.
+    """
+
+    def __init__(self, host: str, port: int, token: str, model: dict[str, Any]) -> None:
+        self.host = host
+        self.port = port
+        self.token = token
+        self.model = model
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}/v1/chat/completions"
+
+    @property
+    def declares_tools(self) -> bool:
+        return "tool_use" in (self.model.get("capabilities") or [])
+
+    def payload(self) -> dict[str, Any]:
+        sampling = (self.model.get("install") or {}).get("sampling") or {}
+        body: dict[str, Any] = {
+            "model": self.model["model"],
+            "messages": [{"role": "user", "content": CANARY_PROMPT}],
+            "max_tokens": CANARY_OUTPUT_TOKENS,
+            "stream": True,
+            "temperature": sampling.get("temperature", 0.0),
+            # Deterministic where the engine supports it: the point is a token out of the model,
+            # and a creative sampler can decline to produce one on a run that is otherwise fine.
+            "seed": 0,
+        }
+        if "top_p" in sampling:
+            body["top_p"] = sampling["top_p"]
+        # Thinking is disabled through the mechanism the pinned engine documents rather than by
+        # ignoring the capability: a reasoning block with no answer behind it classifies as
+        # reasoning_only, which is unusable, so a canary that left thinking on could fail a healthy
+        # engine. The field is the one llama.cpp's server honours for chat templates that gate it.
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+        return body
+
+    def request(self, payload: dict[str, Any] | None = None) -> urllib.request.Request:
+        body = json.dumps(
+            payload or self.payload(), separators=(",", ":"), allow_nan=False
+        ).encode()
+        return urllib.request.Request(
+            self.url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
+        )
+
+    def _generate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run one streaming completion and classify what came back."""
+        scanner = StreamingCanaryScanner()
+        with urllib.request.urlopen(
+            self.request(payload), timeout=CANARY_TIMEOUT_SECONDS
+        ) as response:
+            if response.status != 200:
+                raise EngineError(f"canary generation returned HTTP {response.status}")
+            for chunk in iter(lambda: response.read(4096), b""):
+                scanner.feed(chunk)
+        scanner.finish()
+        return {"outcome": scanner.outcome(), "content_chars": scanner.content_chars}
+
+    def _tool_payload(self) -> dict[str, Any]:
+        body = self.payload()
+        body["messages"] = [
+            {"role": "user", "content": "What is 26 minus 19? Use the calculator tool."}
+        ]
+        body["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "calculator",
+                    "description": "Evaluate an arithmetic expression.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"expression": {"type": "string"}},
+                        "required": ["expression"],
+                    },
+                },
+            }
+        ]
+        # Forcing the call takes the model's discretion out of it, so a miss here is about the
+        # template and the parser rather than about whether this quant felt like calling a tool.
+        body["tool_choice"] = "required"
+        body["max_tokens"] = 64
+        return body
+
+    def run(self) -> dict[str, Any]:
+        """Prove the engine can compute, and that it can do so in every mode it claims.
+
+        Returns a record rather than raising on an unusable answer where possible, so the caller
+        attaches the reason to a failed launch instead of losing it to a traceback.
+        """
+        record = self._generate(self.payload())
+        if record["outcome"] != "content":
+            raise EngineError(
+                "the engine answered metadata but its compute canary produced "
+                f"{record['outcome']!r}"
+            )
+        if self.declares_tools:
+            # The only thing that makes a declared tool_use capability mean anything. A server
+            # without the checkpoint's template applied still accepts a `tools` array and returns
+            # prose, which at the transport layer is a perfectly successful completion.
+            tool_record = self._generate(self._tool_payload())
+            if tool_record["outcome"] != "tool_only":
+                raise EngineError(
+                    "the model declares tool_use but the engine returned "
+                    f"{tool_record['outcome']!r} for a forced tool call, so the chat template is "
+                    "not being applied"
+                )
+            record["tool_canary"] = tool_record["outcome"]
+        return record
+
+
 def wait_engine_ready(
     child: Any, model: dict[str, Any], engine: dict[str, Any], token: str
 ) -> dict[str, int | None]:
-    """Do not stage Kimi until this owned child has loaded and satisfied its contract."""
+    """Do not stage Kimi until this owned child has loaded *and* actually computed.
+
+    Metadata validation is a precondition, never the verdict: see :class:`LocalModelCanary`.
+    """
     if __package__:
         from . import host_caps
     else:
         import host_caps
-    port = int(model["install"]["port"])
-    bind = os.environ.get("LOCAL_MPS_BIND", "").strip()
-    host = bind if bind and bind != DEFAULT_BIND else "127.0.0.1"
+    host = engine_host()
     req = urllib.request.Request(
-        f"http://{host}:{port}/props", headers={"Authorization": f"Bearer {token}"}
+        f"http://{host}:{engine_port(model)}/props",
+        headers={"Authorization": f"Bearer {token}"},
     )
     while child.poll() is None:
         try:
             with urllib.request.urlopen(req, timeout=5) as response:
-                data = response.read(65537)
-                if len(data) > 65536:
+                data = response.read(LOCAL_PROPS_BYTES + 1)
+                if len(data) > LOCAL_PROPS_BYTES:
                     raise EngineError("engine properties exceed the supported metadata size")
                 props = json.loads(data)
         except (OSError, ValueError):
             time.sleep(0.1)
             continue
         validate_properties(props, engine)
+        # The engine has now proven it is the process the plan describes. Ask it to compute.
+        try:
+            canary = LocalModelCanary(host, engine_port(model), token, model).run()
+        except EngineError as exc:
+            # A canary failure is a failed launch, not a degraded start: terminating only this
+            # attempt's child is what keeps the occupied-listener protections meaningful and stops
+            # a receipt ever reaching the launcher for a backend that cannot serve.
+            raise EngineError(f"{model['id']}: {exc}") from exc
+        except (OSError, urllib.error.URLError) as exc:
+            raise EngineError(
+                f"{model['id']}: the compute canary could not reach the engine ({exc})"
+            ) from exc
+        if child.poll() is not None:
+            raise EngineError("the owned engine exited during readiness validation")
         try:
             footprint = host_caps.process_memory_bytes(child.pid) or None
             available = host_caps.available_memory_bytes() or None
         except (OSError, ValueError):
             footprint, available = None, None
-        if child.poll() is not None:
-            raise EngineError("the owned engine exited during readiness validation")
-        return {
+        ready = {
             "resident_bytes": footprint,
             "available_host_bytes": available,
             "context_tokens": engine["context_tokens"],
             "sequences": engine["sequences"],
+            "canary_outcome": canary["outcome"],
+            "canary_content_chars": canary["content_chars"],
         }
+        # Recorded only when the model claimed the capability, so an absent key and a failed probe
+        # are different facts in the receipt rather than the same-looking one.
+        if "tool_canary" in canary:
+            ready["tool_canary"] = canary["tool_canary"]
+        return ready
     raise EngineError(f"{model['id']}: the engine exited before readiness")
 
 
@@ -1057,7 +1509,7 @@ def cmd_check(argv: list[str]) -> int:
     if state == READY:
         # A verified weight set and a dead process are different answers, and only the second
         # one means the operator's first request is going to fail.
-        port = int((model.get("install") or {}).get("port") or 0) or 8181
+        port = engine_port(model)
         note = ", engine listening" if probe_port(port) else ", engine not up yet"
     print(f"{model['where']}: {state}{note}")
     return 0

@@ -107,6 +107,49 @@ requirements determine which models are offered. Eligible models use full native
 windows and explicit provider-owned slots; available RAM, RSS and projected memory
 must not resize or limit them. Allocation and paging belong to the OS/backend.
 
+**Engine selection is a manifest fact, never a runtime decision.** A version-3
+managed provider declares one or more named `[execution.profiles.<id>]` tables,
+each naming its own `engine`, and a version-3 model selects exactly one with
+`[serving] profile`. A provider offering several profiles declares no default, and a
+model that omits `[serving]` fails to parse rather than receiving whichever profile
+sorted first. Never add automatic backend, weight or precision selection. Dispatch
+is by declared engine kind through `tools/local_engines/`; an adapter owns seven
+operations (provision, identity, artifact validation, launch, status normalisation,
+status verification, compute canary) and owns no policy — the resolver decides
+windows, slots and residency, and the adapter reports whether the engine agrees.
+Do not make an engine implement a harness endpoint to satisfy the contract:
+llama.cpp answers `/props` and is normalised through its adapter. `build_commit` is
+optional in the plan because a library-resolved engine has no build number; use the
+structured `identity` record instead.
+
+**Readiness is a computation, not an endpoint reply.** Publish an engine's
+readiness receipt only after an authenticated generation has produced content, and
+after a model declaring `tool_use` has returned a tool call for a forced one.
+Assert no specific answer string. A token count must come from the same
+chat-preparation path that generation uses. `proxy/local_engine_contract.py` is the
+single standard-library vocabulary for completion outcomes because the launcher,
+the proxy and the worker all read it and only the proxy may have aiohttp — do not
+fork that vocabulary into a second definition. Authority is split: the proxy decides
+whether the client received a usable completion, the engine decides whether it is
+fatally broken, and a healthy metadata observation must never clear a latched
+failure. Latch only on real damage (in-band error objects, framing failures), never
+on an empty or truncated answer, and refuse a latched engine before it reaches the
+wire. Never introduce a wall-clock cap on a local generation to fix a hang: a
+slow-but-healthy native-context prefill is the exact thing such a cap would kill.
+Progress-based leases and attempt bounds are the shape, and both stay disabled
+until native measurement selects a value.
+
+**MLX specifics.** Its wired-limit, cache-limit and memory counters are
+process-global with no device or scope argument, so one engine per process is what
+makes a bounded-wiring split meaningful, and the frontend must be a separate
+process from the executor so status and counting stay answerable during a
+generation. Process isolation guarantees listener liveness, not GPU reference
+release — the worker still owns synchronisation before declaring a slot free. MLX
+wheels require macOS 14+, which is a floor of the dependency set. Provision into
+`.local/runtimes/mlx/<identity>/` atomically, install only with `--require-hashes`,
+never into the operator's Python, and never treat a directory lacking its completion
+marker as installed.
+
 When changing model, provider, concurrency, context, or proxy behavior:
 - preserve compliance with every rule the selected providers publish, and keep
   the resolver's derived limits the largest those rules allow rather than
