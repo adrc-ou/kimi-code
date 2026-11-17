@@ -1,0 +1,30 @@
+# gitleaks reads this file from the repository root, and it is the only suppression mechanism this
+# repository uses on purpose: a `.gitleaks.toml` - even one carrying nothing but a `title` - replaces
+# gitleaks' embedded rule set in v8, so an allowlist-only config silently disables the scan. Verified
+# against gitleaks 8.30.1: with a minimal config present, a planted `github-pat` stops being
+# reported. An entry here is one finding, keyed to the commit, file, rule and line that produced it,
+# and it exempts nothing else - same rules, same files, any other line still fails the job.
+#
+# Regenerating tests/fixtures/local-inference/*.json with
+# tools/capture_local_inference_references.py moves these lines and rewrites their commits, so the
+# security job will name the new fingerprints in its log and they belong here. Add a fingerprint only
+# for a finding you have confirmed was never a live credential.
+#
+# The six below are `"credential": "default__qwen3"` in the two captured NRP-only plans. That field
+# states *which* provider credential a lane is metered under - the name of a file the launcher
+# generates into the instance runtime directory and mounts into model-proxy alone, from
+# [credential.*] in providers/nrp/provider.toml. The identifier is also part of the metering key
+# `nrp/default__qwen3/Qwen3.8 Flash Next` quoted throughout those plans' own guidance text, so it
+# cannot be renamed to dodge the rule. The secret itself never reaches a plan.
+e23a17e6629dd904fab34b72849dfb9fbc1076c4:tests/fixtures/local-inference/nrp-only-primary.json:generic-api-key:57
+e23a17e6629dd904fab34b72849dfb9fbc1076c4:tests/fixtures/local-inference/nrp-only-primary.json:generic-api-key:93
+e23a17e6629dd904fab34b72849dfb9fbc1076c4:tests/fixtures/local-inference/nrp-only-primary.json:generic-api-key:129
+e23a17e6629dd904fab34b72849dfb9fbc1076c4:tests/fixtures/local-inference/nrp-only-long.json:generic-api-key:57
+e23a17e6629dd904fab34b72849dfb9fbc1076c4:tests/fixtures/local-inference/nrp-only-long.json:generic-api-key:93
+e23a17e6629dd904fab34b72849dfb9fbc1076c4:tests/fixtures/local-inference/nrp-only-long.json:generic-api-key:129
+#
+# `KIMI_WEB_TOKEN` in `.env.example` as it stood in c28bbad: the documented placeholder there was
+# shaped like the provider's real key format, which is what `generic-api-key` reports. The tree no
+# longer carries that value, so this is history alone, and history is never rewritten here
+# (AGENTS.md: "Never rewrite or delete user commits").
+c28bbada2ba35063a284c96d095d014f013cc1e4:.env.example:generic-api-key:5

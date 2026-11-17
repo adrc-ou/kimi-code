@@ -172,6 +172,19 @@ else:
 '''
 config = base / "extension-volume-test.json"
 compose = ["docker", "compose", "-p", project, "-f", str(config)]
+
+
+def run_service(*extra, stdin=None):
+    """One `compose run`, announced before it starts.
+
+    Seven containers share the single `runtime` label this check prints, so without a line per
+    invocation a failure says only that the check died - and the daemon's reason for refusing a
+    container never reaches the job log at all.
+    """
+    print("  run " + " ".join(extra), flush=True)
+    subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", *extra], stdin=stdin, check=True)
+
+
 try:
     for attempt in range(4):
         prepare(workspace, base / "extension-approval.json", state, output)
@@ -196,15 +209,13 @@ try:
         }}
         config.write_text(json.dumps(fragment))
         with (state / "extension-snapshot.tar").open("rb") as archive:
-            subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", SERVICE],
-                           stdin=archive, check=True)
+            run_service(SERVICE, stdin=archive)
         # Delete the host bytes before creating the consumer: no snapshot lookup can succeed.
         shutil.rmtree(state / "extension-snapshot")
         (state / "extension-snapshot.tar").unlink()
-        subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", "extension-test"], check=True)
-    subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", SERVICE,
-                    "--gid", "1000", "--clear"], stdin=subprocess.DEVNULL, check=True)
-    subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", "extension-empty-check"], check=True)
+        run_service("extension-test")
+    run_service(SERVICE, "--gid", "1000", "--clear", stdin=subprocess.DEVNULL)
+    run_service("extension-empty-check")
 finally:
     if config.exists():
         subprocess.run([*compose, "down", "--volumes"], check=True)

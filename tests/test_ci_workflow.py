@@ -7,7 +7,11 @@ key is worse than it looks — GitHub validates the whole file, so one bad step 
 job down rather than just the new one.
 """
 
+import ast
+import json
+import os
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -182,6 +186,138 @@ class SharedActionPinTests(unittest.TestCase):
         self.assertEqual(
             len(everywhere), 1, f"jobs disagree on the checkout pin: {sorted(pins.items())}"
         )
+
+
+#: Directories whose contents are never import candidates: build output, dependencies, and the
+#: scratch a running session leaves beside the checkout.
+SKIP_DIRS = frozenset({".git", ".local", ".venv", "node_modules", "__pycache__", ".ruff_cache"})
+
+#: Distribution names that differ from the module they install. Everything else is covered by PEP
+#: 503 normalisation (`aiohttp` installs `aiohttp`), and an import that matches neither the table
+#: nor the job's install step is exactly what this reports.
+DISTRIBUTION_ALIASES = {"yaml": "pyyaml"}
+
+
+def canonical(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def repo_module_names() -> set:
+    """Every module and package name this checkout itself provides.
+
+    The suites reach these through ``sys.path`` entries rather than imports of the repo, so
+    ``tools/local_engines/mlx_worker.py`` arrives as a bare ``import mlx_worker`` and is no more
+    third-party than ``import yaml`` is not.
+    """
+    names = set()
+    for base, dirs, files in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            if name != "__init__.py":
+                names.add(name[:-3])
+            # Every directory above a module is itself importable: `tests/helpers.py` is reached as
+            # both `import helpers` and `from tests.helpers import ...`, and the suites use each.
+            names.update(
+                part for part in Path(base).relative_to(ROOT).parts if not part.startswith(".")
+            )
+    return names
+
+
+def hard_imports(path: Path) -> set:
+    """Module-scope imports that run before any skip can take effect.
+
+    Only a bare ``import`` statement at the top level qualifies. An import inside a ``try`` is a
+    suite saying "this is optional here" - which is how ``test_mcp_probe`` and the MLX tests survive
+    a runner without the SDK or the wheels - and one inside a module-level ``if`` is gated on
+    something the file already tests, the same way an import in a function body waits for a test
+    that may never run. Missing a gated import costs nothing here; demanding an install for one
+    would be a false failure, which is the only way this check can make CI worse.
+    """
+    found: set[str] = set()
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.ImportFrom) and node.level:
+            continue
+        for alias in node.names:
+            dotted = node.module if isinstance(node, ast.ImportFrom) else alias.name
+            found.add(dotted.split(".")[0])
+    return found
+
+
+def suite_sources() -> list:
+    roots = [ROOT / "tests", *sorted((ROOT / "modules").glob("*/tests"))]
+    return [path for root in roots if root.is_dir() for path in sorted(root.glob("*.py"))]
+
+
+class TestDependencyCoverage(unittest.TestCase):
+    """A test file cannot import what its job never installed.
+
+    ``unittest discover`` turns that into an import error for the file, which is an error for the
+    step, which is a red job whose message names neither the missing package nor the workflow line
+    that should install it: ``tests/test_ci_workflow.py``'s own ``import yaml`` kept ``static``
+    failing for four runs, and the file that exists to catch a broken workflow was the thing broken.
+    """
+
+    def installed(self, job: dict) -> set:
+        """Requirements the job's ``pip install`` steps make available, `-r` files resolved."""
+        names: set[str] = set()
+        for step in job.get("steps") or []:
+            script = step.get("run")
+            if not script or "pip install" not in script:
+                continue
+            for line in script.splitlines():
+                line = line.strip()
+                if not line.startswith("pip install"):
+                    continue
+                for token in line.split()[2:]:
+                    if token.startswith("-r"):
+                        continue
+                    if token.endswith(".in") or token.endswith(".txt"):
+                        requirement = ROOT / token
+                        text = (
+                            requirement.read_text(encoding="utf-8")
+                            if requirement.is_file()
+                            else ""
+                        )
+                        for pinned in text.splitlines():
+                            head = re.match(r"([A-Za-z0-9._-]+)\s*==", pinned.strip())
+                            if head:
+                                names.add(canonical(head.group(1)))
+                        continue
+                    head = re.match(r"([A-Za-z0-9._-]+)", token)
+                    if head:
+                        names.add(canonical(head.group(1)))
+        return names
+
+    def test_every_hard_test_import_is_installed_by_the_job_that_runs_it(self):
+        local = repo_module_names()
+        wanted: dict[str, set] = {}
+        for path in suite_sources():
+            for name in hard_imports(path):
+                if name in sys.stdlib_module_names or name in local:
+                    continue
+                wanted.setdefault(canonical(DISTRIBUTION_ALIASES.get(name, name)), set()).add(
+                    path.relative_to(ROOT).as_posix()
+                )
+        self.assertTrue(wanted, "no third-party import found to check; the suites changed shape")
+        for path in WORKFLOWS:
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for job_id, job in jobs(document).items():
+                script = json.dumps(job or {})
+                if "unittest discover" not in script:
+                    continue
+                available = self.installed(job or {})
+                for distribution, sources in sorted(wanted.items()):
+                    with self.subTest(workflow=path.name, job=job_id, distribution=distribution):
+                        self.assertIn(
+                            distribution,
+                            available,
+                            f"{job_id} runs {sorted(sources)} which imports {distribution!r}, but "
+                            f"its pip steps install only {sorted(available)}",
+                        )
 
 
 if __name__ == "__main__":

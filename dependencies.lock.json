@@ -33,8 +33,8 @@
     "proxy/requirements.lock": "sha256:476e040b96fd0542472a586a144c094c2136ae724ad4d5e8951b0f1293e61810",
     "container/package-lock.json": "sha256:7488f388ed9b9ba3e57a177c493fce73ef735fbb0b1b030a03efb82a8cbd1a8f",
     "container/serena.lock": "sha256:cb1f3d408c0a91f34c8b3701cba1e789312f91e8f72880b42bf5dd1d197e1001",
-    "proxy/Dockerfile": "sha256:99512e5189c0f6b9836789f4349eb20cbda161ebd0791d6c8c9f0c1207ef229b",
-    "search-adapter/Dockerfile": "sha256:5d9faade02ae659211d07995a026d8dc6b36fa247381145aa42a368407925e7d",
+    "proxy/Dockerfile": "sha256:46f425519a622dad59000c3219aa9811815167678013fa01a06988a560404b6e",
+    "search-adapter/Dockerfile": "sha256:aaf1f2195d8fb3c5b1dd97574ba3fc9f25412b4928c1661e578b02da99e1a5c6",
     "providers/local_mps/requirements-mlx.lock": "sha256:e10be444ae8444c729989e952de278bc0c411c755cea51ffefc547c29aa9e218",
     "providers/local_mps/requirements-mlx.in": "sha256:f9a648b373798cc4e874494964ac1423b1ec70171b050e5b4cbed0e0fd89b530"
   }

@@ -409,9 +409,20 @@ class RealBundleTests(unittest.TestCase):
     def test_the_anchors_find_every_literal_in_the_shipped_build(self):
         self.assertEqual(set(self.literals()), set(pc.kimi_literal_names()))
 
+    #: Which variable of the built-in prompt carries the operating contract. Upstream moved it:
+    #: the shipped template now ends in ``${agents_section}``, a "# Project information" block that
+    #: interpolates ``${agents_md}`` itself, while the same template context still binds both names
+    #: — so the harness files that reference ``${agents_md}`` keep working and only one of the two
+    #: appears in the built-in prompt. Either satisfies this test, which is about the contract
+    #: arriving unsubstituted rather than about a name upstream is free to rename.
+    CONTRACT_VARIABLES = ("${agents_section}", "${agents_md}")
+
     def test_the_built_in_prompt_arrives_as_a_template_not_a_finished_string(self):
         text = self.literals()["kimi.system_default"]
-        self.assertIn("${agents_md}", text)
+        self.assertTrue(
+            any(name in text for name in self.CONTRACT_VARIABLES),
+            f"built-in prompt carries neither {' nor '.join(self.CONTRACT_VARIABLES)}",
+        )
         self.assertIn("${skills_section}", text)
         self.assertIn("system-reminder", text)
 

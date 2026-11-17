@@ -18,8 +18,11 @@ jobs:
         with:
           python-version: "3.13"
       # aiohttp comes from the proxy's own pin rather than a second copy of the version, so
-      # CI cannot drift onto a version the shipped image never had.
-      - run: pip install -r proxy/requirements.in ruff==0.13.2
+      # CI cannot drift onto a version the shipped image never had. PyYAML is what
+      # tests/test_ci_workflow.py reads the workflow with: a test whose import is missing fails as
+      # an import error, which takes the whole discover step down, so the pin belongs here where
+      # the suite's other non-stdlib import is already named.
+      - run: pip install -r proxy/requirements.in PyYAML==6.0.3 ruff==0.13.2
       - run: |
           python -m unittest discover -s tests -v
           for suite in modules/*/tests; do
@@ -260,7 +263,8 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
-      - run: pip install -r proxy/requirements.in ruff==0.13.2
+      # The same suite and the same two non-stdlib imports as the static job; see the pin there.
+      - run: pip install -r proxy/requirements.in PyYAML==6.0.3 ruff==0.13.2
       - run: python -m unittest discover -s tests
       # The host floor the MLX wheels impose. Every published mlx wheel is tagged macosx_14_0 or
       # newer, so this is a property of the dependency set and not a preference; a runner below it
