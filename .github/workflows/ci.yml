@@ -188,8 +188,22 @@ jobs:
       - id: kimi
         env:
           KIMI_ASSET: '${{ matrix.asset }}'
+          # api.github.com answers an unauthenticated caller at 60 requests/hour per IP, and every
+          # hosted runner shares one, so a resolution that succeeded in an earlier run can fail in
+          # this one with nothing changed in this repository - which is exactly what took this step
+          # down. scripts/select_versions.py already reads this name, sends it only to the
+          # api.github.com host it builds itself, and reads nothing the public release listing does
+          # not already show; the per-job token only raises the ceiling to that job's own budget.
+          GITHUB_RELEASES_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
         run: |
-          PYTHONPATH=scripts python - <<'PY' >>"${GITHUB_OUTPUT}"
+          # This step's stdout becomes its outputs, and the selector prints `version=` and `url=`
+          # before it fetches the checksum, so the result is staged and committed only on success -
+          # otherwise a failure leaves half a set of keys on the step. stderr is kept because an
+          # annotation is the part of this message that reaches anyone outside the repository log.
+          status=0
+          resolved="$(mktemp)"
+          reason="$(mktemp)"
+          PYTHONPATH=scripts python - >"${resolved}" 2>"${reason}" <<'PY' || status=$?
           import os
           from select_versions import fetch_asset_checksum, kimi_catalog
           catalog, latest = kimi_catalog(os.environ["KIMI_ASSET"])
@@ -198,6 +212,13 @@ jobs:
           print(f"url={selected['url']}")
           print(f"sha256={fetch_asset_checksum(selected)}")
           PY
+          if [ "${status}" -ne 0 ]; then
+            printf '::error::Kimi release metadata for %s could not be resolved (exit %s): %s\n' \
+              "${KIMI_ASSET}" "${status}" "$(tr '\n' ' ' <"${reason}" | tail -c 700)"
+            cat "${reason}" >&2
+            exit "${status}"
+          fi
+          cat "${resolved}" >>"${GITHUB_OUTPUT}"
       - name: Build the agent image
         run: |
           # Only the runner's own architecture is loaded into Docker. A foreign-platform image

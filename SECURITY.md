@@ -188,7 +188,13 @@ agent image builds on both platforms and leaves it untagged, so scanning it is a
 `vulnerability-exceptions.json` carries all five of `package`, `vulnerability`,
 `owner`, `reason`, and `expires`, and fails when `expires` is earlier than today.
 The boundary is inclusive: an exception dated today is still valid today and fails
-tomorrow, so renew or remove it before the expiry date, not on it.
+tomorrow, so renew or remove it before the expiry date, not on it. The same file is
+what `scripts/generate_sbom.sh` feeds to Grype as its ignore list, so an entry is
+the only way a finding stops failing the `security` job - and because the gate
+reads it, an accepted risk expires on schedule rather than lasting until someone
+remembers to delete it. Grype's exit 2 is the verdict (`--fail-on high` met) and
+exit 1 is a broken scan; the script reports which one happened instead of leaving
+both as a bare number.
 
 ## Reporting
 
