@@ -184,6 +184,21 @@ image you ship and review the Grype result; the `security` CI job currently does
 two Python service images, which are the only images it tags - `build-agent` verifies that the
 agent image builds on both platforms and leaves it untagged, so scanning it is a manual step.
 
+Before pushing a change to a base digest, a dependency pin, or the exception file, run
+`python3 scripts/check_vulnerabilities.py`. It reproduces that gate's decision without Docker:
+it reads which images the `security` job builds straight out of the workflow, scans each
+Dockerfile's **final-stage base by digest** with the same Grype version, flags and database the
+job uses, credits the `apk add --upgrade` lines the Dockerfile actually performs, checks every
+pin in the locks those images install against OSV, and subtracts
+`vulnerability-exceptions.json`. It also prints which pins have fallen behind their tag;
+the weekly Dependency review job runs that part alone.
+
+The reason it takes its targets from the files rather than from a person is documented by its
+own history: a scan of the floating `python:3.14-alpine` tag reported CPython 3.14.10, while the
+Dockerfiles pinned a digest holding 3.14.8 with CVE-2026-115557 at Critical and CVE-2026-107891
+at High. Scanning the tag looked authoritative and was not. If Grype is not on `PATH` the script
+says so and fails rather than reporting a clean run it did not perform.
+
 `scripts/check_locks.py` enforces that every entry in
 `vulnerability-exceptions.json` carries all five of `package`, `vulnerability`,
 `owner`, `reason`, and `expires`, and fails when `expires` is earlier than today.

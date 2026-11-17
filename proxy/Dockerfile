@@ -1,5 +1,12 @@
 # Pin the release's multi-platform index so the build target selects a native CPU image.
-FROM python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72
+# This index is python:3.14.10-alpine. The pin before it was a 3.14.8-era index that carried
+# CVE-2026-115557 (Critical, the ssl module's compromised-certificate denylist) and CVE-2026-107891
+# (High, musl regcomp integer overflow) - neither of which any amount of scanning the floating
+# `3.14-alpine` tag would have shown, because the tag had moved ahead of the pin weeks earlier.
+# So scan the digest, never the tag: `python3 scripts/check_vulnerabilities.py` reads the digests
+# out of these files and gates on them. Raise deliberately, and re-scan the new digest in the same
+# change; `3.14.11` on 2026-12-01 will be the next reason to.
+FROM python:3.14-alpine@sha256:5862d971d1f0ae26b258cefa4e893556b1d3aba81bd2ff30888704ad378bab67
 
 # The base digest freezes Alpine 3.24's installed package set at the moment that image was built,
 # and the zlib inside it (1.3.2-r1) carries CVE-2026-4738, fixed upstream in 1.4-r0. Naming a

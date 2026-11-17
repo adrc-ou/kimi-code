@@ -17,5 +17,10 @@ jobs:
         with:
           python-version: "3.13"
       - run: python scripts/check_locks.py
+      # Informational, and it exits 0 either way: the point is to see a base pin falling behind its
+      # tag in this weekly report rather than meeting it as a failed security job. The 3.14-alpine
+      # pin sat two CPython releases behind that way, carrying a Critical nobody was looking for.
+      - name: Report base-image digest drift
+        run: python3 scripts/check_vulnerabilities.py --drift-only
       - run: npm audit --audit-level=high --prefix container
       - run: echo "Review base-image digests, source commits, Python locks, compatibility evidence, and expiring vulnerability exceptions."
