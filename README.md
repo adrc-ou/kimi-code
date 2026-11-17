@@ -562,13 +562,19 @@ The proxy prints that path on one stdout line at launch. Every event is written 
 with everything known about it - the upstream status, that status's error body, the endpoint's
 quota headers, how long the attempt ran, and an `rid=` shared by every line of one client
 request, which is what separates two sessions that were talking to the same proxy at the same
-time. Only the events in the proxy's default set also reach stdout, and their lines carry the
-same fields they always did:
+time. Only the events in the proxy's default set also reach stdout, and each of those lines
+carries the subset of its record's fields that was declared worth the screen:
 
 ```
-upstream_retry lane=long attempt=6 delay=32.5s                                    # terminal
-upstream_retry rid=9f2c1a77 lane=long attempt=6 delay=32.5s status=503 elapsed_seconds=181.3 input_bytes=1400000 priced_reservation=416922 body='{"error":"no backend capacity"}'   # file
+request_failed lane=long recovery=bb271b0450b550f1 failure=gateway_timeout failures=1 status=504 error_status=None delivered=False admission_ms=23588 header_ms=61145 hop=server:awselb/2.0;content-type:text/html elapsed_seconds=84.738                        # terminal
+2026-11-17T04:21:18.724Z rid=0d94ea32 request_failed lane=long recovery=bb271b0450b550f1 failure=gateway_timeout failures=1 status=504 error_status=None delivered=False admission_ms=23588 header_ms=61145 hop=server:awselb/2.0;content-type:text/html error='<html>\r\n<head><title>504 Gateway Time-out</title></head>…' elapsed_seconds=84.738   # file
 ```
+
+The one field held back there is the upstream's own body, which for an intermediary's error
+page is the same few hundred bytes of HTML on every attempt. `hop` says who answered and
+`status` what they said, so the terminal line reads as a diagnosis and the file keeps the
+quote. `admission_ms` and `header_ms` together split the wall clock between our gate and the
+endpoint, which is the distinction every gateway timeout turns on.
 
 Nothing is lost to that split, because the file is the superset: whatever the terminal showed,
 a grep of the file finds, plus what the endpoint actually said. To watch the whole thing

@@ -411,6 +411,31 @@ class RequestValidationTests(unittest.TestCase):
         self.assertEqual(payload["model"], SUBAGENT.model)
         self.assertEqual(payload["cache_salt"], CACHE_SALT)
 
+    def test_a_body_leaves_as_utf8_rather_than_as_escapes(self):
+        """The wire body carries the text, not an ASCII picture of it.
+
+        Escaping each non-ASCII character to a six-byte ``\\uXXXX`` roughly doubles what a
+        conversation not written in English costs to upload - measured as 10,387 bytes of growth
+        between one long-lane request arriving and it being dispatched - and buys nothing, since
+        the payload is identical either way and UTF-8 is what RFC 8259 specifies for JSON text.
+        """
+        text = "解释一下这个报错 🙏" * 200
+        inbound = json.dumps(
+            {"model": "qwen3-subagent", "messages": [{"role": "user", "content": text}]}
+        ).encode()
+
+        body = PROXY.rewrite_model(inbound, Request(), SUBAGENT)
+
+        payload = json.loads(body)
+        self.assertEqual(payload["messages"][0]["content"], text, "the same string either way")
+        self.assertNotIn(b"\\u", body, "no escape sequences on the wire")
+        self.assertIn(text.encode("utf-8")[:12], body, "the characters themselves")
+        self.assertLess(
+            len(body),
+            len(json.dumps(payload, separators=(",", ":")).encode()),
+            "and strictly fewer bytes than the escaping would have cost",
+        )
+
     def test_a_provider_that_does_not_want_the_cache_salt_gets_none(self):
         # The salt exists so a shared gateway cannot key its prompt cache on one operator's
         # content. A model server on that operator's own machine has no such cache, and an engine
@@ -2473,13 +2498,123 @@ class ProxyLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(names, frozenset({"upstream_rejected", "lane"}))
 
     async def test_an_upstream_error_body_cannot_split_a_record(self):
+        """A gateway's body is a log field like any other: bounded, escaped, and once only.
+
+        The excerpt used to be escaped where it was built and again where the record was
+        rendered, which turned each control character into the escape of its own escape - a
+        real CRLF read back as ``\\r\\n``. Only the render escapes.
+        """
         self.open()
 
-        await self.attempt(500, b"line one\nline two\n")
+        gateway_page = b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n</html>\r\n"
+        outcome = await self.attempt(504, gateway_page)
+
+        self.assertIn("\r\n", outcome.error_excerpt, "the excerpt itself stays raw text")
 
         refusals = [line for line in self.logged.splitlines() if "upstream_rejected" in line]
         self.assertEqual(len(refusals), 1, "one attempt is one line, whatever it carried")
-        self.assertIn("\\nline two", refusals[0], "the newline is escaped, not emitted")
+        self.assertIn("<html>", refusals[0])
+        self.assertIn("</html>", refusals[0], "the whole body stays inside that one line")
+        self.assertIn("\\r\\n", refusals[0], "the newline is escaped, not emitted")
+        self.assertNotIn("\\\\r\\\\n", refusals[0], "escaping runs once, not twice")
+
+    async def test_a_refusal_names_the_hop_that_answered_it(self):
+        """A balancer's error and the application behind it are two different faults.
+
+        The body cannot say which produced it, and the response's own headers can: an origin
+        behind a load balancer is answered *as the balancer* whenever the balancer generated the
+        reply, so ``server`` settles what took a probe against the endpoint to establish.
+        """
+        self.open()
+
+        outcome = await self.attempt(
+            504,
+            b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n</html>\r\n",
+            headers={
+                "Server": "awselb/2.0",
+                "Content-Type": "text/html",
+                "Authorization": "Bearer should-never-be-copied",
+            },
+        )
+
+        self.assertEqual(
+            outcome.hop_headers,
+            {"server": "awselb/2.0", "content-type": "text/html"},
+            "the identity headers only, and folded to one case",
+        )
+        self.assertIsInstance(outcome.header_ms, int)
+
+        refusals = [line for line in self.logged.splitlines() if "upstream_rejected" in line]
+        self.assertIn("awselb/2.0", refusals[0])
+        self.assertIn("admission_ms=", refusals[0])
+        self.assertNotIn("should-never-be-copied", self.logged, "a named list, not a copy of all")
+
+    async def test_a_failed_line_says_where_the_wall_clock_went(self):
+        """``elapsed_seconds`` cannot tell our own queue from the endpoint's silence.
+
+        The split is the whole diagnosis of a gateway timeout, so the fields that carry it have
+        to reach the line an operator is reading, not only the file they would have to grep.
+        """
+        self.open()
+        real_sleep = asyncio.sleep
+
+        async def times_out_once(_request, _session, _lane, _body, attempt, _reservation):
+            if attempt == 1:
+                return PROXY.Attempt(
+                    status=504,
+                    failure="gateway_timeout",
+                    retry_after=0.0,
+                    error_excerpt="the balancer waited for the target and gave up",
+                    hop_headers={"server": "awselb/2.0"},
+                    admission_ms=24_000,
+                    header_ms=60_004,
+                )
+            return PROXY.Attempt(
+                response=SimpleNamespace(), output_tokens=1, prompt_tokens=1, status=200
+            )
+
+        async def immediate(*_args, **_kwargs):
+            return await real_sleep(0)
+
+        body = b'{"messages":[]}'
+        with (
+            patch.object(PROXY, "stream_attempt", times_out_once),
+            patch.object(PROXY.asyncio, "sleep", immediate),
+        ):
+            await PROXY.forward_chat(
+                self.request(),
+                self.lane,
+                body,
+                time.monotonic(),
+                body,
+                PROXY.Cost(input=10, output=8192),
+                1000,
+            )
+
+        terminal = self.captured.getvalue()
+        self.assertIn("request_failed", terminal)
+        self.assertIn("failure=gateway_timeout", terminal, "an intermediary's clock, by name")
+        self.assertIn("header_ms=60004", terminal, "this is the endpoint's own ceiling")
+        self.assertIn("admission_ms=24000", terminal, "and this was our gate holding it")
+        self.assertIn("hop=server:awselb/2.0", terminal, "and who said so, in one token")
+        self.assertNotIn("balancer waited", terminal, "the page itself stays off the terminal")
+        self.assertIn("balancer waited", self.logged, "while the file keeps what was answered")
+
+    async def test_a_gateways_timeout_is_counted_apart_from_a_refusal(self):
+        """One hundred and ninety-six of these all read as `upstream_error`, which is why they
+        looked like one unexplained fault instead of the fixed ceiling they are. The name makes
+        the shape visible in a log, and the counter makes it visible in ``/healthz``, which is
+        the only thing an agent-side operator can actually read.
+        """
+        self.open()
+
+        with patch.object(PROXY, "stats", PROXY.Stats()) as live:
+            timeout = await self.attempt(504, b"<html>504</html>", headers={"server": "awselb/2.0"})
+            refusal = await self.attempt(503, b'{"error":"no backend capacity"}')
+
+        self.assertEqual(timeout.failure, "gateway_timeout")
+        self.assertEqual(refusal.failure, "upstream_error", "a refusal is still a refusal")
+        self.assertEqual(live.gateway_timeouts, 1, "and only the timeout is tallied")
 
 
 class ImageEvictionPipelineTests(unittest.IsolatedAsyncioTestCase):

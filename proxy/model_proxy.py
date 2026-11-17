@@ -189,6 +189,14 @@ USAGE_SUPPORTED = True
 
 RETRYABLE = {408, 409, 429, 500, 502, 503, 504, 529}
 
+#: Statuses that report a proxy's own clock expiring rather than an application's fault. Kept
+#: apart from ``RETRYABLE`` because the retry decision is identical and the *diagnosis* is not:
+#: a 504 arrives with no bytes of generation at all, on a timer fixed by the intermediary, which
+#: makes it a statement about how long the first token took rather than about whether the endpoint
+#: is healthy. Measured on this deployment: 196 of them, every one at or above a 60.109s floor,
+#: against a retry of one such request that completed the same 703,540-token prompt in 38.4s.
+TIMEOUT_STATUSES = {504}
+
 SENSITIVE_HEADERS = {
     "authorization",
     "proxy-authorization",
@@ -1244,6 +1252,20 @@ def _object_no_duplicates(pairs):
     return result
 
 
+def _wire_bytes(payload: object) -> bytes:
+    """Serialize one request body for the upstream, with the options every outbound body shares.
+
+    ``ensure_ascii`` is off, and not for tidiness: the default escapes every non-ASCII character
+    to a six-byte ``\\uXXXX``, so a conversation not written in English leaves at up to twice the
+    bytes its own text occupies. Measured on a live long-lane request, the body grew 10,387 bytes
+    between arriving here and being dispatched, for nothing but that escaping. JSON text is UTF-8
+    by RFC 8259 and the payload parses back identically either way, so escaping buys nothing while
+    this particular upload sits on the critical path to a gateway that stops waiting at sixty
+    seconds.
+    """
+    return json.dumps(payload, separators=(",", ":"), allow_nan=False, ensure_ascii=False).encode()
+
+
 def rewrite_model(body: bytes, request: web.Request, lane: LanePolicy) -> bytes:
     """Validate a chat request and rebind it to the model and clamp this lane was sold.
 
@@ -1281,7 +1303,7 @@ def rewrite_model(body: bytes, request: web.Request, lane: LanePolicy) -> bytes:
     payload["model"] = lane.model
     if lane.sends_cache_salt:
         payload["cache_salt"] = CACHE_SALT
-    return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
+    return _wire_bytes(payload)
 
 
 class _Missing:
@@ -1671,7 +1693,7 @@ class LocalEngines:
             output_tokens=output,
             context_tokens=lane.context,
         )
-        return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode(), tokens, output
+        return _wire_bytes(payload), tokens, output
 
     async def before_dispatch(self, request: web.Request, lane: LanePolicy) -> None:
         if lane.engine_id is None:
@@ -1987,7 +2009,7 @@ def evict_body_images(body: bytes) -> tuple[bytes, Eviction]:
     if not report:
         return body, report
     try:
-        return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode(), report
+        return _wire_bytes(payload), report
     except (TypeError, ValueError):
         return body, Eviction()
 
@@ -2363,6 +2385,11 @@ class Stats:
     usage_unsupported: int = 0
     deadline_stops: int = 0
     stream_stalls: int = 0
+    #: Remote attempts refused by an intermediary's own clock rather than by the application.
+    #: Counted live because the condition is invisible in every other number here: the retry
+    #: normally completes, so no health state, failure rate, or recovery entry reports that a
+    #: minute of wall clock and a full prefill were meanwhile spent getting nothing delivered.
+    gateway_timeouts: int = 0
     policy_errors: int = 0
     # Seen and pending are the denominators that make images_evicted readable: zero evictions is
     # normal for a body whose attachments the model has not been shown yet, and is the whole bug
@@ -2886,6 +2913,7 @@ async def health(_request: web.Request) -> web.Response:
                 "usage_unsupported": stats.usage_unsupported,
                 "deadline_stops": stats.deadline_stops,
                 "stream_stalls": stats.stream_stalls,
+                "gateway_timeouts": stats.gateway_timeouts,
                 "local_lease_expired": stats.local_lease_expired,
                 "local_unusable_completions": stats.local_unusable_completions,
                 "policy_errors": stats.policy_errors,
@@ -3067,6 +3095,17 @@ class Attempt:
     dispatched: bool = False
     failure: str | None = None
     permanent: bool = False
+    #: Milliseconds this request spent waiting for an admission permit, and milliseconds from its
+    #: POST leaving this container until response headers came back. The second was already
+    #: measured but reached only ``upstream_rejected``, which is not the record an operator
+    #: watching a stuck turn reads; the first was measured for local engines alone, under another
+    #: name. Together they say whether a request spent its wall clock in our own queue or
+    #: upstream, and a gateway timeout cannot be attributed without that split.
+    admission_ms: int | None = None
+    header_ms: int | None = None
+    #: The headers naming whichever piece of software actually answered an error, taken from the
+    #: response rather than inferred from its body.
+    hop_headers: dict[str, str] | None = None
     #: What a *local* completion amounted to, in the shared vocabulary. ``None`` on every
     #: remote lane and on every local attempt that never reached a body, because there was no
     #: completion observed to classify - it is not a slot to put a guess in.
@@ -3087,14 +3126,20 @@ class Attempt:
 
 
 def _excerpt(body: bytes, limit: int = LOG_ERROR_EXCERPT_BYTES) -> str:
-    """An upstream error body as one bounded, single-line token.
+    """An upstream error body, bounded, as raw text for a log field.
 
-    The bound is not about disk: it is that one record stays one line, and an upstream body is
-    written by something this plan does not control.
+    The bound is not about disk: it is that one record stays short enough to grep, and an
+    upstream body is written by something this plan does not control.
+
+    Escaping deliberately does not happen here. ``event`` renders every field through
+    ``_one_line``, and a second pass over text that was escaped where it was built turns each
+    control character into the escape of its own escape, so a carriage return reads back as
+    ``\\r`` rather than ``\r``. Truncation stays here because it has to precede that expansion
+    to honour the byte bound.
     """
     if not body:
         return "<empty>"
-    return _one_line(body[:limit].decode("utf-8", errors="replace"))
+    return body[:limit].decode("utf-8", errors="replace")
 
 
 def _quota_headers(headers) -> dict[str, str]:
@@ -3106,6 +3151,38 @@ def _quota_headers(headers) -> dict[str, str]:
     """
     wanted = ("retry-after", "x-ratelimit-remaining", "x-ratelimit-reset")
     return {name: headers[name] for name in wanted if name in headers}
+
+
+#: The headers that name the responding hop. ``server`` carries most of it: an application behind
+#: a load balancer is answered *as the balancer* when the balancer generated the reply itself,
+#: and as the application when the application did, so an HTML error page written by the edge in
+#: front of a gateway is distinguishable from one written by the gateway without reading its body.
+#: ``x-amzn-errortype`` is included because AWS emits it on load-balancer-generated errors and
+#: never on a forwarded target response, which makes it the cleanest such marker available.
+HOP_HEADER_NAMES = ("server", "content-type", "via", "x-amzn-requestid", "x-amzn-errortype")
+
+
+def _hop_headers(headers) -> dict[str, str]:
+    """Which software answered, as far as its own headers admit.
+
+    Case is folded here rather than trusted to the mapping, because aiohttp's headers are
+    case-insensitive and a fixture's are not, and this must read the same either way.
+    """
+    folded = {str(name).lower(): str(value) for name, value in headers.items()}
+    return {name: folded[name] for name in HOP_HEADER_NAMES if name in folded}
+
+
+def _hop_token(hop: dict[str, str] | None) -> str | None:
+    """The responder's identity as one unquoted field.
+
+    A dict repr carries spaces, so ``_one_line`` would wrap it in quotes and nest another set
+    inside them. Collapsing to ``name:value;`` pairs keeps the whole identity one token, which
+    is what lets it stand in for an error body on the terminal line: ``hop=server:awselb/2.0``
+    says who answered, and the file still holds what they said.
+    """
+    if not hop:
+        return None
+    return ";".join(f"{name}:{value}" for name, value in hop.items())
 
 
 def local_outcome(scanner: UsageScanner) -> Outcome:
@@ -3358,6 +3435,7 @@ async def stream_attempt(
     await local_engines.before_dispatch(request, lane)
     queued_at = time.monotonic()
     async with admission(lane, enforcement, reservation):
+        outcome.admission_ms = round((time.monotonic() - queued_at) * 1000)
         if lane.engine_id is not None:
             # Re-checked *after* admission, not because before_dispatch forgot to look but because
             # it could not: it runs before this queue, and the wait here is exactly the window in
@@ -3392,12 +3470,14 @@ async def stream_attempt(
                 allow_redirects=False,
             )
             header_ms = round((time.monotonic() - sent) * 1000)
+            outcome.header_ms = header_ms
             outcome.status = response.status
             for _counter_id, ledger in enforcement.ledgers_for(lane):
                 ledger.note_server(response.headers)
             if response.status >= 400:
                 error_body = await read_bounded(response.content, MAX_ERROR_BYTES)
                 outcome.error_excerpt = _excerpt(error_body)
+                outcome.hop_headers = _hop_headers(response.headers)
                 if body_rejects_stream_usage(response.status, error_body):
                     outcome.rejected_usage = True
                     outcome.retry_after = 0.0
@@ -3433,6 +3513,14 @@ async def stream_attempt(
                             body=outcome.error_excerpt,
                         )
                         return outcome
+                elif response.status in TIMEOUT_STATUSES:
+                    # Named apart from a generic refusal because re-sending identical bytes meets
+                    # an identical clock: what makes the retry win is not that the endpoint
+                    # recovered, it is that the first attempt warmed the provider's prompt cache.
+                    # So the timed-out attempt is better read as a paid warm-up than as a lost
+                    # request, and counting it separately is the only way that shows up as cost.
+                    outcome.failure = "gateway_timeout"
+                    stats.gateway_timeouts += 1
                 else:
                     outcome.failure = "upstream_error"
                 outcome.retry_after = retry_delay(response, attempt)
@@ -3442,8 +3530,10 @@ async def stream_attempt(
                     attempt=attempt,
                     status=response.status,
                     header_ms=header_ms,
+                    admission_ms=outcome.admission_ms,
                     input_bytes=len(body),
                     priced_reservation=reservation,
+                    hop=_hop_token(outcome.hop_headers),
                     headers=_quota_headers(response.headers),
                     body=outcome.error_excerpt,
                 )
@@ -3952,8 +4042,25 @@ async def _forward_chat(request, lane, body, started, inbound_body, cost, reserv
                 lane.engine_id,
                 f"engine reported {outcome.outcome} on a local completion",
             )
+        # The body stays out of the terminal on purpose. An intermediary's error page is the same
+        # three hundred bytes of HTML every time, and this line fires once per attempt, so pasting
+        # it here is what made the condition look mysterious rather than routine. `hop` carries
+        # who answered and `status` what they said; the file keeps what they wrote.
         event(
             "request_failed",
+            (
+                "lane",
+                "recovery",
+                "failure",
+                "failures",
+                "status",
+                "error_status",
+                "delivered",
+                "admission_ms",
+                "header_ms",
+                "hop",
+                "elapsed_seconds",
+            ),
             lane=lane.name,
             recovery=entry.recovery_id,
             failure=outcome.failure,
@@ -3961,6 +4068,9 @@ async def _forward_chat(request, lane, body, started, inbound_body, cost, reserv
             status=outcome.status,
             error_status=outcome.error_status,
             delivered=outcome.streamed,
+            admission_ms=outcome.admission_ms,
+            header_ms=outcome.header_ms,
+            hop=_hop_token(outcome.hop_headers),
             error=outcome.error_excerpt,
             elapsed_seconds=round(time.monotonic() - started, 3),
         )

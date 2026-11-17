@@ -347,7 +347,18 @@ grep 'rid=9f2c1a77' .local/runtime/<instance>/proxy-log/model-proxy.log
 `status=` on an `upstream_rejected` record says what the endpoint answered, and the `headers=`
 field beside it says whether the endpoint's own quota headers came with that answer — their
 absence is how a rejection that did not come from the provider's limiter is told apart from
-one that did. A `request_received` with no `upstream_dispatch` after it means the request is
+one that did. `hop=` answers the same question positively rather than by absence: it carries the
+responding software's own `server` and `content-type`, and an origin behind a load balancer is
+answered *as the balancer* when the balancer generated the reply, which is what identifies an
+HTML error page as the provider's edge rather than the provider's application. A refusal that
+came from an intermediary's clock rather than from the application is named
+`failure=gateway_timeout` rather than `upstream_error`, and `/healthz` tallies it as
+`stats.gateway_timeouts`, because those attempts all completed on a retry and so go unreported by
+every other number here. `request_failed` repeats `hop=` with the split of the wall clock —
+`admission_ms` is how long our own gate held the request, `header_ms` how long the endpoint took
+to answer — and holds the upstream's body back to the file, since an edge's error page is the
+same text every attempt. Read `header_ms` across records before believing any single one: values
+piled on one floor are a fixed timer being met, and only a scattered set is congestion. A `request_received` with no `upstream_dispatch` after it means the request is
 parked at an admission or recovery gate; a `upstream_dispatch` with nothing after it means the endpoint has not
 answered yet. An image-heavy session is checked differently, because its failure is invisible in
 tokens. `images_evicted` is on the live event list, so the launch terminal prints a line for every
