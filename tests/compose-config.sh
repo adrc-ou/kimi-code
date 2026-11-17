@@ -134,7 +134,14 @@ if [[ "${1:-}" == --runtime ]]; then
     local label=$1
     shift
     printf 'runtime %s\n' "${label}"
-    "$@"
+    # `if !` so this line is reached at all: under errexit the failing command would end the script
+    # before the annotation could be written. The label is the only thing that says which check died,
+    # because a job log needs repository admin rights to read while an ::error:: becomes an
+    # annotation, and annotations are public.
+    if ! "$@"; then
+      echo "::error::runtime check failed: ${label}"
+      return 1
+    fi
   }
   extension_test_image=$("${compose[@]}" config --format json |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["searxng"]["image"])')
@@ -174,15 +181,39 @@ config = base / "extension-volume-test.json"
 compose = ["docker", "compose", "-p", project, "-f", str(config)]
 
 
+def annotate(message):
+    """Emit a workflow command whose body survives GitHub's parser.
+
+    Annotations are the only output of this job readable without repository admin rights, so the
+    daemon's explanation has to ride inside one. Percent and newline are the two characters that
+    would otherwise break the command or cut it at the first line, and the tail is the part that
+    names the failure.
+    """
+    tail = message[-1800:]
+    escaped = tail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::error::{escaped}", flush=True)
+
+
 def run_service(*extra, stdin=None):
-    """One `compose run`, announced before it starts.
+    """One `compose run`, announced before it starts and explained when it fails.
 
     Seven containers share the single `runtime` label this check prints, so without a line per
-    invocation a failure says only that the check died - and the daemon's reason for refusing a
-    container never reaches the job log at all.
+    invocation a failure says only that the check died - and `check=True` would add nothing, since
+    the reason arrives on the daemon's stderr, where nobody without log access can see it. The
+    output is still echoed on success, so the log keeps everything it used to show.
     """
     print("  run " + " ".join(extra), flush=True)
-    subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", *extra], stdin=stdin, check=True)
+    result = subprocess.run([*compose, "run", "-T", "--rm", "--no-deps", *extra],
+                            stdin=stdin, capture_output=True, text=True)
+    for line in (result.stdout + "\n" + result.stderr).splitlines():
+        if line.strip():
+            print("    " + line)
+    if result.returncode:
+        detail = "\n".join(line.strip()
+                           for line in (result.stderr + "\n" + result.stdout).splitlines()
+                           if line.strip())
+        annotate(f"compose run {extra[0]} exited {result.returncode}: {detail}")
+        raise SystemExit(result.returncode)
 
 
 try:

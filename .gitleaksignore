@@ -10,12 +10,15 @@
 # security job will name the new fingerprints in its log and they belong here. Add a fingerprint only
 # for a finding you have confirmed was never a live credential.
 #
-# The six below are `"credential": "default__qwen3"` in the two captured NRP-only plans. That field
-# states *which* provider credential a lane is metered under - the name of a file the launcher
-# generates into the instance runtime directory and mounts into model-proxy alone, from
-# [credential.*] in providers/nrp/provider.toml. The identifier is also part of the metering key
-# `nrp/default__qwen3/Qwen3.8 Flash Next` quoted throughout those plans' own guidance text, so it
-# cannot be renamed to dodge the rule. The secret itself never reaches a plan.
+# The six below are the three occurrences, per captured NRP-only plan, of the plan's field naming
+# which provider credential a lane is metered under - it carries the identifier `default__qwen3`,
+# the name of a file the launcher generates into the instance runtime directory and mounts into
+# model-proxy alone, from the credential table in providers/nrp/provider.toml. That identifier is
+# also part of the metering key quoted throughout those plans' own guidance text, so it cannot be
+# renamed to dodge the rule. The secret itself never reaches a plan.
+#
+# Do not spell the matched shape out in this file: a comment here quoting that field and its value
+# verbatim is itself reported by generic-api-key, which is how this first revision failed CI.
 e23a17e6629dd904fab34b72849dfb9fbc1076c4:tests/fixtures/local-inference/nrp-only-primary.json:generic-api-key:57
 e23a17e6629dd904fab34b72849dfb9fbc1076c4:tests/fixtures/local-inference/nrp-only-primary.json:generic-api-key:93
 e23a17e6629dd904fab34b72849dfb9fbc1076c4:tests/fixtures/local-inference/nrp-only-primary.json:generic-api-key:129
@@ -28,3 +31,8 @@ e23a17e6629dd904fab34b72849dfb9fbc1076c4:tests/fixtures/local-inference/nrp-only
 # longer carries that value, so this is history alone, and history is never rewritten here
 # (AGENTS.md: "Never rewrite or delete user commits").
 c28bbada2ba35063a284c96d095d014f013cc1e4:.env.example:generic-api-key:5
+#
+# And the same for this file's first revision (af8653b), which quoted the plan field it was
+# explaining in full. Rewording the comment does not retire that blob: gitleaks reads history, and
+# the line stays where it was committed.
+af8653b92c8a9ac62efe5969ee169e80875e64b1:.gitleaksignore:generic-api-key:13
