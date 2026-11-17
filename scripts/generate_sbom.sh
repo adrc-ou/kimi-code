@@ -52,16 +52,24 @@ for image in "$@"; do
   # measured against the pinned v0.99.1, exit 2 means --fail-on was met - a finding someone owns -
   # while 1 means the scan itself failed and learned nothing. Both used to arrive as
   # "Process completed with exit code 2" with no way to tell the two apart from outside the log.
+  # The finding identifiers go into the annotation too, because a gate that reports only that it
+  # fired sends somebody to read a log they may not have access to.
   status=0
+  report="$(mktemp)"
   docker run --rm \
     -v /var/run/docker.sock:/var/run/docker.sock:ro \
     -v "${ignore_file}:/scan/grype-ignore.yaml:ro" \
     anchore/grype:v0.99.1@sha256:aeaded256cc61f162774b1c0e19f44e1787d0ae7cdc8e8917e9ea2528375090e \
-    "${image}" --config /scan/grype-ignore.yaml --fail-on high --only-fixed || status=$?
+    "${image}" --config /scan/grype-ignore.yaml --fail-on high --only-fixed | tee "${report}" ||
+    status=${PIPESTATUS[0]}
   case "${status}" in
     0) printf 'grype found no unaccepted High or Critical fixable vulnerability in %s\n' "${image}" ;;
     2)
-      printf '::error::grype found a High or Critical fixable vulnerability in %s that this repository has not accepted. Raise the base image or the package, or record a dated entry in vulnerability-exceptions.json with an owner and a reason. This job is failing because the gate held, not because it broke.\n' "${image}"
+      findings="$(grep -E '(^|[^[:alnum:]])(High|Critical)([^[:alnum:]]|$)' "${report}" |
+        grep -oE '(CVE|GHSA)-[0-9]{4}-[0-9A-Za-z-]+' | sort -u | head -8 | tr '\n' ' ')"
+      printf '::error::grype found a High or Critical fixable vulnerability in %s that this repository has not accepted: %s\n' \
+        "${image}" "${findings:-see the report above}"
+      printf '::error::raise the base image or the package, or record a dated entry in vulnerability-exceptions.json with an owner and a reason. This job is failing because the gate held, not because it broke.\n'
       exit 2
       ;;
     *)

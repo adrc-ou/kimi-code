@@ -30,7 +30,7 @@
     }
   },
   "files": {
-    "proxy/requirements.lock": "sha256:476e040b96fd0542472a586a144c094c2136ae724ad4d5e8951b0f1293e61810",
+    "proxy/requirements.lock": "sha256:ff68465d8a19c4c51f175d37212deb495e78f8e14e6c85d48edc35fce56c022d",
     "container/package-lock.json": "sha256:7488f388ed9b9ba3e57a177c493fce73ef735fbb0b1b030a03efb82a8cbd1a8f",
     "container/serena.lock": "sha256:cb1f3d408c0a91f34c8b3701cba1e789312f91e8f72880b42bf5dd1d197e1001",
     "proxy/Dockerfile": "sha256:5328ba41664dac133f08cbbe88c0453fbbfea1e859fdf5d625283ca17f10c14c",
