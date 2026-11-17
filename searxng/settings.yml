@@ -1,9 +1,18 @@
-# The harness has no Tor proxy. These onion engines cannot initialize without one.
+# Engines this harness can never satisfy, dropped from the SearXNG defaults.
 use_default_settings:
   engines:
     remove:
+      # The harness has no Tor proxy, so these onion engines cannot initialize.
       - ahmia
       - torch
+      # Brave's keyless HTML scrapers. search.brave.com is not an API and refuses
+      # them, so every query pays one failed engine and one WARNING here. The
+      # key-based `braveapi` entry stays: SearXNG already disables it while its
+      # api_key is empty, and adding a Brave Search API key is what re-enables it.
+      - brave
+      - brave.images
+      - brave.videos
+      - brave.news
 
 general:
   instance_name: "Kimi local search"

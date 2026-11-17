@@ -141,11 +141,17 @@ on a host port in this harness. Upstream engines can still throttle requests or
 return CAPTCHAs; a healthy container cannot rule that out.
 
 The quick search check tests adapter readiness; the full check requires results
-from an authenticated query. A failing individual engine does not imply an outage
-when other engines still supply results. Tor-only Ahmia and Torch are excluded
-because the harness has no Tor proxy. The adapter supplies the socket client's IP
-to SearXNG, and `searxng/limiter.toml` trusts private Docker proxy addresses and
-loopback for that header; inbound caller forwarding headers are never reused.
+from an authenticated query, and that query is a fixed fixture, never text from a
+session. A failing individual engine does not imply an outage when other engines
+still supply results. Tor-only Ahmia and Torch are excluded because the harness
+has no Tor proxy, and the keyless `brave`, `brave.images`, `brave.videos` and
+`brave.news` engines are excluded because they scrape the `search.brave.com` web
+page instead of calling an API, which Brave refuses; that refusal is otherwise one
+`HTTP Request failed` warning every launch. The key-based `braveapi` engine needs
+a Brave Search API key and disables itself while that key is empty. The adapter
+supplies the socket client's IP to SearXNG, and `searxng/limiter.toml` trusts
+private Docker proxy addresses and loopback for that header; inbound caller
+forwarding headers are never reused.
 
 ## 3. Configure credentials
 
