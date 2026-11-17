@@ -127,6 +127,14 @@ class LlamaCppAdapter:
 
     # ---------------------------------------------------------------- status
 
+    def device_observations(self, runtime: Runtime) -> dict[str, Any]:
+        """llama.cpp cannot say: it ships as a downloaded binary with no interpreter to ask.
+
+        Returning nothing is the honest answer, and the resolver's ``unknown_measurements`` policy
+        is what turns it into "do not wire deliberately" rather than into a guess.
+        """
+        return {}
+
     def status_path(self) -> str:
         return "/props"
 
@@ -156,6 +164,20 @@ class LlamaCppAdapter:
                     "n_ctx",
                 }
             },
+            # Every field above came out of the running server's own ``/props`` reply, so all of it
+            # is observation rather than echo — the opposite of the MLX worker, which is handed its
+            # plan and must say which numbers it then measured. Naming them here keeps a reader from
+            # treating "the engine reported 4096" and "the engine was told 4096" as the same fact.
+            attested=frozenset(
+                {
+                    "model_alias",
+                    "model_path",
+                    "total_slots",
+                    "context_tokens",
+                    "awake",
+                    "identity_fragment",
+                }
+            ),
         )
 
     def status_request(self, base: str, token: str) -> Any:

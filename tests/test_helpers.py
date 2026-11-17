@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,12 @@ for _directory in (ROOT, ROOT / "tools"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
-from tests.helpers import LEAKED_GROUPS, _group_gone, run_in_pty  # noqa: E402
+from tests.helpers import (  # noqa: E402
+    LEAKED_GROUPS,
+    _group_gone,
+    run_in_pty,
+    stage_cross_tree_imports,
+)
 
 #: How long a reaped child is given to leave the process table before it counts as a survivor. The
 #: fixture already waits for its process group to empty, so this only absorbs the kernel's own
@@ -224,6 +230,47 @@ class OrphanScanTests(unittest.TestCase):
                 "/tmp/tmp3fkn6gk6/harness/tools/workspace_choice.py",  # noqa: S108
             ],
         )
+
+
+class StageCrossTreeImportTests(unittest.TestCase):
+    """The fixture helper that keeps staged launchers importable.
+
+    It is now load-bearing for every launcher test, so it needs its own guard: a helper that
+    silently stopped copying would leave 36 tests passing against a tree that cannot run.
+    """
+
+    def setUp(self):
+        self.source = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.source / "tools").mkdir()
+        (self.source / "proxy").mkdir()
+        (self.source / "tools" / "local_engines").mkdir()
+        (self.source / "tools" / "local_engines" / "__init__.py").write_text("", encoding="utf-8")
+        (self.source / "tools" / "local_engines" / "base.py").write_text("", encoding="utf-8")
+        (self.source / "proxy" / "shared_vocab.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (self.source / "tools" / "a.py").write_text(
+            "import shared_vocab\nif True:\n    from local_engines import base\n",
+            encoding="utf-8",
+        )
+        (self.source / "tools" / "b.py").write_text(
+            "def late():\n    import only_at_call_time\n", encoding="utf-8"
+        )
+        self.staged = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.staged / "tools").mkdir()
+        shutil.copy2(self.source / "tools" / "a.py", self.staged / "tools" / "a.py")
+        shutil.copy2(self.source / "tools" / "b.py", self.staged / "tools" / "b.py")
+
+    def test_it_carries_package_and_cross_tree_modules_but_not_function_locals(self):
+        stage_cross_tree_imports(self.staged, self.source)
+        self.assertTrue((self.staged / "proxy" / "shared_vocab.py").is_file())
+        self.assertTrue((self.staged / "tools" / "local_engines" / "base.py").is_file())
+        # only_at_call_time lives inside a function body, so importing b.py does not need it.
+        self.assertFalse((self.staged / "proxy" / "only_at_call_time.py").exists())
+
+    def test_it_is_idempotent_and_reports_only_what_it_added(self):
+        first = stage_cross_tree_imports(self.staged, self.source)
+        second = stage_cross_tree_imports(self.staged, self.source)
+        self.assertEqual(len(first), len(set(first)))
+        self.assertEqual(second, [])
 
 
 if __name__ == "__main__":  # pragma: no cover

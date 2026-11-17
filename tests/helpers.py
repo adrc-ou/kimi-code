@@ -8,6 +8,7 @@ supply, because a fixture that diverges from ``./models`` and ``./providers`` te
 
 from __future__ import annotations
 
+import ast
 import atexit
 import fcntl
 import importlib.util
@@ -15,6 +16,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -25,6 +27,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -93,6 +96,91 @@ def tracked_files(*suffixes: str) -> list[Path]:
     if suffixes:
         paths = [path for path in paths if path.suffix in suffixes]
     return sorted(path for path in paths if path.is_file())
+
+
+def module_scope_imports(script: Path) -> set[str]:
+    """The import names that must resolve for this file to be importable at all.
+
+    Everything except what sits inside a function body counts. ``capacity.py`` picks its adapter
+    registry with an ``if __package__:`` pair at module level, and a walk that only looked at the
+    top line of the file would miss it and stage a tree that still fails to import.
+    """
+    try:
+        tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+    except (OSError, SyntaxError):  # pragma: no cover - a fixture only copies files that parse
+        return set()
+    names: set[str] = set()
+
+    def walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue  # runs on call, not on import
+            if isinstance(child, ast.Import):
+                names.update(alias.name.split(".")[0] for alias in child.names)
+            elif isinstance(child, ast.ImportFrom):
+                if child.level == 0 and child.module:
+                    names.add(child.module.split(".")[0])
+            walk(child)
+
+    walk(tree)
+    return names
+
+
+def stage_cross_tree_imports(staged_root: Path, source_root: Path = ROOT) -> list[Path]:
+    """Copy every module a staged ``tools/`` file needs at import time but does not contain.
+
+    ``tools/local_llm.py`` reads the shared local-engine vocabulary from ``proxy/``, and
+    ``tools/capacity.py`` needs the ``local_engines`` package, so a launcher fixture that stages a
+    by-name list of ``tools/`` files produces a ``ModuleNotFoundError`` inside the launcher script
+    rather than in the test. Because most of these fixtures also skip whenever ``/tmp`` is mounted
+    ``noexec``, that stayed invisible until someone ran the suite on macOS.
+
+    Deriving the set from the imports instead of a hand-written list means the next cross-tree
+    import is carried automatically, so this cannot be broken the way the previous fixture was.
+    Newly copied files are scanned too, to a fixed point.
+    """
+    if not (staged_root / "tools").is_dir():
+        return []
+    copied: list[Path] = []
+    seen: set[Path] = set()
+    queue = sorted((staged_root / "tools").glob("*.py"))
+    while queue:
+        script = queue.pop(0)
+        if script in seen:
+            continue
+        seen.add(script)
+        for name in sorted(module_scope_imports(script)):
+            staged_module = staged_root / "tools" / f"{name}.py"
+            staged_package = staged_root / "tools" / name / "__init__.py"
+            if staged_module.exists() or staged_package.exists():
+                continue
+            source_package = source_root / "tools" / name / "__init__.py"
+            if source_package.is_file():
+                destination = staged_root / "tools" / name
+                if not destination.exists():
+                    # dirs_exist_ok because a fixture may already stage this tree deliberately;
+                    # the helper's job is to guarantee the import resolves, not to own the layout.
+                    shutil.copytree(
+                        source_package.parent,
+                        destination,
+                        ignore=shutil.ignore_patterns("__pycache__"),
+                        dirs_exist_ok=True,
+                    )
+                    copied.append(destination)
+                    queue.extend(sorted(destination.rglob("*.py")))
+                continue
+            for tree in ("proxy", "scripts"):
+                origin = source_root / tree / f"{name}.py"
+                if origin.is_file():
+                    destination = staged_root / tree / f"{name}.py"
+                    if destination.exists():
+                        break
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(origin, destination)
+                    copied.append(destination)
+                    queue.append(destination)
+                    break
+    return copied
 
 
 def reserved_context_size() -> int:
@@ -463,3 +551,125 @@ def _settle(
             return
         if not _pump(master, output, process, deadline):
             return
+
+
+#: The complete key set ``capacity.prepare()`` writes into every resolved engine record, taken from
+#: a real resolution rather than from memory. A test fixture that hand-writes a subset is how four
+#: separate bugs stayed invisible: the launcher, the readiness validator and the smoke tool each
+#: reached for a field the fixture had never heard of, and only the shipped tree noticed. Use this
+#: instead of a literal, and keep it in sync with :func:`tests.helpers.resolved_engine_record`.
+RESOLVED_ENGINE_KEYS = frozenset(
+    {
+        "allocation",
+        "artifact_bytes",
+        "artifact_format",
+        "artifact_variant",
+        "build_commit",
+        "build_info",
+        "cache_allocation",
+        "capacity_strategy",
+        "context_tokens",
+        "engine_kind",
+        "fingerprint",
+        "identity",
+        "memory_management",
+        "memory_policy",
+        "model_alias",
+        "model_lock_digest",
+        "model_manifest_digest",
+        "model_path",
+        "native_context_tokens",
+        "placement",
+        "protocol_version",
+        "provider_manifest_digest",
+        "residency_group",
+        "runtime_details",
+        "runtime_identity",
+        "sequences",
+        "serving_profile",
+        "serving_profile_id",
+        "snapshot_id",
+        "source_revision",
+        "template_identity",
+        "tensor_bytes",
+        "tokenizer_identity",
+        "total_context_tokens",
+        "validation_evidence",
+        "validation_status",
+        "version",
+        "wiring",
+    }
+)
+
+
+def resolved_engine_record(**overrides: Any) -> dict[str, Any]:
+    """A resolved engine record with every field the resolver produces.
+
+    Values are internally consistent for a single-slot llama.cpp fixture. Anything a consumer reads
+    is present, so a test cannot pass simply because the code under test never reached the field its
+    real input would have carried.
+    """
+    allocation = {
+        "context_granularity": 256,
+        "max_sequences": 8,
+        "batch_tokens": 2048,
+        "microbatch_tokens": 512,
+        "cache_type_k": "f16",
+        "cache_type_v": "f16",
+        "flash_attention": "auto",
+        "load_mode": "auto",
+        "lazy_mode": "auto",
+        "gpu_layers": "all",
+        "kv_unified": False,
+        "cache_ram_mib": 0,
+        "context_checkpoints": 0,
+    }
+    record = {
+        "engine_kind": "llama_cpp",
+        "model_alias": "fixture",
+        "model_path": "/fixture/model.gguf",
+        "context_tokens": 4096,
+        "sequences": 1,
+        "total_context_tokens": 4096,
+        "native_context_tokens": 4096,
+        "capacity_strategy": "native_context",
+        "memory_management": "os_managed",
+        "allocation": allocation,
+        "cache_allocation": "preallocated",
+        "artifact_format": "gguf",
+        "artifact_variant": "Q4",
+        "artifact_bytes": 1 << 30,
+        "tensor_bytes": 1 << 30,
+        "build_info": "fixture b11846 abcdef0",
+        "build_commit": "abcdef0",
+        "source_revision": "0" * 40,
+        "version": "b11846",
+        "identity": {
+            "build_info": "fixture b11846 abcdef0",
+            "source_revision": "0" * 40,
+            "version": "b11846",
+        },
+        "runtime_identity": "r" * 64,
+        "runtime_details": {},
+        "fingerprint": "f" * 64,
+        "snapshot_id": "s" * 32,
+        "serving_profile": "llama_cpp_q4",
+        "serving_profile_id": "p" * 64,
+        "protocol_version": 4,
+        "model_lock_digest": "1" * 64,
+        "model_manifest_digest": "2" * 64,
+        "provider_manifest_digest": "3" * 64,
+        "tokenizer_identity": None,
+        "template_identity": None,
+        "memory_policy": {},
+        "placement": {"backend": "metal"},
+        "residency_group": None,
+        "wiring": {"wired_bytes": 0, "reason": "uncontrolled engine", "controllable": False},
+        "validation_status": "pending_native_validation",
+        "validation_evidence": None,
+    }
+    record.update(overrides)
+    missing = RESOLVED_ENGINE_KEYS - set(record)
+    if missing:
+        raise AssertionError(f"fixture omits resolver fields: {sorted(missing)}")
+    return record

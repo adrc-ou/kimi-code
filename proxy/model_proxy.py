@@ -86,6 +86,7 @@ from aiohttp import (
 )
 
 from local_engine_contract import (  # noqa: E402
+    partition_for_status,
     FailureClass as EngineFailureClass,
     Outcome,
     is_usable_completion,
@@ -1441,8 +1442,12 @@ class LocalEngines:
         self.suspect: dict[str, int] = {}
         #: engine_id -> when a generation on this engine last produced real content.
         self.progress_at: dict[str, float] = {}
-        #: engine_id -> executions holding a permit right now, so health can name a saturated slot.
-        self.active: dict[str, int] = {}
+        # NOTE: there is deliberately no `active` permit counter here. One was declared, documented
+        # as the reason health exists, read by liveness(), and never written — so every engine
+        # reported zero permits in use forever. A health figure that is always the reassuring one is
+        # worse than no figure. Reporting it truthfully needs the release-acknowledgement work in
+        # the cancellation plan step (the proxy currently frees capacity on a counter decrement,
+        # not when the engine actually lets go); until then the field is absent rather than false.
 
     def sync(self, policy: RuntimePolicy) -> None:
         signatures = {
@@ -1535,7 +1540,6 @@ class LocalEngines:
         """
         last = self.progress_at.get(engine_id)
         return {
-            "active_permits": self.active.get(engine_id, 0),
             "seconds_since_last_completion": (
                 round(time.monotonic() - last, 1) if last is not None else None
             ),
@@ -1674,9 +1678,12 @@ class LocalEngines:
             return
         engine = current_policy().engines[lane.engine_id]
         async with self.semaphore(lane.engine_id):
-            # Runs after queue admission and before the wire, which is exactly where a latch closed
-            # during the wait has to be caught: a request admitted while the engine still worked
-            # must not spend a scarce execution slot discovering otherwise.
+            # This is the *preparation* check, ahead of the execution queue: it refuses a request
+            # whose engine is already latched before the queue is entered at all, which is the
+            # cheap win. It cannot see a latch closed during the queue wait, and does not try to —
+            # :meth:`refuse_if_fatal` runs again immediately after admission for that. Splitting
+            # the two keeps the status round trip below off the execution slot while still
+            # refusing before the wire.
             self.refuse_if_fatal(request, lane)
             # The second attestation per request is deliberate and not folded into the first.
             # Preparation and dispatch are separated in time by a queue wait that can be long, and
@@ -3352,6 +3359,12 @@ async def stream_attempt(
     queued_at = time.monotonic()
     async with admission(lane, enforcement, reservation):
         if lane.engine_id is not None:
+            # Re-checked *after* admission, not because before_dispatch forgot to look but because
+            # it could not: it runs before this queue, and the wait here is exactly the window in
+            # which a peer's failure closes the latch. Without this a request admitted against a
+            # healthy engine spends a scarce execution slot and a full native-context prefill
+            # discovering that the engine died while it was queued.
+            local_engines.refuse_if_fatal(request, lane)
             event(
                 "local_execution_admitted",
                 lane=lane.name,
@@ -3395,7 +3408,33 @@ async def stream_attempt(
                         body=outcome.error_excerpt,
                     )
                     return outcome
-                outcome.failure = "upstream_error"
+                if lane.engine_id is not None:
+                    # A local engine that answers 4xx is refusing *this request*, which re-sending
+                    # it cannot improve and which must never be read as a dead device. Before the
+                    # frontend was fixed to answer a refusal before sending headers, an unsupported
+                    # field arrived as an in-band error object on a 200, the classifier called it
+                    # fatal, and one client typo latched a healthy engine for the session. The
+                    # status line is now available, so the shared partition decides.
+                    outcome.failure = (
+                        "invalid_request"
+                        if partition_for_status(response.status) is EngineFailureClass.INVALID
+                        else "upstream_error"
+                    )
+                    if outcome.failure == "invalid_request":
+                        # Retrying an inadmissible request spends the scarcest resource on the host
+                        # — a full prefill — to reach the same refusal.
+                        outcome.retry_after = 0.0
+                        outcome.permanent = True
+                        event(
+                            "local_request_refused",
+                            lane=lane.name,
+                            engine=lane.engine_id,
+                            status=response.status,
+                            body=outcome.error_excerpt,
+                        )
+                        return outcome
+                else:
+                    outcome.failure = "upstream_error"
                 outcome.retry_after = retry_delay(response, attempt)
                 event(
                     "upstream_rejected" if response.status in RETRYABLE else "upstream_error",

@@ -72,7 +72,9 @@ min_p = 0.0
 
 # ------------------------------------------------------------
 # Which of providers/local_mps' named serving profiles runs this model. Retained on llama.cpp
-# until the MLX candidate clears native qualification; flipping this one line to "mlx_lm" is the
-# promotion, and the engine, its settings and its artifact all follow it.
+# until the MLX candidate clears native qualification. Changing this line is necessary but not
+# sufficient: the MLX engine requires a weights.lock.json at schema 2 whose [artifact] block
+# declares format = "mlx", and validate_artifact() refuses anything else, so the artifact must be
+# pinned and verified first. See README, "Two engines".
 [serving]
 profile = "llama_cpp_q4"

@@ -450,10 +450,10 @@ profile sorted first.
 | `llama_cpp` profile | `flash_attention`, `load_mode`, `lazy_mode`, `gpu_layers` | Normalised to `"auto"` for the first three and `"all"` for GPU layers |
 | `llama_cpp` profile | `kv_unified`, `cache_ram_mib`, `context_checkpoints` | Independent slots require `false`; extra RAM prompt cache and checkpoints require zero |
 | `mlx_lm` profile | `kv_allocation` | `"growing"`: cache storage is committed as tokens are consumed, not at the native maximum |
-| `mlx_lm` profile | `cache_type_k`, `cache_type_v` | `"f16"` or `"bf16"`, subject to native qualification; a quantised cache is not offered |
+| `mlx_lm` profile | *(no cache-precision keys)* | MLX derives attention cache dtype from the loaded model, so the harness has no control to declare and the schema accepts none. The `llama_cpp` rows above are real `--cache-type-*` flags; a key here would be a claim of control the engine does not offer, hashed into a fingerprint that would change no behaviour |
 | `mlx_lm` profile | `prefill_chunk_tokens`, `prefill_chunk_candidates` | The selected chunk must be one of the declared candidates, so a tuned value cannot arrive without the benchmark that justified it |
 | `mlx_lm` profile | `allocator_cache_bytes` | Free device buffers retained by the allocator. Zero is meaningful and declarable: it retains none |
-| `mlx_lm` profile | `prefix_cache` | `"continuation_only"` or `"none"` |
+| `mlx_lm` profile | `prefix_cache` | `"none"` only. Generation owns a per-request cache; `"continuation_only"` is unimplemented and was removed rather than left as a declared policy no code reads. Adding it back requires a conversation identity on the wire and upstream's `can_trim_prompt_cache` gate |
 | `execution.memory` | `strategy`, `target`, `distribution`, `unknown_measurements` | How deliberately-wired bytes are chosen. Bounds residency only; it is never an admission test and cannot resize a window or a slot count. `unknown_measurements = "unwired"` means an unavailable reading disables deliberate wiring rather than inventing a size |
 | `capacity` | `strategy` | `"native_context"`: full model-native windows without available-memory fitting |
 | `capacity` | `sequence_slots` | Explicit positive slot count, bounded by the `max_sequences` of the profile each model named |

@@ -294,6 +294,9 @@ def provision(*, install: bool = True) -> dict[str, Any]:
         interpreter_tree = _fetch_interpreter(staging / "_interpreter", pin)
         environment = staging / "environment"
         environment.mkdir()
+        # The copy below lands in bin/, and copy2 does not create parents: without this the
+        # provision died with FileNotFoundError before a single dependency was installed.
+        (environment / "bin").mkdir()
         python = environment / "bin" / "python3"
         shutil.copy2(interpreter_tree / "bin" / "python3", python)
         # The standalone build's lib/ is addressed by the binary's runpath, so the tree travels
@@ -313,6 +316,11 @@ def provision(*, install: bool = True) -> dict[str, Any]:
             "lock_digest": lock_digest,
             "platform": f"{platform.system()}-{platform.machine()}",
             "executable": str((destination / "environment" / "bin" / "python3").resolve()),
+            # Named here rather than re-derived by each consumer. pip installs with --target into a
+            # directory that is not on the interpreter's own search path, so whoever launches
+            # anything must put it there, and every reader that guessed the layout guessed
+            # differently.
+            "site_packages": str((destination / "environment" / "site-packages").resolve()),
             "directory": str(destination.resolve()),
             "imports": imports,
         }

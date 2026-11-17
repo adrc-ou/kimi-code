@@ -26,11 +26,19 @@ if str(ROOT / "proxy") not in sys.path:
 
 import local_native_probe as probe  # noqa: E402
 
+#: Shaped exactly like the record ``local_mlx_runtime.provision()`` commits: ``executable`` is the
+#: interpreter at ``<root>/environment/bin/python3``, not a wrapper script (there is no wrapper) and
+#: not a bare ``bin/python3`` under the root. A fixture that invented a third layout is what let the
+#: probe's re-spliced path look plausible in review.
+RUNTIME_ROOT = Path(tempfile.gettempdir()) / "probe-runtime" / "abc"
 RUNTIME = {
     "identity": "abc",
-    "python": "3.12.11",
+    "kind": "mlx_lm",
+    "python_version": "3.12.11",
     "lock_digest": "sha256:x",
-    "executable": str(Path(tempfile.gettempdir()) / "probe-worker" / "run-worker.py"),
+    "platform": "Darwin-arm64",
+    "directory": str(RUNTIME_ROOT),
+    "executable": str(RUNTIME_ROOT / "environment" / "bin" / "python3"),
     "imports": {"mlx": "0.32.4", "mlx_lm": "0.32.2"},
 }
 
@@ -46,10 +54,39 @@ class RefusalTests(unittest.TestCase):
         ):
             probe._require_mac()
 
-    def test_an_unknown_makes_the_interpreter_path_a_failure_not_a_default(self):
-        missing = RUNTIME["executable"].replace("probe-worker", "absent-worker")
+    def test_an_absent_interpreter_is_a_failure_not_a_default(self):
+        missing = RUNTIME["executable"].replace("abc", "absent")
         with self.assertRaises(probe.ProbeError):
             probe._interpreter({"executable": missing})
+
+    def test_a_relative_or_missing_executable_never_becomes_a_silent_guess(self):
+        for record in ({"executable": "environment/bin/python3"}, {}, {"executable": ""}):
+            with self.subTest(record=record), self.assertRaises(probe.ProbeError):
+                probe._interpreter(record)
+
+    def test_the_interpreter_path_is_used_verbatim_rather_than_re_derived(self):
+        """F11a: the record already names the interpreter.
+
+        Splicing ``environment/bin/python3`` onto it again doubled the path.
+
+        Planted as a real file so this asserts the resolution, not an error message.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            interpreter = root / "environment" / "bin" / "python3"
+            interpreter.parent.mkdir(parents=True)
+            interpreter.write_text("#!/bin/sh\nexit 0\n")
+            interpreter.chmod(0o755)
+            record = {"executable": str(interpreter)}
+            self.assertEqual(probe._interpreter(record), str(interpreter))
+            self.assertEqual(
+                probe.site_packages(record),
+                str(root / "environment" / "site-packages"),
+            )
+
+    def test_a_runtime_record_outside_an_environment_tree_is_refused(self):
+        with self.assertRaisesRegex(probe.ProbeError, "environment/"):
+            probe.site_packages({"executable": "/somewhere/else/bin/python3"})
 
 
 class EnvironmentHygieneTests(unittest.TestCase):
@@ -370,13 +407,26 @@ class CrossModuleReferenceTests(unittest.TestCase):
         )
 
     def test_contract_symbols_the_worker_imports_are_all_exported(self):
-        worker = (ROOT / "tools" / "local_engines" / "mlx_worker.py").read_text(encoding="utf-8")
+        """Every name the worker takes from the shared contract must exist there.
+
+        Parsed with ast rather than a regex over the import statement: the text scan checked only
+        the first parenthesised block, so a symbol added in a second one escaped entirely, and it
+        split on whitespace, which turned a trailing ``# noqa: E402`` into an imported name.
+        """
+        import ast
+
         import local_engine_contract as contract
 
-        for name in re.findall(r"from local_engine_contract import \(([^)]+)\)", worker)[0:1]:
-            for symbol in re.split(r"[,\s]+", name):
-                if symbol:
-                    self.assertTrue(
-                        hasattr(contract, symbol),
-                        f"worker imports local_engine_contract.{symbol}, which does not exist",
-                    )
+        source = (ROOT / "tools" / "local_engines" / "mlx_worker.py").read_text(encoding="utf-8")
+        names = sorted(
+            alias.name
+            for node in ast.parse(source).body
+            if isinstance(node, ast.ImportFrom) and node.module == "local_engine_contract"
+            for alias in node.names
+        )
+        self.assertTrue(names, "the worker no longer imports from the shared contract")
+        for symbol in names:
+            self.assertTrue(
+                hasattr(contract, symbol),
+                f"worker imports local_engine_contract.{symbol}, which does not exist",
+            )

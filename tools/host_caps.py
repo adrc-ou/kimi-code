@@ -163,36 +163,14 @@ def metal_observations() -> dict[str, Any]:
     }
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         return {**unknown, "source": "not apple silicon"}
-    # There is no stable syscall for this. ``system_profiler`` reports the SP_DisplayData card
-    # fields, and ``sysctl`` knows nothing about a device working set, so the observation is taken
-    # from a one-shot helper the engine runtime already has bindings for. Absent that helper - which
-    # is the case on every Linux test host and on a Mac without the provisioned MLX runtime - the
-    # answer is unknown, and the caller disables deliberate wiring rather than guessing.
-    helper = os.environ.get("LOCAL_MPS_METAL_PROBE", "").strip()
-    if not helper or not Path(helper).is_file():
-        return {**unknown, "source": "no metal probe available"}
-    try:
-        result = subprocess.run(
-            [sys.executable, helper],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        )
-        document = json.loads(result.stdout)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return {**unknown, "source": "probe failed"}
-    if not isinstance(document, dict):
-        return {**unknown, "source": "probe malformed"}
-    working_set = document.get("recommended_max_working_set_size")
-    count = document.get("device_count")
-    return {
-        "device_count": _count(count),
-        "recommended_working_set_bytes": _count(working_set, positive=True),
-        "presentation_model": document.get("presentation_model"),
-        "low_power_mode": document.get("low_power_mode"),
-        "source": "probe",
-    }
+    # There is no stable syscall for this on Darwin: ``system_profiler`` reports display-card
+    # fields and ``sysctl`` knows nothing about a device working set. The measurement therefore
+    # comes from the engine runtime, which already has bindings for it — see
+    # ``EngineAdapter.device_observations`` — and not from a script named by an environment
+    # variable. That indirection used to live here and nothing in the launcher ever set it, so
+    # this function's honest answer is unknown on every host, and the caller disables deliberate
+    # wiring rather than guessing. Unknown is not zero.
+    return {**unknown, "source": "device facts come from the engine runtime"}
 
 
 def swap_activity() -> dict[str, Any]:

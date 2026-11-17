@@ -404,10 +404,12 @@ _PROFILE_KEYS: dict[str, dict[str, Any]] = {
         # device buffers. A positive-integer check would make the disabled setting undeclarable.
         "nonnegative": {"allocator_cache_bytes"},
         "choice": {
-            "cache_type_k": {"f16", "bf16"},
-            "cache_type_v": {"f16", "bf16"},
+            # No cache_type_* here on purpose: MLX derives attention cache precision from the
+            # model, so a profile key would be a declaration of control the engine does not offer.
             "kv_allocation": {"growing"},
-            "prefix_cache": {"continuation_only", "none"},
+            # "continuation_only" stays unimplemented until a conversation identity exists on the
+            # wire; "none" is the only value any code today can honour.
+            "prefix_cache": {"none"},
         },
         "list": {"prefill_chunk_candidates"},
         "fixed": {},

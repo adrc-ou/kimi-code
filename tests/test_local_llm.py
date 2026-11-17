@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 import threading
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -28,6 +29,8 @@ if str(ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(ROOT / "tools"))
 
 import local_llm  # noqa: E402
+
+from tests.helpers import resolved_engine_record  # noqa: E402
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
 DIGEST = "a" * 64
@@ -659,18 +662,51 @@ def _stub_adapter(_kind):
 
 
 class ServeTests(InstallFixture):
+    #: What a forced tool call answers with, split out from ``canary`` because the
+    #: interesting cases are all shapes of a *valid* call: with prose around it, and cut
+    #: off mid-arguments.
+    TOOL_STREAMS = {
+        "tool_only": [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+            b'data: [DONE]\n\n',
+        ],
+        "tool_with_prose": [
+            b'data: {"choices":[{"delta":{"content":"Calling the tool now."}}]}\n\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+            b'data: [DONE]\n\n',
+        ],
+        "tool_truncated": [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n',
+            b'data: [DONE]\n\n',
+        ],
+        "prose": [
+            b'data: {"choices":[{"delta":{"content":"I could not do that."}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            b'data: [DONE]\n\n',
+        ],
+        "tool_fragmented": [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+            b'data: [DONE]\n\n',
+        ],
+    }
+
     @staticmethod
-    def transport(props: dict, *, canary: str = "content") -> mock.Mock:
+    def transport(
+        props: dict, *, canary: str = "content", tool: str = "tool_only"
+    ) -> mock.Mock:
         """Answer ``/props`` and the compute canary the way a real engine does.
 
         Readiness is now a generation, not a metadata read, so a fixture that only serves ``/props``
         describes the buggy contract. ``canary`` picks what generation does, which is how the tests
         below cover the poisoned-backend case: metadata healthy, compute producing nothing.
         """
-        tools_events = [
-            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n',
-            b"data: [DONE]\n\n",
-        ]
+        tools_events = ServeTests.TOOL_STREAMS[tool]
         events = {
             "content": [
                 b'data: {"choices":[{"delta":{"content":"ready"}}]}\n\n',
@@ -699,21 +735,8 @@ class ServeTests(InstallFixture):
         import host_caps
 
         self.model["install"]["port"] = 8181
-        engine = {
-            "context_tokens": 4096,
-            "sequences": 1,
-            "model_alias": "fixture",
-            "model_path": "/fixture.gguf",
-            "build_commit": "abcdef0",
-        }
-        props = {
-            "default_generation_settings": {"n_ctx": 4096},
-            "total_slots": 1,
-            "model_alias": "fixture",
-            "model_path": "/fixture.gguf",
-            "build_info": "fixture abcdef0",
-            "is_sleeping": False,
-        }
+        engine = resolved_engine_record()
+        props = self._props(engine)
         for rss in (0, 1 << 50):
             child = mock.Mock(pid=4321)
             child.poll.return_value = None
@@ -737,21 +760,8 @@ class ServeTests(InstallFixture):
         import host_caps
 
         self.model["install"]["port"] = 8181
-        engine = {
-            "context_tokens": 4096,
-            "sequences": 1,
-            "model_alias": "fixture",
-            "model_path": "/fixture.gguf",
-            "build_commit": "abcdef0",
-        }
-        props = {
-            "default_generation_settings": {"n_ctx": 4096},
-            "total_slots": 1,
-            "model_alias": "fixture",
-            "model_path": "/fixture.gguf",
-            "build_info": "fixture abcdef0",
-            "is_sleeping": False,
-        }
+        engine = resolved_engine_record()
+        props = self._props(engine)
         for canary in ("empty", "error", "reasoning"):
             child = mock.Mock(pid=4321)
             child.poll.return_value = None
@@ -794,21 +804,22 @@ class ServeTests(InstallFixture):
                 self.assertEqual(record["outcome"], "content")
 
     def _engine_record(self):
-        return {
-            "context_tokens": 4096,
-            "sequences": 1,
-            "model_alias": "fixture",
-            "model_path": "/fixture.gguf",
-            "build_commit": "abcdef0",
-        }
+        return resolved_engine_record(serving_profile_id='p' * 64)
 
-    def _props(self):
+    def _props(self, engine: dict | None = None):
+        """The engine's own answer about itself, derived from the plan record it must match.
+
+        Written from the record rather than as a second literal: these two fixtures used to agree
+        by eye, and when the shared record changed ``model_path`` every readiness test in this class
+        failed at once for a reason that had nothing to do with what they were asserting.
+        """
+        record = engine or self._engine_record()
         return {
-            "default_generation_settings": {"n_ctx": 4096},
-            "total_slots": 1,
-            "model_alias": "fixture",
-            "model_path": "/fixture.gguf",
-            "build_info": "fixture abcdef0",
+            "default_generation_settings": {"n_ctx": record["context_tokens"]},
+            "total_slots": record["sequences"],
+            "model_alias": record["model_alias"],
+            "model_path": record["model_path"],
+            "build_info": record["build_info"],
             "is_sleeping": False,
         }
 
@@ -833,6 +844,9 @@ class ServeTests(InstallFixture):
             )
         self.assertEqual(result["canary_outcome"], "content")
         self.assertEqual(result["tool_canary"], "tool_only")
+        # The receipt must distinguish observation from echo, or the labelling the adapters produce
+        # is thrown away before anything can read it.
+        self.assertIn("context_tokens", result["attested"], result)
 
     def test_a_declared_tool_capability_fails_the_launch_when_prose_comes_back(self):
         import host_caps
@@ -867,6 +881,177 @@ class ServeTests(InstallFixture):
                 local_llm.wait_engine_ready(
                     child, self.model, self._engine_record(), "fixture-value"
                 )
+
+    def test_a_forced_tool_call_with_a_lead_in_sentence_still_passes(self):
+        """P2a: requiring tool_only meant "said nothing else", which no chat template promises.
+
+        ``classify()`` returns content whenever any prose arrived, even alongside a valid call, so
+        a template that says "let me look that up" before emitting the call failed readiness and
+        killed an otherwise healthy launch.
+        """
+        import host_caps
+
+        self.model["install"]["port"] = 8181
+        self.model["capabilities"] = ["thinking", "tool_use"]
+        child = mock.Mock(pid=4321)
+        child.poll.return_value = None
+        with (
+            mock.patch.object(
+                local_llm.urllib.request,
+                "urlopen",
+                self.transport(self._props(), tool="tool_with_prose"),
+            ),
+            mock.patch.object(host_caps, "process_memory_bytes", return_value=0),
+            mock.patch.object(host_caps, "available_memory_bytes", return_value=0),
+        ):
+            result = local_llm.wait_engine_ready(
+                child, self.model, self._engine_record(), "fixture-value"
+            )
+        self.assertEqual(result["tool_canary"], "content", result)
+
+    def test_a_truncated_tool_call_fails_readiness(self):
+        """Step 21: the canary used to be blind to truncation, and so published it as healthy.
+
+        ``StreamingCanaryScanner`` never captured ``finish_reason``, so the classifier's length
+        branch was unreachable from this path. A call cut off at the 64-token probe budget still
+        sent [DONE] and still counted as a tool call, which made it indistinguishable from a
+        completion the client can parse.
+        """
+        import host_caps
+
+        self.model["install"]["port"] = 8181
+        self.model["capabilities"] = ["tool_use"]
+        child = mock.Mock(pid=4321)
+        child.poll.return_value = None
+        with (
+            mock.patch.object(
+                local_llm.urllib.request,
+                "urlopen",
+                self.transport(self._props(), tool="tool_truncated"),
+            ),
+            mock.patch.object(host_caps, "process_memory_bytes", return_value=0),
+            mock.patch.object(host_caps, "available_memory_bytes", return_value=0),
+            self.assertRaisesRegex(local_llm.EngineError, "truncated"),
+        ):
+            local_llm.wait_engine_ready(
+                child, self.model, self._engine_record(), "fixture-value"
+            )
+
+    def test_one_tool_call_split_across_deltas_counts_once(self):
+        """The scanner counted per SSE fragment, so one streamed call reported as several."""
+        scanner = local_llm.StreamingCanaryScanner()
+        for event in ServeTests.TOOL_STREAMS["tool_fragmented"]:
+            scanner.feed(event)
+        scanner.finish()
+        self.assertEqual(scanner.tool_calls, 1)
+        self.assertEqual(scanner.outcome(), "tool_only")
+
+    def test_an_mlx_engine_reaches_readiness_through_its_own_adapter(self):
+        """F2: readiness polled /props unconditionally, a route this engine does not serve.
+
+        The MLX frontend exposes /v1/harness/status, so a healthy MLX process could never finish
+        starting. Asserted by the path actually requested and by the document being accepted, which
+        is what the adapter split exists to make possible.
+        """
+        import host_caps
+
+        status = {
+            "engine_kind": "mlx_lm",
+            "model": "fixture",
+            "model_path": "/fixture",
+            "protocol_version": 4,
+            "ready": True,
+            "context_tokens": 4096,
+            "sequences": 1,
+            "total_context_tokens": 4096,
+            "fingerprint": "f" * 64,
+            "launch_identity": "s" * 32,
+            "runtime_identity": "r" * 64,
+            "serving_profile_id": "p" * 64,
+            "tokenizer_identity": "t" * 64,
+            "template_identity": "",
+            "artifact_format": "mlx",
+            "cache_allocation": "growing",
+            "settings": {"context_tokens": 4096, "sequences": 1},
+            "identity": {"build_info": "mlx 0.32.4", "source_revision": None, "version": None},
+            "attested": ["model", "model_path"],
+            "declared": [],
+            "fatal": None,
+        }
+        seen = []
+
+        def urlopen(request, timeout=None):
+            url = getattr(request, "full_url", str(request))
+            seen.append(url)
+            body = json.loads(getattr(request, "data", b"{}") or b"{}")
+            if "tools" in body:
+                return _ChunkedStream(
+                    b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}'
+                    b'\n\ndata: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}'
+                    b'\n\ndata: [DONE]\n\n'
+                )
+            if url.endswith("/props"):
+                # The old code's route: an MLX frontend answers nothing here, which is the bug.
+                raise urllib.error.HTTPError(url, 404, "not found", {}, None)
+            if url.endswith("/v1/harness/status"):
+                return io.BytesIO(json.dumps(status).encode())
+            return _ChunkedStream(
+                b'data: {"choices":[{"delta":{"content":"ready"}}]}\n\ndata: [DONE]\n\n'
+            )
+
+        self.model["install"]["port"] = 8181
+        child = mock.Mock(pid=4321)
+        child.poll.return_value = None
+        engine = resolved_engine_record(
+            engine_kind="mlx_lm", model_path="/fixture", model_alias="fixture",
+            context_tokens=4096, sequences=1, total_context_tokens=4096,
+        )
+        with (
+            mock.patch.object(local_llm.urllib.request, "urlopen", side_effect=urlopen),
+            mock.patch.object(host_caps, "process_memory_bytes", return_value=0),
+            mock.patch.object(host_caps, "available_memory_bytes", return_value=0),
+        ):
+            result = local_llm.wait_engine_ready(child, self.model, engine, "fixture-value")
+
+        self.assertTrue(
+            any(url.endswith("/v1/harness/status") for url in seen),
+            f"readiness never asked the MLX status route; it asked {seen}",
+        )
+        self.assertEqual(result["canary_outcome"], "content", result)
+
+    def test_readiness_authenticates_with_a_real_credential(self):
+        """F2 second half: the token was blanked for the child and then reused for the probe.
+
+        Handing the child a descriptor and clearing the parent's copy are different acts; the
+        readiness request is the parent's, and it went out with an empty bearer token.
+        """
+        import host_caps
+
+        seen = []
+        self.model["install"]["port"] = 8181
+        child = mock.Mock(pid=4321)
+        child.poll.return_value = None
+
+        def urlopen(request, timeout=None):
+            seen.append((getattr(request, "full_url", ""), request.headers.get("Authorization")))
+            body = json.loads(getattr(request, "data", b"{}") or b"{}")
+            if "tools" in body:
+                return _ChunkedStream(ServeTests.TOOL_STREAMS["tool_only"])
+            if request.full_url.endswith("/props"):
+                return io.BytesIO(json.dumps(self._props()).encode())
+            return _ChunkedStream(
+                b'data: {"choices":[{"delta":{"content":"ready"}}]}\n\ndata: [DONE]\n\n'
+            )
+
+        with (
+            mock.patch.object(local_llm.urllib.request, "urlopen", side_effect=urlopen),
+            mock.patch.object(host_caps, "process_memory_bytes", return_value=0),
+            mock.patch.object(host_caps, "available_memory_bytes", return_value=0),
+        ):
+            local_llm.wait_engine_ready(child, self.model, self._engine_record(), "secret-token")
+        self.assertTrue(seen, "readiness made no request at all")
+        for _url, header in seen:
+            self.assertEqual(header, "Bearer secret-token", seen)
 
     def test_the_template_flag_follows_the_declared_capability(self):
         from tests.test_capacity import PROFILE
@@ -995,6 +1180,18 @@ class ServeTests(InstallFixture):
             "model_path": "/fixture/model.gguf",
             "build_commit": "abcdef0",
         }
+        from local_engines.base import EngineAdapterError
+        from local_engines.llama_cpp import LlamaCppAdapter
+
+        adapter = LlamaCppAdapter()
+
+        def verify(document: dict, record: dict) -> None:
+            """One validator for both paths: whatever the launcher will accept on a real launch."""
+            try:
+                adapter.verify_status(adapter.normalize_status(document), record)
+            except EngineAdapterError as exc:
+                raise local_llm.EngineError(str(exc)) from exc
+
         props = {
             "default_generation_settings": {"n_ctx": 4096},
             "total_slots": 2,
@@ -1003,7 +1200,7 @@ class ServeTests(InstallFixture):
             "build_info": "b1-abcdef0",
             "is_sleeping": False,
         }
-        local_llm.validate_properties(props, engine)
+        verify(props, engine)
         for field, value in (
             ("total_slots", 1),
             ("model_alias", "other"),
@@ -1013,7 +1210,7 @@ class ServeTests(InstallFixture):
             ("total_slots", 2.0),
         ):
             with self.subTest(field=field), self.assertRaises(local_llm.EngineError):
-                local_llm.validate_properties(dict(props, **{field: value}), engine)
+                verify(dict(props, **{field: value}), engine)
 
     def test_projection_and_server_share_the_allocation_arguments(self):
         from tests.test_capacity import PROFILE
@@ -1176,3 +1373,129 @@ class ServeTests(InstallFixture):
         ):
             args = local_llm.engine_args(self.model, 1024, 1, "t")
         self.assertEqual(args[args.index("--host") + 1], "192.168.65.1")
+
+
+class MlxArtifactValidationTests(unittest.TestCase):
+    """The MLX artifact contract, exercised against a real directory on disk.
+
+    ``validate_artifact`` is what makes "every file the engine consumes is pinned" more than a
+    sentence in a docstring, and until now no test called it. Both directions are checked: pinned
+    files must exist, and files on disk must be pinned.
+    """
+
+    def setUp(self):
+        from local_engines.mlx_lm import MlxLmAdapter
+
+        self.adapter = MlxLmAdapter()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.artifact = self.root / "mlx-snapshot"
+        self.artifact.mkdir()
+
+    def lock(self, *names: str, extra_files: dict[str, str] | None = None) -> dict:
+        files = []
+        for name in names:
+            (self.artifact / name).write_text("data")
+            files.append({"path": name, "sha256": "0" * 64, "size": 4})
+        for name, body in (extra_files or {}).items():
+            (self.artifact / name).write_text(body)
+        return {
+            "schema_version": 2,
+            "artifact": {"format": "mlx", "variant": "4bit", "directory": "mlx-snapshot"},
+            "files": files,
+        }
+
+    def model(self) -> dict:
+        return {"weights_dir": self.root, "id": "local_mps/x", "where": "models/local_mps/x"}
+
+    def test_a_fully_pinned_artifact_is_accepted(self):
+        lock = self.lock("model-00001.safetensors", "config.json")
+        artifact = self.adapter.validate_artifact(self.model(), lock)
+        self.assertEqual(artifact.format, "mlx")
+
+    def test_a_pinned_file_that_vanished_is_refused(self):
+        lock = self.lock("model-00001.safetensors", "config.json")
+        (self.artifact / "model-00001.safetensors").unlink()
+        with self.assertRaisesRegex(Exception, "missing"):
+            self.adapter.validate_artifact(self.model(), lock)
+
+    def test_an_unpinned_extra_shard_is_refused(self):
+        """The disk->lock direction. Upstream globs the directory, so presence is consumption."""
+        lock = self.lock("model-00001.safetensors", "config.json")
+        (self.artifact / "model-00002.safetensors").write_text("somebody else's weights")
+        with self.assertRaisesRegex(Exception, "does not pin"):
+            self.adapter.validate_artifact(self.model(), lock)
+
+    def test_a_config_present_but_unpinned_is_refused(self):
+        # config.json silently decides architecture, dtype and context length while every shard
+        # digest still matches, which is the whole hole a shard-only pin leaves open.
+        lock = self.lock("model-00001.safetensors")
+        (self.artifact / "config.json").write_text('{"num_hidden_layers": 1}')
+        with self.assertRaisesRegex(Exception, "config.json"):
+            self.adapter.validate_artifact(self.model(), lock)
+
+    def test_a_gguf_lock_is_refused_on_the_mlx_profile(self):
+        lock = self.lock("model-00001.safetensors", "config.json")
+        lock["artifact"]["format"] = "gguf"
+        with self.assertRaisesRegex(Exception, "artifact.format is mlx"):
+            self.adapter.validate_artifact(self.model(), lock)
+
+
+class AttestationTests(unittest.TestCase):
+    """The receipt must say which numbers the engine measured and which it echoed.
+
+    Both engines are covered: llama.cpp answers ``/props`` from its own state, while the MLX worker
+    is handed a plan and can therefore report a plan-shaped number without ever having observed it.
+    Presenting those two as the same kind of fact is what let a wired-limit echo read as a grant.
+    """
+
+    def test_llama_properties_are_attested_as_observations(self):
+        from local_engines.llama_cpp import LlamaCppAdapter
+
+        status = LlamaCppAdapter().normalize_status(
+            {
+                "default_generation_settings": {"n_ctx": 4096},
+                "total_slots": 1,
+                "model_alias": "fixture",
+                "model_path": "/fixture/model.gguf",
+                "build_info": "fixture abcdef0",
+                "is_sleeping": False,
+            }
+        )
+        self.assertIn("context_tokens", status.attested)
+        self.assertIn("total_slots", status.attested)
+
+    def test_mlx_attestation_comes_from_the_worker_not_the_adapter(self):
+        from local_engines.mlx_lm import MlxLmAdapter
+
+        document = json.loads(json.dumps(READY_STATUS_DOCUMENT))
+        document["attested"] = ["active_memory_bytes"]
+        status = MlxLmAdapter().normalize_status(document)
+        self.assertEqual(status.attested, frozenset({"active_memory_bytes"}))
+        # A worker that names nothing must not be credited with having measured something.
+        document["attested"] = []
+        self.assertEqual(MlxLmAdapter().normalize_status(document).attested, frozenset())
+
+
+READY_STATUS_DOCUMENT = {
+    "engine_kind": "mlx_lm",
+    "model": "fixture",
+    "model_path": "/fixture",
+    "protocol_version": 4,
+    "ready": True,
+    "context_tokens": 4096,
+    "sequences": 1,
+    "total_context_tokens": 4096,
+    "fingerprint": "f" * 64,
+    "launch_identity": "s" * 32,
+    "runtime_identity": "r" * 64,
+    "serving_profile_id": "p" * 64,
+    "tokenizer_identity": "t" * 64,
+    "template_identity": "",
+    "artifact_format": "mlx",
+    "cache_allocation": "growing",
+    "settings": {"context_tokens": 4096, "sequences": 1},
+    "identity": {"build_info": "mlx", "source_revision": None, "version": None},
+    "attested": [],
+    "declared": [],
+    "fatal": None,
+}

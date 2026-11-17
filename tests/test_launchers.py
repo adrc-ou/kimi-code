@@ -19,7 +19,12 @@ for _directory in (ROOT, ROOT / "tools"):
 import prompt_context  # noqa: E402
 import workspace_registry  # noqa: E402
 
-from tests.helpers import SHIPPED_MODEL, run_in_pty, tracked_files  # noqa: E402
+from tests.helpers import (  # noqa: E402
+    SHIPPED_MODEL,
+    run_in_pty,
+    stage_cross_tree_imports,
+    tracked_files,
+)
 
 
 class PlatformTests(unittest.TestCase):
@@ -116,6 +121,10 @@ class LauncherTests(unittest.TestCase):
             self.root / "tools" / "tui",
             ignore=shutil.ignore_patterns("__pycache__"),
         )
+        # Last, so a tree the fixture staged deliberately is never a collision: tools/local_llm.py
+        # imports the shared local-engine vocabulary from proxy/ and tools/capacity.py needs the
+        # local_engines package, and a launcher that cannot import them fails inside start.sh.
+        stage_cross_tree_imports(self.root)
         self.workspace.mkdir(parents=True, exist_ok=True)
         (self.root / ".env").touch()
         (self.root / "scripts/select_versions.py").write_text(
@@ -251,6 +260,7 @@ class SessionFlowTests(unittest.TestCase):
     def test_module_session_then_core_session_preserves_workspace(self):
         for directory in ("tools", "runtime"):
             shutil.copytree(ROOT / directory, self.root / directory, dirs_exist_ok=True)
+        stage_cross_tree_imports(self.root)
         (self.root / "scripts/select_versions.py").write_text("""
 import os
 from pathlib import Path
@@ -903,6 +913,7 @@ class PromptsScriptTests(unittest.TestCase):
         # The panel is a real program in this repo, so the stubbed launcher runs the real one.
         shutil.copytree(ROOT / "tools", self.root / "tools", dirs_exist_ok=True)
         shutil.copytree(ROOT / "runtime", self.root / "runtime", dirs_exist_ok=True)
+        stage_cross_tree_imports(self.root)
 
     def instance_runtime_dir(self) -> Path:
         """The instance directory the launcher would compute for this fixture.

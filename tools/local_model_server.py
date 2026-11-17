@@ -25,11 +25,14 @@ start, for no capability the platform does not already have.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import hmac
 import json
 import os
+import queue
 import secrets
+import signal
 import subprocess
 import sys
 import threading
@@ -46,6 +49,7 @@ for entry in (str(ROOT / "tools"), str(ROOT / "proxy")):
 
 from local_engine_contract import (  # noqa: E402
     WorkerError,
+    unsupported_request_fields,
     validate_status_document,
 )
 
@@ -53,12 +57,38 @@ from local_engine_contract import (  # noqa: E402
 #: to answer while a generation is running; a bound here is what makes "the frontend is stuck" a
 #: detectable condition rather than a hang.
 CONTROL_TIMEOUT_SECONDS = 30.0
+
+#: What one exact count may take from the tokenizer process. Far below the proxy's
+#: preparation timeout on purpose: the point of the separate process is that this
+#: never queues behind generation, so a longer bound here would only delay the
+#: fallback that does.
+COUNT_TIMEOUT_SECONDS = 20.0
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_STATUS_BYTES = 1024 * 1024
 #: SSE comments during a long prefill. Deliberately a comment line, not a chunk: a keepalive that
 #: looks like model output would be counted as progress by exactly the lease that exists to notice
 #: the absence of progress.
 KEEPALIVE_INTERVAL_SECONDS = 15.0
+
+#: How long a generation may go without emitting a *token* before this frontend gives up on it.
+#: Deliberately an idle bound rather than a total one and set far above any plausible prefill: an
+#: absolute cap on a request is what kills the longest, most valuable work, while silence after the
+#: stream already started is a different kind of evidence. Keepalives do not reset this clock.
+GENERATION_IDLE_LIMIT_SECONDS = 900.0
+
+
+class _EOF:
+    """Poison pill from the reader thread: the channel ended, and here is why.
+
+    A sentinel rather than an exception raised in the thread, because nothing in that thread has a
+    caller to receive it — the reason has to travel the same queue as the documents so the consumer
+    that would have read the next one learns that there never will be one.
+    """
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
 
 
 class WorkerGone(RuntimeError):
@@ -78,8 +108,7 @@ class WorkerChannel:
         self.plan = plan
         self._sequence = 0
         self._lock = threading.Lock()
-        self._reader_lock = threading.Lock()
-        self._deadline = 0.0
+        self._inbox: queue.Queue[Any] = queue.Queue()
         self._fatal: str | None = None
         self._status: dict[str, Any] | None = None
         self._started_at = time.monotonic()
@@ -91,28 +120,66 @@ class WorkerChannel:
             json.dump(plan, sink)
         os.set_inheritable(plan_read, True)
 
+        # A dedicated byte channel for "stop". It is not a command on the existing pipe because
+        # the command pipe is read only between requests, and the entire point of a cancellation is
+        # that a request is in flight. Written from the disconnect path, which cannot also be
+        # waiting on the channel lock that the generation itself is holding.
+        cancel_read, self._cancel_write = os.pipe()
+        os.set_inheritable(cancel_read, True)
+
         def _hand_over_plan() -> None:  # pragma: no cover - runs between fork and exec
             os.dup2(plan_read, 3)
             if plan_read != 3:
                 os.close(plan_read)
+            os.dup2(cancel_read, 4)
+            if cancel_read != 4:
+                os.close(cancel_read)
 
         self.process = subprocess.Popen(  # noqa: S603 - argv is built from the pinned runtime
-            [*argv, "--plan-fd", "3"],
+            [*argv, "--plan-fd", "3", "--cancel-fd", "4"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
-            pass_fds=(plan_read,),
+            pass_fds=(plan_read, cancel_read),
             preexec_fn=_hand_over_plan,
             text=True,
             encoding="utf-8",
             bufsize=1,
         )
         os.close(plan_read)
+        # The parent keeps only the write end. Holding the read end too would mean the worker's
+        # blocking read(1) could never see EOF, not even when this process has gone away.
+        os.close(cancel_read)
+        self._cancel_read_in_parent = None
         self._stdin = self.process.stdin
         self._stdout = self.process.stdout
+        #: Held as an attribute so teardown can close it. The diagnostics reader below already
+        #: reached through ``self.process.stderr``, which left this stream out of the close list
+        #: and leaked a descriptor per engine stop.
+        self._stderr = self.process.stderr
+        # Started here rather than lazily: a document that arrives before the first consumer is
+        # waiting must be kept, not lost to a pipe nobody has looked at yet.
+        threading.Thread(
+            target=self._reader, name="mlx-worker-reader", daemon=True
+        ).start()
 
     # ------------------------------------------------------------------ lifecycle
+
+    def cancel(self) -> None:
+        """Tell the worker to abandon the generation in flight, without waiting for it.
+
+        One byte is the protocol. Nothing here takes ``self._lock``: the lock is held by the very
+        generation being cancelled, so a cancellation that queued behind it would arrive after the
+        work it meant to stop. This is what lets a client hanging up actually release the device
+        rather than leave the worker running to its token budget for an audience of none.
+        """
+        try:
+            if self._cancel_write is not None:
+                os.write(self._cancel_write, b"x")
+        except OSError:
+            # The worker is gone, which is a worse-but-equally-final answer than cancelling.
+            pass
 
     def await_ready(self, timeout: float) -> dict[str, Any]:
         """Read the worker's opening document: readiness is *its* claim, not ours to assume."""
@@ -152,8 +219,20 @@ class WorkerChannel:
         return self._fatal or (None if self.alive() else self._exit_reason())
 
     def stop(self) -> None:
-        for close in (self._close_pipes,):
-            close()
+        """End the worker, then close. Not the other way round.
+
+        The reader thread is parked in ``readline()`` on the worker's stdout. Closing that stream
+        from this thread while a blocking read is outstanding does not release it — the fd is
+        released underneath a C-level read that keeps waiting — so a stop() that closed first hung
+        the frontend's own teardown and it never exited on SIGTERM. Terminating the child closes the
+        writer end, the read returns EOF, and the reader posts its sentinel and finishes.
+
+        Closing the cancel write end happens first and deliberately: it is not read by the worker as
+        a shutdown signal (see :func:`watch_cancellation`, which ignores an empty read), and leaving
+        it open leaked one descriptor per engine teardown while also keeping the worker's read from
+        ever seeing EOF.
+        """
+        self._close_cancel()
         if self.process.poll() is None:
             # escalate, never wait forever: a worker blocked in a driver call will not read the
             # termination signal, and the launcher cannot be held hostage by it.
@@ -163,9 +242,23 @@ class WorkerChannel:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
+        self._close_pipes()
 
-    def _close_pipes(self) -> None:  # noqa: B027
-        for stream in (self._stdin,):
+    def _close_cancel(self) -> None:
+        for attribute in ("_cancel_write",):
+            fd = getattr(self, attribute, None)
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                setattr(self, attribute, None)
+
+    def _close_pipes(self) -> None:
+        # All three, not just stdin: stdout is the stream the reader thread is parked in and
+        # stderr is the worker's diagnostics pipe, and leaving either open leaks a descriptor on
+        # every engine teardown. Closing stdout is also how a wedged reader is released — the
+        # thread's readline() raises, and _reader turns that into the same EOF it would have
+        # reported for a clean exit.
+        for stream in (self._stdin, self._stdout, self._stderr):
             try:
                 if stream is not None and not stream.closed:
                     stream.close()
@@ -236,13 +329,20 @@ class WorkerChannel:
                 remaining = KEEPALIVE_INTERVAL_SECONDS
                 if self._stdout is None:
                     raise WorkerGone("engine channel is closed")
-                message = self._read_line(remaining, hold_lock=True)
+                message = self._read_line(remaining)
                 if message is None:
                     if not self.alive():
                         raise WorkerGone(self._fatal or self._exit_reason())
+                    # Bounded by *silence since the last real token*, not by elapsed wall clock: an
+                    # overall cap would kill the slowest native-context prefill, which is the one
+                    # request worth waiting for. Keepalives do not reset it.
+                    if time.monotonic() - idle_started >= GENERATION_IDLE_LIMIT_SECONDS:
+                        raise WorkerGone(
+                            f"engine emitted nothing for {GENERATION_IDLE_LIMIT_SECONDS:.0f}s "
+                            "mid-generation"
+                        )
                     if time.monotonic() - idle_started >= KEEPALIVE_INTERVAL_SECONDS:
                         yield {"kind": "keepalive"}
-                        idle_started = time.monotonic()
                     continue
                 if message.get("kind") == "fatal":
                     self._fatal = str(message.get("reason", "engine failed"))
@@ -254,46 +354,192 @@ class WorkerChannel:
                     idle_started = time.monotonic()
                     yield {"kind": "token", "text": str(message.get("text", ""))}
                 elif kind == "end":
-                    yield {"kind": "end", "content_chars": int(message.get("content_chars", 0))}
+                    # Carried through rather than inferred. The worker knows whether the model said
+                    # stop or the budget ran out; this layer does not, and a hardcoded "stop" here
+                    # would relabel a truncation as a finished answer for every client.
+                    yield {
+                        "kind": "end",
+                        "content_chars": int(message.get("content_chars", 0)),
+                        "finish_reason": message.get("finish_reason") or "length",
+                        "generation_tokens": int(message.get("generation_tokens") or 0),
+                        "peak_memory_bytes": message.get("peak_memory_bytes"),
+                        "cancelled": bool(message.get("cancelled")),
+                    }
                     return
                 elif kind == "refused":
                     yield {"kind": "refused", "code": message.get("code")}
                     return
 
-    def _read_line(self, timeout: float, *, hold_lock: bool = False) -> dict[str, Any] | None:
-        """Read one control line without blocking the frontend's other threads.
+    def _reader(self) -> None:
+        """Drain the worker's stdout into a queue, one document at a time, until it ends.
 
-        ``select`` on the worker's stdout rather than a blocking ``readline`` is what lets a status
-        request be answered while a generation is mid-flight: the read cannot park the interpreter
-        in a syscall that outlives the caller's patience.
+        A dedicated reader exists because ``select()`` on the pipe and ``readline()`` on a buffered
+        text stream disagree about where a line lives. The wrapper reads ahead in 8 KiB blocks
+        regardless of ``bufsize=1`` — line buffering governs writes, not reads — so a worker that
+        wrote a token and its terminal ``end`` back to back left the second line stranded in
+        userspace, invisible to ``select()`` forever. The caller then reported a live worker as idle
+        and the frontend hung while its own health endpoint answered ``ready``.
+
+        Reading in a thread removes the fd/userspace split entirely: there is one reader, and it
+        never asks the kernel about bytes the interpreter already holds. It also keeps draining when
+        no HTTP client is reading, which is what stops a disconnected client from filling the pipe
+        and parking the worker inside its generation loop.
         """
-        import select
-
-        if self._stdout is None:
-            raise WorkerGone("engine channel is closed")
-        deadline = time.monotonic() + max(0.05, timeout)
+        stream = self._stdout
+        assert stream is not None  # set by __init__ before the thread starts
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            ready, _, _ = select.select([self._stdout], [], [], min(remaining, 0.25))
-            if not ready:
-                if self.process.poll() is not None:
-                    raise WorkerGone(self._exit_reason())
-                continue
-            line = self._stdout.readline()
+            try:
+                line = stream.readline()
+            except (OSError, ValueError) as failure:
+                self._inbox.put(_EOF(f"engine channel failed: {failure}"))
+                return
             if not line:
-                raise WorkerGone(self._exit_reason())
+                self._inbox.put(_EOF(self._exit_reason()))
+                return
             line = line.strip()
             if not line:
                 continue
             try:
-                return json.loads(line)
+                self._inbox.put(json.loads(line))
             except ValueError:
-                # A torn control line means the channel can no longer be trusted to be
-                # synchronised with anything. Recovering from it would require framing the worker
-                # does not provide, so this is terminal by design.
-                raise WorkerGone("engine control channel produced unparseable output") from None
+                # A torn control line means the channel can no longer be trusted to be synchronised
+                # with anything. Recovering from it would require framing the worker does not
+                # provide, so this is terminal by design.
+                self._inbox.put(_EOF("engine control channel produced unparseable output"))
+                return
+
+    def _read_line(self, timeout: float) -> dict[str, Any] | None:
+        """Next worker document, or ``None`` if none arrived within ``timeout``.
+
+        Never returns a document the interpreter already holds but the kernel does not: that
+        distinction is the whole reason for :meth:`_reader`.
+        """
+        try:
+            message = self._inbox.get(timeout=max(0.05, timeout))
+        except queue.Empty:
+            if self.process.poll() is not None:
+                raise WorkerGone(self._exit_reason()) from None
+            return None
+        if isinstance(message, _EOF):
+            raise WorkerGone(message.reason)
+        return message
+
+
+class TokenCounter:
+    """A tokenizer-only child process, so an exact count never waits for a generation.
+
+    The worker reads one command at a time, which is a property of MLX's stream and cache rules and
+    not something the frontend's locking can work around: releasing the channel lock would only
+    move the queue from Python into the worker's stdin loop. Counting needs no device, so it runs
+    beside the engine instead of in front of it.
+
+    Availability is reported rather than assumed. If this process dies, counts fall back to the
+    engine channel — correct but slow — and ``status`` says so, because silently returning to the
+    behaviour that caused the original timeout would be invisible from outside.
+    """
+
+    def __init__(self, python: str, script: str, model_dir: str, environment: dict[str, str]):
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self._failed: str | None = None
+        self.script = script
+        try:
+            self.process = subprocess.Popen(  # noqa: S603 - both paths come from the launch plan
+                [python, script, "--model-dir", model_dir],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
+        except OSError as exc:
+            self.process = None
+            self._failed = f"counter could not start: {exc}"
+
+    @property
+    def available(self) -> bool:
+        if self.process is None:
+            return False
+        code = self.process.poll()
+        if code is None:
+            return True
+        # Record *why* it stopped being available. Without this the frontend can report a degraded
+        # counting path but not what caused it, which is how a counter that dies on the operator's
+        # machine becomes an afternoon of guessing instead of one line of output.
+        if self._failed is None:
+            self._failed = f"token counter exited with status {code}"
+        return False
+
+    @property
+    def failure(self) -> str | None:
+        return self._failed
+
+    def count(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        """Ask for an exact count. Raises WorkerGone if this process cannot answer."""
+        if not self.available:
+            raise WorkerGone(self._failed or "token counter has exited")
+        with self._lock:
+            assert self.process is not None and self.process.stdin is not None
+            assert self.process.stdout is not None
+            self._sequence += 1
+            sequence = self._sequence
+            self.process.stdin.write(
+                json.dumps(
+                    {"action": "input_tokens", "sequence": sequence, "payload": payload},
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            )
+            self.process.stdin.flush()
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkerGone(f"token counter produced nothing within {timeout}s")
+                line = self.process.stdout.readline()
+                if not line:
+                    raise WorkerGone(self._exit_reason())
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    raise WorkerGone("token counter produced unparseable output") from None
+                if message.get("kind") == "fatal":
+                    self._failed = str(message.get("reason", "counter failed"))
+                    raise WorkerGone(self._failed)
+                if message.get("sequence") == sequence:
+                    return message
+
+    def _exit_reason(self) -> str:
+        code = self.process.returncode if self.process is not None else None
+        return f"token counter exited with code {code}"
+
+    def stop(self) -> None:
+        if self.process is None:
+            return
+        try:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+        except OSError:
+            pass
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        for stream in (self.process.stdout, self.process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
 
 
 class Frontend:
@@ -305,8 +551,12 @@ class Frontend:
         token: str,
         plan: dict[str, Any],
         expected_status: dict[str, Any],
+        counter: TokenCounter | None = None,
     ) -> None:
         self.channel = channel
+        self.counter = counter
+        self.counter_failures = 0
+        self.count_fallbacks = 0
         self.token_digest = hashlib.sha256(token.encode()).digest()
         self.plan = plan
         self.expected_status = expected_status
@@ -317,6 +567,13 @@ class Frontend:
         self._status: dict[str, Any] = dict(expected_status)
         self._status_at = time.monotonic()
         self.requests = 0
+
+    def note_counter_failure(self, reason: str) -> None:
+        self.counter_failures += 1
+        self._counter_reason = reason
+
+    def note_count_fallback(self) -> None:
+        self.count_fallbacks += 1
 
     def authorized(self, header: str | None) -> bool:
         if not header or not header.lower().startswith("bearer "):
@@ -342,6 +599,15 @@ class Frontend:
             "status_age_seconds": round(time.monotonic() - self._status_at, 1),
             "engine_alive": self.channel.alive(),
             "uptime_seconds": round(time.monotonic() - self.channel._started_at, 1),
+            # Reported so a degraded counting path is visible from outside rather than being
+            # experienced as unexplained slowness. Counting still works when the counter is gone —
+            # it just queues behind generation again, which is the condition this split exists to
+            # remove.
+            "token_counter_available": bool(self.counter and self.counter.available),
+            "token_counter_failures": self.counter_failures,
+            "counts_served_by_engine": self.count_fallbacks,
+            "token_counter_reason": getattr(self, "_counter_reason", None),
+            "counter_failure_reason": (None if self.counter is None else self.counter.failure),
         }
         return document
 
@@ -469,17 +735,46 @@ def make_handler(frontend: Frontend) -> type[BaseHTTPRequestHandler]:
             self._error(404, "not_found", f"no route {path}")
 
         def _count(self, payload: dict[str, Any]) -> None:
-            try:
-                message = frontend.channel.call("input_tokens", payload)
-            except WorkerGone as gone:
-                self._error(503, str(WorkerError.COMPUTE_FAILED), str(gone))
-                return
+            # Counting goes to the tokenizer-only process when it is alive, so a queued request
+            # never waits behind someone else's prefill and then times out into a retry that queues
+            # again behind the same prefill. The engine channel stays as the fallback: a missing
+            # count is worse than a slow one, but the degradation is reported, not hidden.
+            counter = frontend.counter
+            message: dict[str, Any] | None = None
+            if counter is not None and counter.available:
+                try:
+                    message = counter.count(payload, COUNT_TIMEOUT_SECONDS)
+                except WorkerGone as gone:
+                    frontend.note_counter_failure(str(gone))
+                    message = None
+            if message is None:
+                frontend.note_count_fallback()
+                try:
+                    message = frontend.channel.call("input_tokens", payload)
+                except WorkerGone as gone:
+                    self._error(503, str(WorkerError.COMPUTE_FAILED), str(gone))
+                    return
             if message.get("kind") == "refused":
                 self._error(400, str(message.get("code")), "engine refused the request")
                 return
             self._send(200, json.dumps(message.get("count") or {}).encode())
 
         def _complete(self, payload: dict[str, Any]) -> None:
+            refused = unsupported_request_fields(payload)
+            if refused:
+                # Answered before the headers, not inside the stream. Once 200 is out, the only way
+                # to tell the client its request was inadmissible is an in-band error object, and
+                # the proxy classifies an error object as engine damage and latches the lane — so a
+                # client setting one unsupported field could disable a healthy engine for the rest
+                # of the session. The worker refuses these too; this is the same policy (shared via
+                # local_engine_contract so it cannot drift) applied where the status code is still
+                # chooseable.
+                self._error(
+                    400,
+                    str(WorkerError.UNSUPPORTED_SETTING),
+                    "unsupported request fields: " + ", ".join(refused),
+                )
+                return
             if payload.get("stream") is False:
                 self._complete_whole(payload)
                 return
@@ -533,6 +828,14 @@ def make_handler(frontend: Frontend) -> type[BaseHTTPRequestHandler]:
                         )
                         self.wfile.write(b"data: [DONE]\n\n")
             except (WorkerGone, BrokenPipeError, ConnectionResetError) as failure:
+                if not isinstance(failure, WorkerGone):
+                    # The client hung up while the engine was mid-generation. Nothing else in this
+                    # process will ever read the rest of that completion, so without a cancellation
+                    # the worker runs to its token budget for an audience of none — still holding
+                    # the one execution slot and the device memory behind it — while /health keeps
+                    # answering ready. Sent before anything else, and on its own byte channel,
+                    # because the channel lock belongs to the generation being abandoned.
+                    frontend.channel.cancel()
                 # Headers are already sent, so the status line cannot be repaired. An in-band error
                 # object is the only honest signal left, and the proxy classifies it.
                 with_error = {
@@ -624,53 +927,80 @@ def main(argv: list[str] | None = None) -> int:
         print("a session credential of at least 32 characters is required", file=sys.stderr)
         return 2
 
-    channel = WorkerChannel(
-        [args.worker, *args.worker_arg],
-        dict(os.environ),
-        plan,
-    )
-    try:
-        status = channel.await_ready(args.ready_timeout)
-    except (WorkerGone, ValueError) as failure:
-        print(f"engine failed to become ready: {failure}", file=sys.stderr)
-        channel.stop()
-        return 3
+    # Handlers are installed before the executor is spawned, and the whole lifecycle sits in one
+    # try/finally, because the previous shape left two windows: no handler at all until just before
+    # serve_forever(), and no teardown path for a signal that arrived during readiness, the plan
+    # comparison, or the bind. A SIGTERM in either window ended the interpreter by default
+    # disposition — running no ``finally`` — and left the worker resident with the model. The test
+    # of the teardown raced that and failed roughly a third of the time; closing the window is the
+    # fix, not a retry. macOS offers no PR_SET_PDEATHSIG equivalent, so there is nothing to fall
+    # back on if this process dies unhandled.
+    def _stop(signum, _frame):
+        raise SystemExit(128 + int(signum))
 
-    mismatches = _compare_to_plan(status, plan)
-    if mismatches:
+    for signal_number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signal_number, _stop)
+
+    channel: WorkerChannel | None = None
+    listener: _Server | None = None
+    counter: TokenCounter | None = None
+    try:
+        channel = WorkerChannel([args.worker, *args.worker_arg], dict(os.environ), plan)
+        try:
+            status = channel.await_ready(args.ready_timeout)
+        except (WorkerGone, ValueError) as failure:
+            print(f"engine failed to become ready: {failure}", file=sys.stderr)
+            return 3
+
+        mismatches = _compare_to_plan(status, plan)
+        if mismatches:
+            print(
+                "engine readiness disagrees with the resolved plan: "
+                + "; ".join(mismatches),
+                file=sys.stderr,
+            )
+            return 4
+
+        counter: TokenCounter | None = None
+        if plan.get("model_dir"):
+            # Same interpreter, same sanitized environment: the counter needs mlx_lm's tokenizer
+            # loader and nothing else, so it shares the provisioned runtime rather than the host's.
+            counter = TokenCounter(
+                args.worker,
+                str(Path(__file__).with_name("local_token_counter.py")),
+                str(plan["model_dir"]),
+                dict(os.environ),
+            )
+        frontend = Frontend(channel, token, plan, status, counter)
+        handler = make_handler(frontend)
+        try:
+            listener = _Server((args.host, args.port), handler)
+        except OSError as exc:
+            print(f"cannot bind {args.host}:{args.port}: {exc}", file=sys.stderr)
+            return 5
+
+        if args.ready_file:
+            # The receipt is written by the supervisor, after both identity verification and a real
+            # generation have succeeded. Writing it here would repeat the mistake this replaced.
+            Path(args.ready_file).write_text(
+                json.dumps({"ready": True, "pid": os.getpid()})
+            )
         print(
-            "engine readiness disagrees with the resolved plan: " + "; ".join(mismatches),
-            file=sys.stderr,
+            f"local engine listening on {args.host}:{args.port} "
+            f"(ctx={status['context_tokens']}, slots={status['sequences']})",
+            flush=True,
         )
-        channel.stop()
-        return 4
-
-    frontend = Frontend(channel, token, plan, status)
-    handler = make_handler(frontend)
-    try:
-        server = _Server((args.host, args.port), handler)
-    except OSError as exc:
-        print(f"cannot bind {args.host}:{args.port}: {exc}", file=sys.stderr)
-        channel.stop()
-        return 5
-
-    if args.ready_file:
-        # The receipt is written by the supervisor, after both identity verification and a real
-        # generation have succeeded. Writing it here would repeat the mistake this replaced.
-        Path(args.ready_file).write_text(json.dumps({"ready": True, "pid": os.getpid()}))
-    print(
-        f"local engine listening on {args.host}:{args.port} "
-        f"(ctx={status['context_tokens']}, slots={status['sequences']})",
-        flush=True,
-    )
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
+        listener.serve_forever()
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        server.shutdown()
-        server.server_close()
-        channel.stop()
+        if listener is not None:
+            listener.shutdown()
+            listener.server_close()
+        if counter is not None:
+            counter.stop()
+        if channel is not None:
+            channel.stop()
     return 0
 
 

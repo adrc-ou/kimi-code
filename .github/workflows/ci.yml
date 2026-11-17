@@ -25,6 +25,24 @@ jobs:
           for suite in modules/*/tests; do
             [ ! -d "$suite" ] || python -m unittest discover -s "$suite" -v
           done
+      # 19 of the launcher tests skip whenever TMPDIR is on a noexec filesystem, and a skipped test
+      # that would have caught a P1 is the most expensive kind of green: that is exactly how a
+      # launcher fixture missing a shared module stayed invisible on Linux while it failed on
+      # macOS. Run them from an explicitly executable directory and require the full count.
+      - name: Run launcher tests with no filesystem skips
+        env:
+          TMPDIR: ${{ runner.temp }}/exec-tmp
+        run: |
+          mkdir -p "$TMPDIR"
+          out="$(python -m unittest tests.test_launchers -v 2>&1)" || {
+            printf '%s\n' "$out"
+            exit 1
+          }
+          printf '%s\n' "$out" | tail -n 3
+          if printf '%s\n' "$out" | grep -q 'skipped'; then
+            echo '::error::launcher tests skipped rather than executing; they must run in CI'
+            exit 1
+          fi
       - run: python -m compileall -q proxy scripts search-adapter tests tools modules container
       - run: ruff check .
       - run: python scripts/check_locks.py
@@ -238,7 +256,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e3a63bd5f65534435c # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
@@ -257,7 +275,7 @@ jobs:
         continue-on-error: true
         run: python tools/local_native_probe.py --output /tmp/probe.json
       - name: Report what the probe concluded
-        when: always()
+        if: always()
         run: |
           if [ -f /tmp/probe.json ]; then
             python -c "import json;d=json.load(open('/tmp/probe.json'));print(json.dumps(d,indent=2))"

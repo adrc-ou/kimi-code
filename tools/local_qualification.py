@@ -297,6 +297,37 @@ def cancel_during(origin, payload: dict, after_seconds: float) -> dict[str, Any]
 SHORT_TOKENS = 32
 
 
+#: Cases a promotion cannot be decided without. A skipped case is not a passed case, and the
+#: verdict is derived from this list rather than from the absence of failures — which is exactly
+#: how ``--skip-near-ceiling`` used to report ``promotion_permitted: true`` having never attempted
+#: the workload class that started the whole investigation.
+#: Matched by prefix, because the repeated-turn case records one entry per turn.
+REQUIRED_CASES = (
+    "short_completion",
+    "tool_call",
+    "cancellation",
+    "repeat_tool_turn",
+    "near_ceiling",
+)
+
+
+def completed(answer: dict[str, Any], *, expect_tools: bool = False) -> bool:
+    """True only for a completion the engine declared finished.
+
+    ``finish_reason`` was already captured and then never consulted, so an engine that truncated
+    every single request would have been qualified on the strength of content that arrived before
+    the cut. ``length`` means the output budget ran out mid-thought; that is a failure to complete,
+    whatever arrived first.
+    """
+    if answer.get("saw_error_object"):
+        return False
+    if answer.get("finish_reason") != "stop":
+        return False
+    if expect_tools:
+        return int(answer.get("tool_calls") or 0) > 0
+    return bool(int(answer.get("content_characters") or 0))
+
+
 def run(argv: list[str] | None = None) -> dict[str, Any]:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--near-ceiling-fraction", type=float, default=0.9)
@@ -327,12 +358,14 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
     #    interpretable and continuing only spends the operator's afternoon.
     payload, count = fit_request(origin, SHORT_TOKENS, tools=False)
     answer = timed_generation(origin, payload, args.request_timeout)
-    usable = bool(answer["content_characters"] or answer["tool_calls"])
     record(
         "short_completion",
         {**answer, "prepared_tokens": count},
-        failing=answer["saw_error_object"] or not usable,
-        note="a short request produced no usable completion",
+        failing=not completed(answer),
+        note=(
+            "a short request produced no completed usable completion "
+            f"(finish_reason={answer.get('finish_reason')!r})"
+        ),
     )
     if result["failures"]:
         return _finish(result, started, args.output)
@@ -343,8 +376,8 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
     record(
         "tool_call",
         {**answer, "prepared_tokens": count},
-        failing=answer["tool_calls"] == 0,
-        note="declared tool_use produced no tool call",
+        failing=not completed(answer, expect_tools=True),
+        note="declared tool_use produced no completed tool call",
     )
 
     # 3. Cancellation, and the slot returning.
@@ -368,8 +401,8 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
         record(
             f"repeat_tool_turn_{index}",
             answer,
-            failing=answer["saw_error_object"],
-            note="a repeated identical turn errored",
+            failing=not completed(answer, expect_tools=True),
+            note="a repeated identical turn did not complete usefully",
         )
     if len(rates) == len(payloads):
         spread = max(rates) - min(rates)
@@ -398,43 +431,71 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
             record(
                 "near_ceiling",
                 {**answer, "prepared_tokens": count, "declared_context": declared},
-                failing=bool(answer["saw_error_object"]) or not (
-                    answer["content_characters"] or answer["tool_calls"]  # noqa: SIM220
-                ),
+                # Either shape is acceptable at the ceiling — prose or a tool call — but both
+                # must have *finished*, which is the part this check used to omit.
+                failing=not (completed(answer) or completed(answer, expect_tools=True)),
                 note=(
                     f"a {count}-token request against a {declared}-token window did not "
                     "complete usefully"
                 ),
             )
     else:
+        # Recorded as an observation for the human reading the artifact, but the missing case is
+        # what _finish() keys on; the observation alone used to be the only trace, and the verdict
+        # was computed from failures, of which a skipped case produces none.
         result["observations"].append({"kind": "near_ceiling_skipped", "by_flag": True})
 
     return _finish(result, started, args.output)
 
 
 def _declared_context(origin) -> int | None:
-    """Read the engine's own enforced window, refusing to assume it matches the plan."""
+    """The context length the running engine attests to, from its status document.
+
+    Read with GET: ``/v1/harness/status`` is served by the frontend's ``do_GET`` only, and this
+    posted to it, so the call answered nothing and the near-ceiling case silently degraded to
+    "the engine reported no context length".
+    """
+    host, port, token = origin
+    request = urllib.request.Request(
+        f"http://{host}:{port}/v1/harness/status",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+    )
     try:
-        status = _post(origin, "/v1/harness/status", {}, 30.0)
-    except (OSError, urllib.error.URLError, QualificationError):
-        status = {}
-    for key in ("context_tokens",):
-        value = status.get(key)
-        if isinstance(value, int) and not isinstance(value, bool):
+        with urllib.request.urlopen(request, timeout=30.0) as response:
+            document = json.loads(response.read())
+    except (OSError, ValueError):
+        return None
+    for key in ("context_tokens", "native_context_tokens"):
+        value = document.get(key)
+        if isinstance(value, int) and value > 0:
             return value
     return None
 
 
 def _finish(result: dict[str, Any], started: float, output: str) -> dict[str, Any]:
+    """Derive the verdict from what was *established*, never from what merely did not fail.
+
+    ``passes`` alone was the old rule, and a case that never ran contributes no failure, so
+    ``--skip-near-ceiling`` produced ``promotion_permitted: true``. Completeness is now a separate
+    condition, and the artifact says which cases were missing rather than leaving a reader to count.
+    """
     result["elapsed_seconds"] = round(time.monotonic() - started, 1)
+    ran = set(result["cases"])
+    missing = sorted(
+        group for group in REQUIRED_CASES if not any(name.startswith(group) for name in ran)
+    )
+    result["required_cases_missing"] = missing
     result["passes"] = not result["failures"]
-    if not result["passes"]:
-        # Stated in the artifact, so a summary line cannot accidentally imply more than the run
-        # established.
-        result["promotion_permitted"] = False
-        result["blocking_failures"] = result["failures"]
-    else:
-        result["promotion_permitted"] = True
+    result["evidence_complete"] = not missing
+    result["promotion_permitted"] = result["passes"] and result["evidence_complete"]
+    if not result["promotion_permitted"]:
+        if result["failures"]:
+            result["blocking_failures"] = result["failures"]
+        if missing:
+            result["blocking_reason"] = (
+                "required cases were not run, so nothing about them is evidence: "
+                + ", ".join(missing)
+            )
     if output:
         destination = Path(output)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -451,7 +512,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"qualification refused: {error}", file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if result["passes"] else 1
+    return 0 if result["promotion_permitted"] else 1
 
 
 if __name__ == "__main__":

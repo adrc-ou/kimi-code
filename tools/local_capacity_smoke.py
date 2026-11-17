@@ -28,11 +28,13 @@ from typing import Any
 
 if __package__:
     from . import capacity, host_caps, local_llm
+    from .local_engines.base import EngineAdapterError
     from .private_file import write_private_json
 else:
     import capacity
     import host_caps
     import local_llm
+    from local_engines.base import EngineAdapterError
     from private_file import write_private_json
 
 METADATA_BYTES = 65536
@@ -197,8 +199,17 @@ def exercise_engine(
 ) -> dict:
     """Observe all full slots plus preparation; a missed overlap is failed evidence."""
     try:
-        local_llm.validate_properties(client.request("/props"), engine)
-    except local_llm.EngineError as exc:
+        # Through the adapter, which is the single definition of "this running engine is the one the
+        # plan describes". The launcher validates via adapter.verify_status(); a smoke tool keeping
+        # its own property checks is a second validator that can pass while the real launch path
+        # rejects, and the two quietly disagree about what was attested.
+        adapter = local_llm.capacity_adapter(engine["engine_kind"])
+        adapter.verify_status(
+            adapter.normalize_status(client.request(adapter.status_path())), engine
+        )
+    except (local_llm.EngineError, EngineAdapterError, OSError, ValueError) as exc:
+        # Named types, not a blanket Exception: the smoke tool reporting its own bug as an engine
+        # failure would be a false negative on exactly the thing it exists to detect.
         raise SmokeError(str(exc)) from None
     slots = engine["sequences"]
     if occupied_slots(client, slots):

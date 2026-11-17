@@ -10,9 +10,10 @@ another engine's residency settings has no honest way to report which bytes it a
 
 Everything the process does runs on one thread. MLX's own rules about stream and cache state mean
 two threads issuing work would corrupt the conversation rather than merely interleave it, so the
-worker accepts one request at a time and says ``busy`` rather than queueing invisibly. The thread is
-the worker's main thread; the "one dedicated execution thread" requirement in the plan is satisfied
-by there being exactly one thread at all.
+worker accepts one request at a time and the frontend queues them on its channel lock. The worker
+never reports "busy", because from its side there is no such moment: it is handed a request only
+when it is free. The thread is the worker's main thread; the "one dedicated execution thread"
+requirement in the plan is satisfied by there being exactly one thread at all.
 
 The model, its identity and its numbers all arrive from the resolved plan and are echoed back
 through the status document. Nothing here decides a context window, a slot count or a wiring
@@ -30,9 +31,29 @@ import hashlib
 import json
 import os
 import sys
+import threading
+from pathlib import Path
 from typing import Any
 
-from local_engine_contract import WorkerError, status_document
+# This file is started as a script by the frontend, which is itself started by the launcher, so it
+# cannot rely on anyone else's sys.path. proxy/ holds the shared vocabulary and is not a sibling of
+# this package.
+_ROOT = Path(__file__).resolve().parents[2]
+for _entry in (str(_ROOT / "proxy"), str(_ROOT / "tools")):
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)
+
+# Two statements, not one: isort will not merge an aliased import into the plain group below it, so
+# joining them re-introduces I001. The noqa is the same reason proxy/model_proxy.py carries one —
+# a module-level path bootstrap has to precede the import it makes resolvable.
+from local_engine_contract import (  # noqa: E402
+    LOCAL_UNSUPPORTED_REQUEST_FIELDS as _UNSUPPORTED_REQUEST_FIELDS,
+)
+from local_engine_contract import (  # noqa: E402
+    WorkerError,
+    status_document,
+    unsupported_request_fields,
+)
 
 #: MLX is imported lazily by :func:`_mlx` rather than at module scope. The pure logic in this file -
 #: request validation, the output bound, the status document - is the part with real failure modes,
@@ -66,11 +87,14 @@ class WorkerRefused(RuntimeError):
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", required=True)
     #: The resolved engine document is read from a descriptor, not from argv and not from a path
     #: handed over the command line: it carries the fingerprint and the plan's numeric knobs, and
     #: the process table is world-readable on the operator's machine.
     parser.add_argument("--plan-fd", type=int, default=3)
+    #: A second, byte-wide input used only to say "stop". It cannot be the command channel, because
+    #: a cancellation that has to wait for the command loop to come back around is not a
+    #: cancellation: the loop is exactly what is busy.
+    parser.add_argument("--cancel-fd", type=int, default=4)
     return parser.parse_args(argv)
 
 
@@ -98,6 +122,11 @@ class Engine:
         profile = dict(expected.get("allocation") or {})
         self.prefill_step_size = int(profile.get("prefill_chunk_tokens") or 0) or None
         self.max_kv_size = profile.get("max_kv_size")
+        self.allocator_cache_bytes: int | None = (
+            int(profile["allocator_cache_bytes"])
+            if profile.get("allocator_cache_bytes") is not None
+            else None
+        )
         # KV quantisation is deliberately not plumbed: the profile declares f16/bf16 attention
         # caches, and a quantised KV cache is a different precision decision that U3 has not
         # qualified. Absent means generate_step keeps its own no-quantisation default.
@@ -111,31 +140,53 @@ class Engine:
         # per request, and the status document would then describe a setting the engine ignored.
         config = getattr(self.model, "config", None) or {}
         self.native_context = _config_int(config, "max_position_embeddings", "n_positions")
-        self.cache = _new_cache(self.model)
-        self.cache_allocation = "growing" if _grows(self.cache) else "fixed"
-        self.wired_limit_bytes = 0
-        self.declared_wired_limit_bytes = int(expected.get("wired_bytes") or 0)
+        # No cache is built here. Each request gets its own from the generator, so nothing outlives
+        # the completion that created it; the profile's max_kv_size then actually bounds it, which a
+        # process-lifetime cache silently prevented.
+        self.cache_allocation = "growing" if self.max_kv_size is None else "bounded"
+        #: Set by :func:`watch_cancellation`, which touches nothing else. The pinned MLX rules this
+        #: process exists to respect are about stream and cache state, and reading a byte off a
+        #: pipe is neither, so this stays the one atom the generation loop consults.
+        self.cancel_requested = False
+        # The resolver stores its decision as engine["wiring"]["wired_bytes"] (capacity.py:540), the
+        # plan document carries that key through whitelisted as-is, and policy.py reads it back from
+        # the same nesting. A top-level read here found nothing, applied zero, and left the guard
+        # below permanently unreachable because both sides were consistently absent.
+        self.declared_wired_limit_bytes = int(
+            (expected.get("wiring") or {}).get("wired_bytes") or 0
+        )
         self._apply_wiring()
         self._verify_against_plan()
 
     # ------------------------------------------------------------------ residency
 
     def _apply_wiring(self) -> None:
-        """Request the plan's deliberate residency and then read back what the device granted."""
+        """Ask the device for the plan's residency, and record only what it can actually tell us.
+
+        mlx 0.32.4 binds ``set_wired_limit`` to return the *previous* limit and offers no getter, so
+        there is no observation of the new one to be had. Reporting the request as an observation is
+        what made this look verified; the status document now carries the requested number and the
+        previous one separately, and leaves "observed" null.
+        """
         target = self.declared_wired_limit_bytes
-        recommended = None
         try:
             recommended = self._mx.device_info().get("max_recommended_working_set_size")
         except Exception:  # noqa: BLE001 - a device that will not say is an unknown, not a crash
             recommended = None
         self.recommended_working_set_bytes = int(recommended) if recommended else None
+        self.wired_limit_requested_bytes = target
+        self.wired_limit_previous_bytes: int | None = None
+        # No mlx 0.32.4 getter exists, so this stays None: unknown, never assumed.
+        self.wired_limit_observed_bytes: int | None = None
         if target > 0:
-            # MLX clamps the wired limit to the system ceiling internally; the read-back is the
-            # only evidence of what was actually granted, and the worker reports that rather than
-            # echoing the request it made.
-            self._mx.set_wired_limit(target)
-        reader = getattr(self._mx, "get_wired_limit", None)
-        self.wired_limit_bytes = int(reader()) if callable(reader) else target
+            self.wired_limit_previous_bytes = int(self._mx.set_wired_limit(target))
+        # Declared in the profile, hashed into the engine fingerprint, and previously read by
+        # nobody — so editing it rotated the engine identity while changing no behaviour. Zero is a
+        # meaningful value ("retain no free buffers"), not an absence, which is why the schema
+        # allows it; applying it is what makes the fingerprint honest.
+        retained = self.allocator_cache_bytes
+        if retained is not None:
+            self._mx.set_cache_limit(retained)
 
     def _verify_against_plan(self) -> None:
         expected_context = self.expected.get("context_tokens")
@@ -144,12 +195,13 @@ class Engine:
                 f"model native context {self.native_context} differs from the resolved plan "
                 f"{expected_context}"
             )
-        if self.declared_wired_limit_bytes and not self.wired_limit_bytes:
-            # A requested bound that reads back as zero means the setting did not take. Saying so
-            # beats reporting ready while silently paging everything.
+        if self.declared_wired_limit_bytes and self.wired_limit_previous_bytes is None:
+            # A declared bound that never reached the setter means the plan and the device disagree
+            # about whether residency is controlled at all. Saying so beats reporting ready while
+            # paging everything.
             raise WorkerFatal(
-                f"requested wired limit {self.declared_wired_limit_bytes} bytes but the device "
-                f"reports {self.wired_limit_bytes}"
+                f"plan declares {self.declared_wired_limit_bytes} bytes of deliberate wiring but "
+                "the device was never asked for it"
             )
 
     # ------------------------------------------------------------------ memory
@@ -165,50 +217,15 @@ class Engine:
         }
 
     def reset_peak(self) -> None:
-        self._mx.reset_peak_memory_stats()
+        self._mx.reset_peak_memory()
 
     # ------------------------------------------------------------------ preparation
 
     def prepare(self, payload: dict[str, Any]) -> tuple[list[int], str]:
-        """Run the one chat preparation, returning prompt token ids.
-
-        Counting and generation both call this. Two code paths that each apply a template are the
-        classic source of an off-by-a-few-token count, and with this engine the count decides both
-        admission and the output budget, so a divergent pair does not merely misreport — it lets a
-        request through that cannot fit.
-        """
-        messages = payload.get("messages")
-        if not isinstance(messages, list) or not messages:
-            raise WorkerRefused(WorkerError.MALFORMED_REQUEST, "no messages in request")
-        unsupported = sorted(
-            set(payload) - _ACCEPTED_REQUEST_FIELDS,
-        )
-        if unsupported:
-            # Refusing is safer than ignoring: an ignored field would still change what the model
-            # sees, and the count reported for the request would describe a different prompt than
-            # the one served.
-            raise WorkerRefused(
-                WorkerError.UNSUPPORTED_SETTING,
-                "unsupported request fields: " + ", ".join(unsupported),
-            )
-        tools = payload.get("tools") or None
-        chat_template = getattr(self.tokenizer, "chat_template", None)
-        template_identity = _digest_of_text(chat_template or "")
-        kwargs: dict[str, Any] = {"add_generation_prompt": True}
-        if tools:
-            kwargs["tools"] = tools
-        thinking = payload.get("chat_template_kwargs") or {}
-        if isinstance(thinking, dict):
-            kwargs.update(thinking)
-        try:
-            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, **kwargs)
-        except TypeError as exc:
-            # A template that needs a kwarg this worker does not pass is a version skew between
-            # plan and engine, not a client error.
-            raise WorkerFatal(f"chat template rejected the request: {exc}") from exc
-        ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        """Run the one chat preparation, returning prompt token ids and the templated text."""
+        ids, prompt, template_identity = prepare_prompt(self.tokenizer, payload)
         self.template_identity = template_identity
-        return list(ids), prompt
+        return ids, prompt
 
     def token_count(self, payload: dict[str, Any]) -> dict[str, Any]:
         ids, _prompt = self.prepare(payload)
@@ -220,86 +237,177 @@ class Engine:
         }
 
     def tokenizer_identity(self) -> str:
-        # The tokenizer is identified by the bytes that define it, so a swapped tokenizer under the
-        # same model directory changes the identity instead of silently changing every count.
-        material = json.dumps(
-            {
-                "vocab": len(getattr(self.tokenizer, "vocab", {}) or {}),
-                "name": type(self.tokenizer).__name__,
-            },
-            sort_keys=True,
-        )
-        return _digest_of_text(material)
+        return digest_of_tokenizer(self.tokenizer)
 
     # ------------------------------------------------------------------ generation
 
     def generate(self, payload: dict[str, Any]):
-        """Yield completion events. One caller at a time; the slot is this thread.
+        """Yield one event per produced segment, then a terminal event that says why it stopped.
 
-        Called through ``generate_step`` rather than ``stream_generate``. The high-level wrapper
-        enters a ``wired_limit()`` context that raises the device wiring to
-        ``max_recommended_working_set_size`` for the duration of every request and restores it
-        afterwards, so a bound the launcher computed from the plan would be overwritten per
-        request while the status document still reported the plan's value. ``generate_step`` is the
-        supported path that leaves the setting alone, and it is the one that takes the cache,
-        prefill chunk and quantised-KV arguments explicitly rather than deriving them.
+        Generation goes through ``stream_generate`` rather than the raw step function. The reason
+        this file originally gave for bypassing the wrapper — that it raises the device wiring for
+        the duration of a request — is the wrapper *saving the previous limit and restoring it on
+        exit*, and doing nothing at all when the device reports no recommendation. What bypassing it
+        actually cost is everything the wrapper owns and ``generate_step`` does not implement: the
+        EOS break, the incremental detokenizer, and the stop-versus-length distinction. A worker
+        that cannot tell those apart reports a truncated completion as a finished one.
+
+        No ``prompt_cache`` is passed. The cache the step function builds for itself is per request,
+        which is what keeps one conversation's state from being appended to another's, and
+        ``max_kv_size`` only bounds a cache built this way — supplying a long-lived one made the
+        profile's bound inert.
         """
+        from mlx_lm import stream_generate
         from mlx_lm.sample_utils import make_sampler
 
         ids, _prompt = self.prepare(payload)
         sampling = _sampling_from(payload, self.defaults)
         limit = _output_limit(payload)
         self.reset_peak()
-        step_kwargs: dict[str, Any] = {
-            "max_tokens": limit,
-            "sampler": make_sampler(**sampling),
-            "prompt_cache": self.cache,
-        }
+        kwargs: dict[str, Any] = {"sampler": make_sampler(**sampling)}
         if self.prefill_step_size:
-            step_kwargs["prefill_step_size"] = self.prefill_step_size
+            kwargs["prefill_step_size"] = self.prefill_step_size
         for key in ("max_kv_size", "kv_bits", "kv_group_size", "quantized_kv_start"):
             value = getattr(self, key, None)
             if value is not None:
-                step_kwargs[key] = value
-        # generate_step takes a token array and owns the chunked prefill itself, which is what
-        # makes prefill_step_size the peak-memory knob rather than a caller-side loop.
-        prompt = self._mx.array([ids])
-        for token, _logprobs in self._generate_step(prompt, self.model, **step_kwargs):
-            yield {"token": token, "text": self.tokenizer.decode([int(token)])}
+                kwargs[key] = value
+        stop = _StopScanner(_stop_sequences(payload))
+        produced = 0
+        tool_deltas = 0
+        finish_reason = "length"
+        peak_memory_bytes: int | None = None
+        generation_tokens = 0
+        # The prompt arrives one-dimensional because stream_generate normalises it itself; wrapping
+        # it in a list made len(prompt) read as one token and skipped the chunked prefill entirely.
+        for response in stream_generate(
+            self.model, self.tokenizer, ids, max_tokens=limit, **kwargs
+        ):
+            if response.peak_memory is not None:
+                peak_memory_bytes = int(float(response.peak_memory) * 1_000_000_000)
+            generation_tokens = int(response.generation_tokens or generation_tokens)
+            if response.finish_reason:
+                finish_reason = response.finish_reason
+            if not response.text:
+                continue
+            emitted = stop.feed(response.text)
+            if emitted:
+                produced += len(emitted)
+                yield {"kind": "segment", "text": emitted, "token": int(response.token)}
+            if self.cancel_requested:
+                # Checked between segments rather than inside a step: the segment boundary is the
+                # first point where no MLX operation is in flight, so stopping here cannot leave a
+                # half-issued kernel call holding device state.
+                finish_reason = "cancelled"
+                break
+            if stop.hit:
+                # A stop sequence is a completion that ended, not one that was cut short: reporting
+                # "length" here would tell the client to expect more than will ever arrive.
+                finish_reason = "stop"
+                break
+        tail = stop.flush()
+        if tail:
+            produced += len(tail)
+            yield {"kind": "segment", "text": tail, "token": -1}
+        yield {
+            "kind": "terminal",
+            "finish_reason": finish_reason,
+            "cancelled": finish_reason == "cancelled",
+            "content_chars": produced,
+            "generation_tokens": generation_tokens,
+            "peak_memory_bytes": peak_memory_bytes,
+            "tool_calls": tool_deltas,
+        }
 
     def release(self) -> None:
-        """Drop the cache and let the device reclaim what the conversation no longer needs.
+        """Drop what the device is holding for a conversation that is over.
 
-        Called on cancellation and between conversations. It does not, and cannot, un-wire memory
-        the device pinned: process teardown is what guarantees release, which is why the frontend
-        treats "worker exited" as the strongest possible signal rather than an error to retry.
+        There is no long-lived cache to rebuild: :meth:`generate` lets the generator own one per
+        request, so the cross-request state this used to clear never exists. ``clear_cache`` still
+        matters — it returns buffers the allocator retained — and cancellation and teardown both
+        want it. Process exit remains the only guarantee that *wired* memory comes back, which is
+        why the frontend treats "worker exited" as the strongest signal rather than an error.
         """
-        self.cache = _new_cache(self.model)
         self._mx.clear_cache()
 
 
-#: Fields the worker will honour. Anything else is refused rather than dropped, because a dropped
-#: field still changed the prompt the client meant to send.
-_ACCEPTED_REQUEST_FIELDS = frozenset(
-    {
-        "model",
-        "messages",
-        "tools",
-        "tool_choice",
-        "temperature",
-        "top_p",
-        "max_tokens",
-        "max_completion_tokens",
-        "stream",
-        "stream_options",
-        "seed",
-        "chat_template_kwargs",
-        "stop",
-        "presence_penalty",
-        "frequency_penalty",
-        "repetition_penalty",
-    }
-)
+def _stop_sequences(payload: dict[str, Any]) -> tuple[str, ...]:
+    """Validate and normalise ``stop``. A malformed stop list is refused, never ignored."""
+    value = payload.get("stop")
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise WorkerRefused(
+            WorkerError.MALFORMED_REQUEST, "stop must be a non-empty string or list of strings"
+        )
+    return tuple(value)
+
+
+class _StopScanner:
+    """Cut the stream at the first stop sequence without emitting what follows it.
+
+    Streaming means the sequence can straddle two segments, so the tail of the emitted text is held
+    back for as long as it could still be the beginning of a stop string. Anything else would either
+    leak pasted tool output or require buffering the whole completion.
+    """
+
+    def __init__(self, sequences: tuple[str, ...]) -> None:
+        self.sequences = sequences
+        self.holdback = max((len(item) for item in sequences), default=0)
+        self.buffer = ""
+        self.hit = False
+
+    def feed(self, text: str) -> str:
+        if self.hit:
+            return ""
+        self.buffer += text
+        for sequence in self.sequences:
+            index = self.buffer.find(sequence)
+            if index >= 0:
+                emit, self.buffer, self.hit = self.buffer[:index], "", True
+                return emit
+        keep = 0
+        for length in range(min(self.holdback - 1, len(self.buffer)), 0, -1):
+            tail = self.buffer[-length:]
+            if any(item.startswith(tail) for item in self.sequences):
+                keep = length
+                break
+        cut = len(self.buffer) - keep
+        emit, self.buffer = self.buffer[:cut], self.buffer[cut:]
+        return emit
+
+    def flush(self) -> str:
+        emit, self.buffer = ("" if self.hit else self.buffer), ""
+        return emit
+
+
+def check_request(payload: dict[str, Any]) -> None:
+    """Refuse what this engine cannot honour, before any device work or stream state exists.
+
+    Called by both :meth:`Engine.prepare` and the generate branch of :func:`serve`, and by the
+    latter *before* it writes ``begin``: a request-level refusal that arrives after the stream has
+    started can only reach the client as an in-band error object on a response that already said
+    HTTP 200, which is what let one malformed client request look like engine damage.
+    """
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise WorkerRefused(WorkerError.MALFORMED_REQUEST, "no messages in request")
+    unsupported = unsupported_request_fields(payload)
+    if unsupported:
+        # Refusing is safer than ignoring: an ignored field still changes what the model sees, and
+        # the token count reported for the request would describe a different prompt than served.
+        reasons = "; ".join(
+            f"{name}: {_UNSUPPORTED_REQUEST_FIELDS[name]}"
+            for name in unsupported
+            if name in _UNSUPPORTED_REQUEST_FIELDS
+        )
+        detail = f"unsupported request fields: {', '.join(unsupported)}"
+        raise WorkerRefused(
+            WorkerError.UNSUPPORTED_SETTING, f"{detail} ({reasons})" if reasons else detail
+        )
+    _stop_sequences(payload)
+    _output_limit(payload)
 
 
 #: Request field -> the ``make_sampler`` argument it maps to. The request speaks OpenAI and the
@@ -353,28 +461,6 @@ def _output_limit(payload: dict[str, Any]) -> int:
     return int(value)
 
 
-def _new_cache(model: Any):
-    """Ask the model for its own cache rather than constructing one.
-
-    A hybrid architecture returns a mix of token-proportional KV caches and fixed-size recurrent
-    state. Building a plain KVCache for such a model produces something that runs and is wrong, and
-    a recurrent state cannot be sliced or truncated like an attention cache, so the only safe
-    source of truth is the model's own ``make_cache``.
-    """
-    from mlx_lm.models.cache import KVCache
-
-    maker = getattr(model, "make_cache", None)
-    if callable(maker):
-        return maker()
-    return KVCache()
-
-
-def _grows(cache: Any) -> bool:
-    from mlx_lm.models.cache import ArraysCache, KVCache
-
-    return isinstance(cache, (KVCache, ArraysCache, list))
-
-
 def _config_int(config: Any, *names: str) -> int | None:
     for name in names:
         value = config.get(name) if isinstance(config, dict) else getattr(config, name, None)
@@ -385,6 +471,53 @@ def _config_int(config: Any, *names: str) -> int | None:
 
 def _digest_of_text(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+
+
+def digest_of_tokenizer(tokenizer: Any) -> str:
+    """Identify a tokenizer by the bytes that define it, not by its path.
+
+    Shared with the standalone counting process: a count is only meaningful if the identity it is
+    reported under is the identity the engine will compute with, and a swapped tokenizer under an
+    unchanged model directory must change the digest rather than silently change every count.
+    """
+    material = json.dumps(
+        {
+            "vocab": len(getattr(tokenizer, "vocab", {}) or {}),
+            "name": type(tokenizer).__name__,
+        },
+        sort_keys=True,
+    )
+    return _digest_of_text(material)
+
+
+def prepare_prompt(tokenizer: Any, payload: dict[str, Any]) -> tuple[list[int], str, str]:
+    """Template a chat request and encode it, returning ``(token_ids, prompt, template_digest)``.
+
+    Module-level and shared by the worker *and* the standalone counting process, because the whole
+    value of a separate counter is that it reaches the same number the engine will later spend.
+    Two code paths that each apply a template are the classic source of an off-by-a-few-token
+    count, and with this engine the count decides both admission and the output budget — a
+    divergent pair does not merely misreport, it lets through a request that cannot fit.
+    """
+    check_request(payload)
+    messages = payload["messages"]
+    tools = payload.get("tools") or None
+    chat_template = getattr(tokenizer, "chat_template", None)
+    template_identity = _digest_of_text(chat_template or "")
+    kwargs: dict[str, Any] = {"add_generation_prompt": True}
+    if tools:
+        kwargs["tools"] = tools
+    thinking = payload.get("chat_template_kwargs") or {}
+    if isinstance(thinking, dict):
+        kwargs.update(thinking)
+    try:
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, **kwargs)
+    except TypeError as exc:
+        # A template that needs a kwarg this harness does not pass is version skew between plan
+        # and engine, not a client error.
+        raise WorkerFatal(f"chat template rejected the request: {exc}") from exc
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+    return list(ids), prompt, template_identity
 
 
 def build_status(engine: Engine, expected: dict[str, Any], ready: bool) -> dict[str, Any]:
@@ -406,8 +539,27 @@ def build_status(engine: Engine, expected: dict[str, Any], ready: bool) -> dict[
         template_identity=getattr(engine, "template_identity", ""),
         artifact_format=str(expected.get("artifact_format", "mlx")),
         cache_allocation=engine.cache_allocation,
-        wired_limit_bytes=engine.wired_limit_bytes,
-        declared_wired_limit_bytes=engine.declared_wired_limit_bytes,
+        # Read back from the loaded model or from the device counters. Everything not listed here
+        # is a value the plan told this process, and the document says so rather than letting a
+        # health endpoint present an echo as a measurement.
+        attested=(
+            "active_memory_bytes",
+            "peak_memory_bytes",
+            "cache_memory_bytes",
+            "recommended_working_set_bytes",
+            "wired_bytes_previous",
+            "tokenizer_identity",
+            "template_identity",
+            "cache_allocation",
+            "model",
+            "model_path",
+        ),
+        # Requested and observed are separate fields on purpose. mlx exposes no wired-limit getter,
+        # so the observed value is null rather than a copy of the request; conflating them is what
+        # let an applied-zero bug report a bounded engine.
+        wired_bytes_requested=engine.declared_wired_limit_bytes,
+        wired_bytes_observed=engine.wired_limit_observed_bytes,
+        wired_bytes_previous=engine.wired_limit_previous_bytes,
         recommended_working_set_bytes=engine.recommended_working_set_bytes,
         **engine.memory(),
     )
@@ -421,7 +573,27 @@ def _write(stream, payload: dict[str, Any]) -> None:
     stream.flush()
 
 
-def serve(stdin, stdout, expected: dict[str, Any]) -> int:
+def watch_cancellation(engine: Engine, cancel_fd: int) -> None:
+    """Block on ``cancel_fd`` and raise the flag when anything arrives.
+
+    Deliberately a byte channel rather than a command: the frontend should not have to know a
+    sequence number, hold a lock, or hope the worker is listening in order to stop work it already
+    asked for. A write of one byte is the whole protocol, which is what makes it usable from a
+    disconnect handler that is itself already unwinding.
+    """
+    try:
+        with os.fdopen(cancel_fd, "rb", closefd=True) as source:
+            arrived = source.read(1)
+    except OSError:
+        return
+    # EOF is not a cancellation. The frontend closes this descriptor on every teardown, so treating
+    # an empty read as a stop request would have the last act of a shutting-down parent be a phantom
+    # cancel of work that has already finished.
+    if arrived:
+        engine.cancel_requested = True
+
+
+def serve(stdin, stdout, expected: dict[str, Any], cancel_fd: int = -1) -> int:
     """The worker's whole life: build, announce readiness, serve requests one at a time.
 
     Reads requests from ``stdin`` and writes responses to ``stdout``, both line-delimited. The
@@ -437,6 +609,13 @@ def serve(stdin, stdout, expected: dict[str, Any]) -> int:
     except Exception as failure:  # noqa: BLE001 - a model that will not load is a failed launch
         _write(stdout, {"kind": "fatal", "reason": f"model load failed: {failure}"})
         return 1
+
+    if cancel_fd >= 0:
+        # Started before the first request is accepted, so a client that hangs up during the very
+        # first prefill is still heard.
+        threading.Thread(
+            target=watch_cancellation, args=(engine, cancel_fd), daemon=True
+        ).start()
 
     status = build_status(engine, expected, ready=True)
     _write(stdout, {"kind": "ready", "status": status})
@@ -461,17 +640,64 @@ def serve(stdin, stdout, expected: dict[str, Any]) -> int:
                 count = engine.token_count(payload)
                 _write(stdout, {"kind": "input_tokens", "sequence": sequence, "count": count})
             elif action == "generate":
+                try:
+                    check_request(payload)
+                except WorkerRefused as refusal:
+                    _write(
+                        stdout,
+                        {
+                            "kind": "refused",
+                            "code": refusal.code,
+                            "sequence": sequence,
+                            "message": str(refusal),
+                        },
+                    )
+                    continue
                 _write(stdout, {"kind": "begin", "sequence": sequence})
-                produced = 0
+                # The terminal event carries what the frontend cannot infer: whether the model
+                # said stop or the budget ran out. Without it the frontend has nothing honest to
+                # put in finish_reason, and a truncation is indistinguishable from a completion.
                 for event in engine.generate(payload):
-                    produced += len(event["text"])
-                    _write(stdout, {"kind": "token", "sequence": sequence, "text": event["text"]})
-                _write(stdout, {"kind": "end", "sequence": sequence, "content_chars": produced})
+                    if event["kind"] == "segment":
+                        _write(
+                            stdout,
+                            {
+                                "kind": "token",
+                                "sequence": sequence,
+                                "text": event["text"],
+                            },
+                        )
+                        continue
+                    _write(
+                        stdout,
+                        {
+                            "kind": "end",
+                            "sequence": sequence,
+                            "content_chars": event["content_chars"],
+                            "finish_reason": event["finish_reason"],
+                            "generation_tokens": event["generation_tokens"],
+                            "peak_memory_bytes": event["peak_memory_bytes"],
+                            # Named with the contract's own code so the frontend can tell "the
+                            # caller stopped me" apart from "the device failed". Both end a stream
+                            # early; only one of them is engine damage, and labelling the other as
+                            # such would latch a healthy engine because the client hung up.
+                            "code": (str(WorkerError.CANCELLED) if event["cancelled"] else None),
+                        },
+                    )
             elif action == "cancel":
-                # The worker only ever runs one generation, so a cancel arriving here was queued
-                # behind it; releasing between requests is therefore the honest handling.
+                # Reached only when the worker is idle, because a real cancellation arrives on the
+                # byte channel while it is busy. It still has a job: releasing retained allocator
+                # buffers after an aborted turn, which is what the byte channel cannot do from its
+                # own thread (no MLX calls off the main thread).
                 engine.release()
-                _write(stdout, {"kind": "cancelled", "sequence": sequence})
+                _write(
+                    stdout,
+                    {
+                        "kind": "refused",
+                        "code": WorkerError.CANCELLED,
+                        "sequence": sequence,
+                    },
+                )
             else:
                 _write(stdout, {"kind": "refused", "code": WorkerError.MALFORMED_REQUEST,
                                 "sequence": sequence})
@@ -496,8 +722,12 @@ def main(argv: list[str] | None = None) -> int:
     # operator's machine is running.
     with os.fdopen(args.plan_fd, "r", encoding="utf-8") as control:
         expected = json.load(control)
-    expected["model_dir"] = args.model_dir
-    return serve(sys.stdin, sys.stdout, expected)
+    # The artifact directory arrives inside the plan document, not as an argument. It used to be
+    # both, and the argv half could not even be parsed: the frontend emitted
+    # "--worker-arg --model-dir", which argparse rejects because the value begins with a dash.
+    if not str(expected.get("model_dir") or ""):
+        raise SystemExit("the resolved plan document names no artifact directory")
+    return serve(sys.stdin, sys.stdout, expected, args.cancel_fd)
 
 
 if __name__ == "__main__":

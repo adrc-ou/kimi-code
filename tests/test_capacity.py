@@ -1,5 +1,6 @@
 """Native-context resolution does not admit or resize models using physical memory."""
 
+import contextlib
 import copy
 import json
 import sys
@@ -52,14 +53,19 @@ class AllocationTests(unittest.TestCase):
     def setUp(self):
         self.providers = {
             "local": {
+                # Faithful to what a version-3 parse actually emits: with named profiles the
+                # singular ``engine``/``profile``/``default_profile`` keys are None, because a
+                # provider offering several engines has no default to fall back to. Declaring a
+                # populated ``profile`` here is what let launch validation pass while the shipped
+                # provider failed it.
                 "execution": {
                     "kind": "local",
-                    "engine": "llama_cpp",
-                    "profile": PROFILE,
+                    "engine": None,
+                    "profile": None,
                     "profiles": {
                         "default": {"engine": "llama_cpp", "settings": PROFILE},
                     },
-                    "default_profile": "default",
+                    "default_profile": None,
                     "memory": {},
                 },
                 "capacity": {"strategy": "native_context", "sequence_slots": 1},
@@ -219,6 +225,353 @@ class PreparationTests(unittest.TestCase):
                 )
 
 
+class ShippedDefinitionLaunchTests(unittest.TestCase):
+    """Launch validation against the definitions that actually ship.
+
+    Every other case in this file resolves against a hand-written provider dictionary, and that is
+    how a schema migration shipped broken: the fixture declared a populated singular ``profile``
+    while a version-3 provider emits ``None`` for it, so validation compared ``None`` against the
+    resolver's allocation and the shipped models were rejected at serve time while the suite stayed
+    green. Only the real tree can prove the reader and the writer agree.
+    """
+
+    @staticmethod
+    def shipped() -> list[dict]:
+        from tools import definitions
+
+        _, models = definitions.load_definitions(ROOT)
+        return [model for model in models if model["provider"] == "local_mps"]
+
+    @staticmethod
+    def execution(model: dict) -> dict:
+        from tools import definitions
+
+        providers, _ = definitions.load_definitions(ROOT)
+        return providers[model["provider"]]["execution"]
+
+    @contextlib.contextmanager
+    def prepared(self, model: dict):
+        """Resolve one shipped model and validate against it under the same synthetic runtime.
+
+        The patches have to stay live while ``validate_launch`` runs, because it re-reads the
+        binary identity and the weights path: exiting first would validate against a host that has
+        neither the pinned binary nor the artifact installed.
+        """
+        import tempfile
+
+        from tools import definitions
+
+        providers, model_list = definitions.load_definitions(ROOT)
+        models = {entry["id"]: entry for entry in model_list}
+        identity = EngineIdentity(
+            kind="llama_cpp",
+            build_info="fixture b11846 abcdef0",
+            source_revision="0" * 40,
+            version="b11846",
+            build_commit="abcdef0",
+        )
+        adapter = type(capacity.adapter_for("llama_cpp"))
+        local_llm = capacity.local_llm
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "fixture.gguf"
+            binary.write_bytes(b"x" * 1024)
+            artifact = Artifact(
+                format="gguf",
+                variant="Q4",
+                primary=binary,
+                paths=(binary,),
+                tensor_bytes=1 << 30,
+                total_bytes=1 << 30,
+            )
+            stack = contextlib.ExitStack()
+            for target, attribute, value in (
+                (local_llm, "is_ready", True),
+                (local_llm, "engine_binary", Path("fixture")),
+                (
+                    local_llm,
+                    "engine_plan",
+                    {"version": "b11846", "commit": "0" * 40},
+                ),
+                (local_llm, "primary_weights_path", binary),
+                (adapter, "identity", identity),
+                (adapter, "validate_artifact", artifact),
+                (
+                    capacity,
+                    "engine_identity",
+                    {
+                        "build_info": "fixture b11846 abcdef0",
+                        "build_commit": "abcdef0",
+                        "source_commit": "0" * 40,
+                    },
+                ),
+                (capacity.platform, "system", "Darwin"),
+                (capacity.platform, "machine", "arm64"),
+            ):
+                stack.enter_context(mock.patch.object(target, attribute, return_value=value))
+            stack.enter_context(
+                mock.patch.object(
+                    capacity.host_caps,
+                    "probe",
+                    return_value={
+                        "memory_bytes": 128 * capacity.GIB,
+                        "available_memory_bytes": 100 * capacity.GIB,
+                    },
+                )
+            )
+            with stack:
+                plan = capacity.prepare(
+                    ROOT,
+                    root / "runtime",
+                    providers,
+                    models,
+                    {"primary": model["id"], "subagent": model["id"]},
+                    512,
+                )
+                bound = models[model["id"]]
+                engine = plan["engines"][model["id"]]
+                yield bound, engine
+
+    def test_every_shipped_local_model_survives_launch_validation(self):
+        shipped = self.shipped()
+        self.assertTrue(shipped, "no local_mps models are defined to validate")
+        for model in shipped:
+            with self.subTest(model=model["id"]), self.prepared(model) as (bound, engine):
+                self.assertIsNone(
+                    # The provider offers more than one engine, so it declares no default; the
+                    # profile a model is served with is bound onto the model, and validation must
+                    # read it from there.
+                    self.execution(bound)["profile"],
+                    f"{model['id']}: expected a provider with no default profile",
+                )
+                self.assertEqual(bound["serving_profile"], "llama_cpp_q4")
+                capacity.local_llm.validate_launch(bound, engine)
+
+    def test_launch_validation_still_catches_drift(self):
+        model = self.shipped()[0]
+        with self.prepared(model) as (bound, engine):
+            for changes in (
+                {"context_tokens": 8192},
+                {"sequences": 2},
+                {"memory_management": "bounded"},
+                {"engine_kind": "mlx_lm"},
+                {"allocation": dict(engine["allocation"], prefill_chunk_tokens=99)},
+                {"serving_profile_id": "0" * 64},
+            ):
+                with self.subTest(changes=sorted(changes)):
+                    with self.assertRaises(capacity.local_llm.EngineError):
+                        capacity.local_llm.validate_launch(bound, dict(engine, **changes))
+
+
+class ResolvedRecordShapeTests(unittest.TestCase):
+    """The shared test fixture must cover every field the resolver actually writes.
+
+    Four separate defects hid behind a hand-written engine dict that omitted ``engine_kind`` or
+    the nested ``wiring`` block: the launcher, the readiness validator, the smoke tool and the
+    proxy each read a field the fixture had never heard of, and the suite passed. This compares
+    the fixture against a real resolution, so the next mandatory field opens the suite instead of
+    hiding a bug.
+    """
+
+    def test_shared_fixture_matches_a_real_resolution(self):
+        import tempfile
+        from unittest import mock
+
+        from tests.helpers import RESOLVED_ENGINE_KEYS, resolved_engine_record
+        from tools import definitions
+
+        providers, model_list = definitions.load_definitions(ROOT)
+        models = {entry["id"]: entry for entry in model_list}
+        model = next(m for m in model_list if m["provider"] == "local_mps")
+        identity = EngineIdentity(
+            kind="llama_cpp",
+            build_info="fixture b11846 abcdef0",
+            source_revision="0" * 40,
+            version="b11846",
+            build_commit="abcdef0",
+        )
+        local_llm = capacity.local_llm
+        adapter = type(capacity.adapter_for("llama_cpp"))
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "fixture.gguf"
+            binary.write_bytes(b"x")
+            artifact = Artifact(
+                format="gguf",
+                variant="Q4",
+                primary=binary,
+                paths=(binary,),
+                tensor_bytes=1 << 30,
+                total_bytes=1 << 30,
+            )
+            # One ExitStack: `with stack, (a, b):` parses as two items where the second is a
+            # plain tuple, which raises TypeError rather than entering anything, and it only
+            # showed up in a full run because the isolated invocation failed earlier.
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.multiple(
+                        local_llm,
+                        is_ready=lambda _m: True,
+                        engine_binary=lambda **_k: Path("fixture"),
+                        engine_plan=lambda **_k: {"version": "b11846", "commit": "0" * 40},
+                        primary_weights_path=lambda _m: binary,
+                    )
+                )
+                for target, attribute, value in (
+                    (adapter, "identity", identity),
+                    (adapter, "validate_artifact", artifact),
+                    (capacity.platform, "system", "Darwin"),
+                    (capacity.platform, "machine", "arm64"),
+                ):
+                    stack.enter_context(mock.patch.object(target, attribute, return_value=value))
+                stack.enter_context(
+                    mock.patch.object(
+                        capacity.host_caps,
+                        "probe",
+                        return_value={
+                            "memory_bytes": 128 * capacity.GIB,
+                            "available_memory_bytes": 100 * capacity.GIB,
+                        },
+                    )
+                )
+                plan = capacity.prepare(
+                    ROOT,
+                    Path(directory) / "runtime",
+                    providers,
+                    models,
+                    {"primary": model["id"], "subagent": model["id"]},
+                    512,
+                )
+            produced = set(plan["engines"][model["id"]])
+        self.assertTrue(
+            produced, "the resolver produced no engine record to compare against"
+        )
+        # Two directions matter: the fixture must not omit a field production writes, and it
+        # must not
+        # invent one, or a consumer can read a field no real plan carries and nothing notices.
+        self.assertEqual(
+            RESOLVED_ENGINE_KEYS,
+            frozenset(produced),
+            "resolver fields and RESOLVED_ENGINE_KEYS drifted; update the shared fixture",
+        )
+        self.assertEqual(
+            set(resolved_engine_record()),
+            set(produced),
+            "shared fixture keys differ from a real record",
+        )
+
+
+class DeviceObservationTests(unittest.TestCase):
+    """S15e: the device recommendation arrives through the engine adapter, not an env var.
+
+    ``LOCAL_MPS_METAL_PROBE`` named a script nothing in the launcher ever set, so the second input
+    to ``min_available_and_recommended`` was absent on every real launch. These assert the
+    replacement: the resolver asks the adapter, and what the adapter says is what the wiring
+    decision is given.
+    """
+
+    def collect(self, *, per_engine, available=100 * capacity.GIB):
+        import tempfile
+
+        from local_engines.base import Artifact, EngineIdentity
+
+        from tools import definitions
+
+        providers, model_list = definitions.load_definitions(ROOT)
+        models = {entry["id"]: entry for entry in model_list}
+        local = [m for m in model_list if m["provider"] == "local_mps"]
+        self.assertTrue(local, "no shipped local model to resolve")
+        adapter = type(capacity.adapter_for("llama_cpp"))
+        local_llm = capacity.local_llm
+        identity = EngineIdentity(
+            kind="llama_cpp", build_info="fixture b11846 abcdef0",
+            source_revision="0" * 40, version="b11846", build_commit="abcdef0",
+        )
+        per_engine = list(per_engine)
+        calls = iter(per_engine)
+        seen: dict[str, dict] = {}
+
+        # Bound *before* patching: calling capacity.wiring_targets from inside the replacement
+        # re-enters the spy forever, which is the one way this helper could fail noisily rather
+        # than quietly, so it is worth naming.
+        original = capacity.wiring_targets
+
+        def spy(engines, provider_map, measured):
+            seen["measured"] = dict(measured)
+            return original(engines, provider_map, measured)
+
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "fixture.gguf"
+            binary.write_bytes(b"x")
+            artifact = Artifact(
+                format="gguf", variant="Q4", primary=binary, paths=(binary,),
+                tensor_bytes=1 << 30, total_bytes=1 << 30,
+            )
+            # One engine per observation supplied, so the disagreeing case really has two.
+            wanted = local[: len(per_engine)]
+            self.assertEqual(
+                len(wanted), len(per_engine), "not enough shipped local models for this case"
+            )
+            selection = {"primary": wanted[0]["id"]}
+            for extra in wanted[1:]:
+                # A second lane key, so two distinct models really are resolved: one engine per
+                # observation is what the disagreeing case is about.
+                selection["subagent"] = extra["id"]
+            with (
+                mock.patch.object(local_llm, "is_ready", return_value=True),
+                mock.patch.object(local_llm, "engine_binary", return_value=Path("fixture")),
+                mock.patch.object(
+                    local_llm, "engine_plan",
+                    return_value={"version": "b11846", "commit": "0" * 40},
+                ),
+                mock.patch.object(local_llm, "primary_weights_path", return_value=binary),
+                mock.patch.object(adapter, "identity", return_value=identity),
+                mock.patch.object(adapter, "validate_artifact", return_value=artifact),
+                mock.patch.object(adapter, "device_observations",
+                                  side_effect=lambda _r: next(calls)),
+                mock.patch.object(capacity.platform, "system", return_value="Darwin"),
+                mock.patch.object(capacity.platform, "machine", return_value="arm64"),
+                mock.patch.object(
+                    capacity.host_caps, "probe",
+                    return_value={"memory_bytes": 128 * capacity.GIB,
+                                  "available_memory_bytes": available},
+                ),
+                mock.patch.object(capacity, "wiring_targets", side_effect=spy),
+            ):
+                plan = capacity.prepare(
+                    ROOT, Path(directory) / "runtime", providers, models, selection, 512
+                )
+        return plan, seen.get("measured", {})
+
+    def test_a_reported_recommendation_reaches_the_wiring_decision(self):
+        eight = 8 * capacity.GIB
+        _plan, measured = self.collect(per_engine=[{"recommended_max_working_set_size": eight}])
+        self.assertEqual(
+            measured["metal"]["recommended_working_set_bytes"], eight, measured
+        )
+        # Provenance is recorded, not implied: a reader can see which engine said so.
+        self.assertTrue(
+            measured["metal"]["source"].startswith("engine:"), measured["metal"]
+        )
+
+    def test_an_engine_that_cannot_say_leaves_the_recommendation_absent(self):
+        # Absent, not zero: the difference is what the unknown_measurements policy keys on.
+        _plan, measured = self.collect(per_engine=[{}])
+        self.assertNotIn(
+            "recommended_working_set_bytes",
+            (measured.get("metal") or {}),
+            measured,
+        )
+
+    def test_two_engines_that_disagree_are_refused_rather_than_arbitrated(self):
+        gib = capacity.GIB
+        per_engine = [
+            {"recommended_max_working_set_size": 8 * gib},
+            {"recommended_max_working_set_size": 16 * gib},
+        ]
+        with self.assertRaisesRegex(capacity.CapacityError, "different device working sets"):
+            self.collect(per_engine=per_engine)
+
+
 class ProjectionTests(unittest.TestCase):
     def test_identity_pins_the_commit_in_addition_to_release_number(self):
         commit = "a" * 40
@@ -319,6 +672,60 @@ class WiringTests(unittest.TestCase):
             "available_memory_bytes": available,
             "metal": {"recommended_working_set_bytes": recommended},
         }
+
+    def test_a_single_missing_measurement_unwires_rather_than_minning_the_remainder(self):
+        """F9f: `unknown_measurements = "unwired"` was consulted only when *all* inputs were absent.
+
+        With one number missing, `min()` over the survivor silently turned
+        `target = "min_available_and_recommended"` into whichever input happened to arrive, so a
+        host that could not report a Metal recommendation was asked to pin its entire available
+        memory — which is reachable on every real launch, because nothing supplies the probe.
+        """
+        engines = self.engines(("local/a", 60 * capacity.GIB, "mlx_lm"))
+        providers = self.providers()
+        for label, available, recommended in (
+            ("available reported as zero", 0, 100 * capacity.GIB),
+            ("recommendation absent", 100 * capacity.GIB, None),
+            ("recommendation reported as zero", 100 * capacity.GIB, 0),
+        ):
+            with self.subTest(case=label):
+                decision = capacity.wiring_targets(
+                    dict(engines), providers, self.measured(available, recommended)
+                )["local/a"]
+                self.assertEqual(decision["wired_bytes"], 0, decision)
+                self.assertIn("measurement unavailable", decision["reason"])
+
+    def test_a_target_naming_one_measurement_accepts_that_one_alone(self):
+        # The policy is per *named* input, not a blanket demand for every measurement the module
+        # knows how to read; a provider that promises available-memory-only must be honourable.
+        engines = self.engines(("local/a", 60 * capacity.GIB, "mlx_lm"))
+        providers = self.providers(
+            {
+                "strategy": "bounded_wiring",
+                "target": "available_memory",
+                "distribution": "verified_weight_bytes",
+                "unknown_measurements": "unwired",
+            }
+        )
+        decision = capacity.wiring_targets(
+            dict(engines), providers, self.measured(100 * capacity.GIB, None)
+        )["local/a"]
+        self.assertEqual(decision["wired_bytes"], 60 * capacity.GIB, decision)
+
+    def test_refuse_still_refuses_for_one_missing_measurement(self):
+        engines = self.engines(("local/a", 60 * capacity.GIB, "mlx_lm"))
+        providers = self.providers(
+            {
+                "strategy": "bounded_wiring",
+                "target": "min_available_and_recommended",
+                "distribution": "verified_weight_bytes",
+                "unknown_measurements": "refuse",
+            }
+        )
+        with self.assertRaisesRegex(capacity.CapacityError, "refuse"):
+            capacity.wiring_targets(
+                dict(engines), providers, self.measured(100 * capacity.GIB, None)
+            )
 
     def test_the_target_is_the_minimum_of_the_two_measurements(self):
         engines = self.engines(("local/a", 1000, "mlx_lm"))

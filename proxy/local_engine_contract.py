@@ -33,8 +33,12 @@ to see, so authority is split by kind of judgment rather than crowned:
   sees an allocator or driver give up. A healthy metadata observation is a readiness signal and must
   never reset a latched failure - that is the bug, not a trade-off.
 
-Where the two disagree, :func:`reconcile` refuses to call it success and also refuses to condemn the
-engine, because a contract violation between two observers is not evidence the device is broken.
+Where the two disagree there is no arbiter, and this module deliberately offers no reconciliation
+helper: nothing in the engine path declares an outcome, so a function combining a declared and an
+inferred verdict would take one live input and one permanently ``None`` input. It was removed rather
+than left as an unwired authority rule. The proxy decides usability from the wire; the worker
+decides latching from the device, and a contract violation between two observers is not evidence
+that the device is broken.
 
 Pure standard library. No engine imports, no MLX, no wire details.
 """
@@ -46,28 +50,23 @@ from enum import StrEnum
 from typing import Any
 
 __all__ = [
-    "DIVERGENT",
     "OUTCOMES",
     "STATUS_REQUIRED_FIELDS",
+    "LOCAL_ACCEPTED_REQUEST_FIELDS",
+    "LOCAL_UNSUPPORTED_REQUEST_FIELDS",
+    "unsupported_request_fields",
     "FailureClass",
     "WorkerError",
     "status_document",
     "validate_status_document",
     "Outcome",
-    "Reconciliation",
     "StreamEvidence",
     "classify",
     "implies_engine_damage",
     "is_usable_completion",
     "partition_for_outcome",
     "partition_for_status",
-    "reconcile",
 ]
-
-#: The value :func:`reconcile` reports when the worker declared one outcome and the wire showed
-#: another. It is not a member of :class:`Outcome` because no stream ever produced it: it names a
-#: disagreement between observers, not something that arrived.
-DIVERGENT = "divergent"
 
 
 class Outcome(StrEnum):
@@ -139,8 +138,10 @@ class WorkerError(StrEnum):
     COMPUTE_FAILED = "compute_failed"
     #: The caller cancelled. Not an error the engine caused.
     CANCELLED = "cancelled"
-    #: The worker is executing and will not take a second request.
-    BUSY = "busy"
+    # There is deliberately no BUSY code. The worker takes one request at a time and the frontend
+    # serialises them behind a lock, so "busy" is a queue, never an answer the worker gives — and a
+    # code in this taxonomy invites a reader to write a handler for a case that cannot arrive.
+    # Re-adding it requires a producer, not just a plausible-sounding category.
 
 
 #: The fields a harness status document must carry, and the type each one has.
@@ -212,6 +213,27 @@ def status_document(**fields: Any) -> dict[str, Any]:
     observations = {**optional, **(fields.get("observations") or {})}
     if observations:
         document["observations"] = observations
+    # Which values this engine *measured*, and which it repeated from the plan it was handed. The
+    # distinction is the whole reason a status document is evidence: a field copied out of the
+    # expected plan and reported beside a device counter is indistinguishable from a measurement
+    # unless someone says which is which, and every consumer downstream (health, the readiness
+    # receipt, a qualification record) reads this document as an observation.
+    attested = sorted({str(name) for name in fields.get("attested") or ()})
+    # Any value the document carries may be attested. The top-level fields are as much observations
+    # as the counters — model_path and the tokenizer digest are read off the loaded model — so
+    # restricting attestation to the observations block would understate what the engine proved.
+    reported = {
+        key
+        for key in document
+        if key not in {"attested", "declared", "fatal", "identity", "settings", "observations"}
+    }
+    reported.update(document.get("settings", {}))
+    reported.update(observations)
+    unknown = sorted(set(attested) - set(reported))
+    if unknown:
+        raise ValueError(f"status attests to fields it does not report: {', '.join(unknown)}")
+    document["attested"] = attested
+    document["declared"] = sorted(reported - set(attested))
     return document
 
 
@@ -234,6 +256,15 @@ def validate_status_document(payload: Any) -> dict[str, Any]:
     )
     if wrong:
         raise ValueError(f"engine status document has wrong field types: {', '.join(wrong)}")
+    # Not in STATUS_REQUIRED_FIELDS because :func:`status_document` derives them after validating
+    # its inputs. A document that skips the constructor therefore arrives unlabelled, and an
+    # unlabelled echo read beside a measurement is the failure this pair exists to prevent.
+    unlabelled = [name for name in ("attested", "declared") if name not in payload]
+    if unlabelled:
+        raise ValueError(
+            f"engine status document does not say which values it measured: "
+            f"{', '.join(unlabelled)}"
+        )
     return payload
 
 
@@ -279,6 +310,50 @@ class StreamEvidence:
 
     def damage_observed(self) -> bool:
         return implies_engine_damage(classify(self))
+
+
+#: ------------------------------------------------------------------ request policy
+#:
+#: Lives here rather than in the worker because two processes must agree on it exactly: the worker
+#: refuses what it cannot honour, and the frontend has to know the same set *before* it commits an
+#: HTTP 200. Duplicated, the two would drift, and the drift would show up as a client-caused 4xx
+#: arriving as an in-band error on a stream that already promised success — which is precisely how a
+#: bad request ended up latching a healthy engine.
+LOCAL_ACCEPTED_REQUEST_FIELDS = frozenset(
+    {
+        "model",
+        "messages",
+        "tools",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "max_tokens",
+        "max_completion_tokens",
+        "stream",
+        "stream_options",
+        "chat_template_kwargs",
+        "stop",
+    }
+)
+
+#: Each omission is a written decision with a reason, not an oversight to be re-derived.
+LOCAL_UNSUPPORTED_REQUEST_FIELDS = {
+    "tool_choice": "no tool-call parser; the completion is detokenized as prose",
+    "seed": "mlx.random.seed is process-global and would leak across concurrent requests",
+    "presence_penalty": "needs make_logits_processors, which generation does not build",
+    "frequency_penalty": "needs make_logits_processors, which generation does not build",
+    "repetition_penalty": "needs make_logits_processors, which generation does not build",
+}
+
+
+def unsupported_request_fields(payload: dict) -> list[str]:
+    """The request keys a local engine will not honour, sorted and named.
+
+    Empty means the payload is admissible. This never raises: the caller decides whether that is a
+    400 or a worker refusal, and the two decisions are deliberately different.
+    """
+    return sorted(set(payload) - LOCAL_ACCEPTED_REQUEST_FIELDS)
 
 
 def classify(evidence: StreamEvidence) -> Outcome:
@@ -334,48 +409,3 @@ def partition_for_status(status: int, *, body_rejects: bool = False) -> FailureC
     if body_rejects or 400 <= status < 500 and status != 429:
         return FailureClass.INVALID
     return FailureClass.TRANSIENT
-
-
-@dataclass(frozen=True)
-class Reconciliation:
-    """The verdict after both observers have reported.
-
-    ``divergent`` is a field rather than an outcome because the two facts are independent: the proxy
-    still has to tell the client whether it received an answer, and the operator still has to be
-    able to see that the engine contradicted itself.
-    """
-
-    outcome: Outcome
-    divergent: bool
-
-    @property
-    def usable(self) -> bool:
-        return is_usable_completion(self.outcome)
-
-    @property
-    def failure_class(self) -> FailureClass | None:
-        """What this verdict implies about the engine, as far as the proxy may claim.
-
-        ``None`` when the observers disagreed. Divergence is a defect in the contract between two
-        reporters, and the proxy has no authority to declare a device dead because of it - latching
-        belongs to the worker alone. The verdict still reports as not usable, so nothing is smuggled
-        past the client.
-        """
-        if self.divergent:
-            return None
-        return partition_for_outcome(self.outcome)
-
-
-def reconcile(declared: Outcome | None, inferred: Outcome) -> Reconciliation:
-    """Combine a worker's self-report with the proxy's reading of the wire.
-
-    A worker that does not declare an outcome is not a contradiction, it is a backend predating this
-    contract, so the proxy's inference simply governs. When both report and disagree, the result is
-    :attr:`Outcome.UNKNOWN`: never a success, and never a fatal latch, because the two observers
-    disagreeing is a defect in the contract and not proof that the device stopped working.
-    """
-    if declared is None:
-        return Reconciliation(outcome=inferred, divergent=False)
-    if declared == inferred:
-        return Reconciliation(outcome=inferred, divergent=False)
-    return Reconciliation(outcome=Outcome.UNKNOWN, divergent=True)

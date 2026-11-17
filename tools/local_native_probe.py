@@ -92,8 +92,7 @@ def _run_in_runtime(runtime: dict[str, Any], source: str, *, timeout: int = 900)
     # measurement is the deliverable.
     for key in [name for name in environment if name.startswith(("MLX_", "GGML_", "LLAMA_"))]:
         environment.pop(key, None)
-    site = str(Path(runtime["executable"]).parent.parent / "environment" / "site-packages")
-    environment["PYTHONPATH"] = site
+    environment["PYTHONPATH"] = site_packages(runtime)
     try:
         result = subprocess.run(
             [_interpreter(runtime), "-c", source],
@@ -117,11 +116,36 @@ def _run_in_runtime(runtime: dict[str, Any], source: str, *, timeout: int = 900)
 
 
 def _interpreter(runtime: dict[str, Any]) -> str:
-    """The bare interpreter inside the provisioned runtime, not the worker wrapper."""
-    candidate = Path(runtime["executable"]).parent / "environment" / "bin" / "python3"
+    """The interpreter the provisioned record names.
+
+    ``provision()`` already writes the full path to ``environment/bin/python3`` into ``executable``
+    (local_mlx_runtime.py:315), so re-splicing that suffix produced
+    ``.../environment/bin/environment/bin/python3`` and the probe refused a runtime that was in
+    fact installed. Deriving the layout here was always a second opinion on a path the producer
+    chose; the record is the single source of truth.
+    """
+    candidate = Path(str(runtime.get("executable") or ""))
+    if not candidate.is_absolute():
+        raise ProbeError("the provisioned runtime record names no absolute interpreter path")
     if not candidate.is_file():
         raise ProbeError(f"provisioned interpreter is missing at {candidate}")
     return str(candidate)
+
+
+def site_packages(runtime: dict[str, Any]) -> str:
+    """The dependency tree inside the provisioned runtime.
+
+    ``<root>/environment/bin/python3`` and ``<root>/environment/site-packages`` share a grandparent,
+    which is what ``_install_dependencies`` installs to with pip ``--target``. Getting this wrong
+    does not fail loudly: the interpreter starts, imports nothing, and the probe reports that MLX
+    cannot do the thing it was never able to import.
+    """
+    environment = Path(str(runtime.get("executable") or "")).parent.parent
+    if environment.name != "environment":
+        raise ProbeError(
+            f"provisioned interpreter is not inside an environment/ tree: {environment}"
+        )
+    return str(environment / "site-packages")
 
 
 # ------------------------------------------------------------------------ questions
@@ -137,7 +161,9 @@ import json, mlx.core as mx
 from mlx_lm import load, generate
 info = mx.device_info()
 model, tokenizer = load({model!r})
-out = generate.generate(
+# mlx_lm.generate is the *function* the package re-exports, which shadows the module of the same
+# name; calling generate.generate(...) is an AttributeError, not a device failure.
+out = generate(
     model, tokenizer, prompt="Reply with one word.", max_tokens=4, verbose=False
 )
 print(json.dumps({{
@@ -157,59 +183,78 @@ print(json.dumps({{
 def question_two(runtime: dict[str, Any], model: str) -> dict[str, Any]:
     """Does a harness-chosen wired limit survive the generation call?
 
-    This is U2, and it is the question the whole bounded-wiring design rests on. The high-level
-    wrapper raises the wired limit to the device recommendation on entry and restores it on exit,
-    so a limit set before calling it is overwritten for the duration of the request. The probe
-    therefore measures both paths: if the wrapper clobbers the setting and the lower-level step
-    preserves it, the answer is "use generate_step", which is a design input rather than a failure.
+    This is U2, and the bounded-wiring design rests on the answer.
+
+    mlx 0.32.4 binds no wired-limit *getter*, so "what is the limit right now" is only observable
+    through the setter: ``set_wired_limit(n)`` returns the value it replaced. Calling it twice with
+    the same number therefore reads the current limit without changing it — the one readback the
+    pinned API affords, and the reason the previous version of this probe could never have produced
+    the evidence it was written to produce.
+
+    An exception here is a failure of the *instrument*, not a negative observation. The previous
+    version caught every error into the result document, so four AttributeErrors from wrong API
+    names collapsed into ``honoured_by = []`` and the probe reported the design premise as refuted
+    without having measured anything.
     """
     source = f"""
 import json, mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import stream_generate, generate_step
+from mlx_lm.models.cache import make_prompt_cache
 
 model, tokenizer = load({model!r})
 requested = 256 * 1024 * 1024
-observed = {{}}
 
-def probe(name, run):
+def wired_now():
+    # Setting a limit reads the previous one; setting it to what it already was changes nothing.
+    previous = int(mx.set_wired_limit(requested))
+    return previous
+
+def measure(name, run):
     mx.set_wired_limit(requested)
-    before = int(mx.get_wired_limit())
+    before = wired_now()
     run()
-    after = int(mx.get_wired_limit())
-    observed[name] = {{"before": before, "after_call": after, "honoured": before == requested}}
+    after = wired_now()
+    return {{
+        "before": before,
+        "after_call": after,
+        "honoured": before == requested,
+        "restored_after_call": after == requested,
+    }}
 
 prompt = tokenizer.encode("Count from one to thirty.", add_special_tokens=False)
+prompt_array = mx.array(prompt)
+cache = make_prompt_cache(model)
 
-def use_wrapper():
-    for _ in stream_generate(model, tokenizer, prompt=prompt, max_tokens=8):
-        pass
-
-def use_step():
-    cache = model.make_cache() if hasattr(model, "make_cache") else None
-    kwargs = {{}} if cache is None else {{"cache": cache}}
-    for _ in generate_step(iter(prompt), model, max_tokens=8, **kwargs):
-        pass
-
-try:
-    probe("stream_generate", use_wrapper)
-except Exception as exc:
-    observed["stream_generate"] = {{"error": str(exc)[:200]}}
-try:
-    probe("generate_step", use_step)
-except Exception as exc:
-    observed["generate_step"] = {{"error": str(exc)[:200]}}
+observed = {{}}
+observed["stream_generate"] = measure(
+    "stream_generate",
+    lambda: [token for token in stream_generate(
+        model, tokenizer, prompt_array, max_tokens=8)],
+)
+observed["generate_step"] = measure(
+    "generate_step",
+    lambda: [token for token in generate_step(
+        prompt_array, model, max_tokens=8, prompt_cache=make_prompt_cache(model))],
+)
 mx.set_wired_limit(0)
 print(json.dumps(observed))
 """
-    observed = _run_in_runtime(runtime, source)
-    honoured = [name for name, value in observed.items() if value.get("honoured")]
+    try:
+        observed = _run_in_runtime(runtime, source)
+    except ProbeError as failure:
+        # Refuse rather than infer. "no honoured path" is a finding about MLX; this is a finding
+        # about the probe, and the two must not arrive in the same shape.
+        raise ProbeError(f"the wiring question could not be measured: {failure}") from failure
+    if not isinstance(observed, dict) or not observed:
+        raise ProbeError(f"the wiring question returned an unusable document: {observed!r}")
+    honoured = sorted(name for name, value in observed.items() if value.get("honoured"))
     return {
         "observed": observed,
-        "honoured_by": sorted(honoured),
-        # Answering "no" is not a failure of the probe; it is the finding that decides the API path.
+        "honoured_by": honoured,
+        # "no" is a real answer about the wrapper; a crash is not, and is raised above instead.
         "wrapper_overwrites": not observed.get("stream_generate", {}).get("honoured", False),
-        "usable_path": sorted(honoured)[0] if honoured else None,
+        "usable_path": honoured[0] if honoured else None,
     }
 
 
@@ -224,15 +269,19 @@ def question_three(runtime: dict[str, Any], model: str) -> dict[str, Any]:
 import json, mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import generate_step
+from mlx_lm.models.cache import make_prompt_cache
 
 model, tokenizer = load({model!r})
 
 def measure(tokens):
-    mx.reset_peak_memory_stats()
-    cache = model.make_cache() if hasattr(model, "make_cache") else None
-    kwargs = {{}} if cache is None else {{"cache": cache}}
+mx.reset_peak_memory()
+    # A fresh cache per measurement: reusing one would measure the previous prompt's tail and
+    # report that as this prompt's growth, which is the same conflation F6 found in the worker.
+    cache = make_prompt_cache(model)
     prompt = [17] * tokens
-    for _ in generate_step(iter(prompt), model, max_tokens=2, **kwargs):
+    for _ in generate_step(
+        mx.array(prompt), model, max_tokens=2, prompt_cache=cache, prefill_step_size=2048
+    ):
         pass
     nbytes = getattr(cache, "nbytes", None)
     return {{

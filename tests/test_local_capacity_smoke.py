@@ -8,31 +8,35 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.helpers import resolved_engine_record
 from tools import capacity
 from tools import local_capacity_smoke as smoke
 
 
 def engine(slots=2):
-    return {
-        "context_tokens": 1024,
-        "sequences": slots,
-        "total_context_tokens": 1024 * slots,
-        "model_alias": "fixture",
-        "model_path": "/fixture/model.gguf",
-        "build_commit": "abcdef123",
-        "build_info": "fixture abcdef123",
-        "fingerprint": "fixture-fingerprint",
-        "snapshot_id": "fixture-snapshot",
-        "capacity_strategy": "native_context",
-        "memory_management": "os_managed",
-        "native_context_tokens": 1024,
-        "allocation": {"cache_type_k": "f16", "cache_type_v": "f16"},
-        "serving_profile_id": "profile-fixture",
-        "projection": {
+    """A resolved engine record carrying every field the resolver writes.
+
+    Built from the shared fixture rather than a literal subset: this tool now validates through
+    the same adapter path the launcher uses, and that reads ``engine_kind`` to choose the adapter.
+    A hand-written subset silently tests a plan shape production never emits.
+    """
+    return resolved_engine_record(
+        context_tokens=1024,
+        sequences=slots,
+        total_context_tokens=1024 * slots,
+        native_context_tokens=1024,
+        model_alias="fixture",
+        model_path="/fixture/model.gguf",
+        build_commit="abcdef123",
+        build_info="fixture abcdef123",
+        fingerprint="fixture-fingerprint",
+        snapshot_id="fixture-snapshot",
+        serving_profile_id="profile-fixture",
+        projection={
             "core_host_bytes": 14 * capacity.MIB,
             "core_device_bytes": {"Metal": 11 * capacity.MIB},
         },
-    }
+    )
 
 
 class FakeEngine:

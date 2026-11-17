@@ -7,6 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiohttp import web
+
 from tests import test_model_proxy as fixtures
 
 P = fixtures.PROXY
@@ -362,6 +364,63 @@ class FatalLatchTests(unittest.TestCase):
         self.manager.sync(self.policy)
         self.assertIsNotNone(self.manager.is_fatal(self.policy, ENGINE_ID))
 
+    def test_a_latch_closed_while_queued_is_seen_before_the_wire(self):
+        """F10a: a check made before the execution queue cannot see what happens during it.
+
+        One request latches the engine while another already holds a reservation. Without a check
+        *inside* the admission block the queued request posts a full native-context prompt at a
+        process that just died, spending the scarcest resource on the host to rediscover a fact the
+        proxy already knows.
+        """
+        dispatched = []
+
+        class Session:
+            def post(self, *_args, **_kwargs):
+                dispatched.append(True)
+                raise AssertionError("must not reach the wire")
+
+        manager, policy, lane = self.manager, self.policy, self.lane
+
+        class LatchingAdmission:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                manager.latch_fatal(policy, ENGINE_ID, "peer failed during the wait")
+                return None
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        request = SimpleNamespace(
+            method="POST",
+            content_type="application/json",
+            headers={},
+            transport=SimpleNamespace(is_closing=lambda: False),
+            app={"client": SimpleNamespace()},
+        )
+        with (
+            patch.object(P, "admission", LatchingAdmission),
+            # stream_attempt consults the module-level manager, so the latch has to be closed on
+            # that same object; the fixture's own instance would leave the path under test
+            # permanently healthy and the assertion below vacuously true.
+            patch.object(P, "local_engines", manager),
+            patch.object(manager, "before_dispatch", AsyncMock(return_value=None)),
+            patch.object(P, "upstream_credential", lambda _name: "k" * 40),
+            patch.object(P, "filtered_request_headers", lambda *_a: {}),
+        ):
+            with self.assertRaises(web.HTTPServiceUnavailable) as caught:
+                asyncio.run(
+                    P.stream_attempt(request, Session(), lane, b'{"x":1}', 6, 1000)
+                )
+        self.assertEqual(dispatched, [], "the request reached a latched engine")
+        body = caught.exception.text
+        self.assertIn("failed permanently", body)
+        # A terminal verdict withholds the one header that tells a client to keep trying. What the
+        # configured Kimi client then does is still unmeasured (U1), but the engine is latched, so
+        # every later attempt is refused here rather than re-prefilled.
+        self.assertNotIn("Retry-After", caught.exception.headers)
+
     def test_a_policy_refresh_for_the_same_engine_is_not_a_relaunch(self):
         self.latch()
         refreshed = copy.deepcopy(self.policy)
@@ -467,7 +526,16 @@ class FatalLatchTests(unittest.TestCase):
 
     def test_health_reports_liveness_alongside_last_preparation(self):
         report = self.manager.liveness(ENGINE_ID)
-        self.assertEqual(report["active_permits"], 0)
+        # An `active_permits` figure here used to be read from a dictionary nothing ever wrote, so
+        # it reported zero — the reassuring value — for a saturated engine as readily as an idle
+        # one. Asserting it equalled 0 was a test that could never fail. The field is now absent
+        # until release is acknowledged by the engine rather than by a counter decrement, and a
+        # health payload must not acquire a permissive default in the meantime.
+        self.assertNotIn(
+            "active_permits",
+            report,
+            "health may not report a permit count the proxy does not actually track",
+        )
         self.assertIsNone(
             report["seconds_since_last_completion"],
             "an engine that has served nothing must not look freshly healthy",
@@ -639,3 +707,101 @@ class ScannerOutcomeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalRefusalTests(unittest.TestCase):
+    """A local engine answering 4xx is refusing the request, not dying.
+
+    Before the frontend was fixed to answer a refusal before sending headers, the same condition
+    arrived as an in-band error object on a 200 and the classifier called it FATAL — so one client
+    setting one unsupported field disabled a healthy engine for the rest of the session. These pin
+    the other half: the proxy must read the status, not retry, and above all must not latch.
+    """
+
+    def setUp(self):
+        self.addCleanup(fixtures.clean_counters)
+        self.plan = local_plan()
+        mounted = fixtures.live(self.plan)
+        mounted.__enter__()
+        self.addCleanup(mounted.__exit__, None, None, None)
+        self.policy = P.current_policy()
+        self.lane = self.policy.lanes["subagent"]
+        self.manager = P.LocalEngines()
+        self.manager.sync(self.policy)
+        patcher = patch.object(P, "current_policy", return_value=self.policy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patch.object(P, "upstream_credential", lambda _name: "k" * 40).start()
+
+    def _attempt(self, status: int):
+        class Content:
+            """Shaped like aiohttp's stream reader: the proxy consumes bodies by iteration."""
+
+            def __init__(self, body: bytes):
+                self._body = body
+
+            async def read(self, *_a, **_k):
+                return self._body
+
+            async def iter_any(self):
+                yield self._body
+
+        response = SimpleNamespace(
+            status=status,
+            headers={},
+            content=Content(b'{"error":{"message":"unsupported request fields: tool_choice"}}'),
+            release=lambda: None,
+            close=lambda: None,
+        )
+        session = SimpleNamespace(post=lambda *_a, **_k: asyncio.sleep(0, result=response))
+        request = SimpleNamespace(
+            method="POST",
+            content_type="application/json",
+            headers={},
+            transport=SimpleNamespace(is_closing=lambda: False),
+            app={"client": SimpleNamespace()},
+        )
+        manager = self.manager
+
+        class Admit:
+            def __init__(self, *_a, **_k):
+                pass
+
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        with (
+            patch.object(P, "admission", Admit),
+            patch.object(P, "local_engines", manager),
+            patch.object(P.local_engines, "before_dispatch", AsyncMock(return_value=None)),
+            patch.object(P, "filtered_request_headers", lambda *_a: {}),
+        ):
+            return asyncio.run(
+                P.stream_attempt(request, session, self.lane, b'{"x":1}', 6, 1000)
+            )
+
+    def test_a_local_400_is_classified_as_invalid_not_upstream_error(self):
+        outcome = self._attempt(400)
+        self.assertEqual(outcome.status, 400)
+        self.assertEqual(outcome.failure, "invalid_request", outcome.failure)
+        self.assertTrue(outcome.permanent)
+
+    def test_a_local_refusal_never_latches_the_engine(self):
+        self._attempt(400)
+        self.assertIsNone(
+            self.manager.is_fatal(self.policy, ENGINE_ID),
+            "a client's inadmissible request disabled a healthy engine",
+        )
+
+    def test_a_local_refusal_is_not_retried(self):
+        # Retrying spends a full prefill to reach the identical refusal.
+        outcome = self._attempt(400)
+        self.assertEqual(outcome.retry_after, 0.0, outcome.retry_after)
+
+    def test_a_local_500_is_still_a_transient_upstream_error(self):
+        outcome = self._attempt(500)
+        self.assertEqual(outcome.failure, "upstream_error", outcome.failure)
+        self.assertFalse(outcome.permanent)

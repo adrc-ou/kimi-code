@@ -344,13 +344,26 @@ repository fixtures are not evidence of native generation correctness or peak
 memory behavior. Available-memory and RSS measurements do not size or limit execution.
 
 **Two engines, selected in the manifest, never at runtime.** Each model names one
-`[serving] profile` in `providers/local_mps/provider.toml`; nothing chooses an
-engine while a session is running, and there is no automatic fallback between them.
-The 27B currently names the retained llama.cpp profile. Moving it to MLX is one
-line, and the old GGUF and its verification record are kept beside the new artifact
-so rollback is the same one-line edit on your next launch. Retaining both formats
-roughly doubles that model's disk use; the manifest's `disk_gib` covers the artifact
-being installed, so check free space before switching.
+`[serving] profile` in `providers/local_mps/provider.toml`; nothing chooses an engine while a
+session is running, and there is no automatic fallback between them.
+The 27B currently names the retained llama.cpp profile. Switching it is **not** a
+one-line edit: a profile selects an engine, and the engine it selects requires an
+artifact of its own format. Both shipped locks are schema 1 and describe a GGUF, and
+`MlxLmAdapter.validate_artifact` refuses a non-MLX artifact outright, so the profile
+change alone fails closed rather than serving the wrong bytes. A real promotion is:
+
+1. pin the MLX artifact — a `weights.lock.json` at `schema_version = 2` with an
+   `[artifact]` block (`format = "mlx"`, a `variant`, and the `directory` the loader
+   reads), a different source repository and revision, and the SHA-256 of every file;
+2. download and verify it, which is what writes the coexistence record;
+3. then name `mlx_lm` in `[serving] profile`.
+
+Rollback is the profile line again, because schema 2 keeps each artifact in its own
+subdirectory so neither loader discovers the other's files. That coexistence is a
+documented capability of the format, not a state either shipped model is in yet.
+Re-check `disk_gib` before switching: it is a single static per-model host floor that
+cannot vary by artifact or profile, so the number covering a 16.35 GiB GGUF says
+nothing about an MLX conversion of a different size.
 
 Two commands produce the evidence a switch is supposed to rest on, and both must run
 on the Mac that will serve the model — `./start.sh` and this repository's test suite

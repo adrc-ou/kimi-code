@@ -239,6 +239,18 @@ def project(
     return estimate
 
 
+#: Which host measurements each declared ``[execution.memory] target`` name requires. A target is
+#: a promise about the inputs it reads, so the unknown-measurement policy has to know them too.
+_TARGET_MEASUREMENTS = {
+    "min_available_and_recommended": (
+        "available_memory_bytes",
+        "recommended_working_set_bytes",
+    ),
+    "available_memory": ("available_memory_bytes",),
+    "recommended_working_set": ("recommended_working_set_bytes",),
+}
+
+
 def wiring_targets(
     engines: dict[str, Any], providers: dict[str, Any], measured: Mapping[str, Any]
 ) -> dict[str, dict[str, Any]]:
@@ -294,17 +306,39 @@ def wiring_targets(
 
     # min(), never sum(): available memory already accounts for what is resident now, and adding a
     # device recommendation to it would double-count the same physical pages.
-    candidates = [value for value in (available, recommended) if value is not None]
-    if not candidates:
-        if unknown_policy == "refuse":
-            raise CapacityError(
-                "memory measurements unavailable and unknown_measurements = refuse"
-            )
+    #
+    # The policy is evaluated per named measurement, not only when every one is missing. Under the
+    # old rule `target = "min_available_and_recommended"` silently degraded to whichever single
+    # number happened to arrive, so a host whose Metal recommendation was unobtainable was asked to
+    # pin up to its full available memory — the opposite of what `unknown_measurements = "unwired"`
+    # says should happen, and reachable on every launch because nothing supplies the Metal probe.
+    named = {
+        "available_memory_bytes": available,
+        "recommended_working_set_bytes": recommended,
+    }
+    target = memory.get("target", "min_available_and_recommended")
+    wanted = _TARGET_MEASUREMENTS.get(target)
+    if wanted is None:  # pragma: no cover - the parser refuses other values
+        raise CapacityError(f"unknown memory target {target!r}")
+    missing = sorted(name for name in wanted if named.get(name) is None)
+    candidates = [named[name] for name in wanted if named.get(name) is not None]
+    if missing and unknown_policy == "refuse":
+        raise CapacityError(
+            f"memory measurements unavailable ({', '.join(missing)}) and "
+            "unknown_measurements = refuse"
+        )
+    if missing:
+        # "unwired", and the only other value the parser accepts. An absent number is not a
+        # smaller number, and inventing one from the friendliest remaining input is a guess.
         for engine_id in engines:
             result[engine_id] = {
                 "wired_bytes": 0,
                 "controllable": True,
-                "reason": "measurements unavailable: deliberate wiring disabled, not zero-sized",
+                "reason": (
+                    "measurement unavailable: "
+                    + ", ".join(missing)
+                    + " — deliberate wiring disabled, not zero-sized"
+                ),
             }
         return result
     aggregate = min(candidates)
@@ -476,6 +510,9 @@ def prepare(
         measured = {"memory_bytes": 0, "available_memory_bytes": 0}
     snapshot_id = uuid.uuid4().hex
     measured["snapshot_id"] = snapshot_id
+    #: Engine-reported device facts, collected in the loop below and folded in before the wiring
+    #: decision, so the measurement a diagnostic shows is the one the numbers came from.
+    device_recommended: dict[str, Any] = {"value": None, "source": None}
     write_private_json(runtime / host_caps.CAPS_FILE, measured)
     result = allocate(local, providers, reserved)
     for model in local:
@@ -486,6 +523,25 @@ def prepare(
         # numbers in and reads nothing back but facts.
         runtime_ = adapter.provision(install=True)
         identity = adapter.identity(runtime_).as_record()
+        # Device facts come from whichever runtime is already installed to answer them, rather than
+        # from a helper script an operator would have to know to point at. Observations from two
+        # engines must agree, on the same principle _memory_policy() applies to declared policies:
+        # one device cannot be bounded by two recommendations at once, and silently taking the
+        # first would make dictionary order decisive.
+        reported = adapter.device_observations(runtime_).get("recommended_max_working_set_size")
+        if reported is not None:
+            value = int(reported)
+            if value <= 0:
+                raise CapacityError(
+                    f"{model['id']}: engine reported a recommended working set of {value}"
+                )
+            previous = device_recommended["value"]
+            if previous is not None and previous != value:
+                raise CapacityError(
+                    f"selected engines report different device working sets: {previous} and {value}"
+                )
+            device_recommended["value"] = value
+            device_recommended["source"] = model["id"]
         # The lock is read inside the adapter, which is the only party that knows which of its
         # fields describe a loadable artifact for this engine.
         artifact = adapter.validate_artifact(model, local_llm.read_lock(Path(model["lock_path"])))
@@ -533,6 +589,13 @@ def prepare(
     # Residency is resolved *after* every engine record is final, so the same measurements that a
     # diagnostic will show are the ones the numbers came from, and no engine's wiring can depend on
     # a peer that had not been priced yet.
+    if device_recommended["value"] is not None:
+        metal = dict(measured.get("metal") or {})
+        # The engine's own answer wins over anything the host probe happened to offer, recorded with
+        # the engine that produced it so the provenance survives into the snapshot.
+        metal["recommended_working_set_bytes"] = device_recommended["value"]
+        metal["source"] = f"engine:{device_recommended['source']}"
+        measured["metal"] = metal
     wiring = wiring_targets(result["engines"], providers, measured)
     for engine_id, decision in wiring.items():
         # Recorded beside the plan, not inside the fingerprint: a different available-memory reading

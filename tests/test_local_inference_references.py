@@ -28,6 +28,10 @@ from tests.helpers import add_tools_to_path, shipped_plan  # noqa: E402
 
 add_tools_to_path()
 import policy  # noqa: E402
+from capture_local_inference_references import (  # noqa: E402
+    REDACTED_HOST,
+    redact_plan,
+)
 from definitions import LANES  # noqa: E402
 
 
@@ -64,8 +68,42 @@ class NrpReferenceTests(unittest.TestCase):
     def test_the_resolved_plan_is_byte_for_byte_unchanged(self):
         for lane in policy.AGENT_LANES:
             with self.subTest(lane=lane):
-                plan = shipped_plan(agent_lane=lane)
+                plan = redact_plan(shipped_plan(agent_lane=lane))
                 self.assertEqual(plan, reference(lane)["plan"])
+
+    def test_the_fixture_does_not_record_which_gateway_serves_the_endpoint(self):
+        # The plan comparison above is worth keeping only if it does not turn the fixture into a
+        # second home for the provider's endpoint host. tests/test_configuration.py allows that name
+        # in exactly one tracked file; a captured plan is where it would otherwise creep back in.
+        #
+        # The forbidden string is read from the provider manifest rather than written here, so this
+        # guard does not itself become a second place that names the gateway, and it keeps working
+        # if the operator ever points the provider somewhere else.
+        from tools import definitions
+
+        providers, _ = definitions.load_definitions(ROOT)
+        real_host = providers["nrp"]["base_url"].split("://", 1)[-1].split("/")[0]
+        self.assertNotEqual(real_host, REDACTED_HOST)
+        for lane in policy.AGENT_LANES:
+            document = reference(lane)
+            with self.subTest(lane=lane):
+                text = json.dumps(document)
+                self.assertNotIn(real_host, text)
+                self.assertIn(REDACTED_HOST, text)
+                self.assertEqual(
+                    document["plan"]["providers"]["nrp"]["base_url"],
+                    f"https://{REDACTED_HOST}",
+                )
+                self.assertTrue(
+                    document["plan"]["providers"]["nrp"]["base_url_env"],
+                    "the indirection that makes the host irrelevant must survive redaction",
+                )
+                # A URL on a different host is the provider's own terms, not a gateway, and must
+                # still be the real value rather than collateral damage from the redaction.
+                self.assertEqual(
+                    document["plan"]["providers"]["nrp"]["policy_url"],
+                    providers["nrp"]["policy_url"],
+                )
 
     def test_the_generated_guidance_is_unchanged(self):
         for lane in policy.AGENT_LANES:

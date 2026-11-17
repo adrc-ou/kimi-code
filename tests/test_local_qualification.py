@@ -66,6 +66,37 @@ class SizingTests(unittest.TestCase):
 
 
 class DeclaredContextTests(unittest.TestCase):
+    def test_the_status_document_is_read_with_the_method_the_route_serves(self):
+        """F11c: this posted to a GET-only route, so the ceiling target was never obtainable.
+
+        Asserted on the request object rather than on a mocked urlopen result, because the bug was
+        the verb and every earlier stub answered regardless of it.
+        """
+        seen = {}
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"context_tokens": 262144}'
+
+        def fake_urlopen(request, timeout=None):
+            seen["method"] = request.get_method()
+            seen["path"] = request.selector
+            seen["auth"] = request.get_header("Authorization")
+            return _Response()
+
+        with mock.patch.object(qualify.urllib.request, "urlopen", fake_urlopen):
+            declared = qualify._declared_context(("h", 1, "tok"))
+        self.assertEqual(declared, 262144)
+        self.assertEqual(seen["method"], "GET", "the status route is served by do_GET only")
+        self.assertEqual(seen["path"], "/v1/harness/status")
+        self.assertEqual(seen["auth"], "Bearer tok", "status authenticates like every other route")
+
     def test_a_missing_status_means_no_near_ceiling_target_rather_than_a_guess(self):
         with mock.patch.object(qualify, "_post", side_effect=OSError("unreachable")):
             self.assertIsNone(qualify._declared_context(("h", 1, "t")))
@@ -76,7 +107,16 @@ class DeclaredContextTests(unittest.TestCase):
 
 
 class VerdictTests(unittest.TestCase):
-    def _run(self, *, statuses=None, near=None, declared=4096, skip_near=False):
+    def _run(
+        self,
+        *,
+        statuses=None,
+        near=None,
+        declared=4096,
+        skip_near=False,
+        finish="stop",
+        prose_on_tool_turns=False,
+    ):
         def fake_fit(origin, target, *, tools):
             payload = {"messages": [{"role": "user", "content": "x"}], "stream": True}
             if tools:
@@ -86,8 +126,12 @@ class VerdictTests(unittest.TestCase):
         def fake_timed(origin, payload, timeout):
             # The engine answers a tool request with a call. Tests that want the opposite say so
             # explicitly rather than relying on a shared stub that cannot tell the cases apart.
-            return answer(tool_calls=1 if payload.get("tools") else 0,
-                          content_characters=0 if payload.get("tools") else 20)
+            tools = bool(payload.get("tools"))
+            return answer(
+                tool_calls=1 if tools else 0,
+                content_characters=(20 if prose_on_tool_turns else 0) if tools else 20,
+                finish_reason=finish,
+            )
 
         def fake_cancel(origin, payload, after):
             return {"slot_recovered": True, "cancelled_after_seconds": 0.1, "recovery_seconds": 0.2}
@@ -171,10 +215,41 @@ class VerdictTests(unittest.TestCase):
         self.assertFalse(result["passes"])
         self.assertTrue(any("no context length" in item for item in result["failures"]))
 
-    def test_skipping_the_near_ceiling_case_is_recorded_not_silently_passed(self):
+    def test_skipping_a_required_case_never_permits_promotion(self):
+        """F11d: the run that records a skip and still says "promote".
+
+        The old assertion here only checked that an observation was appended, which is what let the
+        false positive through review — a note in the artifact is not a gate on the verdict, and
+        ``promotion_permitted`` used to be derived purely from ``not failures``, so a case that
+        never ran contributed nothing.
+        """
         result = self._run(skip_near=True)
         kinds = [item["kind"] for item in result["observations"]]
         self.assertIn("near_ceiling_skipped", kinds)
+        self.assertTrue(result["passes"], result["failures"])
+        self.assertFalse(result["evidence_complete"], result)
+        self.assertEqual(result["required_cases_missing"], ["near_ceiling"])
+        self.assertFalse(result["promotion_permitted"], result)
+        self.assertIn("required cases were not run", result.get("blocking_reason", ""))
+
+    def test_every_completion_truncated_blocks_promotion(self):
+        """F11e: finish_reason was captured and then never consulted.
+
+        An engine that ran out of output budget on every single request is the exact failure the
+        operator reported, so it must not be the profile a qualification blesses.
+        """
+        result = self._run(finish="length")
+        self.assertFalse(result["passes"], result)
+        self.assertFalse(result["promotion_permitted"], result)
+        self.assertTrue(
+            any("finish_reason='length'" in item for item in result["failures"]),
+            result["failures"],
+        )
+
+    def test_a_tool_call_that_also_prose_is_still_a_tool_turn(self):
+        # The near-ceiling case accepts either shape, so a completion carrying both must pass.
+        result = self._run(prose_on_tool_turns=True)
+        self.assertTrue(result["promotion_permitted"], result["failures"])
 
     def test_throughput_spread_is_an_observation_and_never_a_failure(self):
         # A slow measurement is evidence for the operator; failing a promotion on one noisy sample

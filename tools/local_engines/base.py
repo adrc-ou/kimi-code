@@ -127,6 +127,12 @@ class EngineStatus:
     identity_fragment: str
     #: Anything the engine reported that diagnostics will show but no decision reads.
     observations: Mapping[str, Any] = field(default_factory=dict)
+    #: Which of the reported names the engine *measured* itself, as opposed to repeating what the
+    #: plan told it. A status endpoint that answers with a copy of its own configuration is not
+    #: evidence that the configuration took effect, and the two have to be tellable apart by
+    #: whatever reads the readiness receipt. Adapters fill this in because only they know which
+    #: engine endpoint the values came from.
+    attested: frozenset[str] = frozenset()
 
     @property
     def total_context_tokens(self) -> int:
@@ -145,7 +151,7 @@ class Computed:
 
 @runtime_checkable
 class EngineAdapter(Protocol):
-    """The seven operations an engine must support to be servable by this harness."""
+    """The operations an engine must support to be servable by this harness."""
 
     kind: str
 
@@ -158,6 +164,19 @@ class EngineAdapter(Protocol):
 
     def identity(self, runtime: Runtime) -> EngineIdentity:
         """Ask the runtime what it is. Used to bind the plan to these exact bytes."""
+
+    def device_observations(self, runtime: Runtime) -> dict[str, Any]:
+        """Device facts this engine's own runtime can report about this host.
+
+        Optional by nature — an engine installed as a bare binary has no way to ask — so the
+        resolver treats ``{}`` as "this engine could not say" rather than as zero. The one value
+        the wiring decision reads is ``recommended_max_working_set_size``.
+
+        Before this existed the same number came only from a script named by an environment
+        variable no launcher set, so on every real launch the recommendation was simply missing
+        and ``min()`` fell back to the single surviving measurement.
+        """
+        ...
 
     def validate_artifact(self, model: Mapping[str, Any], lock: Mapping[str, Any]) -> Artifact:
         """Check the verified bytes are loadable *by this engine* and describe them."""

@@ -42,7 +42,7 @@
     "lanes": {
       "long": {
         "alias": "qwen3-long",
-        "base_url": "https://litellm.lib.ou.edu",
+        "base_url": "https://gateway.invalid",
         "capabilities": [
           "thinking",
           "image_in",
@@ -78,7 +78,7 @@
       },
       "primary": {
         "alias": "qwen3-primary",
-        "base_url": "https://litellm.lib.ou.edu",
+        "base_url": "https://gateway.invalid",
         "capabilities": [
           "thinking",
           "image_in",
@@ -114,7 +114,7 @@
       },
       "subagent": {
         "alias": "qwen3-subagent",
-        "base_url": "https://litellm.lib.ou.edu",
+        "base_url": "https://gateway.invalid",
         "capabilities": [
           "thinking",
           "image_in",
@@ -161,7 +161,7 @@
     },
     "providers": {
       "nrp": {
-        "base_url": "https://litellm.lib.ou.edu",
+        "base_url": "https://gateway.invalid",
         "base_url_env": "NRP_BASE_URL",
         "context_margin_percent": 95,
         "credentials": {
@@ -169,7 +169,7 @@
             "env": "NRP_API_KEY",
             "fallback_env": "",
             "generate": false,
-            "key_url": "https://litellm.lib.ou.edu/ui/?page=api-keys",
+            "key_url": "https://gateway.invalid/ui/?page=api-keys",
             "label": "NRP managed-LLM API token",
             "prompt": "NRP API token",
             "secret_name": "nrp__default"
@@ -178,7 +178,7 @@
             "env": "QWEN3_API_KEY",
             "fallback_env": "NRP_API_KEY",
             "generate": false,
-            "key_url": "https://litellm.lib.ou.edu/ui/?page=api-keys",
+            "key_url": "https://gateway.invalid/ui/?page=api-keys",
             "label": "Qwen3.8-Flash-Next API key",
             "prompt": "API key for Qwen3.8-Flash-Next",
             "secret_name": "nrp__default__qwen3"

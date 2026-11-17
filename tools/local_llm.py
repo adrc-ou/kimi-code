@@ -998,8 +998,12 @@ def cmd_serve(argv: list[str]) -> int:
             sink.write(token + "\n")
         # The write end is closed here, so the child reads the value and then EOF: a credential
         # that stays open on a pipe would keep the child waiting on a descriptor the parent has
-        # finished with.
-        token = ""
+        # finished with. Clearing `token` as well was a conflation of two different holders: the
+        # child needs the descriptor and nothing else, but *this* process still has to authenticate
+        # the readiness probe it is about to make, and blanking the value handed every later
+        # Authorization header an empty bearer token. The token therefore stays in scope here and
+        # is passed on to wait_engine_ready() below.
+        pass
     if credential_pipe is not None:
         read_fd = credential_pipe[0]
 
@@ -1099,52 +1103,55 @@ def validate_launch(model: dict[str, Any], engine: dict[str, Any]) -> None:
     else:
         import capacity
     providers, _ = definitions.load_definitions(ROOT)
-    profile = providers[model["provider"]]["execution"]["profile"]
+    provider = providers[model["provider"]]
+    # The profile is read from the *model*, never from the provider. A provider offering more than
+    # one engine deliberately declares no default (``execution.profile`` is None) because the
+    # choice is always written down on the model, and ``definitions._bind_serving_profile`` is the
+    # single place that resolves it. Reading the provider here would compare the resolved
+    # allocation against None and reject every launch.
+    profile = model["serving_settings"]
+    slots = provider["capacity"]["sequence_slots"]
     checks = {
         "model_alias": model["model"],
+        "engine_kind": model["serving_engine"],
         "model_path": str(primary_weights_path(model)),
         "model_lock_digest": hashlib.sha256(Path(model["lock_path"]).read_bytes()).hexdigest(),
         "model_manifest_digest": hashlib.sha256(
             (Path(model["path"]) / "model.toml").read_bytes()
         ).hexdigest(),
         "provider_manifest_digest": hashlib.sha256(
-            (Path(providers[model["provider"]]["path"]) / "provider.toml").read_bytes()
+            (Path(provider["path"]) / "provider.toml").read_bytes()
         ).hexdigest(),
         "allocation": profile,
         "capacity_strategy": "native_context",
         "memory_management": "os_managed",
         "native_context_tokens": model["native_tokens"],
         "context_tokens": model["native_tokens"],
-        "sequences": providers[model["provider"]]["capacity"]["sequence_slots"],
-        "total_context_tokens": model["native_tokens"]
-        * providers[model["provider"]]["capacity"]["sequence_slots"],
+        "sequences": slots,
+        "total_context_tokens": model["native_tokens"] * slots,
     }
     if any(engine.get(key) != value for key, value in checks.items()):
         raise EngineError("model or serving profile changed after capacity resolution")
+    # Identity is read through the adapter, in the same shape the resolver recorded it. Calling
+    # capacity.engine_identity() directly compares its ``source_commit`` key against the plan's
+    # ``source_revision`` and so rejects every launch: the two vocabularies differ, and the adapter
+    # is the party that owns the mapping between them.
+    adapter = capacity_adapter(engine["engine_kind"])
     try:
-        identity = capacity.engine_identity(engine_binary())
-    except capacity.CapacityError as exc:
+        identity = adapter.identity(adapter.provision(install=False)).as_record()
+    except (EngineError, capacity.CapacityError) as exc:
         raise EngineError(str(exc)) from exc
     if any(engine.get(key) != value for key, value in identity.items()):
         raise EngineError("engine binary changed after capacity resolution")
-
-
-def validate_properties(props: dict[str, Any], engine: dict[str, Any]) -> None:
-    """Attest the actual server's read-only properties against its resolved allocation."""
-    settings = props.get("default_generation_settings") if isinstance(props, dict) else None
-    if (
-        not isinstance(props, dict)
-        or not isinstance(settings, dict)
-        or props.get("model_alias") != engine["model_alias"]
-        or props.get("model_path") != engine["model_path"]
-        or type(props.get("total_slots")) is not int
-        or props.get("total_slots") != engine["sequences"]
-        or type(settings.get("n_ctx")) is not int
-        or settings.get("n_ctx") != engine["context_tokens"]
-        or engine["build_commit"] not in str(props.get("build_info") or "")
-        or props.get("is_sleeping") is not False
-    ):
-        raise EngineError("the running engine differs from its resolved allocation")
+    # Recomputed rather than trusted. The resolver digests the pair this process is about to launch
+    # with, so this is the check that binds the *observed* binary identity and the profile settings
+    # to the identifier the proxy compares later; a stored digest alone only proves the plan agreed
+    # with itself.
+    profile_id = hashlib.sha256(
+        json.dumps({"engine": identity, "allocation": profile}, sort_keys=True).encode()
+    ).hexdigest()
+    if engine.get("serving_profile_id") != profile_id:
+        raise EngineError("serving profile identity changed after capacity resolution")
 
 
 #: What a ``/props`` body may weigh. This used to be a bare 65536 repeated at the read and the
@@ -1172,6 +1179,12 @@ class StreamingCanaryScanner:
         self.terminated = False
         self.saw_error_object = False
         self.saw_framing_failure = False
+        #: Without this the classifier's truncation branch is unreachable from here, and a
+        #: completion cut off at the token budget reads as a finished one.
+        self.finish_reason: str | None = None
+        #: Counted by stream index rather than per fragment: an OpenAI tool call arrives split
+        #: across many deltas, so a fragment count is not a number of calls.
+        self.tool_indices: set[Any] = set()
         self.overflowed = False
 
     def feed(self, chunk: bytes) -> None:
@@ -1227,9 +1240,18 @@ class StreamingCanaryScanner:
                 reasoning = source.get("reasoning_content")
                 if isinstance(reasoning, str):
                     self.reasoning_chars += len(reasoning)
+                reason = choice.get("finish_reason")
+                if isinstance(reason, str) and reason:
+                    self.finish_reason = reason
                 calls = source.get("tool_calls")
                 if isinstance(calls, list):
-                    self.tool_calls += sum(1 for item in calls if isinstance(item, dict))
+                    for position, item in enumerate(calls):
+                        if not isinstance(item, dict):
+                            continue
+                        key = item.get("index", position)
+                        if key not in self.tool_indices:
+                            self.tool_indices.add(key)
+                            self.tool_calls += 1
 
     def outcome(self) -> str:
         return str(
@@ -1241,6 +1263,7 @@ class StreamingCanaryScanner:
                     terminated=self.terminated,
                     saw_error_object=self.saw_error_object,
                     saw_framing_failure=self.saw_framing_failure,
+                    finish_reason=self.finish_reason,
                 )
             )
         )
@@ -1330,7 +1353,14 @@ class LocalModelCanary:
             for chunk in iter(lambda: response.read(4096), b""):
                 scanner.feed(chunk)
         scanner.finish()
-        return {"outcome": scanner.outcome(), "content_chars": scanner.content_chars}
+        return {
+            "outcome": scanner.outcome(),
+            "content_chars": scanner.content_chars,
+            # Asked for separately because the outcome is not the question here: a completion that
+            # carries both a lead-in sentence and a valid call classifies as content, and a gate on
+            # "tool_only" alone would fail a healthy engine for describing what it was about to do.
+            "produced_tool_call": scanner.tool_calls > 0,
+        }
 
     def _tool_payload(self) -> dict[str, Any]:
         body = self.payload()
@@ -1374,11 +1404,19 @@ class LocalModelCanary:
             # without the checkpoint's template applied still accepts a `tools` array and returns
             # prose, which at the transport layer is a perfectly successful completion.
             tool_record = self._generate(self._tool_payload())
-            if tool_record["outcome"] != "tool_only":
+            if not tool_record["produced_tool_call"]:
                 raise EngineError(
                     "the model declares tool_use but the engine returned "
                     f"{tool_record['outcome']!r} for a forced tool call, so the chat template is "
                     "not being applied"
+                )
+            if tool_record["outcome"] == "truncated":
+                # Requiring a *complete* call is not pedantry. The probe asks for one in 64 tokens;
+                # a call cut off mid-arguments classifies as tool_only on the strength of having
+                # started, publishes a ready receipt, and hands the client JSON it cannot parse.
+                raise EngineError(
+                    "the forced tool call was truncated rather than completed, so the engine "
+                    "cannot be trusted with tool arguments"
                 )
             record["tool_canary"] = tool_record["outcome"]
         return record
@@ -1396,21 +1434,24 @@ def wait_engine_ready(
     else:
         import host_caps
     host = engine_host()
-    req = urllib.request.Request(
-        f"http://{host}:{engine_port(model)}/props",
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    # The endpoint, the request shape and the meaning of the response all belong to the adapter.
+    # Reading /props here was a llama.cpp assumption surviving inside a two-engine launcher, and a
+    # healthy MLX frontend — which exposes /v1/harness/status — could never complete readiness.
+    adapter = capacity_adapter(engine["engine_kind"])
+    base = f"http://{host}:{engine_port(model)}"
+    req = adapter.status_request(base, token)
     while child.poll() is None:
         try:
             with urllib.request.urlopen(req, timeout=5) as response:
                 data = response.read(LOCAL_PROPS_BYTES + 1)
                 if len(data) > LOCAL_PROPS_BYTES:
                     raise EngineError("engine properties exceed the supported metadata size")
-                props = json.loads(data)
+                payload = json.loads(data)
         except (OSError, ValueError):
             time.sleep(0.1)
             continue
-        validate_properties(props, engine)
+        status = adapter.normalize_status(payload)
+        adapter.verify_status(status, engine)
         # The engine has now proven it is the process the plan describes. Ask it to compute.
         try:
             canary = LocalModelCanary(host, engine_port(model), token, model).run()
@@ -1431,6 +1472,11 @@ def wait_engine_ready(
         except (OSError, ValueError):
             footprint, available = None, None
         ready = {
+            # Which of the engine's own numbers it measured, and which it merely repeated from the
+            # plan it was handed. Recorded on the receipt because "the engine reports 4096 context"
+            # is only evidence if the engine derived that from the model rather than reading it back
+            # out of its arguments.
+            "attested": sorted(status.attested),
             "resident_bytes": footprint,
             "available_host_bytes": available,
             "context_tokens": engine["context_tokens"],

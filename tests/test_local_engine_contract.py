@@ -214,34 +214,29 @@ class RequestVersusTransportTests(unittest.TestCase):
 
 
 class TwoObserverAuthorityTests(unittest.TestCase):
-    """Neither observer may overrule the other on the question only it can see."""
+    """Neither observer may overrule the other on the question only it can see.
 
-    def test_a_backend_that_declares_nothing_leaves_the_call_to_the_proxy(self):
-        result = contract.reconcile(None, contract.Outcome.CONTENT)
-        self.assertEqual(result.outcome, contract.Outcome.CONTENT)
-        self.assertFalse(result.divergent)
-        self.assertTrue(result.usable)
-
-    def test_agreement_is_not_divergence(self):
-        result = contract.reconcile(contract.Outcome.TOOL_ONLY, contract.Outcome.TOOL_ONLY)
-        self.assertEqual(result.outcome, contract.Outcome.TOOL_ONLY)
-        self.assertFalse(result.divergent)
-
-    def test_a_worker_claiming_success_over_an_empty_wire_is_never_a_success(self):
-        result = contract.reconcile(contract.Outcome.CONTENT, contract.Outcome.EMPTY)
-        self.assertEqual(result.outcome, contract.Outcome.UNKNOWN)
-        self.assertTrue(result.divergent)
-        self.assertFalse(result.usable)
-
-    def test_divergence_does_not_let_the_proxy_latch_the_engine_dead(self):
-        # Latching is the worker's alone. Two reporters disagreeing is a contract defect, not
-        # evidence about the device, so it must not consume the one action that ends the session.
-        result = contract.reconcile(contract.Outcome.EMPTY, contract.Outcome.CONTENT)
-        self.assertIsNone(result.failure_class)
+    These used to be six cases over a ``reconcile(declared, inferred)`` helper. The helper is gone:
+    nothing in the engine path ever declares an outcome, so half of every assertion here was
+    exercising a parameter that production could only ever pass as ``None``. What actually enforces
+    the split now is ``partition_for_outcome`` on the proxy side and the worker's own fatal
+    reporting, and the authority rule that matters — a divergence-shaped observation must not latch
+    — is covered where the latch lives, in tests/test_local_proxy.py.
+    """
 
     def test_genuine_damage_a_proxy_observes_still_names_itself(self):
-        result = contract.reconcile(None, contract.Outcome.FRAMING_FAILURE)
-        self.assertEqual(result.failure_class, contract.FailureClass.FATAL)
+        # Deleting the reconciliation helper must not have softened the rule it was built around:
+        # framing damage observed on the wire is still fatal, and still the thing that latches.
+        self.assertEqual(
+            contract.partition_for_outcome(contract.Outcome.FRAMING_FAILURE),
+            contract.FailureClass.FATAL,
+        )
+        self.assertEqual(
+            contract.partition_for_outcome(contract.Outcome.ERROR_OBJECT),
+            contract.FailureClass.FATAL,
+        )
+        # And an intact-but-unusable completion is still not a failure class, so it cannot latch.
+        self.assertIsNone(contract.partition_for_outcome(contract.Outcome.EMPTY))
 
     def test_every_classifiable_member_is_accounted_for(self):
         for outcome in contract.OUTCOMES:

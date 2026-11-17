@@ -51,25 +51,42 @@ kv_unified = false
 cache_ram_mib = 0
 context_checkpoints = 0
 
-# The MLX serving of the 27B. Numeric values are the ones selected by the native qualification
-# recorded in docs/capacity-compatibility.md; a profile may not carry a placeholder, because the
-# engine fingerprint hashes these bytes and a placeholder would pin an engine to a value nobody
-# measured. `prefill_chunk_tokens` must be one of the declared candidates, which is what stops a
-# tuned number from arriving without the benchmark that justified it.
+# The MLX serving of the 27B. These numbers are UNQUALIFIED DEFAULTS, not measurements: no native
+# qualification has been run on any Apple silicon host, and docs/capacity-compatibility.md says the
+# same in its verification section ("Native declarations remain `pending_native_validation`"). They
+# are written here as concrete values rather than placeholders because the engine fingerprint hashes
+# these bytes, and a profile that changed on first measurement would invalidate every receipt.
+#
+# `prefill_chunk_tokens` must be one of `prefill_chunk_candidates`. That constrains the shape of a
+# future tuning change — it cannot introduce an untested magnitude — but it is not a substitute for
+# the benchmark, and nothing here records that one was run. Replace this paragraph with a citation
+# to a real qualification record when `tools/local_qualification.py` has produced one, and only mark
+# the profile `validated` together with `validation_evidence`, which the schema already requires.
 #
 # `allocator_cache_bytes = 0` retains no free buffers for the engine's allocator. It is a residency
 # knob and not a context knob: it never resizes a window and never gates a launch.
+#
+# This profile deliberately declares NO cache precision. llama.cpp takes `--cache-type-k/-v` as real
+# server flags, so the same keys there are controls; in MLX the attention cache dtype is a property
+# of the loaded model and nothing the harness can set. Declaring "f16" here would have the profile
+# assert a control it does not hold, and would hash into the engine fingerprint a value that changes
+# no behaviour — which is the defect class this whole pass has been removing. If a future mlx-lm
+# exposes it, restore the keys together with code that establishes *and attests* them.
+#
+# `prefix_cache = "none"`: generation owns a per-request cache, so nothing is reused across
+# requests at all. "continuation_only" was declared here while no code read it, which read as a
+# half-built prefix cache; it is in fact an unimplemented feature. Reaching it needs a conversation
+# identity on the wire plus upstream's `can_trim_prompt_cache` gate, and trimming a hybrid
+# recurrent+KV state without both is how answers get contaminated rather than cached.
 [execution.profiles.mlx_lm]
 engine = "mlx_lm"
 context_granularity = 256
 max_sequences = 1
 kv_allocation = "growing"
-cache_type_k = "f16"
-cache_type_v = "f16"
 prefill_chunk_tokens = 2048
 prefill_chunk_candidates = [512, 1024, 2048, 4096]
 allocator_cache_bytes = 0
-prefix_cache = "continuation_only"
+prefix_cache = "none"
 
 # How deliberately-wired bytes are chosen. This bounds residency; it is not an admission test and
 # it cannot resize a context window or a slot count. `unknown_measurements = "unwired"` means a

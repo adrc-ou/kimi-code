@@ -60,6 +60,12 @@ class MlxLmAdapter:
                 "python_version": staged["python_version"],
                 "lock_digest": staged["lock_digest"],
                 "platform": staged["platform"],
+                # A runtime provisioned before this field existed is not broken, just older than
+                # the record format, so fall back to the one layout _install_dependencies writes.
+                "site_packages": str(
+                    staged.get("site_packages")
+                    or (Path(staged["executable"]).parent.parent / "site-packages")
+                ),
             },
         )
 
@@ -115,10 +121,38 @@ class MlxLmAdapter:
             raise EngineAdapterError(
                 "verified MLX files are missing: " + ", ".join(sorted(missing)[:4])
             )
-        # The index is the manifest the loader follows, so its references have to land on files the
-        # lock actually pinned. A shard present-but-unlisted is refused here rather than discovered
-        # by a loader that would happily read it.
+        # Lock -> disk: the index is the manifest the loader follows, so its references have to
+        # land on files the lock actually pinned.
         tensor_bytes = _index_tensor_bytes(root, paths)
+        # Disk -> lock: the direction the comment above has always claimed and never implemented.
+        # mlx-lm loads a directory by globbing its weight files when it is not walking an index, so
+        # a shard dropped into a verified artifact directory is read by the engine without ever
+        # appearing in the digest list — "every consumed file is pinned" would be true only of the
+        # files that happened to be there at install time. Refusing the extra file is the only
+        # reading of the contract that survives someone rsync-ing a directory.
+        pinned = {path.resolve() for path in paths}
+        extra = sorted(
+            str(path.relative_to(root))
+            for path in root.glob("*.safetensors")
+            if path.resolve() not in pinned
+        )
+        if extra:
+            raise EngineAdapterError(
+                "MLX artifact directory holds weight files the lock does not pin: "
+                + ", ".join(extra[:4])
+                + (" ..." if len(extra) > 4 else "")
+            )
+        # A model directory is not only shards: the loader opens config.json by name, and a
+        # changed config silently changes architecture, dtype and context length while every
+        # pinned digest still matches. Requiring it in the lock makes the pinning claim mean what
+        # it says instead of covering the large files only.
+        for required in _REQUIRED_ARTIFACT_FILES:
+            if (root / required).is_file() and not any(
+                entry["path"] == required for entry in lock["files"]
+            ):
+                raise EngineAdapterError(
+                    f"MLX artifact reads {required} but the lock does not pin it"
+                )
         return Artifact(
             format="mlx",
             variant=str(artifact.get("variant", "")),
@@ -160,14 +194,12 @@ class MlxLmAdapter:
             str(local_llm.engine_port(model)),
             "--worker",
             str(runtime.executable),
+            # The only value the worker is given on its own command line: the script to run. An
+            # option-shaped value (a --model-dir flag, say) cannot be passed this way at all,
+            # because argparse refuses an argument that begins with a dash, and everything the
+            # worker needs beyond the script is already in the plan document.
             "--worker-arg",
             str(_worker_path()),
-            # Everything the worker needs to identify itself is in the plan document, which the
-            # frontend writes to it on a descriptor; only the artifact path is a worker argument.
-            "--worker-arg",
-            "--model-dir",
-            "--worker-arg",
-            str(artifact.primary),
             "--plan-file",
             str(plan_file),
             # The session credential reaches the frontend on fd 3, never in argv: a token on the
@@ -180,13 +212,42 @@ class MlxLmAdapter:
             # Ambient engine overrides are stripped, not merged: an exported MLX_ or GGML_METAL_
             # variable would otherwise change the residency or cache behaviour the plan just hashed
             # into the engine fingerprint, silently and only on one operator's shell.
-            environment=_sanitized_environment(),
+            environment=_sanitized_environment(runtime.details),
             host=local_llm.engine_host(),
             port=local_llm.engine_port(model),
             secret_argument_indices=(),
         )
 
     # ---------------------------------------------------------------- status
+
+    def device_observations(self, runtime: Runtime) -> dict[str, Any]:
+        """Read the Metal working-set recommendation through the provisioned interpreter.
+
+        ``mx.device_info()["max_recommended_working_set_size"]`` is the very number mlx-lm's own
+        ``wired_limit()`` context manager consults, so the harness and the library reason about
+        deliberate residency from one measurement instead of two.
+        """
+        raw = _run(
+            [
+                str(runtime.executable),
+                "-c",
+                "import json,mlx.core as mx;"
+                "i=mx.device_info();"
+                "print(json.dumps({"
+                "'recommended_max_working_set_size':"
+                " i.get('max_recommended_working_set_size'),"
+                " 'device_count': 1,"
+                " 'device_name': str(i.get('device_name',''))}))",
+            ],
+            cwd=str(runtime.directory),
+        )
+        try:
+            document = json.loads(raw.strip().splitlines()[-1])
+        except (ValueError, IndexError) as exc:
+            raise EngineAdapterError("MLX runtime returned an unreadable device document") from exc
+        if not isinstance(document, dict):
+            raise EngineAdapterError("MLX device observations must be an object")
+        return document
 
     def status_path(self) -> str:
         return "/v1/harness/status"
@@ -215,7 +276,9 @@ class MlxLmAdapter:
                     "tokenizer_identity",
                     "template_identity",
                     "cache_allocation",
-                    "wired_limit_bytes",
+                    "wired_bytes_requested",
+                    "wired_bytes_observed",
+                    "wired_bytes_previous",
                     "active_memory_bytes",
                     "peak_memory_bytes",
                     "cache_memory_bytes",
@@ -223,6 +286,9 @@ class MlxLmAdapter:
                 )
                 if key in document
             },
+            # Passed through from the worker: it is the only party that can say which of its own
+            # numbers came from the device and which it was handed.
+            attested=frozenset(str(name) for name in document.get("attested") or ()),
         )
 
     def status_request(self, base: str, token: str) -> Any:
@@ -298,6 +364,11 @@ def _worker_path() -> Path:
     return Path(__file__).resolve().parent / "mlx_worker.py"
 
 
+#: Files an MLX load opens by name rather than through the weight index. Presence is what makes
+#: them required: a directory without a chat template is legitimately template-less.
+_REQUIRED_ARTIFACT_FILES = ("config.json",)
+
+
 def _write_plan_document(
     engine: Mapping[str, Any], artifact: Artifact, model: Mapping[str, Any]
 ) -> Path:
@@ -353,21 +424,37 @@ def _server_path() -> Path:
     return Path(__file__).resolve().parents[2] / "tools" / "local_model_server.py"
 
 
-def _sanitized_environment() -> Mapping[str, str]:
+def _sanitized_environment(runtime: Mapping[str, Any] | None = None) -> Mapping[str, str]:
     """Keep operational environment, drop anything an engine would read as policy.
 
     An inherited ``MLX_MAX_RECOMMENDED_WORKING_SET_SIZE`` or ``GGML_METAL_*`` would silently change
     residency on one operator's machine while the plan still claimed the profile's numbers, and the
     fingerprint would match either way because the override never passed through it.
+
+    ``PYTHONPATH`` is the exception and is set deliberately: dependencies install with pip
+    ``--target`` into ``environment/site-packages``, which is not on the provisioned interpreter's
+    own search path. The provisioning import check added that directory by hand, so a tree that
+    passed provisioning could still not import anything when actually launched. Both the frontend
+    and the worker inherit this environment, so it is stated once here.
     """
     import os
 
     blocked = ("MLX_", "GGML_", "LLAMA_", "PYTORCH_", "CUDA", "Metal")
-    return {
+    environment = {
         key: value
         for key, value in os.environ.items()
         if not any(key.upper().startswith(prefix) for prefix in blocked)
     }
+    if runtime is not None:
+        site = str(runtime.get("site_packages") or "")
+        if not site:
+            raise EngineAdapterError(
+                "the provisioned MLX runtime records no site_packages directory, so the frontend "
+                "and worker would start without a path to mlx"
+            )
+        existing = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = f"{site}{os.pathsep}{existing}" if existing else site
+    return environment
 
 
 def _run(argv: list[str], *, cwd: str) -> str:

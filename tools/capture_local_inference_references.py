@@ -28,6 +28,50 @@ from tests.helpers import shipped_plan  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures" / "local-inference"
 
+#: The host a captured plan's endpoint URLs are rewritten to. ``.invalid`` is reserved by RFC 2606
+#: and can never resolve, so a fixture cannot accidentally become a working endpoint.
+REDACTED_HOST = "gateway.invalid"
+
+
+def redact_host(value, host: str | None = None):
+    """Replace the *gateway* host in any URL with a reserved one, recursing through the document.
+
+    Which product sits behind the endpoint is an operator's choice and the harness must not assume
+    it — ``tests/test_configuration.py`` enforces that the real host appears in exactly one tracked
+    file, the provider manifest. A captured plan is a *second* copy of that host and would make the
+    fixture a place a gateway name can silently accumulate.
+
+    ``host`` names the only host that is replaced, so a URL pointing somewhere else — the provider's
+    policy terms live on a different one — keeps its real value. Scheme and path are preserved even
+    on the redacted URL, because they are part of the resolved contract and a change to either must
+    still move the fixture.
+    """
+    if isinstance(value, str):
+        if "://" not in value:
+            return value
+        scheme, _, rest = value.partition("://")
+        found, slash, tail = rest.partition("/")
+        found = found.split(":", 1)[0]
+        if host is None or found != host:
+            return value
+        port = rest.partition("/")[0].partition(":")[2]
+        return f"{scheme}://{REDACTED_HOST}{':' + port if port else ''}{slash + tail}"
+    if isinstance(value, dict):
+        return {key: redact_host(item, host) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_host(item, host) for item in value]
+    return value
+
+
+def gateway_host(plan: dict) -> str:
+    """The host the resolved plan points its endpoint at, without scheme or path."""
+    return plan["providers"]["nrp"]["base_url"].split("://", 1)[-1].split("/")[0]
+
+
+def redact_plan(plan: dict) -> dict:
+    """Redact the plan with its own gateway host, so writer and reader agree by construction."""
+    return redact_host(plan, gateway_host(plan))
+
 
 def capture(lane: str) -> dict:
     """One complete NRP-only plan plus every generated guidance block for it."""
@@ -37,12 +81,15 @@ def capture(lane: str) -> dict:
             f"the {lane} reference selection resolved engines; it must be NRP-only or the "
             "reference stops guarding NRP behaviour"
         )
-    return {
-        "plan": plan,
-        "guidance": {
-            name: policy.render_guidance(plan, name) for name in policy.GUIDANCE_AUDIENCES
-        },
-    }
+    guidance = {name: policy.render_guidance(plan, name) for name in policy.GUIDANCE_AUDIENCES}
+    host = gateway_host(plan)
+    for name, text in guidance.items():
+        if host in text:
+            raise SystemExit(
+                f"the {name} guidance renders the provider host {host!r}, so a captured "
+                "fixture could not redact it without also breaking the guidance comparison"
+            )
+    return {"plan": redact_plan(plan), "guidance": guidance}
 
 
 def main(argv: list[str] | None = None) -> int:
