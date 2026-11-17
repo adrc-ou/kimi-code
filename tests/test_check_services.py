@@ -270,6 +270,22 @@ class ServiceCheckTests(unittest.TestCase):
                 self.assertEqual(checks.main(), 0)
             self.assertEqual(list(Path(directory).iterdir()), [config])
 
+    def test_closing_lines_roll_up_compatibility_without_reading_as_a_finding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "mcp.json"
+            config.write_text(json.dumps(
+                {"mcpServers": {"deepwiki": {"url": "https://example.invalid"}}}))
+            output = io.StringIO()
+            with patch.object(sys, "argv", ["check", "--config", str(config)]), \
+                    patch.object(checks, "run_probe", return_value={
+                        "status": "FAIL", "detail": "contract review required",
+                        "compatibility": {"verdict": "review"}}), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(checks.main(), 1)
+            text = output.getvalue()
+            self.assertIn("Compatibility: review 1", text)
+            self.assertIn("Scope note, not a result", text)
+
     def test_disabled_and_oauth_servers_are_explicitly_not_verified_without_discovery(self):
         with tempfile.TemporaryDirectory() as directory:
             config, report = (Path(directory) / name for name in ("mcp.json", "report.json"))

@@ -529,9 +529,16 @@ def main():
             manual |= status == "SETUP"
             results.append({"kind": kind, "name": name, **result})
             print(f"{status:5} {kind} {name}: {detail}", flush=True)
+    verdicts = Counter(
+        result.get("compatibility", {}).get("verdict", "unverified")
+        for result in results if result["kind"] == "mcp"
+    )
     print("Scope: harness MCP config only; project/plugin tools + model routing need Kimi checks.")
-    print("Compatibility: hosted contracts checked at discovery; local unenrolled servers use "
-          "discovery only; disabled/OAuth servers are not verified. No permission gate.")
+    print("Compatibility: "
+          + (", ".join(f"{name} {count}" for name, count in sorted(verdicts.items()))
+             or "no MCP servers in this pass")
+          + ". Scope note, not a result; the action is in the status lines above, and no "
+            "contract grants a permission.")
     code = 1 if failed else 2 if manual else 0
     if args.report:
         write_report(args.report, mode, results, code, run_id)

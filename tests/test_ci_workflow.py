@@ -126,6 +126,23 @@ class WorkflowSchemaTests(unittest.TestCase):
                     f"{path.name}:{line_number}: 'when:' is not a GitHub Actions key; use 'if:'",
                 )
 
+    def test_ubuntu_runners_name_a_version(self):
+        # A floating label moves on a schedule GitHub owns, which would make a green run stop
+        # meaning "the image under test passed". Lists are allowed for matrix or self-hosted label
+        # sets; only a value that claims to be Ubuntu has to say which Ubuntu it is.
+        pinned = re.compile(r"^ubuntu-\d{2}\.\d{2}$")
+        for path in WORKFLOWS:
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for job_id, job in jobs(document).items():
+                runs_on = (job or {}).get("runs-on")
+                for image in runs_on if isinstance(runs_on, list) else [runs_on]:
+                    if not isinstance(image, str) or not image.startswith("ubuntu"):
+                        continue
+                    with self.subTest(workflow=path.name, job=job_id, image=image):
+                        self.assertRegex(
+                            image, pinned, f"{job_id} runs on the floating label {image}"
+                        )
+
     def test_action_pins_are_full_commit_shas(self):
         for path in WORKFLOWS:
             document = yaml.safe_load(path.read_text(encoding="utf-8"))

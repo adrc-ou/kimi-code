@@ -48,13 +48,17 @@ are reported as `not_enrolled`. Disabled and unsupported OAuth connections remai
 `SKIP` and `MANUAL`.
 
 The initial hosted contracts cover DeepWiki, Context7 and ComfyUI's Hugging Face
-`hf_fs` tool. The interfaces were reviewed against public discovery on
-2026-10-23. Hugging Face's initial selected schema was observed anonymously;
-its contract expects the module's configured bearer authentication, which must
-still be verified in each authenticated launch. An empty `HF_TOKEN` is `SETUP`
-before any network request, never an anonymous compatibility pass. Different
-authentication scopes can produce different catalogs; a mismatch alone does not
-prove an upstream rename.
+`hf_fs` tool. Context7 and `hf_fs` were reviewed against public discovery on
+2026-10-23. DeepWiki was re-reviewed on 2026-11-17 when its hosted input schemas
+and tool titles changed: the same three tool names and output schema remain, and
+`ask_wiki_question` additionally accepts a list of up to ten repositories, so the
+reviewed selection and its smoke recipe are unchanged. Hugging Face's initial
+selected schema was observed anonymously; its contract expects the module's
+configured bearer authentication, which must still be verified in each
+authenticated launch. An empty `HF_TOKEN` is `SETUP` before any network
+request, never an anonymous compatibility pass. Different authentication scopes
+can produce different catalogs; a mismatch alone does not prove an upstream
+rename.
 
 ## Comparison and results
 
@@ -95,6 +99,11 @@ responses to avoid unbounded decompression. Local stdio still uses the SDK's
 transport plus application-level limits and the worker process deadline.
 
 ## Reports and focused checks
+
+The human-readable pass closes with two coverage lines rather than a verdict of
+its own: `Scope:` names what the checker looks at, and `Compatibility:` counts the
+interface verdicts it observed. Only a per-server status line asks something of the
+operator.
 
 The existing `service-check.json` keeps status/detail fields and adds a
 `compatibility` object for MCP checks. It records the verdict, observed catalog

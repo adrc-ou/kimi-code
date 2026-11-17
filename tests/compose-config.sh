@@ -75,7 +75,18 @@ export SEARCH_ADAPTER_TOKEN=test-search-token-with-at-least-32-characters
 export KIMI_CODE_VERSION=0.42.0
 export KIMI_CODE_ASSET_URL=https://example.invalid/kimi.tar.gz
 export KIMI_CODE_ASSET_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-export LOCAL_UID=1000 LOCAL_GID=1000
+# The identity the containers run as, with the same platform rule start.sh applies: Docker Desktop
+# presents host files as uid 1000 whatever the Mac user is, while on Linux the uid that owns the
+# workspace is the uid the containers have to be, because a host directory the launcher created at
+# 0700 is only walkable by its owner. A CI runner is uid 1001, so pinning 1000 here made the
+# streamed-extension check's consumer unable to traverse the very mountpoint directory the check had
+# just created, and its first `is_dir()` assertion failed on a volume that was populated correctly.
+if [[ "$(uname -s)" == Darwin ]]; then
+  export LOCAL_UID=1000 LOCAL_GID=1000
+else
+  export LOCAL_UID=${LOCAL_UID:-$(id -u)}
+  export LOCAL_GID=${LOCAL_GID:-$(id -g)}
+fi
 printf '%s\n' \
   'services:' \
   '  model-proxy:' \
@@ -149,6 +160,7 @@ if [[ "${1:-}" == --runtime ]]; then
     python3 - "${root}" "${fixture}" "${extension_test_image}" \
       "${HARNESS_DOCKER_PLATFORM}" "${test_project}" <<'PY'
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -159,6 +171,10 @@ from tools.approve_extensions import prepare
 from tools.extension_volume import SERVICE, VOLUME
 
 base, image, platform, project = Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+# The receiver chowns the volume to this group and the consumer runs as it, so both must be the
+# identity that owns the host mountpoints prepare_mountpoints just created. The receiver's own
+# `--gid` arrives through ${LOCAL_GID} in the fragment's command, i.e. the same value.
+agent_uid, agent_gid = os.environ["LOCAL_UID"], os.environ["LOCAL_GID"]
 workspace, state, output = (base / name for name in ("extension-workspace", "extension-state",
                                                    "extension-approved.yaml"))
 workspace.mkdir()
@@ -224,7 +240,8 @@ try:
         receiver["image"] = image
         receiver["entrypoint"][0] = "python"
         fragment["services"] = {SERVICE: receiver, "extension-test": {
-            "image": image, "platform": platform, "user": "1000:1000", "network_mode": "none",
+            "image": image, "platform": platform, "user": f"{agent_uid}:{agent_gid}",
+            "network_mode": "none",
             "read_only": True, "cap_drop": ["ALL"], "entrypoint": ["python"],
             "command": ["-c", probe], "volumes": [
                 {"type": "bind", "source": str(workspace), "target": "/workspace",
@@ -245,7 +262,7 @@ try:
         shutil.rmtree(state / "extension-snapshot")
         (state / "extension-snapshot.tar").unlink()
         run_service("extension-test")
-    run_service(SERVICE, "--gid", "1000", "--clear", stdin=subprocess.DEVNULL)
+    run_service(SERVICE, "--gid", agent_gid, "--clear", stdin=subprocess.DEVNULL)
     run_service("extension-empty-check")
 finally:
     if config.exists():
