@@ -60,14 +60,21 @@ class ReleaseCatalogTests(unittest.TestCase):
             "status": status,
         }
 
-    def cached(self, listed: list[str], *, age: float = 0.0, repository=REPOSITORY) -> None:
+    def cached(
+        self,
+        listed: list[str],
+        *,
+        age: float = 0.0,
+        repository=REPOSITORY,
+        requirements: dict[str, str] | None = None,
+    ) -> None:
         self.cache.write_text(
             json.dumps(
                 {
                     "repository": repository,
                     "fetched_at": NOW - age,
                     "releases": listed,
-                    "requirements": {},
+                    "requirements": requirements or {},
                 }
             ),
             encoding="utf-8",
@@ -255,6 +262,64 @@ class ReleaseCatalogTests(unittest.TestCase):
         stored = json.loads(self.cache.read_text(encoding="utf-8"))
         self.assertEqual(stored["requirements"][OTHER_COMMIT], first["requirements_sha256"])
         self.assertEqual(stored["fetched_at"], NOW)
+
+    def test_refreshing_the_listing_keeps_the_digest_already_learned(self):
+        # A digest is stored against a commit, so it cannot go stale the way a listing can, and
+        # `resolve` promises it is "cached ... forever". The menu is drawn before a release is
+        # resolved, so if refreshing the listing dropped the digest map, every launch that refreshed
+        # would re-fetch requirements.txt — and offline it would refuse a release it had already
+        # verified, because only the baseline keeps a digest outside the cache.
+        path = self.linux(baseline=None)
+        digest = hashlib.sha256(b"torch==2.11.0\n").hexdigest()
+        self.cached(
+            ["v0.10.0"],
+            age=RELEASES.LISTING_TTL_SECONDS + 1,
+            requirements={OTHER_COMMIT: digest},
+        )
+        with (
+            mock.patch.object(RELEASES, "_fetch_releases", return_value=["v0.10.0"]),
+            mock.patch.object(RELEASES, "_tag_commit", return_value=OTHER_COMMIT),
+            mock.patch.object(
+                RELEASES,
+                "read_text_url",
+                side_effect=AssertionError("refetched requirements the cache already held"),
+            ),
+        ):
+            self.catalog(path)
+            chosen = RELEASES.resolve(
+                {"version": "v0.10.0"},
+                "linux-x86_64",
+                profile_path=path,
+                cache=self.cache,
+                now=NOW,
+            )
+        self.assertEqual(chosen["requirements_sha256"], digest)
+
+    def test_a_refresh_does_not_borrow_digests_from_another_repository(self):
+        # Carrying digests across a listing refresh is only honest while the cache still describes
+        # the same source: the commit is meaningless in another repository.
+        path = self.linux(baseline=None)
+        self.cached(
+            ["v0.10.0"],
+            age=RELEASES.LISTING_TTL_SECONDS + 1,
+            requirements={OTHER_COMMIT: hashlib.sha256(b"x\n").hexdigest()},
+            repository="someone-else/ComfyUI",
+        )
+        body = "torch==2.11.0\n"
+        with (
+            mock.patch.object(RELEASES, "_fetch_releases", return_value=["v0.10.0"]),
+            mock.patch.object(RELEASES, "_tag_commit", return_value=OTHER_COMMIT),
+            mock.patch.object(RELEASES, "read_text_url", return_value=body),
+        ):
+            self.catalog(path)
+            chosen = RELEASES.resolve(
+                {"version": "v0.10.0"},
+                "linux-x86_64",
+                profile_path=path,
+                cache=self.cache,
+                now=NOW,
+            )
+        self.assertEqual(chosen["requirements_sha256"], hashlib.sha256(body.encode()).hexdigest())
 
     def test_a_release_with_no_lock_and_no_way_to_read_its_requirements_is_refused(self):
         # The honest answer: this harness can install a release whose dependency set it can name.

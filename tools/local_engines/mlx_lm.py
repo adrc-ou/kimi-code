@@ -18,23 +18,49 @@ resolved plan and this module reports whether the engine agrees with them.
 from __future__ import annotations
 
 import json
+import sys
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from local_engines.base import (
-    Artifact,
-    Computed,
-    EngineAdapterError,
-    EngineIdentity,
-    EngineStatus,
-    Launch,
-    Registry,
-    Runtime,
-    normalize_engine_document,
-    positive_int,
-)
+if __package__:
+    from .base import (
+        Artifact,
+        Computed,
+        EngineAdapterError,
+        EngineIdentity,
+        EngineStatus,
+        Launch,
+        Registry,
+        Runtime,
+        normalize_engine_document,
+        positive_int,
+        sibling_module,
+    )
+else:  # every launcher path imports these flat, from tools/ on sys.path
+    from local_engines.base import (
+        Artifact,
+        Computed,
+        EngineAdapterError,
+        EngineIdentity,
+        EngineStatus,
+        Launch,
+        Registry,
+        Runtime,
+        normalize_engine_document,
+        positive_int,
+        sibling_module,
+    )
+
+# The shared vocabulary lives beside the proxy, which is its other reader; each reader states its
+# own path rather than relying on another module's side effect, because proxy/ is not a sibling of
+# tools/local_engines/.
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT / "proxy") not in sys.path:
+    sys.path.insert(0, str(_ROOT / "proxy"))
+
+from local_engine_contract import strip_engine_policy  # noqa: E402
 
 
 class MlxLmAdapter:
@@ -45,7 +71,7 @@ class MlxLmAdapter:
     # ---------------------------------------------------------------- provision
 
     def provision(self, *, install: bool = True) -> Runtime:
-        import local_mlx_runtime
+        local_mlx_runtime = sibling_module("local_mlx_runtime")
 
         try:
             staged = local_mlx_runtime.provision(install=install)
@@ -182,7 +208,7 @@ class MlxLmAdapter:
         by construction, one on a descriptor and one in the instance directory that only the
         launcher and the worker can read.
         """
-        import local_llm
+        local_llm = sibling_module("local_llm")
 
         plan_file = _write_plan_document(engine, artifact, model)
         argv = (
@@ -272,6 +298,8 @@ class MlxLmAdapter:
                 key: document.get(key)
                 for key in (
                     "launch_identity",
+                    "fingerprint",
+                    "artifact_format",
                     "protocol_version",
                     "tokenizer_identity",
                     "template_identity",
@@ -318,11 +346,25 @@ class MlxLmAdapter:
         # The plan's tokenizer and template identities are compared, not just its numbers: this
         # engine counts tokens with the same preparation path it generates with, so a template that
         # changed under the plan would make every count a count of a different prompt.
-        for key in ("tokenizer_identity", "template_identity", "protocol_version"):
-            want = engine.get(key)
-            got = status.observations.get(key)
+        # Two of these are what binds *this* process to *this* launch: the fingerprint hashes the
+        # resolved allocation, and the launch identity is generated fresh every time. An engine left
+        # over from the previous launch agrees on every number and disagrees on exactly these. The
+        # proxy has refused on all of them since the engine contract landed, so leaving them out
+        # here made the host-side attestation weaker than the request path it exists to certify - a
+        # smoke run could pass against an engine the proxy would refuse. Status key and plan key
+        # differ for the launch identity, so the pairs are named rather than derived.
+        for status_key, plan_key in (
+            ("tokenizer_identity", "tokenizer_identity"),
+            ("template_identity", "template_identity"),
+            ("protocol_version", "protocol_version"),
+            ("artifact_format", "artifact_format"),
+            ("fingerprint", "fingerprint"),
+            ("launch_identity", "snapshot_id"),
+        ):
+            want = engine.get(plan_key)
+            got = status.observations.get(status_key)
             if want is not None and got is not None and got != want:
-                raise EngineAdapterError(f"engine {key} differs from the resolved plan")
+                raise EngineAdapterError(f"engine {status_key} differs from the resolved plan")
 
     def canary(
         self, origin: str, token: str, model: Mapping[str, Any], engine: Mapping[str, Any]
@@ -333,7 +375,7 @@ class MlxLmAdapter:
         device* can produce a token, and an engine-specific idea of that would let one backend's
         readiness imply the other's.
         """
-        import local_llm
+        local_llm = sibling_module("local_llm")
 
         host, _, port = origin.rpartition(":")
         record = local_llm.LocalModelCanary(
@@ -382,7 +424,7 @@ def _write_plan_document(
     """
     import os
 
-    from private_file import write_private_json
+    write_private_json = sibling_module("private_file").write_private_json
 
     runtime = os.environ.get("HARNESS_RUNTIME_DIR", "")
     if not runtime:
@@ -439,12 +481,13 @@ def _sanitized_environment(runtime: Mapping[str, Any] | None = None) -> Mapping[
     """
     import os
 
-    blocked = ("MLX_", "GGML_", "LLAMA_", "PYTORCH_", "CUDA", "Metal")
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not any(key.upper().startswith(prefix) for prefix in blocked)
-    }
+    # Uppercased on both sides. The key was normalised and the prefix was not, so the "Metal" entry
+    # could never match anything: "METAL_DEVICE_WRAPPER_TYPE".startswith("Metal") is False, so a
+    # bare METAL_* or Metal* variable reached the engine untouched while the plan and its
+    # fingerprint still claimed the profile's numbers - the exact silent override this function
+    # exists to prevent. A denylist entry that cannot match reads as coverage, and is worse than no
+    # entry at all.
+    environment = dict(strip_engine_policy(dict(os.environ)))
     if runtime is not None:
         site = str(runtime.get("site_packages") or "")
         if not site:

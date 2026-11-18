@@ -452,6 +452,10 @@ def install(
         detokenizer = tokenizer_arg.detokenizer
         eos_hit = False
         produced = 0
+        # Bound apart from the loop: a model that yields no token at all still owes the one final
+        # response below, and reaching for a variable the loop never assigned turns an empty
+        # generation into an UnboundLocalError inside the fake.
+        token = None
         try:
             for token, logprobs in generate_step(prompt, model_arg, stream, **kwargs):
                 if token in tokenizer_arg.eos_token_ids:

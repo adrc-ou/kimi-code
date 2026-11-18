@@ -18,25 +18,121 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ModuleTests(unittest.TestCase):
+    def build_harness(self, root):
+        """The harness-side directories a launch reads, under whatever root is given.
+
+        Used by :meth:`setUp` and by cases that need a second complete root: ``assemble()`` stages
+        from the harness's own ``runtime/`` as well as from the modules, so a root holding only
+        ``modules/`` is enough to probe ``discover()`` but not enough to reach an assembly refusal.
+        """
+        shutil.copytree(ROOT / "runtime", root / "runtime")
+        (root / "tools").mkdir()
+        workspace = root / "workspace"
+        initialize(workspace)
+        runtime = root / ".local/runtime/test"
+        runtime.mkdir(parents=True)
+        (runtime / "compose").mkdir()
+        return runtime, workspace
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
-        self.runtime = self.root / ".local/runtime/test"
-        self.runtime.mkdir(parents=True)
-        (self.runtime / "compose").mkdir()
-        self.workspace = self.root / "workspace"
-        initialize(self.workspace)
-        shutil.copytree(ROOT / "runtime", self.root / "runtime")
-        (self.root / "tools").mkdir()
+        self.runtime, self.workspace = self.build_harness(self.root)
 
-    def module(self, name="demo", **fields):
-        path = self.root / "modules" / name
+    def module_in(self, root, name="demo", **fields):
+        """One module directory under ``root``, valid unless the caller says otherwise."""
+        path = Path(root) / "modules" / name
         path.mkdir(parents=True)
         doc = {"schema_version": 1, "label": name.title(), **fields}
         (path / "module.json").write_text(json.dumps(doc))
         (path / "module.sh").write_text("exit 0\n")
         return path
+
+    def module(self, name="demo", **fields):
+        return self.module_in(self.root, name, **fields)
+
+    def isolated(self):
+        """A root holding nothing but the modules one case puts in it.
+
+        discover() walks every module and raises on the first refusal it meets, so cases that each
+        expect a *different* sentence cannot share ``self.root``: the first case's bad module would
+        answer for every later one, and the assertions would pass without their own guard firing.
+        """
+        root = Path(tempfile.mkdtemp(dir=self.temp.name))
+        self.addCleanup(shutil.rmtree, root, True)
+        return root
+
+    def test_a_module_environment_declaration_without_a_name_is_a_named_refusal(self):
+        # discover() read the prompt field with .get() and the name field with a subscript, so a
+        # manifest missing "name" stopped the launch with a bare KeyError traceback instead of the
+        # sentence that tells the operator which declaration is wrong.
+        self.module(environment=[{"prompt": "Which port should the proxy use?"}])
+        with self.assertRaisesRegex(ValueError, "Invalid module environment declaration"):
+            discover(self.root)
+
+    def test_a_malformed_manifest_is_refused_by_name_whatever_shape_it_has(self):
+        # Each shape used to fail a different way: an unparseable file reached the operator as a
+        # bare JSONDecodeError naming a byte offset, a non-string image as a TypeError out of
+        # re.fullmatch, and a bare string in a list field iterated into its characters so the module
+        # silently "declared" several entries. Each now answers the way the rest of discover() does,
+        # naming the module.
+        shapes = (
+            ("unparseable", "{oops"),
+            ("list instead of object", "[1, 2]"),
+            ("label not a string", '{"schema_version": 1, "label": 7}'),
+            ("images is a bare string", '{"schema_version": 1, "label": "D", "images": "one"}'),
+            ("image not a string", '{"schema_version": 1, "label": "D", "images": [5]}'),
+            (
+                "environment is a mapping",
+                '{"schema_version": 1, "label": "D", "environment": {"NAME": "p"}}',
+            ),
+        )
+        for number, (label, text) in enumerate(shapes):
+            with self.subTest(manifest=label):
+                root = self.isolated()
+                self.module_in(root, f"bad{number}").joinpath("module.json").write_text(
+                    text, encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "Invalid module manifest|Invalid image name"
+                ):
+                    discover(root)
+
+    def test_every_discovery_refusal_says_which_rule_it_applied(self):
+        # discover() raises ValueError for all of these, so an assertion on the type alone cannot
+        # tell a working guard from an unrelated one three lines later — which is how six of them
+        # went unwitnessed.
+        def linked_module(root):
+            self.module_in(root, "linkd")
+            (root / "modules" / "linkd-lnk").symlink_to("linkd", target_is_directory=True)
+
+        def symlink_inside(root):
+            path = self.module_in(root, "insyn")
+            (path / "runtime").mkdir()
+            (path / "runtime" / "escape").symlink_to("/etc/passwd")
+
+        cases = (
+            (lambda r: self.module_in(r, "BAD"), "lowercase identifiers", "uppercase module id"),
+            (linked_module, "lowercase identifiers", "symlinked module dir"),
+            (symlink_inside, "Unsafe module entry", "symlink inside module"),
+            (lambda r: os.mkfifo(self.module_in(r, "fifomod") / "pipe"),
+             "Unsafe module entry", "fifo inside module"),
+            (lambda r: self.module_in(r, "blank", label="   "),
+             "Invalid module label", "blank label"),
+            (lambda r: self.module_in(r, "ctrl", label="Bad\x01label"),
+             "Invalid module label", "control character in label"),
+            (lambda r: self.module_in(r, "img", images=["Bad Image!"]),
+             "Invalid image name", "image with a space"),
+            (lambda r: self.module_in(r, "noscript").joinpath("module.sh").unlink(),
+             "Module requires module.sh", "module without its script"),
+        )
+        for build, refused, label in cases:
+            with self.subTest(case=label):
+                root = self.isolated()
+                build(root)
+                with self.assertRaisesRegex(ValueError, refused):
+                    discover(root)
 
     def test_discovery_is_drop_in_and_removal_is_automatic(self):
         self.assertEqual(discover(self.root), [])
@@ -120,8 +216,82 @@ class ModuleTests(unittest.TestCase):
             "demo", json.loads((self.runtime / "assets/mcp.json").read_text())["mcpServers"]
         )
         (path / "runtime/mcp.json").write_text(json.dumps({"mcpServers": {"serena": {}}}))
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "Duplicate MCP server names"):
             assemble(self.root, self.runtime, discover(self.root), self.workspace)
+
+    def test_each_merge_collision_is_refused_by_its_own_name(self):
+        # assemble() raises ValueError for several different collisions, and a bare type assertion
+        # cannot tell them apart -- the guard that matters can be deleted while a neighbour three
+        # lines on keeps the test green. Each row builds the one input that must trip one guard.
+        def two_modules_sharing_a_skill(root):
+            for name in ("alpha", "beta"):
+                self.module_in(root, name)
+                directory = root / f"modules/{name}/runtime/skills/shared"
+                directory.mkdir(parents=True)
+                (directory / "SKILL.md").write_text("x", encoding="utf-8")
+
+        def module_shadowing_a_harness_server(root):
+            self.module_in(root, "alpha")
+            (root / "modules/alpha/runtime").mkdir()
+            (root / "modules/alpha/runtime/mcp.json").write_text(
+                json.dumps({"mcpServers": {"serena": {"url": "https://example.invalid"}}}),
+                encoding="utf-8",
+            )
+
+        def modules_declaring_the_same_server(root):
+            for name, url in (("alpha", "https://a.invalid"), ("beta", "https://b.invalid")):
+                self.module_in(root, name)
+                (root / f"modules/{name}/runtime").mkdir()
+                (root / f"modules/{name}/runtime/mcp.json").write_text(
+                    json.dumps({"mcpServers": {"shared": {"url": url}}}), encoding="utf-8"
+                )
+
+        def contracts_without_a_configuration(root):
+            path = self.module_in(root, "alpha")
+            (path / "runtime").mkdir()
+            (path / "runtime/mcp-contracts.json").write_text(
+                json.dumps({"schema_version": 1, "servers": {}}), encoding="utf-8"
+            )
+
+        for build, refused, label in (
+            (two_modules_sharing_a_skill, "Duplicate runtime asset", "same skill twice"),
+            (
+                module_shadowing_a_harness_server,
+                "Duplicate MCP server names",
+                "module shadows harness",
+            ),
+            (modules_declaring_the_same_server, "Duplicate MCP server names", "same server twice"),
+            (contracts_without_a_configuration, "owning mcp.json", "contracts without config"),
+        ):
+            with self.subTest(case=label):
+                root = self.isolated()
+                runtime, workspace = self.build_harness(root)
+                build(root)
+                with self.assertRaisesRegex(ValueError, refused):
+                    assemble(root, runtime, discover(root), workspace)
+
+    def test_a_module_mcp_manifest_is_read_as_data_not_as_a_promise(self):
+        # Each shape below stopped the launcher with a KeyError, TypeError or AttributeError,
+        # none of which the CLI's refusal handler catches, so a module author's typo printed a
+        # traceback where the contract reader one call later already prints a sentence.
+        shapes = (
+            ("empty object", "{}"),
+            ("a list", "[]"),
+            ("wrong key", '{"servers": {}}'),
+            ("servers is a list", '{"mcpServers": ["a"]}'),
+            ("unparseable", "{oops"),
+        )
+        for label, text in shapes:
+            with self.subTest(manifest=label):
+                root = self.isolated()
+                runtime, workspace = self.build_harness(root)
+                module = self.module_in(root, "demo")
+                (module / "runtime").mkdir()
+                (module / "runtime" / "mcp.json").write_text(text, encoding="utf-8")
+                with self.assertRaisesRegex(
+                    ValueError, "invalid MCP configuration|has no mcpServers object"
+                ):
+                    assemble(root, runtime, discover(root), workspace)
 
     def test_module_contract_ownership_staging_and_deselection(self):
         path = self.module()

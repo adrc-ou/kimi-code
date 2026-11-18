@@ -483,6 +483,33 @@ class PrefsTests(unittest.TestCase):
                 self.assertEqual(pc.load_prefs(self.path), dict(pc.DEFAULT_ENABLED))
                 self.assertEqual(pc.load_static(self.path), dict(pc.STATIC_DEFAULT))
 
+    def test_a_hand_edited_value_says_what_it_means(self):
+        # Every option defaults to True, so the old ``bool(stored[option])`` could only ever answer
+        # True - `bool("false")` is True - which meant an operator editing the file to switch an
+        # add-on off got it switched on. The recognised spellings are the same vocabulary
+        # ``tools/image_eviction.answer_of`` uses, so the two screens cannot disagree about "no".
+        option = next(iter(pc.OPTION_IDS))
+        for stored, expected in (
+            ("false", False), ("no", False), ("off", False), ("0", False), (0, False),
+            ("true", True), ("yes", True), ("on", True), (1, True),
+            (False, False), (True, True),
+        ):
+            with self.subTest(stored=stored):
+                self.path.write_text(json.dumps({option: stored}), encoding="utf-8")
+                self.assertEqual(pc.load_prefs(self.path)[option], expected)
+
+    def test_a_value_no_one_means_falls_back_instead_of_guessing(self):
+        # Unrecognisable is not the same as false: a file written by a newer panel keeps the shipped
+        # default rather than silently switching something off, which is the rule resolve_static
+        # already applies to the other half of this file.
+        option = next(iter(pc.OPTION_IDS))
+        for junk in ("nonsense", None, [], {}, ""):
+            with self.subTest(junk=junk):
+                self.path.write_text(json.dumps({option: junk}), encoding="utf-8")
+                self.assertEqual(
+                    pc.load_prefs(self.path)[option], pc.DEFAULT_ENABLED[option]
+                )
+
     def test_the_static_states_share_the_file_and_survive_a_round_trip(self):
         wanted = {pc.STATIC_CONTEXT: pc.OFF, pc.STATIC_SYSTEM: pc.ON}
         pc.save_prefs(self.path, pc.DEFAULT_ENABLED, wanted)
@@ -526,6 +553,18 @@ class PrefsTests(unittest.TestCase):
         # stale key behind.
         self.path.write_text('{"gone_option": false}\n', encoding="utf-8")
         self.assertEqual(pc.load_prefs(self.path), dict(pc.DEFAULT_ENABLED))
+
+    def test_the_reader_and_the_normaliser_agree_on_every_spelling(self):
+        # ``load_prefs`` reads the file and ``resolve_enabled`` normalises a caller's mapping. Both
+        # may see the same token - a panel hands on what it loaded, and an operator edits the file -
+        # so a value must not mean one thing in the reader and its opposite in the normaliser.
+        option = next(iter(pc.OPTION_IDS))
+        for stored in ("false", "no", "off", "0", 0, "true", "yes", "on", 1, True, False, "junk"):
+            with self.subTest(stored=stored):
+                self.path.write_text(json.dumps({option: stored}), encoding="utf-8")
+                from_file = pc.load_prefs(self.path)[option]
+                through_normaliser = pc.resolve_enabled({option: stored})[option]
+                self.assertEqual(from_file, through_normaliser)
 
     def test_resolve_enabled_never_invents_or_forgets_an_option(self):
         self.assertEqual(pc.resolve_enabled(None), dict(pc.DEFAULT_ENABLED))

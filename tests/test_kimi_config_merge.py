@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -186,6 +187,107 @@ class EmitterTests(unittest.TestCase):
         emitted = kcm.emit({"providers": {"one": {"api_key": "k"}}})
         self.assertNotIn("[providers]\n", emitted)
         self.assertIn("[providers.one]", emitted)
+
+
+class StandaloneImportTests(unittest.TestCase):
+    """compose mounts this file into the initializer's container *by itself*.
+
+    ``compose.yaml`` bind-maps only ``tools/kimi_config_merge.py`` to ``/stage/``, so a module-level
+    import of anything else under ``tools/`` - ``private_file`` included - makes the file
+    unimportable inside the container and the root-owned one-shot dies before the agent starts.
+    Nothing but running it in a bare interpreter catches that, which is exactly how such an import
+    would sneak in: it looks correct on the host, where ``tools/`` is always on the path.
+    """
+
+    MODULE = ROOT / "tools" / "kimi_config_merge.py"
+
+    def _import_alone(self) -> tuple[int, str]:
+        """Import a copy of the module from a directory with no sibling tools/ to lean on."""
+        with tempfile.TemporaryDirectory() as raw:
+            lonely = Path(raw) / "kimi_config_merge.py"
+            lonely.write_text(self.MODULE.read_text(encoding="utf-8"), encoding="utf-8")
+            code = (
+                "import importlib.util as u, pathlib, sys;"
+                f"p = pathlib.Path({str(lonely)!r});"
+                "s = u.spec_from_file_location('staged', p);"
+                "m = u.module_from_spec(s); s.loader.exec_module(m);"
+                "print(sorted(n for n in sys.modules if 'private_file' in n))"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=raw,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        return result.returncode, result.stdout + result.stderr
+
+    def test_the_module_imports_with_nothing_from_tools_on_the_path(self):
+        rc, output = self._import_alone()
+        self.assertEqual(rc, 0, f"the staged module cannot load on its own: {output}")
+
+    def test_it_declares_no_dependency_on_any_tools_sibling_at_all(self):
+        # The exec probe above only sees an import that runs at load time; a lazy
+        # ``from private_file import ...`` inside a function body would slip past it while still
+        # being a promise that something else is mounted at /stage. Asserting on the parsed import
+        # statements states the actual rule: this file may reach only the standard library.
+        import ast
+
+        tree = ast.parse(self.MODULE.read_text(encoding="utf-8"))
+        siblings = {p.stem for p in self.MODULE.parent.glob("*.py")} - {self.MODULE.stem}
+        reach = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                reach.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                reach.add(node.module.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.level:
+                reach.add("<relative>")
+        self.assertFalse(
+            reach & siblings,
+            f"tools/kimi_config_merge.py imports {sorted(reach & siblings)}, which compose does "
+            "not mount into the initializer's container",
+        )
+        self.assertNotIn("<relative>", reach, "a relative import cannot resolve from /stage")
+
+    def test_the_cli_publishes_the_merged_config_as_owner_only(self):
+        # The merged document sits on top of a rendered baseline carrying the model-proxy bearer
+        # token (the fixture above has an api_key for a reason), so the file the CLI writes must not
+        # land at the umask default, and must not share one fixed temporary name with the next run.
+        import os
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as raw:
+            stage = Path(raw)
+            baseline = stage / "kimi-config.toml"
+            baseline.write_text(BASELINE, encoding="utf-8")
+            policy = stage / "config-policy.json"
+            policy.write_text(
+                json.dumps({"schema_version": 1, "user_owned": ["telemetry"]}), encoding="utf-8"
+            )
+            out = stage / "config.toml"
+            os.umask(0o022)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self.MODULE),
+                    "--baseline", str(baseline),
+                    "--policy", str(policy),
+                    "--output", str(out),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(out.stat().st_mode & 0o777, 0o600, "the merged token landed readable")
+            self.assertIn("fresh-token", out.read_text(encoding="utf-8"))
+            self.assertEqual(
+                sorted(p.name for p in stage.iterdir() if p.name != out.name
+                       and p.name not in {"kimi-config.toml", "config-policy.json"}),
+                [],
+                "a temporary file outlived the publish",
+            )
 
 
 if __name__ == "__main__":

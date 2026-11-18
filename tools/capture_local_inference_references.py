@@ -22,7 +22,10 @@ for entry in (str(ROOT), str(ROOT / "tools"), str(ROOT / "proxy")):
     if entry not in sys.path:
         sys.path.insert(0, entry)
 
-import policy  # noqa: E402
+if __package__:
+    from . import policy
+else:  # run as a loose script, with tools/ on sys.path
+    import policy  # noqa: E402
 
 from tests.helpers import shipped_plan  # noqa: E402
 
@@ -109,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             if not path.is_file() or path.read_text(encoding="utf-8") != rendered:
                 drifted.append(path.name)
             continue
-        path.write_text(rendered)
+        path.write_text(rendered, encoding="utf-8")
         print(f"wrote {path.relative_to(ROOT)}")
     if drifted:
         print(

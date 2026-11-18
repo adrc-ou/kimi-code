@@ -73,9 +73,17 @@ preserves the previous unbounded behaviour, because no measurement of worst-case
 native-context prefill on the affected host exists yet; they are armed from native
 evidence, not from a guess.
 
-Engine metadata is bounded at 1 MiB rather than 64 KiB in both readers. `/props`
-embeds the model's entire chat template, so a large template previously made a
-healthy engine report "exceeded metadata byte limit" and refuse traffic.
+Engine metadata is bounded by one shared `LOCAL_METADATA_BYTES` in
+`proxy/local_engine_contract.py`, at 1 MiB. `/props` embeds the model's
+entire chat template, so the previous 64 KiB made a healthy engine report
+"exceeded metadata byte limit" and refuse traffic. The bound is shared rather
+than restated because four processes read those same documents — the launcher
+before the plan is final, the proxy on every preparation call, the capacity
+smoke tool while attesting an engine, and the qualification tool while reading
+the declared context length — and when each kept its own number the
+smoke tool was left at 64 KiB: it failed the evidence run against an engine the
+proxy was serving normally, which is the one thing an operator-only attestation
+must never do.
 
 Fixtures for all of the above run without aiohttp where they describe the shared
 vocabulary, so the launcher side is not silently skipped on a host that has only

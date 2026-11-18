@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "tools") not in sys.path:
@@ -118,6 +119,82 @@ class DefinitionFixture(unittest.TestCase):
         with self.assertRaises(definitions.DefinitionError) as caught:
             self.load(**kwargs)
         return str(caught.exception)
+
+
+class TreeShapeTests(DefinitionFixture):
+    """Nothing the loader reads may be a link out of the model tree.
+
+    A manifest is trusted to name weights, ports and provider endpoints, and `_walk_safe` exists
+    so a definition cannot reach outside its own directory. These guards apply the same rule to the
+    tree's own shape, and none of them was executed by any test before this class existed: a
+    refactor that dropped one would have loaded a symlinked provider directory as though it were
+    shipped source.
+    """
+
+    @staticmethod
+    def link_over(root: Path, relative: str, holder: Path) -> Path:
+        """Move ``relative`` out of the tree and leave a symlink in its place."""
+        original = root / relative
+        destination = holder / relative.replace("/", "_")
+        holder.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(original), str(destination))
+        original.symlink_to(destination)
+        return root
+
+    def test_a_symlinked_providers_root_is_refused(self):
+        root = self.link_over(write_tree(self.tree_base()), "providers", self.tree_base())
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, "providers/ must not be a symlink"
+        ):
+            definitions.load_definitions(root)
+
+    def test_a_symlinked_models_root_is_refused(self):
+        root = self.link_over(write_tree(self.tree_base()), "models", self.tree_base())
+        with self.assertRaisesRegex(definitions.DefinitionError, "models/ must not be a symlink"):
+            definitions.load_definitions(root)
+
+    def test_a_symlinked_provider_manifest_is_refused(self):
+        # Asserted against the message that ACTUALLY answers, found by running it rather than by
+        # reading the reader: _walk_safe (called immediately before every manifest parse) already
+        # refuses a symlink inside a definition directory, so the reader's own
+        # "manifest must not be a symlink" branch is a backstop no public call path can reach.
+        # Refusing here is correct either way; only the wording differs.
+        root = write_tree(self.tree_base())
+        self.link_over(root, "providers/fixture/provider.toml", self.tree_base())
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, "Unsafe provider definition entry"
+        ):
+            definitions.load_definitions(root)
+
+    def test_a_provider_directory_named_outside_the_grammar_is_refused(self):
+        # The sibling of the model-directory guard below, and it survived a whole mutation pass
+        # before this class existed. The directory name becomes the provider id that every selection
+        # and every secret name is built from, so a name the grammar rejects has to stop the load.
+        root = write_tree(self.tree_base())
+        (root / "providers/fixture").rename(root / "providers/FIXTURE")
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, "Provider directories must be real directories"
+        ):
+            definitions.load_definitions(root)
+
+    def test_a_symlinked_model_directory_is_refused(self):
+        root = write_tree(self.tree_base())
+        self.link_over(root, "models/fixture/fixture_model", self.tree_base())
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, "real directories with lowercase identifiers"
+        ):
+            definitions.load_definitions(root)
+
+    def test_a_model_directory_named_outside_the_grammar_is_refused(self):
+        # Same guard as the link above, reached the other way: the directory name becomes the model
+        # id, so anything the identifier grammar rejects must stop the load rather than ship a model
+        # whose id cannot be spelled in a selection.
+        root = write_tree(self.tree_base())
+        (root / "models/fixture/fixture_model").rename(root / "models/fixture/FIXTURE_Model")
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, "real directories with lowercase identifiers"
+        ):
+            definitions.load_definitions(root)
 
 
 class ProviderTests(DefinitionFixture):
@@ -778,6 +855,613 @@ def local_tree(
 def model_dir(root: Path) -> Path:
     return root / "models" / "local_fixture" / "local_model"
 
+
+class UnknownKeyTests(DefinitionFixture):
+    """Every table refuses a key it does not define, instead of ignoring it.
+
+    Manifests are edited by hand, so a misspelt limit or option is the likeliest real defect an
+    operator can introduce. Ignoring the extra key would run the provider or the model on a default
+    nobody agreed to, which is why each table closes its own key set -- and none of these guards was
+    executed by any test before this class existed.
+
+    Each expectation names the FULL table path, not just "has unknown key". The first draft of this
+    class asserted the bare phrase and passed while testing the wrong guard: appending a key at the
+    end of a manifest puts it in the LAST table, so the model-root refusal never fired and a lane
+    guard answered instead.
+    """
+
+    ROOT = "models/fixture/fixture_model"
+
+    def test_a_remote_table_refuses_a_key_it_does_not_define(self):
+        cases = (
+            ("endpoint",
+             PROVIDER.replace('protocol = "openai"', 'protocol = "openai"\nstray = 1'),
+             None,
+             r"providers/fixture\.endpoint has unknown key 'stray'"),
+            ("model root", None,
+             MODEL.replace('provider = "fixture"', 'provider = "fixture"\nstray = 1', 1),
+             rf"{self.ROOT} has unknown key 'stray'"),
+            ("context", None,
+             MODEL.replace("[context]\n", "[context]\nstray = 1\n"),
+             rf"{self.ROOT}\.context has unknown key 'stray'"),
+            ("lane.primary", None,
+             MODEL.replace("[lane.primary]\n", "[lane.primary]\nstray = 1\n"),
+             rf"{self.ROOT}\.lane\.primary has unknown key 'stray'"),
+        )
+        for label, provider, model, refused in cases:
+            with self.subTest(table=label):
+                with self.assertRaisesRegex(definitions.DefinitionError, refused):
+                    self.load(provider=provider or PROVIDER,
+                              models={"fixture_model": model or MODEL})
+
+    def test_the_provider_root_and_its_repeated_tables_close_their_keys(self):
+        # Same rule applied to the tables a provider repeats: a stray key inside [[credential]] or
+        # [[rule]] would otherwise ride along into the resolved plan unnoticed, and the two messages
+        # differ ("unknown key 'x'" versus "unknown key(s): x"), so each is asserted in full.
+        root = PROVIDER.replace(
+            'policy_url = "https://fixture.invalid/policy"',
+            'policy_url = "https://fixture.invalid/policy"\nstray = 1',
+            1,
+        )
+        with self.subTest(table="provider root"):
+            with self.assertRaisesRegex(
+                definitions.DefinitionError, r"providers/fixture has unknown key 'stray'"
+            ):
+                self.load(provider=root)
+        credential = PROVIDER.replace(
+            'label = "Fixture API token"', 'label = "Fixture API token"\nstray = 1', 1
+        )
+        with self.subTest(table="credential"):
+            with self.assertRaisesRegex(
+                definitions.DefinitionError,
+                r"providers/fixture\.credential\[0\] has unknown key 'stray'",
+            ):
+                self.load(provider=credential)
+        rule = PROVIDER.replace("percent = 35", "percent = 35\nstray = 1", 1)
+        with self.subTest(table="rule"):
+            with self.assertRaisesRegex(
+                definitions.DefinitionError,
+                r"providers/fixture\.rule\[0\] has unknown key\(s\): stray",
+            ):
+                self.load(provider=rule)
+
+    def test_a_local_serving_table_refuses_a_key_it_does_not_define(self):
+        local = "models/local_fixture/local_model"
+        cases = (
+            ("requires", LOCAL_MODEL.replace("[requires]\n", "[requires]\nstray = 1\n"),
+             rf"{local}\.requires has unknown key 'stray'"),
+            ("install", LOCAL_MODEL.replace("[install]\n", "[install]\nstray = 1\n"),
+             rf"{local}\.install has unknown key 'stray'"),
+            ("install.sampling",
+             LOCAL_MODEL.replace("[install.sampling]\n", "[install.sampling]\nstray = 1\n"),
+             rf"{local}\.install\.sampling has unknown key 'stray'"),
+        )
+        for label, text, refused in cases:
+            with self.subTest(table=label):
+                root = local_tree(self.tree_base(), model=text)
+                with self.assertRaisesRegex(definitions.DefinitionError, refused):
+                    definitions.load_definitions(root)
+
+
+
+#: A version-3 provider: named serving profiles, an explicit memory policy, and a host capacity
+#: table. Nothing in this file could build one before, which is why the whole v3 branch set --
+#: profile identity, engine choice, memory policy, capacity, and the model's [serving] binding --
+#: was never executed by a test, even though every shipped provider is version 3.
+V3_PROVIDER = """\
+
+schema_version = 3
+label = "Local (Fixture)"
+requires = ["metal"]
+
+[endpoint]
+base_url = "http://host.docker.internal:8181"
+base_url_env = "LOCAL_FIXTURE_BASE_URL"
+protocol = "openai"
+sends_cache_salt = false
+
+[[credential]]
+id = "default"
+label = "Local engine token"
+env = "LOCAL_FIXTURE_API_KEY"
+generate = true
+
+[[rule]]
+kind = "max_concurrent_requests"
+scope = "model"
+limit = 2
+
+[execution]
+kind = "local"
+[execution.profiles.llama_cpp_q4]
+engine = "llama_cpp"
+context_granularity = 256
+max_sequences = 256
+batch_tokens = 2048
+microbatch_tokens = 512
+cache_type_k = "f16"
+cache_type_v = "f16"
+flash_attention = "auto"
+load_mode = "auto"
+lazy_mode = "auto"
+gpu_layers = "all"
+kv_unified = false
+cache_ram_mib = 0
+context_checkpoints = 0
+[execution.profiles.mlx_lm]
+engine = "mlx_lm"
+context_granularity = 256
+max_sequences = 1
+prefill_chunk_tokens = 4096
+allocator_cache_bytes = 0
+kv_allocation = "growing"
+prefix_cache = "none"
+prefill_chunk_candidates = [1024, 4096]
+
+[execution.memory]
+strategy = "uncontrolled"
+target = "none"
+distribution = "equal"
+unknown_measurements = "unwired"
+[capacity]
+strategy = "native_context"
+sequence_slots = 4
+"""
+
+V3_MODEL = """\
+
+schema_version = 3
+label = "Fixture Model"
+provider = "local_fixture"
+model = "fixture-model"
+slug = "fixturemodel"
+credential = "default"
+
+[context]
+native_tokens = 16384
+
+[lane.primary]
+allocation = "engine"
+output_mode = "remaining_context"
+
+[lane.subagent]
+allocation = "engine"
+output_mode = "remaining_context"
+
+[serving]
+profile = "llama_cpp_q4"
+
+[requires]
+memory_gib = 32
+disk_gib = 40
+
+[install]
+variant = "UD-Q4_K_XL"
+
+[install.sampling]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+"""
+
+
+class VersionThreeTests(DefinitionFixture):
+    """The version-3 manifest rules, which decide the engine by declaration and never by ordering.
+
+    AGENTS.md is explicit that engine selection is a manifest fact and that a provider offering
+    several profiles declares no default. Each case below is one line away from a valid tree, so
+    every refusal names the rule it guards.
+    """
+
+    def load_v3(self, *, provider=V3_PROVIDER, model=V3_MODEL):
+        root = local_tree(self.tree_base(), provider=provider, model=model)
+        return definitions.load_definitions(root)
+
+    def test_the_plain_v3_tree_loads(self):
+        # Positive control for the two cases below: without it, a refusal could come from the
+        # fixture rather than from the rule under test.
+        providers, models = self.load_v3()
+        self.assertEqual(
+            sorted(providers["local_fixture"]["execution"]["profiles"]),
+            ["llama_cpp_q4", "mlx_lm"],
+        )
+        # A v3 provider declares no default: choosing by dictionary order would pick a runtime from
+        # a key nobody wrote down.
+        self.assertIsNone(providers["local_fixture"]["execution"].get("engine"))
+        self.assertEqual(models[0]["serving"], {"profile": "llama_cpp_q4"})
+
+    def test_each_v3_manifest_rule_refuses_one_bad_line(self):
+        cases = (
+            ("execution unknown key",
+             'kind = "local"', 'kind = "local"\nstray = 1',
+             r"\.execution has unknown key\(s\)"),
+            ("v2 style kind not local", 'kind = "local"', 'kind = "remote"',
+             "must select kind = local"),
+            ("profile id not lowercase",
+             "[execution.profiles.llama_cpp_q4]", "[execution.profiles.LLAMA]",
+             "must be a lowercase identifier"),
+            ("engine with no settings table",
+             'engine = "llama_cpp"', 'engine = "vllm"',
+             r"\.engine must be one of"),
+            ("profile missing a setting",
+             "batch_tokens = 2048\n", "",
+             "must declare exactly"),
+            ("microbatch above batch",
+             "microbatch_tokens = 512", "microbatch_tokens = 4096",
+             "microbatch_tokens exceeds"),
+            # Measured, not assumed: the four `integer` keys go through _positive_int, and the
+            # non-negative branch belongs to `nonnegative` alone -- mlx's allocator_cache_bytes,
+            # where zero means "retain no free device buffers" and is a real value.
+            ("integer holds a string", "batch_tokens = 2048", 'batch_tokens = "2048"',
+             "batch_tokens must be a positive integer"),
+            ("non-negative holds a bool", "allocator_cache_bytes = 0",
+             "allocator_cache_bytes = true",
+             "allocator_cache_bytes must be a non-negative integer"),
+            ("max_sequences above microbatch", "max_sequences = 256", "max_sequences = 1024",
+             "max_sequences exceeds microbatch_tokens"),
+            ("choice outside its set", 'cache_type_k = "f16"', 'cache_type_k = "f32"',
+             "cache_type_k must be one of f16"),
+            ("fixed value overridden", "kv_unified = false", "kv_unified = true",
+             "kv_unified must be False"),
+            ("chunk outside its candidates", "prefill_chunk_tokens = 4096",
+             "prefill_chunk_tokens = 8192",
+             "prefill_chunk_tokens must be one of the declared"),
+            # An empty candidate list cannot satisfy the membership check above it, so that guard
+            # is what answers here -- the "must list at least one" branch is unreachable, and this
+            # case records which one really fires.
+            ("empty candidate list", "prefill_chunk_candidates = [1024, 4096]",
+             "prefill_chunk_candidates = []",
+             "must be one of the declared"),
+            ("non-positive candidate", "prefill_chunk_candidates = [1024, 4096]",
+             "prefill_chunk_candidates = [0, 4096]",
+             "holds a non-positive or repeated value"),
+            ("repeated candidate", "prefill_chunk_candidates = [1024, 4096]",
+             "prefill_chunk_candidates = [4096, 4096]",
+             "lists 4096 twice"),
+            ("capacity status unknown", "sequence_slots = 4",
+             'sequence_slots = 4\nvalidation_status = "bogus"', "validation_status is unknown"),
+            ("credential id not lowercase", 'id = "default"', 'id = "DEFAULT"',
+             "credential\\[0\\].id must be a lowercase identifier"),
+            # A scope outside the vocabulary, and a rule that is not a table at all: both are legal
+            # TOML, and both would otherwise reach the field reads inside the rule loop.
+            ("rule scope is unknown", 'scope = "model"', 'scope = "cluster"',
+             r"rule\[0\]\.scope 'cluster' is unknown"),
+            # A local provider that names no host capability cannot be gated at all: `[execution]`
+            # says an engine runs on this machine, and `requires` is what makes the launcher ask
+            # whether this machine can. Both safety rows insert ahead of [capacity], the last table,
+            # because a header added at the end would re-parent the capacity keys instead.
+            ("execution with no host requirement", 'requires = ["metal"]', 'requires = []',
+             "needs a measured host capability"),
+            # `[[endpoint]]` is an array of one table and not the table the resolver reads, and
+            # `requires = [1]` is a list of the wrong thing -- both legal TOML, both arriving at a
+            # field read that assumes otherwise.
+            ("endpoint is not a table", "[endpoint]", "[[endpoint]]",
+             "must declare an \\[endpoint\\] table"),
+            ("requires is not a list of names", 'requires = ["metal"]', "requires = [1]",
+             "must be a list of host capabilit"),
+            ("safety is not a table", "[capacity]", "[[safety]]\n\n[capacity]",
+             r"\.safety must be a table"),
+            ("safety unknown key", "[capacity]", '[safety]\nbogus = 1\n\n[capacity]',
+             r"\.safety has unknown key"),
+            ("memory strategy unknown",
+             'strategy = "uncontrolled"', 'strategy = "auto"',
+             "strategy must be bounded_wiring or uncontrolled"),
+            ("bounded wiring with no target",
+             'strategy = "uncontrolled"', 'strategy = "bounded_wiring"',
+             "bounds wiring but names no target"),
+            ("memory target unknown", 'target = "none"', 'target = "bogus"',
+             "target is unknown"),
+            ("memory distribution unknown", 'distribution = "equal"',
+             'distribution = "bogus"', "distribution is unknown"),
+            ("memory unknown_measurements invalid", 'unknown_measurements = "unwired"',
+             'unknown_measurements = "guess"', "must be unwired or refuse"),
+            ("capacity unknown key",
+             "sequence_slots = 4", "sequence_slots = 4\nstray = 1",
+             r"\.capacity has unknown key\(s\)"),
+            ("capacity strategy wrong",
+             'strategy = "native_context"', 'strategy = "fixed"',
+             "capacity.strategy must be native_context"),
+            # [[capacity]] arrives as a list of one table rather than as a table, which is the shape
+            # guard above every capacity field check.
+            ("capacity is not a table", "[capacity]", "[[capacity]]",
+             "must declare the host allocation policy"),
+            # Each of these stays inside its own table: the replaced line is a key of the table the
+            # mutant adds a key to, which is why a stray key can be one edit here but not at the end
+            # of the document, where it would be absorbed by whichever table was named last.
+            ("memory unknown key", 'target = "none"', 'target = "none"\nstray = 1',
+             r"execution\.memory has unknown key\(s\)"),
+            ("credential env not upper snake", 'env = "LOCAL_FIXTURE_API_KEY"',
+             'env = "local_fixture_api_key"', r"credential\[0\]\.env must be an UPPER_SNAKE"),
+            ("credential key_url not https", 'env = "LOCAL_FIXTURE_API_KEY"',
+             'env = "LOCAL_FIXTURE_API_KEY"\nkey_url = "http://dashboard.invalid/key"',
+             r"credential\[0\]\.key_url must be an https URL"),
+            ("generated credential names no env", 'env = "LOCAL_FIXTURE_API_KEY"\ngenerate = true',
+             "generate = true", "generates its own value but names no env variable"),
+            ("validated without evidence",
+             "sequence_slots = 4", 'sequence_slots = 4\nvalidation_status = "validated"',
+             "cannot claim validated"),
+        )
+        for label, find, replace, refused in cases:
+            with self.subTest(rule=label):
+                self.assertIn(find, V3_PROVIDER, f"fixture no longer contains {find!r}")
+                broken = V3_PROVIDER.replace(find, replace, 1)
+                self.assertNotEqual(broken, V3_PROVIDER)
+                with self.assertRaisesRegex(definitions.DefinitionError, refused):
+                    self.load_v3(provider=broken)
+
+    def test_each_v3_model_rule_refuses_one_bad_line(self):
+        # The provider table above cannot carry these: a model manifest is where [requires],
+        # [install], [install.sampling], [context] and the lane tables live, and each refusal below
+        # guards a field the resolver reads without re-checking.
+        cases = (
+            ("requires is not a table", "[requires]", "[[requires]]",
+             r"\.requires must be a table"),
+            ("requires unknown key", "memory_gib = 32", "memory_gib = 32\nstray = 1",
+             r"\.requires has unknown key"),
+            ("install unknown key", 'variant = "UD-Q4_K_XL"',
+             'variant = "UD-Q4_K_XL"\nstray = 1', r"\.install has unknown key"),
+            ("install variant is not a bare word", 'variant = "UD-Q4_K_XL"',
+             'variant = "two words"', "variant must be a bare word"),
+            ("install sampling is not a table", "[install.sampling]", "[[install.sampling]]",
+             r"\.install\.sampling must be a table"),
+            ("install sampling negative", "top_k = 20", "top_k = -1",
+             r"sampling\.top_k must be a non-negative number"),
+            ("install port out of range", 'variant = "UD-Q4_K_XL"',
+             'variant = "UD-Q4_K_XL"\nport = 70000', "install.port must be a usable TCP port"),
+            # Read by the shared integer helper before the range check above it, so a negative port
+            # is refused for being negative rather than for being out of range.
+            ("install port must not be negative", 'variant = "UD-Q4_K_XL"',
+             'variant = "UD-Q4_K_XL"\nport = -1', "port must be a non-negative integer"),
+            ("lane effort must be a bare word", 'output_mode = "remaining_context"',
+             'output_mode = "remaining_context"\ndefault_effort = "Medium"',
+             "default_effort must be a bare lowercase word"),
+            ("credential id must be lowercase", 'credential = "default"',
+             'credential = "DEFAULT"', "credential must be a lowercase credential identifier"),
+            # The same field at the two levels it appears: the lane reads it through the same helper
+            # the model now does, and before that only the lane had any check at all.
+            ("model effort must be a bare word", 'slug = "fixturemodel"',
+             'slug = "fixturemodel"\ndefault_effort = "Medium"',
+             r"\.default_effort must be a bare lowercase word"),
+            ("model effort must not be a number", 'slug = "fixturemodel"',
+             'slug = "fixturemodel"\ndefault_effort = 3',
+             r"\.default_effort must be a bare lowercase word"),
+            ("lane must take its window from the engine", 'allocation = "engine"',
+             'allocation = "fixed"', "must use allocation = engine and output_mode"),
+            ("context is not a table", "[context]", "[[context]]", r"\.context must be a table"),
+            ("context has no native_tokens", "native_tokens = 16384", "",
+             "native_tokens must be declared"),
+            ("lane is not a table", "[lane.primary]", "[[lane.primary]]",
+             r"\.lane\.primary must be a table"),
+        )
+        for label, find, replace, refused in cases:
+            with self.subTest(rule=label):
+                self.assertIn(find, V3_MODEL, f"fixture no longer contains {find!r}")
+                broken = V3_MODEL.replace(find, replace, 1)
+                self.assertNotEqual(broken, V3_MODEL)
+                with self.assertRaisesRegex(definitions.DefinitionError, refused):
+                    self.load_v3(model=broken)
+
+    def test_a_bare_lowercase_effort_still_loads_at_both_levels(self):
+        # Control for tightening the effort check. Every shipped manifest spells it in lowercase
+        # ("xhigh", "low"), so a refusal there would be the worse bug -- and the lane value has to
+        # survive as itself, not as the empty string that absence reads as.
+        model = V3_MODEL.replace(
+            'slug = "fixturemodel"', 'slug = "fixturemodel"\ndefault_effort = "xhigh"', 1
+        ).replace(
+            'allocation = "engine"', 'allocation = "engine"\ndefault_effort = "low"', 1
+        )
+        self.assertEqual(model.count("default_effort"), 2)
+        _providers, models = self.load_v3(model=model)
+        self.assertEqual(models[0]["default_effort"], "xhigh")
+        self.assertEqual(models[0]["lanes"]["primary"]["default_effort"], "low")
+
+    def test_a_v3_model_that_declares_no_lane_is_refused(self):
+        # An engine-bound model with no lane table has nothing for the resolver to bind an alias to,
+        # and dropping one lane rather than all of them is the more likely mistake: that names the
+        # missing role instead.
+        none = self.without_table(self.without_table(V3_MODEL, "[lane.primary]"), "[lane.subagent]")
+        self.assertNotIn("[lane.", none)
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, "must declare at least one \\[lane\\.\\*\\] table"
+        ):
+            self.load_v3(model=none)
+        one = self.without_table(V3_MODEL, "[lane.subagent]")
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, r"must declare \[lane\.subagent\] to be selectable"
+        ):
+            self.load_v3(model=one)
+
+    def test_a_v3_provider_with_no_profile_is_refused(self):
+        # Restores a case I dropped when splicing this class together: v3 has no default to fall
+        # back on, so a provider that names an engine kind but declares no profile could not serve
+        # anything, and that has to be a manifest error rather than a launch failure.
+        head = V3_PROVIDER.split("[execution.profiles.")[0]
+        tail = V3_PROVIDER[V3_PROVIDER.index("[execution.memory]"):]
+        broken = head + tail
+        self.assertNotIn("[execution.profiles.", broken)
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, "must declare at least one"
+        ):
+            self.load_v3(provider=broken)
+
+    @staticmethod
+    def without_table(manifest: str, opener: str) -> str:
+        """``manifest`` with one whole TOML table removed, from its header to the next one.
+
+        These manifests are read as text and re-parsed, so dropping a *value* is a one-line
+        replace while dropping a *table* is not: leaving its header behind would re-parent every
+        key that followed it.
+        """
+        start = manifest.index(opener)
+        rest = manifest[start + len(opener):]
+        following = [i for i in (rest.find("\n[["), rest.find("\n[")) if i != -1]
+        return manifest[:start] + rest[min(following, default=len(rest)):].lstrip("\n")
+
+    def test_a_provider_with_no_credential_table_is_refused(self):
+        # Nothing downstream can authenticate, so this belongs in the manifest error rather than
+        # in a launch that has no token to read. The message has to name the missing table and not
+        # one of the per-field checks below it, which never run.
+        broken = self.without_table(V3_PROVIDER, "[[credential]]")
+        self.assertNotIn("[[credential]]", broken)
+        self.assertIn("[[rule]]", broken, "only the credential block was removed")
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, r"must declare at least one \[\[credential\]\] table"
+        ):
+            self.load_v3(provider=broken)
+
+    def test_an_unreadable_manifest_is_named_rather_than_raised_through(self):
+        # ./providers is edited by hand and can be present-but-sealed (a mode, an odd mount, a file
+        # still being written by an editor). The loader has to say which manifest it could not read;
+        # an OSError escaping here reaches the launcher as a traceback with no file in it.
+        real = Path.open
+
+        def flaky(self, *args, **kwargs):
+            if self.name == "provider.toml":
+                raise PermissionError(13, "Permission denied", str(self))
+            return real(self, *args, **kwargs)
+
+        base = local_tree(self.tree_base(), provider=V3_PROVIDER, model=V3_MODEL)
+        with mock.patch.object(Path, "open", flaky):
+            with self.assertRaisesRegex(
+                definitions.DefinitionError, "cannot read provider manifest"
+            ):
+                definitions.load_definitions(base)
+
+    def test_a_credential_that_is_not_a_table_is_refused(self):
+        # Same shape as the rule case: an array of scalars is legal TOML, and the loop reads fields
+        # off each item. The [[credential]] form must go first, or the top-level key collides.
+        broken = self.without_table(V3_PROVIDER, "[[credential]]").replace(
+            'requires = ["metal"]', 'requires = ["metal"]\ncredential = [1]', 1
+        )
+        self.assertNotIn("[[credential]]", broken)
+        self.assertIn("credential = [1]", broken)
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, r"credential\[0\] must be a table"
+        ):
+            self.load_v3(provider=broken)
+
+    def test_a_profile_that_is_not_a_table_is_refused(self):
+        # An inline table lets a profile name carry a scalar, which the sub-table form cannot
+        # produce; both named tables come out first so `profiles` is defined exactly once.
+        broken = V3_PROVIDER
+        for opener in ("[execution.profiles.llama_cpp_q4]", "[execution.profiles.mlx_lm]"):
+            broken = self.without_table(broken, opener)
+        broken = broken.replace('kind = "local"', 'kind = "local"\nprofiles = {bad = 1}', 1)
+        self.assertNotIn("[execution.profiles.", broken)
+        self.assertIn("profiles = {bad = 1}", broken)
+        with self.assertRaisesRegex(definitions.DefinitionError, r"profiles\.bad must be a table"):
+            self.load_v3(provider=broken)
+
+    def test_a_memory_declaration_that_is_not_a_table_is_refused(self):
+        # The scalar has to arrive where the table was, or TOML itself refuses the manifest for
+        # defining `memory` twice and the shape guard under test never runs.
+        broken = self.without_table(V3_PROVIDER, "[execution.memory]").replace(
+            'kind = "local"', 'kind = "local"\nmemory = 1', 1
+        )
+        self.assertIn("memory = 1", broken)
+        self.assertNotIn("[execution.memory]", broken)
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, r"execution\.memory must be a table"
+        ):
+            self.load_v3(provider=broken)
+
+    def test_a_rule_that_is_not_a_table_is_refused(self):
+        # `rule = [1]` is legal TOML and holds no rule: the loop reads fields off each item, so the
+        # shape has to be answered before any field check. The block form is removed first because a
+        # top-level key cannot follow a table header.
+        broken = self.without_table(V3_PROVIDER, "[[rule]]").replace(
+            'requires = ["metal"]', 'requires = ["metal"]\nrule = [1]', 1
+        )
+        self.assertNotIn("[[rule]]", broken)
+        self.assertIn("rule = [1]", broken)
+        with self.assertRaisesRegex(definitions.DefinitionError, r"rule\[0\] must be a table"):
+            self.load_v3(provider=broken)
+
+    def test_a_model_on_a_local_provider_must_declare_what_it_installs(self):
+        # [install] is what pins the weights, the port, and anything "Ready" may claim. The sampling
+        # table has to go first: leaving it behind re-creates the parent table implicitly, and the
+        # loader would then see an install block that is present but empty rather than missing.
+        broken = self.without_table(self.without_table(V3_MODEL, "[install.sampling]"), "[install]")
+        self.assertNotIn("[install", broken)
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, "declares no \\[install\\] block"
+        ):
+            self.load_v3(model=broken)
+
+    def test_a_model_and_its_provider_must_agree_on_being_local(self):
+        # A v1 model on an engine-backed provider would be served by a profile nothing bound to it,
+        # and the converse would demand weights no remote gateway has a download step for. The
+        # version and the provider's [execution] are one decision, not two.
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, "must agree on engine-derived local capacity"
+        ):
+            self.load_v3(model=MODEL.replace('provider = "fixture"', 'provider = "local_fixture"'))
+
+    def test_an_install_block_that_is_not_a_table_is_refused(self):
+        # [[install]] is an array of one table. The sampling table has to be lifted out first, since
+        # [install.sampling] beneath an array parent is not something TOML can express at all -- and
+        # a manifest that fails to parse is not evidence that the shape guard works.
+        broken = self.without_table(V3_MODEL, "[install.sampling]").replace(
+            "[install]", "[[install]]", 1
+        )
+        self.assertNotIn("[install.sampling]", broken)
+        self.assertIn("[[install]]", broken)
+        with self.assertRaisesRegex(definitions.DefinitionError, r"\.install must be a table"):
+            self.load_v3(model=broken)
+
+    def serving_model(self, port: int, slug: str) -> str:
+        return (
+            V3_MODEL.replace('variant = "UD-Q4_K_XL"', f'variant = "UD-Q4_K_XL"\nport = {port}', 1)
+            .replace('model = "fixture-model"', f'model = "fixture-{slug}"', 1)
+            .replace('slug = "fixturemodel"', f'slug = "{slug}"', 1)
+        )
+
+    def test_two_models_on_one_provider_may_not_share_an_engine_port(self):
+        # One engine process per model, so two models naming one port is a definition error the
+        # loader can see and a bind failure it cannot: by the time anything tries to listen, the
+        # manifest has already been accepted and shipped.
+        def tree(first: int, second: int) -> Path:
+            base = write_tree(
+                self.tree_base(),
+                V3_PROVIDER,
+                {
+                    "first": self.serving_model(first, "fixturefirst"),
+                    "second": self.serving_model(second, "fixturesecond"),
+                },
+                provider_id="local_fixture",
+            )
+            for name in ("first", "second"):
+                (base / "models" / "local_fixture" / name / "weights.lock.json").write_text(
+                    LOCAL_LOCK
+                )
+            return base
+
+        _providers, models = definitions.load_definitions(tree(18183, 18184))
+        self.assertEqual(len(models), 2, "distinct ports are two serveable models")
+        with self.assertRaisesRegex(
+            definitions.DefinitionError, "both serve on port 18183; one engine per port"
+        ):
+            definitions.load_definitions(tree(18183, 18183))
+
+    def test_a_v3_model_must_bind_one_of_its_provider_profiles(self):
+        cases = (
+            ("no serving table",
+             lambda s: s.split("[serving]")[0].rstrip() + "\n",
+             r"must declare \[serving\] profile"),
+            ("serving carries a stray key",
+             lambda s: s.replace('profile = "llama_cpp_q4"',
+                                 'profile = "llama_cpp_q4"\nstray = 1'),
+             r"\.serving has unknown key"),
+            ("profile the provider does not declare",
+             lambda s: s.replace('profile = "llama_cpp_q4"', 'profile = "q8_0"'),
+             r"serving\.profile is 'q8_0', which providers/local_fixture does not declare"),
+        )
+        for label, mutate, refused in cases:
+            with self.subTest(rule=label):
+                broken = mutate(V3_MODEL)
+                self.assertNotEqual(broken, V3_MODEL)
+                with self.assertRaisesRegex(definitions.DefinitionError, refused):
+                    self.load_v3(model=broken)
 
 class LocalServingTests(DefinitionFixture):
     """The keys that make one model serveable by two providers, and what they may not do.

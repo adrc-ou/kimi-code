@@ -18,7 +18,7 @@ def digest(path: Path) -> str:
 
 
 def main() -> None:
-    lock = json.loads((ROOT / "dependencies.lock.json").read_text())
+    lock = json.loads((ROOT / "dependencies.lock.json").read_text(encoding="utf-8"))
     for value in lock["images"].values():
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
             raise SystemExit(f"invalid image digest: {value}")
@@ -35,7 +35,9 @@ def main() -> None:
     check_native_ml_lock()
     for module in sorted((ROOT / "modules").glob("*/check_locks.py")):
         subprocess.run(["python3", str(module)], check=True)
-    exceptions = json.loads((ROOT / "vulnerability-exceptions.json").read_text())
+    exceptions = json.loads(
+        (ROOT / "vulnerability-exceptions.json").read_text(encoding="utf-8")
+    )
     required = {"package", "vulnerability", "owner", "reason", "expires"}
     for item in exceptions["exceptions"]:
         if not required.issubset(item):

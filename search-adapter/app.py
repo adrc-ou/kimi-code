@@ -45,8 +45,8 @@ def load_bounded_json(response):
 class Handler(BaseHTTPRequestHandler):
     server_version = "KimiSearchAdapter/2"
 
-    def log_message(self, format_string, *args):
-        print(format_string % args, flush=True)
+    def log_message(self, format, *args):
+        print(format % args, flush=True)
 
     def log_request(self, code="-", size="-"):
         # The container health probe repeats every few seconds, so a healthy
@@ -99,7 +99,9 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise TypeError("request must be an object")
-            query_value = payload["text_query"]
+            query_value = payload.get("text_query")
+            if query_value is None:
+                raise ValueError("text_query is required")
             if not isinstance(query_value, str):
                 raise TypeError("text_query must be a string")
             query = query_value.strip()
@@ -167,12 +169,17 @@ class BoundedHTTPServer(HTTPServer):
         self.pool.submit(self._process, request, client_address)
 
     def _process(self, request, client_address):
+        # socketserver's own shape, which the stdlib spells `process_request_thread`: handle_error
+        # only for a handler that failed, and shutdown on every path exactly once - a shutdown that
+        # raised would otherwise be reported as a second handler failure and then run again. The
+        # outer finally is what keeps the back-pressure slot from leaking when the handler dies.
         try:
-            self.finish_request(request, client_address)
-            self.shutdown_request(request)
-        except BaseException:
-            self.handle_error(request, client_address)
-            self.shutdown_request(request)
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+            finally:
+                self.shutdown_request(request)
         finally:
             self.capacity.release()
 

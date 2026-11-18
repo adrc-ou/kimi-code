@@ -152,7 +152,10 @@ class ApproveExtensionTests(unittest.TestCase):
             manifest = root / "approval.json"
             approve(workspace, manifest)
             source.write_text("two\n")
-            with self.assertRaises(SystemExit):
+            # Named by message: the other two refusals in require_approval are "no manifest" and
+            # "different workspace", and either would satisfy a bare SystemExit assertion while a
+            # changed file was accepted.
+            with self.assertRaisesRegex(SystemExit, "extensions changed"):
                 require_approval(workspace, manifest)
 
 

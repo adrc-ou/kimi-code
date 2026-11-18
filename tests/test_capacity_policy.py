@@ -1,6 +1,7 @@
 """Engine capacity joins provider policy without changing remote allowances."""
 
 import copy
+import json
 import tempfile
 import tomllib
 import unittest
@@ -100,6 +101,25 @@ class CapacityFixture(unittest.TestCase):
         write_tree(self.root, PROVIDER, {"remote": remote_model})
         write_tree(self.root, LOCAL_PROVIDER, {"local": LOCAL_MODEL}, provider_id="local_fixture")
         (self.root / "models/local_fixture/local/weights.lock.json").write_text(LOCAL_LOCK)
+        # The llama.cpp adapter resolves its binary and its archive identity out of this file, so a
+        # fictitious harness root has to carry one. It did not need to until now: the adapter bound
+        # the flat copy of ``local_llm``, whose ROOT this fixture's patch never reached, so the read
+        # silently fell on the real repository instead of on the fixture.
+        (self.root / "dependencies.lock.json").write_text(
+            json.dumps(
+                {
+                    "downloads": {
+                        "llama-cpp-macos-arm64": {
+                            "version": "b11846",
+                            "url": "https://example.invalid/llama-binary.tar.zst",
+                            "digest": "sha256:" + "a" * 64,
+                            "commit": "0" * 40,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         self.providers, items = definitions.load_definitions(self.root)
         self.models = {model["id"]: model for model in items}
         self.local = "local_fixture/local"

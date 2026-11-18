@@ -42,6 +42,16 @@ PROFILE_ROOT = MODULE
 KEYED_INPUTS = ("backend_lock", "torch_constraints", "custom_requirements")
 PIN_RE = re.compile(r"^([A-Za-z0-9_.-]+)\s*(==|@)\s*(\S+)")
 HASH_RE = re.compile(r"--hash=sha256:[0-9a-f]{64}")
+# The reviewed torch set, stated once: the profile field that advertises a version, the
+# ``backend.env`` variable that pins it, and the package a lock has to have resolved. Both halves of
+# the check read this table — the catalog gate that compares a profile against the pin, and the
+# install gate that compares a lock against it — so a torch package added to one is automatically
+# required of the other rather than being added to one and quietly missing from the other.
+TORCH_PACKAGES = (
+    ("torch", "TORCH_VERSION"),
+    ("torchvision", "TORCHVISION_VERSION"),
+    ("torchaudio", "TORCHAUDIO_VERSION"),
+)
 # What uv writes above its own header; the resolver puts this first so a lock carries its own proof
 # of what it was built from, readable without the profile or the runtime directory.
 PROVENANCE_RE = re.compile(r"^# comfyui-requirements-sha256=([0-9a-f]{64})$", re.MULTILINE)
@@ -61,9 +71,18 @@ def digest_of(text: str) -> str:
 
 
 def profile(platform: str, path: Path | None = None) -> dict[str, Any]:
+    """The backend profile one platform installs on.
+
+    An unreadable document is refused with the same sentence ``releases.py`` uses for it: this is
+    the same file, and a launcher that stops with a traceback and one that stops with a message
+    would leave the operator with two different stories about identical damage.
+    """
     if path is None:
         path = COMPATIBILITY_PATH
-    document = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Unable to read the ComfyUI backend profile: {exc}") from exc
     for entry in document.get("platforms", []):
         if isinstance(entry, dict) and entry.get("platform") == platform:
             return entry
@@ -246,21 +265,14 @@ def shipped_lock(prof: dict[str, Any], requirements_sha256: str) -> Path | None:
     return profile_file(prof, "baseline_lock")
 
 
-def check(path: Path, requirements_sha256: str) -> list[str]:
-    if not path.is_file():
-        return [f"{path} does not exist"]
-    return check_text(
-        path.read_text(encoding="utf-8", errors="replace"), requirements_sha256, path.name
-    )
-
-
 def check_text(text: str, requirements_sha256: str, name: str) -> list[str]:
     """Every way a lock can be unfit to install, as messages rather than exceptions.
 
     Returning the problems is what lets one call report all of them: a lock that is both missing its
     provenance and short a hash is two findings, and a resolver that stopped at the first would make
-    the operator fix and re-run twice. Taking text as well as a path is what lets the shipped
-    baseline lock be examined before it is adopted rather than after it is installed.
+    the operator fix and re-run twice. It takes text rather than a path so that a lock still held in
+    memory — one about to be adopted, one the caller has just stamped its header onto — can be
+    examined before it is installed.
     """
     problems: list[str] = []
     found = PROVENANCE_RE.search(text)
@@ -351,12 +363,19 @@ def _missing_hashes(text: str, name: str) -> list[str]:
     return problems
 
 
-def check_torch(path: Path, backend_env: Path) -> list[str]:
-    if not path.is_file():
-        return [f"{path} does not exist"]
-    return check_torch_text(
-        path.read_text(encoding="utf-8", errors="replace"), backend_env, path.name
-    )
+def torch_pins(backend_env: Path) -> dict[str, str]:
+    """The versions a ``backend.env`` file pins, by variable name.
+
+    The one reader of that file: whitespace around the ``=`` is tolerated because a reviewer editing
+    a pin is the exact person this table exists to catch, and refusing their change over a space
+    would teach them to remove the space rather than to fix the version.
+    """
+    pins = {}
+    for line in backend_env.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() in {variable for _, variable in TORCH_PACKAGES}:
+            pins[key.strip()] = value.strip()
+    return pins
 
 
 def check_torch_text(text: str, backend_env: Path, name: str) -> list[str]:
@@ -375,18 +394,10 @@ def check_torch_text(text: str, backend_env: Path, name: str) -> list[str]:
     pass, because both installers import it as the first thing they do after installing, so a lock
     without it is not a backend.
     """
-    pins = {}
-    for line in backend_env.read_text(encoding="utf-8").splitlines():
-        key, _, value = line.partition("=")
-        if key.strip() in {"TORCH_VERSION", "TORCHVISION_VERSION", "TORCHAUDIO_VERSION"}:
-            pins[key.strip()] = value.strip()
+    pins = torch_pins(backend_env)
     resolved = _resolved_versions(text)
     problems = []
-    for package, variable in (
-        ("torch", "TORCH_VERSION"),
-        ("torchvision", "TORCHVISION_VERSION"),
-        ("torchaudio", "TORCHAUDIO_VERSION"),
-    ):
+    for package, variable in TORCH_PACKAGES:
         version = pins.get(variable, "")
         if not version:
             problems.append(f"{backend_env} does not pin {variable}")
@@ -402,24 +413,3 @@ def check_torch_text(text: str, backend_env: Path, name: str) -> list[str]:
             problems.append(f"{name} did not resolve {package} to the reviewed {version}")
     return problems
 
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--platform", required=True)
-    parser.add_argument("--requirements-sha256", required=True)
-    parser.add_argument("--resolver", default="")
-    parser.add_argument("--check", type=Path)
-    args = parser.parse_args()
-    found = profile(args.platform)
-    print(f"profile   {found['installer']} resolver {found['resolver_platform']}")
-    if args.resolver:
-        print(f"lock key  {lock_key(found, args.requirements_sha256, args.resolver)}")
-    if args.check:
-        problems = check(args.check, args.requirements_sha256) + check_torch(
-            args.check, PROFILE_ROOT / found["backend_lock"]
-        )
-        for problem in problems:
-            print(f"problem   {problem}")
-        raise SystemExit(1 if problems else 0)

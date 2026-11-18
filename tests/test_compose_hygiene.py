@@ -70,7 +70,7 @@ class ComposeHygieneTests(unittest.TestCase):
         return self.services["kimi-agent"]["volumes"]
 
     def check_mounts(self):
-        hygiene.check_agent_mounts(self.services, self.workspace, self.runtime)
+        hygiene.check_agent_mounts(self.services, self.workspace)
 
     def test_conforming_configuration_passes(self):
         """The fixture is the launch shape, so every check must accept it.
@@ -234,11 +234,21 @@ class ComposeHygieneTests(unittest.TestCase):
                 "--label",
                 "fixture",
             ]
+            # A refusal raises SystemExit, so reaching this line already means no check failed.
+            # What the assertion adds is the two things a bare "did not raise" cannot show: that
+            # main() ran all four checks to its end rather than returning early, and that the
+            # caller's own label reached the line the launcher prints.
+            out = io.StringIO()
             with (
                 patch.object(sys, "stdin", io.StringIO(json.dumps({"services": services}))),
                 patch.object(sys, "argv", argv),
+                patch.object(sys, "stdout", out),
             ):
                 hygiene.main()
+            self.assertEqual(
+                out.getvalue().strip(),
+                "fixture: agent mounts, credentials, ports and root filesystems are confined",
+            )
 
     def test_main_fails_closed_without_a_services_section(self):
         argv = ["compose_hygiene.py", "--workspace", "/w", "--runtime-dir", "/r"]

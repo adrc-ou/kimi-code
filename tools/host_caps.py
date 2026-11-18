@@ -174,19 +174,19 @@ def metal_observations() -> dict[str, Any]:
 
 
 def swap_activity() -> dict[str, Any]:
-    """Cumulative compressor and swap counters, as deltas waiting to be taken.
+    """Swap occupancy counters, as deltas waiting to be taken.
 
     Split out from :func:`metal_observations` because they answer a different question and change at
     a different rate: a working set is a property of the device, these are a property of the moment.
     High swap occupancy alone does not establish thrashing - only the movement between two samples
     does, which is why this returns counters and no verdict.
     """
-    blank = {"swap_used_bytes": None, "swap_capacity_bytes": None, "compressed_bytes": None}
+    blank: dict[str, Any] = {"swap_used_bytes": None, "swap_capacity_bytes": None}
     if platform.system() != "Darwin":
         return {**blank, "source": "not darwin"}
     try:
         result = subprocess.run(
-            ["/usr/sbin/sysctl", "-n", "vm.swapusage", "vm.page_free_count"],
+            ["/usr/sbin/sysctl", "-n", "vm.swapusage"],
             capture_output=True,
             text=True,
             check=True,
@@ -251,6 +251,15 @@ def read(runtime_dir: Path | None) -> dict[str, Any] | None:
         return None
     if not isinstance(document.get("capabilities"), list):
         return None
+    # The two figures every eligibility test casts with int() have to be numbers by the time they
+    # get there: a document holding "auto" or a list reached model_supported() as a ValueError or
+    # TypeError no caller catches. Rejecting it here costs a fresh measurement, which is what every
+    # other bad shape in this function already costs; a field that is simply absent keeps its
+    # existing meaning of zero rather than becoming a discard.
+    for key in ("memory_gib", "free_disk_gib"):
+        value = document.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
     return document
 
 
@@ -337,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         directory = Path(args.runtime_dir)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / CAPS_FILE
-        path.write_text(json.dumps(measured, indent=2, sort_keys=True) + "\n")
+        path.write_text(json.dumps(measured, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         path.chmod(0o600)
     print(summary(measured) if args.action == "summary" else json.dumps(measured, sort_keys=True))
     return 0

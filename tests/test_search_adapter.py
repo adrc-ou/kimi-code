@@ -286,6 +286,22 @@ class SearchAdapterFailurePathsTests(unittest.TestCase):
             with self.subTest(payload=str(payload)[:24]):
                 self.assertEqual(self.search(payload)[0], 400)
 
+    def test_a_refusal_says_what_is_wrong_rather_than_naming_a_python_artefact(self):
+        # A body without the field reached a subscript, and str(KeyError) is the repr
+        # `'text_query'`, so the one refusal whose message a client could act on was the one that
+        # said nothing: the status was right while the body was a Python artefact.
+        for payload, expected in (
+            ({}, "text_query is required"),
+            ({"text_query": 42}, "must be a string"),
+            ({"text_query": "   "}, "length is invalid"),
+        ):
+            with self.subTest(payload=str(payload)):
+                status, body = self.search(payload)
+                self.assertEqual(status, 400)
+                detail = json.loads(body)["error"]
+                self.assertIn(expected, detail)
+                self.assertNotIn("'", detail)
+
     def test_an_upstream_http_error_is_reported_with_the_status_it_returned(self):
         # A bare 502 would hide whether SearXNG was down, rate-limiting, or 404 on its own route,
         # which is the difference an operator acts on.

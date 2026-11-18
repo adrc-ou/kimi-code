@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 import shutil
@@ -14,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 for _directory in (ROOT, ROOT / "tools"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
+
+import policy  # noqa: E402
 
 import models as model_setup  # noqa: E402
 from tests.helpers import shipped_plan, tracked_files  # noqa: E402
@@ -321,6 +324,113 @@ def compose_value(key: str) -> int:
     if match is None:
         raise AssertionError(f"{key} is not defaulted to a number in compose.yaml")
     return int(match.group(1))
+
+
+#: A compose fallback and the code's own fallback for the same variable are one decision written
+#: twice, in two syntaxes. They agree today; nothing kept them agreeing.
+_COMPOSE_FALLBACK = re.compile(
+    r'^\s*([A-Z][A-Z0-9_]{3,}): "\$\{[A-Z][A-Z0-9_]+:-(-?\d+)\}"', re.MULTILINE
+)
+_CODE_FALLBACK = (
+    re.compile(r"""environ\.get\(\s*["']([A-Z][A-Z0-9_]{3,})["']\s*,\s*(\d+)\s*\)"""),
+    # The dominant spelling in the shipped services: the value is read as text and widened by the
+    # caller, so the fallback is a quoted number rather than a bare one.
+    re.compile(r"""environ\.get\(\s*["']([A-Z][A-Z0-9_]{3,})["']\s*,\s*["']([\d\s*]+)["']\s*\)"""),
+    re.compile(
+        r"""environ\.get\(\s*["']([A-Z][A-Z0-9_]{3,})["']\s*,\s*str\(\s*(\d[\d\s*/+-]*)\s*\)\s*\)"""
+    ),
+    re.compile(r"""environ\.get\(\s*["']([A-Z][A-Z0-9_]{3,})["']\s*,\s*(\d[\d\s*/+-]*)\s*\)"""),
+    re.compile(
+        r"""environ\.get\(\s*["']([A-Z][A-Z0-9_]{3,})["']\s*,\s*str\(\s*([\d\s*/+-]+)\s*\)\s*\)"""
+    ),
+)
+
+
+def _arithmetic(expression: str) -> int:
+    """Evaluate a plain integer expression, or refuse.
+
+    Deliberately an AST walk rather than ``eval``: this must get ``**``, ``//`` and precedence
+    right, and a helper that evaluated them wrongly would report agreement where there was none -
+    the only way this check could fail to fail.
+    """
+    import ast as _ast
+
+    binary = {
+        _ast.Add: lambda a, b: a + b,
+        _ast.Sub: lambda a, b: a - b,
+        _ast.Mult: lambda a, b: a * b,
+        _ast.FloorDiv: lambda a, b: a // b,
+        _ast.Pow: lambda a, b: a**b,
+    }
+
+    def walk(node):
+        if isinstance(node, _ast.Expression):
+            return walk(node.body)
+        if isinstance(node, _ast.Constant) and isinstance(node.value, int):
+            return node.value
+        if isinstance(node, _ast.BinOp) and type(node.op) in binary:
+            return binary[type(node.op)](walk(node.left), walk(node.right))
+        if isinstance(node, _ast.UnaryOp) and isinstance(node.op, _ast.USub):
+            return -walk(node.operand)
+        raise AssertionError(f"unsupported fallback expression: {expression!r}")
+
+    return walk(_ast.parse(expression, mode="eval"))
+
+
+class ComposeFallbackMatchesCodeFallbackTests(unittest.TestCase):
+    """The number in ``compose.yaml`` is what a container gets, and the number in Python is what
+    every other run gets. Diverging them means the suite and a manual start exercise a bound
+    production never applies - three sibling invariants of exactly this shape
+    (``LOCAL_METADATA_BYTES``, the engine status field lists, the TUI column gaps) each drifted once
+    before being given a single owner.
+    """
+
+    def _compose_fallbacks(self) -> dict[str, int]:
+        found: dict[str, int] = {}
+        for source in (COMPOSE_SOURCE, BOOTSTRAP_SOURCE):
+            for name, value in _COMPOSE_FALLBACK.findall(source):
+                found[name] = int(value)
+        return found
+
+    def _code_fallbacks(self) -> dict[str, int]:
+        """Every numeric ``os.environ.get(NAME, <default>)`` in the shipped services.
+
+        Scoped to readers rather than to the proxy alone, because the same shape is used by the
+        search adapter and by the ComfyUI bridge, and a compose default disagrees just as badly
+        whichever of them it is meant to match.
+        """
+        found: dict[str, int] = {}
+        skip = {"tests", "node_modules", "__pycache__", ".local", ".ruff_cache", ".serena"}
+        for path in sorted(ROOT.rglob("*.py")):
+            if skip & set(path.parts):
+                continue
+            for pattern in _CODE_FALLBACK:
+                for name, expression in pattern.findall(
+                    path.read_text(encoding="utf-8", errors="replace")
+                ):
+                    found[name] = _arithmetic(expression)
+        return found
+
+    def test_the_fallbacks_are_parsed_from_both_languages_at_all(self):
+        # Guards the guard: if either pattern stops matching, the comparison below would run over
+        # an empty intersection and pass, which is the one outcome this file must not produce.
+        # Floors are set below the real inventory (20 compose, 32 code, 16 shared today) so they
+        # fire on a pattern that has stopped matching rather than on an ordinary edit.
+        self.assertGreaterEqual(len(self._compose_fallbacks()), 15)
+        self.assertGreaterEqual(len(self._code_fallbacks()), 25)
+
+    def test_every_shared_fallback_is_one_number(self):
+        compose = self._compose_fallbacks()
+        code = self._code_fallbacks()
+        shared = sorted(set(compose) & set(code))
+        self.assertGreaterEqual(len(shared), 12, f"only {len(shared)} fallbacks compared")
+        for name in shared:
+            self.assertEqual(
+                compose[name],
+                code[name],
+                f"{name}: compose falls back to {compose[name]} but the code falls back to "
+                f"{code[name]}, and only one of them is what a launched container uses",
+            )
 
 
 class NoHardcodedModelFactsTests(unittest.TestCase):
@@ -859,6 +969,12 @@ LISTED = 'kind = "max_concurrent_requests"\nscope = "model"\nmodels = ["Listed M
 FALLBACK = 'kind = "max_concurrent_requests"\nscope = "provider"\nlimit = 2\ndefault = true'
 AGGREGATE = 'kind = "aggregate_context_fraction"\nscope = "model"\npercent = 35'
 ACCOUNT_WIDE = 'kind = "max_concurrent_requests"\nscope = "provider"\nlimit = 3'
+#: An exclusivity threshold above its own aggregate ceiling. Between the two a request is
+#: too big to share the pool and not big enough to be licensed to run alone, which is a pair
+#: of provider rules with no admission answer at all.
+EXCLUSIVE_ABOVE = (
+    'kind = "exclusive_above_context_fraction"\nscope = "model"\npercent = 50'
+)
 
 
 class CountRulePrecedenceTests(unittest.TestCase):
@@ -903,6 +1019,20 @@ class CountRulePrecedenceTests(unittest.TestCase):
 
     def counters(self, plan: dict, family: str) -> list[dict]:
         return [c for c in plan["counters"].values() if c["family"] == family]
+
+    def test_an_exclusivity_threshold_above_its_own_ceiling_is_refused(self):
+        # The shipped provider puts both figures at the same 35%, so this pair never occurs
+        # together in a real definition — which is the point: a provider that ever republishes
+        # them apart must stop the launch here rather than strand every lane on that counter.
+        with self.assertRaisesRegex(policy.ResolutionError, "neither share the pool nor run alone"):
+            self.resolve(rule_table(AGGREGATE, EXCLUSIVE_ABOVE, LISTED))
+
+    def test_a_reservation_no_ceiling_or_threshold_can_admit_is_refused(self):
+        # 5% of the fixture's advertised window budgets less than the subagent lane reserves, and
+        # with no exclusivity rule there is nothing left to license running it alone.
+        tiny = 'kind = "aggregate_context_fraction"\nscope = "model"\npercent = 5'
+        with self.assertRaisesRegex(policy.ResolutionError, "could ever be admitted"):
+            self.resolve(rule_table(tiny, LISTED))
 
     def test_a_default_yields_to_the_model_it_would_have_capped(self):
         plan = self.resolve(rule_table(AGGREGATE, LISTED, FALLBACK))
@@ -957,6 +1087,299 @@ class CountRulePrecedenceTests(unittest.TestCase):
         self.assertEqual(context["max"], 16)
         self.assertEqual(context["count_basis"], "the provider's own rule for this model")
         self.assertEqual(plan["limits"]["subagent_concurrency"], 5)
+
+
+class LineCitationTests(unittest.TestCase):
+    """A citation by line number is a citation to a moment in time.
+
+    Every such reference in this repository had already drifted from what its own prose
+    claimed: nine in the prompt docs pointed at unrelated lines, several moved by edits to
+    the very files they named, and two code comments described a writer and a reader tens of
+    lines away from the numbers they carried. Symbol references were the only form that
+    survived every one of those moves, so the rule is enforced rather than preferred.
+    """
+
+    CITATION = re.compile(r"([A-Za-z0-9_./-]+\.(?:py|sh|md|toml|json|ya?ml|lock|in)):(\d+)")
+
+    def test_no_tracked_file_cites_an_our_own_file_by_line_number(self):
+        tracked = {path.resolve() for path in tracked_files()}
+        offenders = []
+        for path in tracked_files():
+            if path.suffix not in {".md", ".py", ".sh", ".toml", ".yaml", ".yml"}:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for number, line in enumerate(text.splitlines(), 1):
+                for target, _ in self.CITATION.findall(line):
+                    # Only names this repository actually tracks count: a fixture path a product
+                    # message is asserted to print (``x.lock:10``) is data, not a citation.
+                    for base in (Path(target), path.parent / target, ROOT / target):
+                        if base.resolve() in tracked:
+                            offenders.append(f"{path.relative_to(ROOT)}:{number}: {target}")
+                            break
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+
+class PositionalActionCitationTests(unittest.TestCase):
+    """A subcommand is not an option, and argparse answers as if it were."""
+
+    #: An argparse positional that enumerates its actions, which is how every CLI here spells a
+    #: subcommand. Options carrying their own ``choices=`` are excluded: those are values a flag
+    #: takes, and a document naming one as ``--value`` would be right.
+    POSITIONAL = re.compile(
+        r"add_argument\(\s*\"(?!-)[a-z_]+\"[^)]*?choices=\[([^\]]*)\]", re.DOTALL
+    )
+    OPTION = re.compile(r"add_argument\(\s*\"(--[^\"]+)\"")
+    WORD = re.compile(r'"([a-z][a-z-]*)"')
+    SPAN = re.compile(r"`([^`]+)`")
+    DASH = re.compile(r"--([a-z][a-z0-9-]*)")
+    SCRIPT = re.compile(r"([A-Za-z0-9_./-]+\.(?:py|sh))")
+
+    def surfaces(self) -> tuple[set[str], dict[str, set[str]], dict[str, set[str]]]:
+        """Every action name anywhere, then each script's own options and positional actions."""
+        every: set[str] = set()
+        options: dict[str, set[str]] = {}
+        actions: dict[str, set[str]] = {}
+        for path in tracked_files(".py", ".sh"):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            here_options = set(self.OPTION.findall(text))
+            here_actions = set()
+            for group in self.POSITIONAL.findall(text):
+                here_actions.update(self.WORD.findall(group))
+            options[path.name] = here_options
+            actions[path.name] = here_actions
+            every |= here_actions
+        return every, options, actions
+
+    def test_no_document_writes_a_positional_action_as_a_flag(self):
+        # Two documents named `--resolve` and `--check` for what the CLIs declare as positional
+        # ``choices=[...]`` actions, so an operator following the prose got a usage error. Only two
+        # shapes are refused: a span that is nothing but the flag, and a flag written against the
+        # very script that makes it a subcommand. Anything else is some other program's interface --
+        # `xcode-select --install` and a real ``--check`` option both belong in the second class.
+        every, options, actions = self.surfaces()
+        # The guard must prove it can see a real action before it is allowed to report none: a
+        # discovery regex that quietly stops matching would turn this into a test that
+        # always passes.
+        self.assertIn("resolve", every)
+        self.assertNotIn("alpha", every)
+        offenders = []
+        for doc in tracked_files(".md"):
+            text = doc.read_text(encoding="utf-8", errors="replace")
+            for number, line in enumerate(text.splitlines(), 1):
+                for span in self.SPAN.findall(line):
+                    scripts = [self.SCRIPT.fullmatch(part) for part in span.split()]
+                    named = [m.group(1) for m in scripts if m]
+                    for token in self.DASH.findall(span):
+                        if not named:
+                            if span.strip() == f"--{token}" and token in every:
+                                offenders.append(f"{doc.relative_to(ROOT)}:{number}: {span}")
+                            continue
+                        script = Path(named[-1]).name
+                        if token in actions.get(script, set()) and f"--{token}" not in options.get(
+                            script, set()
+                        ):
+                            offenders.append(f"{doc.relative_to(ROOT)}:{number}: {span.strip()}")
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+
+class ShellCommandTargetTests(unittest.TestCase):
+    """Shell scripts name Python CLIs by a word; nothing but a run would notice if it went stale."""
+
+    CALL = re.compile(r"python3?\s+(?:\"\${?[A-Z_]*\}?/)?([a-z_/]+\.py)\"?\s+([a-z][a-z-]*)?")
+    ACTION = re.compile(r'(?:argv\[\d+\]|command|mode|action)\s*==\s*"([a-z][a-z-]*)"')
+    #: Same call shape as CALL, but capturing everything after the script so ``--options`` are
+    #: visible; CALL's second group matches a bare action word and deliberately cannot see a flag.
+    ARGS_CALL = re.compile(
+        r"python3?\s+(?:\"\${?[A-Za-z_]*\}?/)?([a-z_/]+\.py)((?:\s+[\w\"\$\{\}/@.\-:=,]+)+)"
+    )
+
+    def accepts(self, path: Path) -> tuple[bool, set[str]] | None:
+        """``(takes_a_bare_word, accepted_words)`` for one script, or ``None`` if undecidable.
+
+        Four parser shapes have to be told apart; conflating them made an early version of
+        this check blind in both directions. A positional that enumerates choices accepts only
+        those words; a positional taking anything (a path, a model id) must not be flagged; a
+        script with no positional but a real parser rejects every bare word, which argparse
+        reports as an unrecognised argument the moment the launcher reaches that line; and a
+        script with no parser at all is undecidable from here.
+        """
+        try:
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text)
+        except (OSError, SyntaxError):  # pragma: no cover - real files parse in the suite
+            return None
+        names: set[str] = set()
+        positional = False
+        computed = False
+        uses_argparse = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "add_argument":
+                uses_argparse = True
+                first = node.args[0] if node.args else None
+                is_positional = (
+                    isinstance(first, ast.Constant)
+                    and isinstance(first.value, str)
+                    and not first.value.startswith("-")
+                )
+                positional = positional or is_positional
+                for keyword in node.keywords:
+                    if keyword.arg != "choices":
+                        continue
+                    value = keyword.value
+                    if isinstance(value, (ast.List, ast.Tuple)):
+                        names.update(
+                            element.value
+                            for element in value.elts
+                            if isinstance(element, ast.Constant)
+                            and isinstance(element.value, str)
+                        )
+                    else:
+                        computed = True
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in {"actions", "COMMANDS", "HANDLERS"}
+                and isinstance(node.value, ast.Dict)
+            ):
+                names.update(
+                    key.value
+                    for key in node.value.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                )
+        names.update(self.ACTION.findall(text))
+        if computed:
+            return None
+        # A script that never builds a parser reads sys.argv itself and accepts whatever its own
+        # logic expects -- open_kimi_browser.py prepends its arguments to a docker command -- so
+        # nothing may be concluded about the word it was handed.
+        if not uses_argparse:
+            return None
+        # Enumerated choices and no positional at all means a bare word is never valid: argparse
+        # reports it as an unrecognised argument the moment the launcher reaches that line.
+        return (positional or bool(names), names)
+
+    def resolves(self, target: str) -> Path | None:
+        """The script a shell command names, from any of the roots the launchers use."""
+        return next(
+            (
+                candidate
+                for candidate in (Path(target), ROOT / target, ROOT / "tools" / target,
+                                  ROOT / "modules/comfyui" / target)
+                if candidate.is_file()
+            ),
+            None,
+        )
+
+    def declared_options(self, path: Path) -> set[str] | None:
+        """The ``--options`` one script declares, or ``None`` if it parses no arguments at all."""
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):  # pragma: no cover - real files parse in the suite
+            return None
+        options: set[str] = set()
+        declared = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "add_argument":
+                declared = True
+                first = node.args[0] if node.args else None
+                if (
+                    isinstance(first, ast.Constant)
+                    and isinstance(first.value, str)
+                    and first.value.startswith("-")
+                ):
+                    options.add(first.value)
+        return options if declared else None
+
+    def flag_calls(self) -> list[tuple[str, int, str, str]]:
+        """Every ``(script, line, target, flag)`` where a shell file passes an option to a CLI."""
+        found = []
+        for script in tracked_files(".sh"):
+            text = script.read_text(encoding="utf-8", errors="replace")
+            for number, line in enumerate(text.splitlines(), 1):
+                for match in self.ARGS_CALL.finditer(line):
+                    for flag in sorted(set(re.findall(r"--[\w-]+", match.group(2) or ""))):
+                        found.append(
+                            (str(script.relative_to(ROOT)), number, match.group(1), flag)
+                        )
+        return found
+
+    def calls(self) -> list[tuple[str, int, str, str]]:
+        found = []
+        for script in tracked_files(".sh"):
+            text = script.read_text(encoding="utf-8", errors="replace")
+            for number, line in enumerate(text.splitlines(), 1):
+                for match in self.CALL.finditer(line):
+                    target, word = match.group(1), match.group(2)
+                    resolved = next(
+                        (
+                            candidate
+                            for candidate in (
+                                Path(target),
+                                ROOT / target,
+                                ROOT / "tools" / target,
+                                ROOT / "modules/comfyui" / target,
+                            )
+                            if candidate.is_file()
+                        ),
+                        None,
+                    )
+                    if resolved is not None and word:
+                        found.append((str(script.relative_to(ROOT)), number, target, word))
+        return found
+
+    def test_the_probe_finds_the_launcher_calls_it_exists_to_check(self):
+        seen = {(Path(target).name, word) for _, _, target, word in self.calls()}
+        for expected in (("modules.py", "select"), ("check_report.py", "collect")):
+            self.assertIn(expected, seen, f"{expected} is no longer covered")
+        self.assertGreaterEqual(len(seen), 6, "the shell-to-python call surface shrank")
+
+    def test_the_flag_probe_sees_the_options_the_launchers_pass(self):
+        # As above: a probe that matches nothing would report success.
+        seen = {(Path(target).name, flag) for _, _, target, flag in self.flag_calls()}
+        self.assertIn(("screen.py", "--runtime-dir"), seen, sorted(seen)[:6])
+        self.assertGreaterEqual(len(seen), 8, f"only {len(seen)} distinct flag calls discovered")
+
+    def test_every_shell_passes_an_option_the_script_declares(self):
+        offenders = []
+        for script, number, target, flag in self.flag_calls():
+            resolved = self.resolves(target)
+            if resolved is None:
+                continue
+            declared = self.declared_options(resolved)
+            if declared is None:
+                continue  # no argparse at all: it reads sys.argv, so nothing is decidable here
+            if flag not in declared:
+                offenders.append(
+                    f"{script}:{number}: {target} {flag} (declares {sorted(declared)})"
+                )
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+    def test_every_shell_named_python_action_is_one_the_script_accepts(self):
+        offenders = []
+        for script, number, target, word in self.calls():
+            if word.startswith("-"):
+                continue
+            resolved = next(
+                (
+                    candidate
+                    for candidate in (Path(target), ROOT / target, ROOT / "tools" / target,
+                                      ROOT / "modules/comfyui" / target)
+                    if candidate.is_file()
+                ),
+                None,
+            )
+            surface = self.accepts(resolved)
+            if surface is None:
+                continue
+            bare_ok, accepted = surface
+            if not bare_ok:
+                offenders.append(f"{script}:{number}: {target} {word} (takes no positional)")
+            elif accepted and word not in accepted:
+                offenders.append(
+                    f"{script}:{number}: {target} {word} (accepts {sorted(accepted)})"
+                )
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
 
 
 if __name__ == "__main__":

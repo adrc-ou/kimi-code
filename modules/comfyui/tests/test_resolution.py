@@ -150,6 +150,25 @@ class KeyValidationTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             resolution.profile("linux-aarch64")
 
+    def test_a_broken_profile_document_is_a_message_not_a_traceback(self):
+        # `releases.py` already refuses an unreadable compatibility.json in words. This reader met
+        # the same file with a raw OSError or JSONDecodeError, so a launch that had already drawn
+        # its menu would stop twice differently about one damaged document.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "compatibility.json"
+        for written in (False, True):
+            with self.subTest(written=written):
+                if written:
+                    path.write_text('{"platforms": [', encoding="utf-8")
+                else:
+                    path.unlink(missing_ok=True)
+                with self.assertRaises(SystemExit) as caught:
+                    resolution.profile(CUDA, path)
+                self.assertIn(
+                    "Unable to read the ComfyUI backend profile", str(caught.exception)
+                )
+
 
 class HeaderTests(unittest.TestCase):
     def test_the_header_states_what_the_lock_was_built_from(self):
@@ -218,11 +237,6 @@ class CheckTests(unittest.TestCase):
         text = f"# comfyui-requirements-sha256={GOOD}\n"
         problems = resolution.check_text(text, GOOD, "x.lock")
         self.assertEqual(problems, ["x.lock is empty"])
-
-    def test_check_reads_a_file_and_reports_its_absence(self):
-        self.assertEqual(resolution.check(Path("/nonexistent/x.lock"), GOOD), [
-            "/nonexistent/x.lock does not exist"
-        ])
 
 
 class TorchCheckTests(unittest.TestCase):

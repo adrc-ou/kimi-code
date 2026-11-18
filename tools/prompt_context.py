@@ -41,8 +41,10 @@ from typing import Any
 
 if __package__:
     from . import policy
+    from .private_file import write_private
 else:
     import policy
+    from private_file import write_private
 
 #: Where each document is written by the operator, and what the harness stages it into. The
 #: staged names are Kimi's own conventions and are not negotiable.
@@ -234,15 +236,48 @@ STATIC_DEFAULT: dict[str, str] = dict.fromkeys(STATIC_IDS, AUTO)
 STATIC_KEY = "static"
 
 
+#: Spellings a remembered choice may take. The panel writes booleans; these exist because the file
+#: is plain JSON in the instance directory and an operator is entitled to edit it. ``"false"`` in
+#: particular has to mean off - ``bool("false")`` is True, so the naive coercion handed the operator
+#: the opposite of what they wrote, on a flag that decides what is appended to every agent's
+#: instructions. Same vocabulary as :func:`tools.image_eviction.answer_of`, which normalises the
+#: answer of another operator-facing screen, so the two files cannot disagree about what "no" means.
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
+
+def choice_value(value: object, default: bool) -> bool:
+    """One remembered choice, or ``default`` when the stored value means nothing."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_WORDS:
+            return True
+        if text in _FALSE_WORDS:
+            return False
+    return default
+
+
 def resolve_enabled(enabled: Mapping[str, bool] | None) -> dict[str, bool]:
     """Normalise a caller's choices against the shipped defaults.
 
     Unknown names are dropped rather than trusted, so a stale prefs file written by an older or
-    newer panel cannot silence a mechanism by accident.
+    newer panel cannot silence a mechanism by accident. Values go through :func:`choice_value`,
+    the same reading :func:`load_prefs` uses, so the file and this normaliser cannot disagree about
+    what ``"false"`` or ``0`` means. ``bool("false")`` is True, and two readers that answered the
+    same token differently is how a quoting mistake becomes a change of policy.
     """
     if enabled is None:
         return dict(DEFAULT_ENABLED)
-    return {option: bool(enabled.get(option, DEFAULT_ENABLED[option])) for option in OPTION_IDS}
+    return {
+        option: choice_value(
+            enabled.get(option, DEFAULT_ENABLED[option]), DEFAULT_ENABLED[option]
+        )
+        for option in OPTION_IDS
+    }
 
 
 def resolve_static(static: Mapping[str, str] | None) -> dict[str, str]:
@@ -272,15 +307,21 @@ def _prefs_document(path: Path) -> dict[str, Any]:
 
 
 def load_prefs(path: Path) -> dict[str, bool]:
-    """Read remembered choices, tolerating a file that has never been written."""
+    """Read remembered choices, tolerating a file that has never been written.
+
+    Unrecognisable values fall back to that option's default rather than being coerced, which is the
+    same rule :func:`resolve_static` applies to the other half of this file: a preference written by
+    a newer panel, or edited by hand into something unrecognisable, must not silently change what
+    the operator agreed to. Recognised spellings of on and off are honoured, though, because ``0``
+    and ``"false"`` are how a person editing JSON by hand says "off".
+    """
     stored = _prefs_document(path)
     if not stored:
         return dict(DEFAULT_ENABLED)
-    prefs = dict(DEFAULT_ENABLED)
-    for option in OPTION_IDS:
-        if option in stored:
-            prefs[option] = bool(stored[option])
-    return prefs
+    return {
+        option: choice_value(stored.get(option, DEFAULT_ENABLED[option]), DEFAULT_ENABLED[option])
+        for option in OPTION_IDS
+    }
 
 
 def load_static(path: Path) -> dict[str, str]:
@@ -297,17 +338,19 @@ def save_prefs(
     ``static=None`` means "leave whatever the file already says", which is what stops a caller that
     only knows about the dynamic options from silently re-enabling a document the operator switched
     off. Both halves are written in full, so the file is always a complete statement of the session.
+
+    Published through :func:`private_file.write_private`, the launcher's one atomic writer, which is
+    what its own module docstring has always said the panel's preferences went through. Writing it
+    here by hand used a fixed ``.tmp`` name - two writers, or a retry after a kill, would share one
+    scratch file - and set 0600 only *after* the rename, leaving the bytes world-readable at the
+    umask default for as long as they existed on disk.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if static is None:
         static = load_static(path)
     ordered: dict[str, Any] = {option: bool(enabled[option]) for option in OPTION_IDS}
     ordered[STATIC_KEY] = resolve_static(static)
-    text = json.dumps(ordered, indent=2, sort_keys=False) + "\n"
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)
-    path.chmod(0o600)
+    write_private(path, json.dumps(ordered, indent=2, sort_keys=False) + "\n")
 
 
 def strip_html_comments(text: str) -> str:

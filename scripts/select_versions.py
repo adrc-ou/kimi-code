@@ -114,7 +114,8 @@ def semver_key(version: str) -> tuple[int, int, int]:
     match = SEMVER_RE.fullmatch(version)
     if not match:
         raise ValueError(f"Not a stable semantic version: {version}")
-    return tuple(int(part) for part in match.groups())
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
 
 
 def is_stable_version(value: str) -> bool:

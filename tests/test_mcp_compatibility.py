@@ -110,14 +110,23 @@ class CompatibilityTests(unittest.TestCase):
         self.assertNotEqual(compat.fingerprint(["a", "b"]), compat.fingerprint(["b", "a"]))
 
     def test_invalid_duplicate_and_repeated_cursor_catalogs_fail(self):
-        for tools in ([tool(), tool()], [tool("forged\nPASS")],
-                      [tool(inputSchema="invalid")], [tool(outputSchema=[])],
-                      [tool(inputSchema={"value": math.nan})]):
-            with self.subTest(tools=tools), self.assertRaises(compat.CatalogError):
-                snapshot(self.config, tools)
+        # Each defect is pinned to the refusal it must produce. Asserting only CatalogError let a
+        # neighbour guard answer for the one under test -- the last row below is the proof: it is
+        # listed among the schema cases but is really caught by the number bound inside canonical(),
+        # so removing either guard would have kept this test green.
+        for tools, refused in (
+            ([tool(), tool()], "invalid or duplicate catalog tool name"),
+            ([tool("forged\nPASS")], "invalid or duplicate catalog tool name"),
+            ([tool(inputSchema="invalid")], "tool input schema is not an object"),
+            ([tool(outputSchema=[])], "tool output schema is not an object"),
+            ([tool(inputSchema={"value": math.nan})], "non-JSON number in catalog"),
+        ):
+            with self.subTest(tools=tools[0].get("name") or tools[0]):
+                with self.assertRaisesRegex(compat.CatalogError, refused):
+                    snapshot(self.config, tools)
         catalog = compat.Catalog()
         catalog.add_page([tool()], "cursor")
-        with self.assertRaises(compat.CatalogError):
+        with self.assertRaisesRegex(compat.CatalogError, "invalid or repeated catalog cursor"):
             catalog.add_page([tool("next")], "cursor")
 
     def test_incremental_catalog_limits_and_nested_or_cyclic_data_fail(self):
@@ -191,3 +200,102 @@ class ContractManifestTests(unittest.TestCase):
         self.path.symlink_to(self.path.parent / "absent")
         with self.assertRaises(compat.ContractError):
             compat.load_manifest(self.path, self.servers)
+
+
+class ServerConfigurationTests(unittest.TestCase):
+    """The one reader shared by the assembler, the CI validation and the service checker."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / "mcp.json"
+
+    def test_an_empty_server_mapping_is_an_answer_and_a_wrong_shape_is_not(self):
+        for text, expected in (
+            ('{"mcpServers": {}}', set()),
+            ('{"mcpServers": {"a": {"url": "https://x.invalid"}}}', {"a"}),
+        ):
+            self.path.write_text(text, encoding="utf-8")
+            self.assertEqual(set(compat.read_servers(self.path)), expected)
+        for label, text in (
+            ("unparseable", "{oops"),
+            ("no keys at all", "{}"),
+            ("a bare list", "[]"),
+            ("servers under another key", '{"servers": {}}'),
+            ("servers is a list", '{"mcpServers": ["a"]}'),
+            ("servers is a string", '{"mcpServers": "a"}'),
+        ):
+            with self.subTest(shape=label):
+                self.path.write_text(text, encoding="utf-8")
+                with self.assertRaises(compat.ContractError):
+                    compat.read_servers(self.path)
+
+    def test_a_refusal_names_the_file_and_never_what_it_holds(self):
+        # ContractError promises the text never carries a server payload, and these files
+        # legitimately hold bearer headers and environment values; the parse-failure branch is
+        # exactly where a wrapped exception's own message could smuggle one out.
+        secret = "Bearer-ghp_REDACTED_VALUE_AbCdEf"
+        for label, text in (
+            ("list where an object belongs", f'{{"mcpServers": ["{secret}"]}}'),
+            ("truncated mid-secret", '{"x": {"headers": {"Authorization": "' + secret),
+        ):
+            with self.subTest(shape=label):
+                self.path.write_text(text, encoding="utf-8")
+                with self.assertRaises(compat.ContractError) as caught:
+                    compat.read_servers(self.path)
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertIn("mcp.json", str(caught.exception))
+
+
+class CatalogLimitTests(unittest.TestCase):
+    """The safe encoder's own bounds, driven from the outside.
+
+    Every branch here protects the one place this harness feeds *server-supplied* tool
+    data into a hash: an MCP catalog arrives over the network, so a limit that silently
+    stopped firing would let a hostile server choose how much memory and time the
+    compatibility check spends. These cases are what prove the limits still exist.
+    """
+
+    def setUp(self):
+        self.small = {"input_schema_sha256": "a" * 64, "tools": [{"name": "read"}]}
+
+    def nested(self, depth: int):
+        value: object = {"x": 1}
+        for _ in range(depth):
+            value = {"c": value}
+        return value
+
+    def test_a_normal_document_is_encoded_and_is_deterministic(self):
+        # Positive control: without this, a check that refuses *everything* would look like success.
+        first = compat.canonical(self.small)
+        self.assertEqual(first, compat.canonical(dict(reversed(list(self.small.items())))))
+        self.assertIsInstance(compat.fingerprint(self.small), str)
+
+    def test_each_bound_refuses_by_name(self):
+        cases = (
+            ("too deep", self.nested(compat.MAX_DEPTH + 5), "nesting or node limit"),
+            ("dict too wide", {f"k{i}": 1 for i in range(compat.MAX_NODES + 1)},
+             "catalog node limit exceeded"),
+            ("list too long", ["a"] * (compat.MAX_NODES + 1), "catalog node limit exceeded"),
+            ("one huge string", {"k": "x" * (compat.MAX_CATALOG_BYTES + 1)},
+             "catalog size limit exceeded"),
+            ("infinity", {"k": float("inf")}, "non-JSON number"),
+            ("not a number", {"k": float("nan")}, "non-JSON number"),
+            ("binary value", {"k": b"raw"}, "non-JSON value"),
+            ("set value", {"k": {1, 2}}, "non-JSON value"),
+            ("integer key", {1: "x"}, "keys must be strings"),
+            ("tuple key", {(1, 2): "x"}, "keys must be strings"),
+        )
+        for label, value, refused in cases:
+            with self.subTest(bound=label):
+                with self.assertRaisesRegex(compat.CatalogError, refused):
+                    compat.canonical(value)
+
+    def test_the_tool_and_catalog_maxima_are_separate_limits(self):
+        # A document of many short strings sits under the catalog bound and over the per-tool one.
+        # If both calls used the same maximum, the tool hash would silently accept an oversized
+        # schema, so the difference itself is what is pinned here.
+        value = {f"k{i}": "abcdefghij" for i in range(20_000)}
+        self.assertIsInstance(compat.canonical(value), bytes)
+        with self.assertRaisesRegex(compat.CatalogError, "size limit exceeded"):
+            compat.fingerprint(value)

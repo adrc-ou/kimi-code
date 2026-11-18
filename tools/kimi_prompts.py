@@ -200,21 +200,36 @@ def interpolate(literals: dict[str, str]) -> dict[str, str]:
     return resolved
 
 
+class BundleLiteral(KeyError):
+    """A promised literal the built bundle does not carry, spoken as a sentence.
+
+    ``str(KeyError)`` renders its argument with ``repr()``, so each message raised here reached the
+    operator wrapped in apostrophes; one print site worked around that by stripping quote characters
+    off the text, which no test pinned. Staying a ``KeyError`` is deliberate: callers catch it
+    as one, and a name absent from a mapping is exactly what this reports.
+    """
+
+    def __str__(self) -> str:
+        return str(self.args[0]) if len(self.args) == 1 else super().__str__()
+
+
 def extract(view: mmap.mmap) -> dict[str, str]:
     """Every promised literal, keyed by the ``${kimi.*}`` name an operator writes.
 
-    Raises :class:`KeyError` on a name the bundle does not carry: a build that dropped one of
-    these is a build this harness should not guess about, and a half-filled cache is worse than an
-    empty one because it substitutes confidently wrong text.
+    Raises :class:`BundleLiteral` (a :class:`KeyError`) on a name the bundle does not carry: a build
+    that dropped one of these is a build this harness should not guess about, and a half-filled
+    cache is worse than an empty one because it substitutes confidently wrong text.
     """
     raw = {}
     for name in pc.kimi_literal_names():
         if name not in _IDENTIFIERS:
-            raise KeyError(f"{name} has no bundle identifier to look for")
+            raise BundleLiteral(f"{name} has no bundle identifier to look for")
         found = find(view, name)
         if found is None:
             candidates = ", ".join(_IDENTIFIERS[name])
-            raise KeyError(f"{name}: none of these string literals ({candidates}) in this bundle")
+            raise BundleLiteral(
+                f"{name}: none of these string literals ({candidates}) in this bundle"
+            )
         raw[name] = found
     return interpolate(raw)
 
@@ -377,11 +392,10 @@ def _extract_file(bundle: Path) -> dict[str, str] | None:
         with bundle.open("rb") as handle:
             with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as view:
                 return extract(view)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, KeyError) as error:
+        # One handler now that the missing-literal refusal speaks for itself: this branch used to
+        # need a second arm that stripped the apostrophes str(KeyError) puts around its argument.
         print(f"{bundle}: {error}", file=sys.stderr)
-        return None
-    except KeyError as error:
-        print(f"{bundle}: {str(error).strip(chr(39))}", file=sys.stderr)
         return None
 
 

@@ -274,7 +274,15 @@ def listing(
         if stored is not None and stored.get("repository") == repository:
             return [str(v) for v in stored["releases"]], "stale"
         raise
-    _write_cache(cache, repository, versions, {}, now if now is not None else time.time())
+    # A refreshed listing says nothing about a dependency set, so the digests learned for individual
+    # commits carry across the rewrite: they are keyed by commit, which is what keeps `resolve`
+    # honest when it promises a digest is cached forever, and offline they are the only reason a
+    # non-baseline release stays installable. They describe one repository's commits, so a cache
+    # being retargeted at another source starts their life over rather than mixing the two.
+    kept = {}
+    if stored is not None and stored.get("repository") == repository:
+        kept = dict(stored.get("requirements") or {})
+    _write_cache(cache, repository, versions, kept, now if now is not None else time.time())
     return versions, "listed"
 
 

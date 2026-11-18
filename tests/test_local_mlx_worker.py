@@ -48,8 +48,9 @@ def _reset_worker_import_cache() -> None:
 def plan_document(**overrides: Any) -> dict:
     """A resolved engine record shaped exactly like ``_write_plan_document``'s output.
 
-    The residency key is nested on purpose: ``capacity.py:540`` writes ``engine["wiring"]``,
-    ``policy.py:1198`` reads it back correctly, and only the worker looked for a top-level
+    The residency key is nested on purpose: ``capacity.py::wiring_targets`` writes
+    ``engine["wiring"]``, ``policy.py::_lane_table_lines`` reads it back correctly, and only the
+    worker looked for a top-level
     ``wired_bytes`` — which does not exist, so it applied zero and its own fail-closed guard could
     never fire because both sides were consistently absent.
     """
@@ -92,10 +93,10 @@ class Worker:
     def __init__(self, expected: dict, **fake: Any) -> None:
         self.expected = expected
         self.recording = fakemlx.install(**fake)
-        self.requests: list[dict] = []
+        self.requests: list[dict | str] = []
 
     def request(
-        self, action: str, payload: dict | None = None, sequence: int | None = None
+        self, action: str, payload: object = None, sequence: int | None = None
     ) -> Worker:
         self.requests.append(
             {
@@ -111,8 +112,16 @@ class Worker:
             "generate", {"messages": messages or [{"role": "user", "content": "x"}], **payload}
         )
 
+    def raw(self, line: str) -> Worker:
+        """One literal stdin line, for a request this driver would never itself construct."""
+        self.requests.append(line)
+        return self
+
     def run(self) -> Worker:
-        joined = "".join(json.dumps(entry) + "\n" for entry in self.requests)
+        joined = "".join(
+            (entry if isinstance(entry, str) else json.dumps(entry)) + "\n"
+            for entry in self.requests
+        )
         stdin = io.StringIO(joined)
         stdout = io.StringIO()
         self.exit_code = mlx_worker.serve(stdin, stdout, self.expected)
@@ -160,6 +169,17 @@ class CompletionTests(MlxWorkerTestCase):
         worker.generate(max_tokens=8).run()
         self.assertNoFatal(worker)
         self.assertEqual(worker.exit_code, 0, worker.documents)
+        self.assertTrue(worker.of("end"), worker.documents)
+
+    def test_a_model_that_emits_nothing_ends_cleanly(self):
+        # A script with no tokens at all: the step generator yields nothing, so the trailing
+        # response is the only thing the worker sees. The stub used to reach for a loop variable
+        # that was never bound on this path, which is an UnboundLocalError inside the fake rather
+        # than a verdict about the worker.
+        worker = self.worker(script=[])
+        worker.generate(max_tokens=8).run()
+        self.assertNoFatal(worker)
+        self.assertEqual(worker.text(), "", worker.documents)
         self.assertTrue(worker.of("end"), worker.documents)
 
     def test_residency_reaches_the_executor_from_the_nested_plan_key(self):
@@ -252,6 +272,35 @@ class GenerationSemanticsTests(MlxWorkerTestCase):
 
 
 class RequestFieldTests(MlxWorkerTestCase):
+    def test_a_line_that_is_not_a_request_object_is_answered_not_fatal(self):
+        # One bad request costs a refusal and nothing else, which is what this loop promises. Valid
+        # JSON that is not an object reached .get() on a list instead, so a single stray line killed
+        # the worker and every request after it.
+        worker = self.worker().raw("[1, 2]").raw("null").request("status").run()
+        self.assertNoFatal(worker)
+        self.assertEqual(
+            [doc["code"] for doc in worker.of("refused")],
+            [mlx_worker.WorkerError.MALFORMED_REQUEST] * 2,
+            worker.documents,
+        )
+        self.assertEqual(worker.kinds()[-1], "status", worker.documents)
+        self.assertEqual(worker.exit_code, 0, worker.documents)
+
+    def test_a_payload_that_is_not_an_object_is_refused_not_reported_as_damage(self):
+        # The command loop distinguishes WorkerRefused from device damage, and an AttributeError out
+        # of the validator landed in the second branch: a fatal document and exit 2, which retires a
+        # healthy engine over a request it was only ever meant to refuse.
+        for action in ("input_tokens", "generate"):
+            with self.subTest(action=action):
+                worker = self.worker().request(action, "not-an-object").run()
+                self.assertEqual(worker.kinds(), ["ready", "refused"], worker.documents)
+                self.assertEqual(
+                    worker.of("refused")[0]["code"],
+                    str(mlx_worker.WorkerError.MALFORMED_REQUEST),
+                    worker.documents,
+                )
+                self.assertEqual(worker.exit_code, 0, worker.documents)
+
     def test_a_field_the_engine_cannot_honour_is_refused_not_ignored(self):
         for field in ("tool_choice", "seed", "presence_penalty", "frequency_penalty"):
             with self.subTest(field=field):

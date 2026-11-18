@@ -16,6 +16,7 @@ that is not a file - exits 1, so a caller treating non-zero as "leave it alone" 
 import argparse
 import fcntl
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -30,10 +31,20 @@ def is_free(path: Path) -> bool:
         return False
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # flock() succeeds on a directory descriptor on Linux, so the lock alone cannot say this was
+        # a launcher lock at all. The caller deletes the containing directory on this answer,
+        # so anything that is not a regular file must be read "not free" and left alone.
+        # fstat runs here, on the still-open descriptor, not after it is closed.
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
     except OSError:
         return False
-    os.close(fd)
-    return True
+    finally:
+        # Closed on every path, including the refusal: the swept directory of a live launch is the
+        # common answer, and a probe that leaked a descriptor when a lock was held would leak
+        # one per running instance. An int descriptor earns no ResourceWarning either, so
+        # nothing else in the suite would ever have noticed.
+        os.close(fd)
+    return regular
 
 
 def main() -> int:

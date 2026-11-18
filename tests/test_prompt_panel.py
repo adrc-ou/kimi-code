@@ -26,6 +26,7 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 # The repository root as well as tools/, so that `tests.helpers` resolves under every way of
@@ -988,24 +989,71 @@ sys.exit(result.status)
 
 
 class NoWritesBeforeAcceptanceTests(unittest.TestCase):
+    """The panel decides what gets staged; it never edits the documents it reads.
+
+    Its own on-screen wording promises this - ``writes nothing to your files``, and ``a block you
+    switch here is staged differently, not edited on disk`` - and the promise is about the
+    operator's ``SYSTEM.md`` and ``CONTEXT.md``, not about the prefs file, which the panel does
+    does own. Those two documents are the harness's only tier-one inputs: a panel that rewrote them
+    would silently change every agent's instructions and survive the next launch, because the
+    operator would have no reason to look at a file they never touched.
+    """
+
+    OPERATOR = {
+        pc.SYSTEM_FILE: "# the operator's own voice\n",
+        pc.CONTEXT_FILE: "# their contract\n",
+    }
+
     def setUp(self) -> None:
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
-        self.runtime = Path(self._dir.name)
+        self.root = stage_files(Path(self._dir.name) / "workspace", dict(self.OPERATOR))
+        self.runtime = self.root / "runtime"
+        self.runtime.mkdir(parents=True, exist_ok=True)
         (self.runtime / "model-policy.json").write_text(json.dumps(PLAN))
+
+    def untouched(self) -> None:
+        for name, text in self.OPERATOR.items():
+            path = self.root / name
+            self.assertTrue(path.is_file(), f"{name} disappeared")
+            self.assertEqual(path.read_text(encoding="utf-8"), text, f"{name} was rewritten")
 
     def test_drawing_never_creates_the_prefs_file(self) -> None:
         pp.draw(PLAN, self.runtime, "m", dict(pc.DEFAULT_ENABLED), {},
                 colour_on=False, remembered=False)
         self.assertFalse((self.runtime / pc.PREFS_FILE).exists())
+        self.untouched()
 
     def test_configure_show_never_creates_the_prefs_file(self) -> None:
         buffer = io.StringIO()
         with redirect_stdout(buffer):
-            code = pp.main(["--runtime-dir", str(self.runtime), "--configure", "--show"])
+            code = pp.main([
+                "--root", str(self.root), "--runtime-dir", str(self.runtime),
+                "--configure", "--show",
+            ])
         self.assertEqual(code, 0)
         self.assertIn("parallelism", buffer.getvalue())
         self.assertFalse((self.runtime / pc.PREFS_FILE).exists())
+        self.untouched()
+
+    def test_even_an_accepted_change_writes_only_the_prefs_file(self) -> None:
+        # The accepting path is the one that could plausibly reach further, and it is reachable
+        # without a terminal, so this is the case a promise about operator files has to survive.
+        before = sorted(q.name for q in self.root.iterdir())
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = pp.main([
+                "--root", str(self.root), "--runtime-dir", str(self.runtime),
+                "--configure", "--disable", policy.OPTION_PARALLELISM,
+            ])
+        self.assertEqual(code, 0, buffer.getvalue())
+        self.assertIn("wrote", buffer.getvalue())
+        self.untouched()
+        self.assertEqual(sorted(q.name for q in self.root.iterdir()), before,
+                         "the accepting path put something new in the operator's directory")
+        loaded = pc.load_prefs(self.runtime / pc.PREFS_FILE)
+        self.assertFalse(loaded[policy.OPTION_PARALLELISM])
+
 
 
 class OptionSetCompletenessTests(unittest.TestCase):
@@ -1175,6 +1223,28 @@ class InstructionBillTests(unittest.TestCase):
         record = measured_record(PLAN, pm.AUDIENCE_MAIN, 900, 300, 300, 300)
         notice, = pp.over_limit(self.pieces(pc.KIMI_RECOMMENDED_MAX_INSTRUCTION_BYTES + 1, record))
         self.assertIn("over Kimi's recommended 32 KB", notice)
+
+    def test_a_document_this_process_cannot_open_costs_a_row_and_not_the_screen(self) -> None:
+        # These are the operator's own files, read out of their tree rather than from anything this
+        # harness staged, so the panel prices what it can reach and moves on. An unreadable one
+        # raised instead, and ./prompts.sh runs this screen under `set -e`.
+        (self.root / "AGENTS.md").write_text("kept", encoding="utf-8")
+        nested = self.root / "sub"
+        nested.mkdir()
+        (nested / "AGENTS.md").write_text("denied", encoding="utf-8")
+        real = Path.read_text
+
+        def flaky(self, *args, **kwargs):
+            if self.parent == nested:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", flaky):
+            numbered = pp._numbered(self.root)
+            main = pp.pieces(PLAN, self.root, "module guidance", self.all_on, None, "primary")
+        self.assertEqual(numbered.strip(), "kept", "one document read, one refused")
+        self.assertNotIn("denied", numbered)
+        self.assertEqual(main.project, numbered)
 
     def test_an_oversized_prompt_is_billed_in_kimis_own_units(self) -> None:
         notice, = pp.over_limit(self.pieces(pc.KIMI_RECOMMENDED_MAX_INSTRUCTION_BYTES + 1))

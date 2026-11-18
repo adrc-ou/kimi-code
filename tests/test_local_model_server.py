@@ -28,6 +28,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 for _directory in (
@@ -346,6 +347,45 @@ class LaunchArgumentTests(unittest.TestCase):
         environment = _sanitized_environment({"site_packages": site})
         self.assertEqual(environment["PYTHONPATH"], site)
 
+    def test_engine_policy_variables_never_reach_the_sanitized_environment(self):
+        """The denylist blocks what it names - including the case macOS actually exposes them in.
+
+        Every prefix is checked in the exact spelling an operator's shell would carry, because the
+        key is upper-cased before comparison and one entry was written mixed-case, which made it
+        unmatchable: ``METAL_DEVICE_WRAPPER_TYPE`` was passing straight through to the engine while
+        the plan and its fingerprint still claimed the profile's residency numbers. A prefix that
+        cannot match reads as coverage and is worse than an absent one.
+        """
+        from local_engines.mlx_lm import _sanitized_environment
+
+        from local_engine_contract import ENGINE_POLICY_ENV_PREFIXES
+
+        blocked = {
+            "MLX_MAX_RECOMMENDED_WORKING_SET_SIZE": "1",
+            "GGML_METAL_USE_BF16": "1",
+            "LLAMA_ARG_CTX_SIZE": "4096",
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.0",
+            "CUDA_VISIBLE_DEVICES": "0",
+            "METAL_DEVICE_WRAPPER_TYPE": "1",
+            "MetalSampleBufferCacheSizeLimit": "1",
+        }
+        # Each blocked name must genuinely fall under a declared prefix, or this fixture tests
+        # nothing and the list can silently stop covering it.
+        for name in blocked:
+            self.assertTrue(
+                name.upper().startswith(tuple(x.upper() for x in ENGINE_POLICY_ENV_PREFIXES)),
+                f"{name} is not covered by {ENGINE_POLICY_ENV_PREFIXES}",
+            )
+        operational = {"PATH": "/usr/bin", "HOME": "/home/agent", "LANG": "en_US.UTF-8"}
+        with mock.patch.dict("os.environ", {**operational, **blocked}, clear=True):
+            environment = dict(_sanitized_environment())
+        for name in blocked:
+            self.assertNotIn(name, environment, f"{name} reached the engine environment")
+        for name, value in operational.items():
+            self.assertEqual(
+                environment.get(name), value, f"{name} was stripped as if it were policy"
+            )
+
     def test_a_runtime_that_records_no_site_packages_is_refused_not_launched_unconfigured(self):
         from local_engines.base import EngineAdapterError
         from local_engines.mlx_lm import _sanitized_environment
@@ -617,10 +657,6 @@ def _free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
-
-
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main()
 
 
 class CancellationTests(ChannelFixture):

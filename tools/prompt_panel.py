@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 if __package__:
-    from . import kimi_prompts, policy
+    from . import definitions, kimi_prompts, policy
     from . import prompt_context as pc
     from . import prompt_measure as pm
     from .tui import flow, screen
@@ -50,6 +50,7 @@ if __package__:
     from .tui.forest import CHECK, FIXED, ForestState, ForestStep, Node
     from .tui.layout import Row
 else:
+    import definitions
     import kimi_prompts
     import policy
     import prompt_context as pc
@@ -339,14 +340,26 @@ def option_cost(option: pc.Option, plan: dict[str, Any], module_guidance: str) -
     return Cost(pm.estimate_tokens(text))
 
 
+def _document_text(path: Path) -> str:
+    """A document's text, or ``""`` for a file that cannot be read.
+
+    Readable-but-unreadable counts as empty rather than absent: the same rule
+    :func:`prompt_context._read_tier` applies, and a tree that disagreed with the composer about
+    which of the two it was looking at would be showing an override nobody asked for. The pricing
+    rows read through here are estimates of what a prompt costs, so a file this process cannot open
+    has nothing to add either way — and raising would take the whole screen down over a document
+    the operator cannot even see from it.
+    """
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def _numbered(root: Path) -> str:
     """The workspace documents Kimi hoists itself, which this harness neither writes nor gates."""
     found = [root / "AGENTS.md", *sorted(root.glob("*/AGENTS.md"))]
-    return "".join(
-        f"{path.read_text(encoding='utf-8', errors='replace')}\n"
-        for path in found
-        if path.is_file()
-    )
+    return "".join(f"{_document_text(path)}\n" for path in found if path.is_file())
 
 
 def _age(row: dict[str, Any], now: datetime | None = None) -> str:
@@ -688,19 +701,6 @@ class Switch(NamedTuple):
         return members[0] if members else pc.AUTO
 
 
-def _tier_text(path: Path) -> str:
-    """What this block is made of, or ``""`` for a file that cannot be read.
-
-    Readable-but-unreadable counts as empty rather than absent: the same rule
-    :func:`prompt_context._read_tier` applies, and a tree that disagreed with the composer about
-    which of the two it was looking at would be showing an override nobody asked for.
-    """
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
 def _effect(root: Path, block: str, mode: str) -> str:
     """What one state of one block puts in front of the model, reduced to a comparable name.
 
@@ -713,7 +713,7 @@ def _effect(root: Path, block: str, mode: str) -> str:
     source = pc.static_source(root, block, mode)
     if source is None:
         return "built-in" if block == pc.STATIC_SYSTEM else "blank"
-    return str(source) if _tier_text(source).strip() else "blank"
+    return str(source) if _document_text(source).strip() else "blank"
 
 
 def _block_switch(root: Path, block: str, saved: str) -> Switch:
@@ -1012,7 +1012,7 @@ class ContextGraph:
                 kind=FIXED,
                 detail="no file of yours, so Kimi's own words open the prompt",
             )
-        if pc.BASE_PROMPT_WRAPPER in pc.strip_html_comments(_tier_text(source)):
+        if pc.BASE_PROMPT_WRAPPER in pc.strip_html_comments(_document_text(source)):
             return Node(
                 id="builtin",
                 label="Kimi's own built-in prompt",
@@ -1255,7 +1255,7 @@ def load_context(runtime_dir: Path) -> Context:
     ``render_runtime.py``, which is what writes it, so a missing file means the launch is out of
     order rather than that the operator has no preference yet.
     """
-    plan_path = runtime_dir / "model-policy.json"
+    plan_path = runtime_dir / definitions.MODEL_POLICY_FILE
     try:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:

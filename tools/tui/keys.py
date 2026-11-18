@@ -9,7 +9,9 @@ replaces ended up documenting keys it no longer answered to.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 # Named keys arrive as CSI or SS3 sequences; a bare ESC is its own key and must not be mistaken
 # for the start of a sequence that never comes.
@@ -339,7 +341,7 @@ class Binding:
     #: A binding may be conditional — ``Back`` is meaningless on the first step. The predicate is
     #: passed the step's state, and an unavailable action leaves the legend instead of ignoring
     #: a keypress with no explanation.
-    when: object = field(default=None, repr=False)
+    when: Callable[[Any], bool] | None = field(default=None, repr=False)
 
     def available(self, state) -> bool:
         return True if self.when is None else bool(self.when(state))
@@ -349,7 +351,12 @@ class Binding:
         return display(self.keys[0])
 
 
-def bind(action: str, description: str, *keys: str, when=None) -> Binding:
+def bind(
+    action: str,
+    description: str,
+    *keys: str,
+    when: Callable[[Any], bool] | None = None,
+) -> Binding:
     return Binding(action=action, description=description, keys=tuple(keys), when=when)
 
 

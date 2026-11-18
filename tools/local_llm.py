@@ -59,10 +59,20 @@ if str(ROOT / "tools") not in sys.path:
 if str(ROOT / "proxy") not in sys.path:
     sys.path.insert(0, str(ROOT / "proxy"))
 
-import definitions  # noqa: E402
-from private_file import write_private_json  # noqa: E402
+if __package__:
+    from . import definitions
+    from .private_file import write_private_json
+else:  # every launcher path imports these flat, from tools/ on sys.path
+    import definitions  # noqa: E402
+    from private_file import write_private_json  # noqa: E402
 
-from local_engine_contract import StreamEvidence, classify  # noqa: E402
+from local_engine_contract import (  # noqa: E402
+    LOCAL_METADATA_BYTES,
+    STALE_LOCAL_PLAN_SCHEMAS,
+    StreamEvidence,
+    classify,
+    strip_engine_policy,
+)
 
 #: Written beside the weights once every file has been digested and matched. It is the difference
 #: between "the files are there" and "these are the bytes the lock promised", and it is the only
@@ -345,6 +355,30 @@ def all_models() -> dict[str, dict[str, Any]]:
     return {model["id"]: model for model in models if model.get("install")}
 
 
+def instance_plan() -> tuple[Path, dict[str, Any]]:
+    """The instance directory and the resolved plan inside it, each refused when absent.
+
+    ``serve`` and ``await-ready`` took ``HARNESS_RUNTIME_DIR`` straight into ``Path``, where an
+    unset value is ``Path("")`` — the current directory. They then read the plan unguarded, so the
+    two failure modes were a bare ``FileNotFoundError`` traceback, or an answer from whatever
+    same-named file happened to be in the directory the command was started from. Both commands
+    also need the directory itself, for the readiness receipt, so one helper returns the pair.
+    """
+    runtime = os.environ.get("HARNESS_RUNTIME_DIR", "").strip()
+    if not runtime:
+        raise LocalModelError("HARNESS_RUNTIME_DIR must name the instance runtime directory")
+    path = Path(runtime) / definitions.MODEL_POLICY_FILE
+    if not path.is_file():
+        raise LocalModelError(f"the launch has no resolved plan at {path}")
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise LocalModelError(f"cannot read the resolved plan {path}: {exc}") from exc
+    if not isinstance(plan, dict):
+        raise LocalModelError(f"the resolved plan {path} is not an object")
+    return Path(runtime), plan
+
+
 def selected_models(runtime: Path) -> list[dict[str, Any]]:
     """The local models this launch actually chose, without repeats.
 
@@ -352,7 +386,7 @@ def selected_models(runtime: Path) -> list[dict[str, Any]]:
     a lane exists at all: a model dropped by the host probe never reaches it, and a model chosen
     for two lanes must be installed and served once.
     """
-    path = Path(runtime) / "model-policy.json"
+    path = Path(runtime) / definitions.MODEL_POLICY_FILE
     if not path.is_file():
         raise EngineError("local engine enumeration requires the resolved policy plan")
     try:
@@ -385,7 +419,7 @@ def lane_sizes(model: dict[str, Any], plan: dict[str, Any]) -> tuple[int, int]:
     """
     engine = (plan.get("engines") or {}).get(model["id"])
     if engine is not None:
-        if plan.get("schema_version") in (2, 3):
+        if plan.get("schema_version") in STALE_LOCAL_PLAN_SCHEMAS:
             raise EngineError(
                 f"stale schema {plan.get('schema_version')} local policy; "
                 "relaunch the harness for the current engine contract"
@@ -569,7 +603,10 @@ def _digest_of(path: Path) -> str:
 
 def bootstrap_token(name: str) -> str:
     """One value out of the launcher's resolved environment, read the way the launcher reads it."""
-    from env_values import read_env_values
+    if __package__:
+        from .env_values import read_env_values
+    else:
+        from env_values import read_env_values
 
     configured = os.environ.get("HARNESS_RESOLVED_BOOTSTRAP", "")
     path = Path(configured) if configured else ROOT / ".env"
@@ -604,6 +641,13 @@ def transfer(url: str, target: Path, total: int | None, label: str) -> None:
     part = target.with_name(target.name + ".part")
     part.parent.mkdir(parents=True, exist_ok=True)
     start = part.stat().st_size if part.is_file() else 0
+    if total is not None and start >= total:
+        # A partial is resumable only while it is a proper prefix of the pinned file. At or past
+        # that length it cannot be one - the artifact was re-pinned smaller, or an earlier run was
+        # over-sent - so the Range below would ask for a tail that does not exist, every attempt
+        # would end in the same size mismatch, and the "leave it and resume" recovery this function
+        # otherwise relies on would never recover. Truncate and take the whole file again.
+        start = 0
     mode = "ab" if start else "wb"
     with request(url, start if mode == "ab" else 0) as response:
         if mode == "ab" and getattr(response, "status", 200) != 206:
@@ -801,8 +845,15 @@ def api_token(model: dict[str, Any], plan: dict[str, Any] | None = None) -> str:
 
 
 def engine_environment() -> dict[str, str]:
-    """Do not let ambient llama.cpp overrides compete with the resolved allocation contract."""
-    return {key: value for key, value in os.environ.items() if not key.startswith("LLAMA_ARG_")}
+    """Do not let ambient engine overrides compete with the resolved allocation contract.
+
+    The same set the MLX adapter clears, from ``local_engine_contract``. This used to drop only
+    ``LLAMA_ARG_``, so an inherited ``GGML_METAL_USE_BF16`` or ``Metal``-prefixed variable reached
+    llama.cpp and changed residency while the plan and its fingerprint still claimed the profile's
+    numbers - the exact override this function exists to prevent, and one the other engine on the
+    same device had already been guarding against.
+    """
+    return strip_engine_policy(dict(os.environ))
 
 
 def primary_weights_path(model: dict[str, Any]) -> Path:
@@ -943,8 +994,7 @@ def cmd_serve(argv: list[str]) -> int:
     if len(argv) != 1:
         raise LocalModelError("serve takes exactly one model id")
     model = require_model(argv[0])
-    runtime = Path(os.environ.get("HARNESS_RUNTIME_DIR", ""))
-    plan = json.loads((runtime / "model-policy.json").read_text(encoding="utf-8"))
+    runtime, plan = instance_plan()
     if not is_ready(model):
         raise EngineError(f"{model['id']}: selected weights are not verified")
     context, parallel = lane_sizes(model, plan)
@@ -994,7 +1044,10 @@ def cmd_serve(argv: list[str]) -> int:
     if _wants_token_descriptor(args):
         credential_pipe = os.pipe()
         os.set_inheritable(credential_pipe[0], True)
-        with os.fdopen(credential_pipe[1], "w", closefd=True) as sink:
+        # Stated, not inherited: the frontend decodes this descriptor as UTF-8
+        # (tools/local_model_server.py::main), and a writer that follows the container's locale
+        # instead would make one handoff depend on an environment neither side controls.
+        with os.fdopen(credential_pipe[1], "w", encoding="utf-8", closefd=True) as sink:
             sink.write(token + "\n")
         # The write end is closed here, so the child reads the value and then EOF: a credential
         # that stays open on a pipe would keep the child waiting on a descriptor the parent has
@@ -1154,14 +1207,6 @@ def validate_launch(model: dict[str, Any], engine: dict[str, Any]) -> None:
         raise EngineError("serving profile identity changed after capacity resolution")
 
 
-#: What a ``/props`` body may weigh. This used to be a bare 65536 repeated at the read and the
-#: comparison, and it is too small to be safe: ``/props`` embeds the model's entire chat template,
-#: so a template large enough to cross this bound makes a perfectly healthy engine report
-#: "exceeds the supported metadata size" and refuse to start. Raised well clear of any real
-#: template, still bounded so a runaway response cannot exhaust the launcher's memory.
-LOCAL_PROPS_BYTES = 1024 * 1024
-
-
 class StreamingCanaryScanner:
     """The minimum SSE reader the canary needs, reporting through the shared vocabulary.
 
@@ -1189,7 +1234,7 @@ class StreamingCanaryScanner:
 
     def feed(self, chunk: bytes) -> None:
         self.buffer += chunk
-        if len(self.buffer) > LOCAL_PROPS_BYTES:
+        if len(self.buffer) > LOCAL_METADATA_BYTES:
             self.buffer.clear()
             self.overflowed = True
             self.saw_framing_failure = True
@@ -1443,8 +1488,8 @@ def wait_engine_ready(
     while child.poll() is None:
         try:
             with urllib.request.urlopen(req, timeout=5) as response:
-                data = response.read(LOCAL_PROPS_BYTES + 1)
-                if len(data) > LOCAL_PROPS_BYTES:
+                data = response.read(LOCAL_METADATA_BYTES + 1)
+                if len(data) > LOCAL_METADATA_BYTES:
                     raise EngineError("engine properties exceed the supported metadata size")
                 payload = json.loads(data)
         except (OSError, ValueError):
@@ -1496,8 +1541,7 @@ def cmd_await_ready(argv: list[str], supervisor_pid: int) -> int:
     """Wait for a readiness receipt from the exact supervisor this launcher started."""
     if len(argv) != 1 or supervisor_pid <= 0:
         raise EngineError("await-ready needs one model id and --supervisor-pid")
-    runtime = Path(os.environ.get("HARNESS_RUNTIME_DIR", ""))
-    plan = json.loads((runtime / "model-policy.json").read_text(encoding="utf-8"))
+    runtime, plan = instance_plan()
     engine = (plan.get("engines") or {}).get(argv[0])
     if engine is None:
         return 0

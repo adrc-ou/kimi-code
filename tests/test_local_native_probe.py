@@ -273,10 +273,6 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(result["kind"], probe.RESULT_KIND)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class UpstreamApiContractTests(unittest.TestCase):
     """The generation calls must use arguments MLX-LM actually accepts.
 
@@ -430,3 +426,7 @@ class CrossModuleReferenceTests(unittest.TestCase):
                 hasattr(contract, symbol),
                 f"worker imports local_engine_contract.{symbol}, which does not exist",
             )
+
+
+if __name__ == "__main__":
+    unittest.main()

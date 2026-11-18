@@ -62,6 +62,27 @@ def runtime_root() -> Path:
     return ROOT / ".local" / "runtimes" / "mlx"
 
 
+def download_cache() -> Path:
+    """Where a fetched interpreter archive and its extracted tree wait between attempts.
+
+    A sibling of :func:`runtime_root` rather than inside the staging tree, because the staging tree
+    is deleted at the start of every attempt and renamed into the identity directory on success.
+    Kept there, an archive was either destroyed before anything could reuse it - so the digest check
+    that guards a cached download could never find one - or published as part of the finished
+    runtime, a second full copy of the interpreter shipped inside a directory whose own marker names
+    nothing but ``environment/``.
+
+    It is deliberately not pruned. It holds one archive and one extracted tree per pinned
+    interpreter *version* - tens of megabytes, growing only when ``dependencies.lock.json`` moves to
+    a new build, and the input to a download measured in minutes. What it replaces was worse: a full
+    duplicate of the interpreter inside every ``<identity>/`` runtime directory, which grew with
+    every dependency-lock change instead. A host that wants the space back can delete this directory
+    outright - the next provision refetches and re-verifies from the pin, and nothing in a completed
+    runtime reads it.
+    """
+    return ROOT / ".local" / "runtimes" / "mlx-download-cache"
+
+
 def _digest_of(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -97,7 +118,17 @@ def requirements_lock_digest() -> str:
     # describe, and do so successfully.
     expected = (_dependencies().get("files") or {}).get(REQUIREMENTS_LOCK, "")
     digest = "sha256:" + _digest_of(path)
-    if expected and digest != expected:
+    if not expected:
+        # Absent is not "agree". Skipping the comparison here would let removing one line from
+        # ``dependencies.lock.json`` turn this gate off in silence, and the runtime would then
+        # provision from hashes the repository does not describe - the exact outcome the check
+        # exists to prevent. ``scripts/check_locks.py`` verifies that every recorded digest still
+        # matches its file; nothing there verifies that this file is still recorded.
+        raise ProvisionError(
+            f"{DEPENDENCIES_LOCK} records no digest for {REQUIREMENTS_LOCK}, so the lock cannot be "
+            "trusted as reviewed; add it under \"files\" with the uv command at the top of the lock"
+        )
+    if digest != expected:
         raise ProvisionError(
             f"{REQUIREMENTS_LOCK} is {digest}, {DEPENDENCIES_LOCK} says {expected}. "
             "Re-run the uv command at the top of the lock, or revert the edit."
@@ -169,10 +200,28 @@ def _fetch_interpreter(cache: Path, pin: dict[str, str]) -> Path:
                 "native interpreter digest does not match the pinned release; the download was "
                 "deleted and nothing was installed"
             )
-    target = cache / "interpreter"
+    # Keyed by the pinned version, because the cache now outlives one attempt: an extraction
+    # directory named ``interpreter`` would be reused verbatim after a version bump, and the tree
+    # would disagree with the archive beside it that the digest check had just accepted.
+    target = cache / f"cpython-{pin['version']}-aarch64-apple-darwin"
     if not (target / "bin" / "python3").is_file():
-        with tarfile.open(archive, "r:gz") as bundle:
-            _extract_safely(bundle, target)
+        # Extracted beside its final name and moved in, so an interrupted unzip cannot leave a
+        # half-written tree that the next run would mistake for a complete one.
+        partial = target.with_name(f".{target.name}.extracting")
+        shutil.rmtree(partial, ignore_errors=True)
+        partial.mkdir(parents=True)
+        try:
+            with tarfile.open(archive, "r:gz") as bundle:
+                _extract_safely(bundle, partial)
+            if not (partial / "bin" / "python3").is_file():
+                raise ProvisionError(
+                    "the native interpreter archive holds no bin/python3; the pin does not "
+                    "describe a python-build-standalone release"
+                )
+            partial.replace(target)
+        except BaseException:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise
     return target
 
 
@@ -291,7 +340,9 @@ def provision(*, install: bool = True) -> dict[str, Any]:
     staging.mkdir(parents=True)
     try:
         pin = interpreter_pin()
-        interpreter_tree = _fetch_interpreter(staging / "_interpreter", pin)
+        # Fetched outside the staging tree so the archive and its extraction survive a retry, then
+        # copied in below: a completed runtime must not depend on the cache still being there.
+        interpreter_tree = _fetch_interpreter(download_cache(), pin)
         environment = staging / "environment"
         environment.mkdir()
         # The copy below lands in bin/, and copy2 does not create parents: without this the
@@ -324,7 +375,9 @@ def provision(*, install: bool = True) -> dict[str, Any]:
             "directory": str(destination.resolve()),
             "imports": imports,
         }
-        (staging / COMPLETE_FILE).write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        (staging / COMPLETE_FILE).write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         (staging / COMPLETE_FILE).chmod(0o600)
         # The move is the commit point. Until this line nothing downstream can see any of it.
         if destination.exists():

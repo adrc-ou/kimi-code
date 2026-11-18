@@ -146,8 +146,12 @@ class ExtractionTests(unittest.TestCase):
     def test_a_missing_literal_is_a_hard_failure_naming_what_was_tried(self):
         with self.assertRaises(KeyError) as caught:
             kp.extract(b'\nsystem_default = "x";')
+        # Still a KeyError, because callers catch it as one; and its text is the sentence rather
+        # than repr() of the sentence, which is what made the operator line read `'kimi.…'`.
         self.assertIn("kimi.coder_role", str(caught.exception))
         self.assertIn("CODER_ROLE", str(caught.exception))
+        self.assertNotIn("'kimi.", str(caught.exception))
+        self.assertIsInstance(caught.exception, kp.BundleLiteral)
 
     def test_a_name_with_no_spec_cannot_be_silently_skipped(self):
         with mock.patch.dict(kp._IDENTIFIERS, {}, clear=True):
@@ -298,6 +302,9 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("kimi.", noise)
         self.assertNotIn("KeyError", noise)
+        # The message reaches the terminal as prose: a handler that undid str(KeyError) quoting by
+        # hand was invisible to this test either way, so nothing held the line.
+        self.assertNotIn("'kimi.", noise)
 
     def test_show_without_a_runtime_directory_fails_usage(self):
         self.assertEqual(self.run_cli("--show")[0], 2)

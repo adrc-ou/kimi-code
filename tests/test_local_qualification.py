@@ -81,8 +81,12 @@ class DeclaredContextTests(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-            def read(self):
-                return b'{"context_tokens": 262144}'
+            def read(self, amount=-1):
+                # A real HTTPResponse.read(n) returns at most n bytes, which is what makes the
+                # caller's `read(bound + 1)` truncation test work. A stub that ignored the argument
+                # would pass against an unbounded read and a bounded one alike.
+                body = b'{"context_tokens": 262144}'
+                return body if amount is None or amount < 0 else body[:amount]
 
         def fake_urlopen(request, timeout=None):
             seen["method"] = request.get_method()
@@ -96,6 +100,31 @@ class DeclaredContextTests(unittest.TestCase):
         self.assertEqual(seen["method"], "GET", "the status route is served by do_GET only")
         self.assertEqual(seen["path"], "/v1/harness/status")
         self.assertEqual(seen["auth"], "Bearer tok", "status authenticates like every other route")
+
+    def test_an_oversize_status_document_is_refused_not_truncated_into_an_answer(self):
+        # Every other reader of this document bounds it; this one read the whole body. A truncated
+        # JSON parse would have returned None, which the caller reports as "the engine stated no
+        # context length" - a wrong diagnosis for a response that said too much, not too little.
+        def fake_urlopen(request, timeout=None):
+            class _Big:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def read(self, amount=-1):
+                    body = b'{"context_tokens": 1,' + b"x" * qualify.LOCAL_METADATA_BYTES
+                    return body if amount is None or amount < 0 else body[:amount]
+
+            return _Big()
+
+        with (
+            mock.patch.object(qualify.urllib.request, "urlopen", fake_urlopen),
+            self.assertRaises(qualify.QualificationError) as caught,
+        ):
+            qualify._declared_context(("h", 1, "tok"))
+        self.assertIn("larger than", str(caught.exception))
 
     def test_a_missing_status_means_no_near_ceiling_target_rather_than_a_guess(self):
         with mock.patch.object(qualify, "_post", side_effect=OSError("unreachable")):

@@ -343,7 +343,8 @@ class HTTPContractTests(unittest.TestCase):
         )
 
     def test_duplicate_json_and_oversized_metadata_are_refused(self):
-        for body in (b'{"input_tokens":1,"input_tokens":2}', b" " * (smoke.METADATA_BYTES + 1)):
+        oversized = b" " * (smoke.LOCAL_METADATA_BYTES + 1)
+        for body in (b'{"input_tokens":1,"input_tokens":2}', oversized):
             client = smoke.EngineClient("http://127.0.0.1:1234", "secret", 2)
             response = mock.MagicMock(status=200, headers={})
             response.read.return_value = body
@@ -352,6 +353,21 @@ class HTTPContractTests(unittest.TestCase):
             client.opener.open.return_value = response
             with self.subTest(length=len(body)), self.assertRaises(smoke.SmokeError):
                 client.request("/props")
+
+    def test_a_props_document_bigger_than_the_old_local_bound_is_attestable(self):
+        # ``/props`` embeds the model's entire chat template, so a healthy engine really does
+        # answer with well over 64 KiB. The rejection test above reads the bound from the same
+        # constant it checks, so it cannot notice a bound that narrowed; this one states the
+        # size an actual engine produces, which is what the smoke tool used to fail on while the
+        # proxy was serving that same engine normally.
+        body = json.dumps({"chat_template": "x" * (200 * 1024)}).encode()
+        client = smoke.EngineClient("http://127.0.0.1:1234", "secret", 2)
+        response = mock.MagicMock(status=200, headers={})
+        response.read.return_value = body
+        response.__enter__.return_value = response
+        client.opener = mock.Mock()
+        client.opener.open.return_value = response
+        self.assertEqual(client.request("/props")["chat_template"], "x" * (200 * 1024))
 
 
 if __name__ == "__main__":

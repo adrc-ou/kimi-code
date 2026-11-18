@@ -33,7 +33,7 @@ from typing import Any
 
 if __package__:
     from . import capacity, host_caps, local_llm, policy
-    from .definitions import LANES, DefinitionError, load_definitions
+    from .definitions import LANES, MODEL_POLICY_FILE, DefinitionError, load_definitions
     from .env_values import read_env_values
     from .private_file import write_private, write_private_json
     from .tui import flow, screen
@@ -45,13 +45,24 @@ else:
     import host_caps
     import local_llm
     import policy
-    from definitions import LANES, DefinitionError, load_definitions
+    from definitions import LANES, MODEL_POLICY_FILE, DefinitionError, load_definitions
     from env_values import read_env_values
     from private_file import write_private, write_private_json
     from tui import flow, screen
     from tui.app import View, run
     from tui.input import FieldStep
     from tui.menu import SINGLE, Choice, Column, ListStep
+
+# The plan-schema vocabulary is shared with the proxy, and each reader states its own path rather
+# than relying on another module's: proxy/ is not a sibling of tools/.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT / "proxy") not in sys.path:
+    sys.path.insert(0, str(_ROOT / "proxy"))
+
+from local_engine_contract import (  # noqa: E402
+    STALE_LOCAL_PLAN_SCHEMAS,
+    SUPPORTED_PLAN_SCHEMAS,
+)
 
 SELECTABLE = ("primary", "subagent")
 #: Suffix on a main-agent-screen row that launches the agent on the queued long lane instead of
@@ -64,7 +75,6 @@ AGENT_SUFFIX = "@long"
 LANE_STEP = {"primary": flow.MODEL, "subagent": flow.SUBAGENT}
 SELECTION = "model-selection.json"
 PREVIOUS_SELECTION = "last-model-selection.json"
-POLICY_FILE = "model-policy.json"
 MODEL_ENV = "model.env"
 COMPOSE_FRAGMENT = "compose/models.json"
 CREDENTIALS_DIR = "credentials"
@@ -100,13 +110,18 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 def load_plan(runtime: Path) -> dict[str, Any]:
     """Read the resolved plan. ``render_runtime.py`` and the proxy consume the same document."""
-    plan = read_json(runtime / POLICY_FILE)
-    if isinstance(plan, dict) and plan.get("schema_version") in (2, 3):
+    plan = read_json(runtime / MODEL_POLICY_FILE)
+    if isinstance(plan, dict) and plan.get("schema_version") in STALE_LOCAL_PLAN_SCHEMAS:
         raise DefinitionError(
-            "stale schema 2 local policy; relaunch the harness to resolve native context"
+            f"stale schema {plan['schema_version']} local policy; "
+            "relaunch the harness to resolve native context"
         )
-    if not isinstance(plan, dict) or plan.get("schema_version") not in (1, 4):
-        raise DefinitionError(f"{POLICY_FILE} is not a supported policy plan")
+    if (
+        not isinstance(plan, dict)
+        or type(plan.get("schema_version")) is not int
+        or plan["schema_version"] not in SUPPORTED_PLAN_SCHEMAS
+    ):
+        raise DefinitionError(f"{MODEL_POLICY_FILE} is not a supported policy plan")
     return plan
 
 
@@ -946,7 +961,7 @@ def cmd_resolve(root: Path, runtime: Path) -> int:
         capacity=allocation,
     )
     require_bootstrap_declarations(root, plan)
-    write_json(runtime / POLICY_FILE, plan)
+    write_json(runtime / MODEL_POLICY_FILE, plan)
     write_json(runtime / COMPOSE_FRAGMENT, compose_fragment(plan, runtime))
     environment = model_environment(plan, values)
     write_text(

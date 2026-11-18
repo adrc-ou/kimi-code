@@ -811,7 +811,8 @@ model splits ledgers, it does not enlarge any allowance.
    rather than tiers, which is why `tools/policy.py` keeps one label map —
    `LANE_DISPLAY` — and every human-facing surface reads its entry for the lane
    in play: the picker rows `tools/models.py` builds, the `display_name` in each
-   generated `[models.*]` table, the `--resolve` summary, and the lane table in
+   generated `[models.*]` table, the `resolve` summary (a positional
+   action, not a flag), and the lane table in
    the generated workspace guidance. Labels are the only thing that map touches;
    the ids stay `primary`/`long`/`subagent` because they name the route, the
    alias, and the provider-scoped policy behind them.

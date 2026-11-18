@@ -58,14 +58,20 @@ class ExtensionVolumeTests(unittest.TestCase):
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_links_special_objects_and_paths_outside_approved_roots_fail_closed(self):
-        for name, kind in (
-            ("../outside", tarfile.REGTYPE), ("/outside", tarfile.REGTYPE),
-            (".kimi-code/skills/../../outside", tarfile.REGTYPE),
-            (".kimi-code/skills/link", tarfile.SYMTYPE),
-            (".kimi-code/skills/link", tarfile.LNKTYPE),
-            (".kimi-code/skills/fifo", tarfile.FIFOTYPE),
+        # Each case names the guard that must refuse it. Asserting only `ValueError` let a deleted
+        # path guard look caught: the traversal wrote its file outside the root and the run was then
+        # "detected" by an unrelated FileExistsError, or by `/` happening to be read-only, and a
+        # path that lexically resolved back inside the root raised nothing at all.
+        for name, kind, refused in (
+            ("../outside", tarfile.REGTYPE, "unexpected path"),
+            ("/outside", tarfile.REGTYPE, "unexpected path"),
+            (".kimi-code/skills/../../outside", tarfile.REGTYPE, "unexpected path"),
+            ("someone-else/skills/file", tarfile.REGTYPE, "unexpected path"),
+            (".kimi-code/skills/link", tarfile.SYMTYPE, "linked or special"),
+            (".kimi-code/skills/link", tarfile.LNKTYPE, "linked or special"),
+            (".kimi-code/skills/fifo", tarfile.FIFOTYPE, "linked or special"),
         ):
-            with self.subTest(name=name, kind=kind), self.assertRaises(ValueError):
+            with self.subTest(name=name, kind=kind), self.assertRaisesRegex(ValueError, refused):
                 volume.receive(self.root, archive([(name, kind)]), 1234)
 
     def test_incomplete_archive_is_not_a_successful_stage(self):

@@ -85,10 +85,23 @@ def render(plan: dict[str, Any], placeholder: str = "__MODEL_PROXY_TOKEN__") -> 
         "# ------------------------------------------------------------",
         "",
     ]
+    seen: dict[str, str] = {}
     for name in LANES:
         if name not in lanes:
             continue
         lane = lanes[name]
+        owner = seen.setdefault(lane["provider_name"], name)
+        if owner != name:
+            # The route is inside the table, so two lanes naming one provider emit that table twice
+            # with two different base_urls. Measured against tomllib, a duplicate table is a hard
+            # TOMLDecodeError, so the old failure was a config that would not parse at all -- loud,
+            # but opaque, because the error names a line of a generated file rather than the two
+            # lanes that collided. Refusing here puts the explanation where the mistake is. The plan
+            # builder keeps them apart by rule; this is the guard for when that rule regresses.
+            raise ValueError(
+                f"lanes {owner} and {name} share provider {lane['provider_name']!r}; each lane "
+                "must reach the proxy through its own route"
+            )
         lines += provider_table(
             lane["provider_name"],
             plan["providers"][lane["provider"]]["protocol"],

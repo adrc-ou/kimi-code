@@ -33,12 +33,9 @@ MULTI = "multi"
 #: Which one — ``Enter`` chooses the focused row and ends the step.
 SINGLE = "single"
 
-#: Blank cells between the label column and the hint column.
-HINT_GAP = 3
-
-#: Blank cells between two columns of a table. Narrower than :data:`HINT_GAP` because a table has
-#: more seams to pay for, and the whole point of one is to be read across.
-COLUMN_GAP = 2
+#: Both gaps are owned by :mod:`layout` so the tree and this panel cannot drift.
+HINT_GAP = L.LABEL_TAIL_GAP
+COLUMN_GAP = L.FIELD_GAP
 
 #: ``(x) `` ahead of every row, table or not.
 MARKER_FIELD = 4

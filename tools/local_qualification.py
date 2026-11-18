@@ -39,6 +39,15 @@ for _entry in (str(ROOT / "tools"), str(ROOT / "proxy")):
     if _entry not in sys.path:
         sys.path.insert(0, _entry)
 
+# The same bound the proxy, the launcher and the capacity smoke tool use for one engine metadata
+# response. This file already names proxy/ on the path; this is the read that needed it.
+if __package__:
+    from .definitions import MODEL_POLICY_FILE
+else:  # every launcher path imports these flat, from tools/ on sys.path
+    from definitions import MODEL_POLICY_FILE  # noqa: E402
+
+from local_engine_contract import LOCAL_METADATA_BYTES  # noqa: E402
+
 RESULT_KIND = "local_native_qualification"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
@@ -59,7 +68,7 @@ class QualificationError(RuntimeError):
 
 def _engine_origin() -> tuple[str, int, str]:
     runtime = Path(os.environ.get("HARNESS_RUNTIME_DIR", ""))
-    plan_path = runtime / "model-policy.json"
+    plan_path = runtime / MODEL_POLICY_FILE
     if not plan_path.is_file():
         raise QualificationError(f"no resolved plan at {plan_path}")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -462,8 +471,21 @@ def _declared_context(origin) -> int | None:
     )
     try:
         with urllib.request.urlopen(request, timeout=30.0) as response:
-            document = json.loads(response.read())
+            # Bounded, like every other reader of this document. An unbounded read here would make
+            # this the one path that trusts a status reply to be whatever size the process behind
+            # the port decides to send, and a truncated body parsed as JSON is a *wrong* answer
+            # rather than a missing one.
+            raw = response.read(LOCAL_METADATA_BYTES + 1)
     except (OSError, ValueError):
+        return None
+    if len(raw) > LOCAL_METADATA_BYTES:
+        raise QualificationError(
+            f"the engine status document is larger than {LOCAL_METADATA_BYTES} bytes; "
+            "qualification refuses to judge an engine from a response it had to cut off"
+        )
+    try:
+        document = json.loads(raw)
+    except ValueError:
         return None
     for key in ("context_tokens", "native_context_tokens"):
         value = document.get(key)
@@ -500,7 +522,7 @@ def _finish(result: dict[str, Any], started: float, output: str) -> dict[str, An
         destination = Path(output)
         destination.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(result, indent=2, sort_keys=True) + "\n"
-        destination.write_text(text)
+        destination.write_text(text, encoding="utf-8")
         destination.chmod(0o600)
     return result
 

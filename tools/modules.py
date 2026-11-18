@@ -14,7 +14,7 @@ from pathlib import Path
 
 if __package__:
     from .definitions import ENV_VAR, ID
-    from .mcp_compatibility import load_manifest
+    from .mcp_compatibility import load_manifest, read_servers
     from .private_file import write_private_json
     from .safe_workspace_init import UnsafeWorkspace, components, initialize
     from .tui import flow, screen
@@ -23,7 +23,7 @@ if __package__:
     from .tui.menu import Choice, ListStep
 else:
     from definitions import ENV_VAR, ID
-    from mcp_compatibility import load_manifest
+    from mcp_compatibility import load_manifest, read_servers
     from private_file import write_private_json
     from safe_workspace_init import UnsafeWorkspace, components, initialize
     from tui import flow, screen
@@ -57,20 +57,39 @@ def discover(root):
         for child in path.rglob("*"):
             if child.is_symlink() or not (child.is_file() or child.is_dir()):
                 raise ValueError(f"Unsafe module entry: {child}")
-        doc = json.loads((path / "module.json").read_text())
-        if doc.get("schema_version") != 1 or not isinstance(doc.get("label"), str):
+        try:
+            doc = json.loads((path / "module.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            # A manifest that will not parse is the same finding as one that parses into the wrong
+            # shape. Unwrapped, it reached the operator as a bare JSONDecodeError naming a byte
+            # offset in a file the message never identified.
+            raise ValueError(f"Invalid module manifest: {path.name}") from exc
+        if not isinstance(doc, dict) or doc.get("schema_version") != 1 or not isinstance(
+            doc.get("label"), str
+        ):
             raise ValueError(f"Invalid module manifest: {path.name}")
         if not doc["label"].strip() or any(ord(c) < 32 for c in doc["label"]):
             raise ValueError("Invalid module label")
+        # Each list field is iterated below, so each has to be a list before anything reads it: a
+        # manifest holding a bare string iterates into its characters and quietly "declares" several
+        # entries, and a dict iterates into keys that the per-entry code then calls .get() on.
+        for key in ("workspace_directories", "images", "environment"):
+            if not isinstance(doc.get(key, []), list):
+                raise ValueError(f"Invalid module manifest: {path.name} lists {key} badly")
         for relative in doc.get("workspace_directories", []):
             components(relative)
         if not (path / "module.sh").is_file():
             raise ValueError("Module requires module.sh")
         for image in doc.get("images", []):
-            if not re.fullmatch(r"[a-z0-9][a-z0-9._/-]*", image):
+            # isinstance first: re.fullmatch on a number raises TypeError, and the whole point of
+            # this refusal is that a manifest the operator can read is rejected by name.
+            if not isinstance(image, str) or not re.fullmatch(
+                r"[a-z0-9][a-z0-9._/-]*", image
+            ):
                 raise ValueError("Invalid image name")
         for item in doc.get("environment", []):
-            if not ENV_VAR.fullmatch(item["name"]) or not isinstance(item.get("prompt"), str):
+            if (not ENV_VAR.fullmatch(str(item.get("name", "")))
+                    or not isinstance(item.get("prompt"), str)):
                 raise ValueError("Invalid module environment declaration")
         result.append({**doc, "id": path.name, "path": path})
     return result
@@ -195,7 +214,8 @@ def module_agents_text(modules):
     workspace, because ``<workspace>/AGENTS.md`` belongs to the project being worked on.
     """
     return "\n".join(
-        f"## Module: {module['label']}\n\n" + (module["path"] / "AGENTS.md").read_text()
+        f"## Module: {module['label']}\n\n"
+        + (module["path"] / "AGENTS.md").read_text(encoding="utf-8")
         for module in modules
         if (module["path"] / "AGENTS.md").exists()
     )
@@ -231,10 +251,20 @@ def assemble(root, runtime, modules, workspace):
                     else:
                         shutil.copy2(item, dest)
         if (source / "mcp.json").exists():
-            entries = json.loads((source / "mcp.json").read_text())["mcpServers"]
+            # mcp_compatibility owns the read: the assembler, its own offline CI validation and the
+            # service checker all open these files, and each used to answer a malformed one with a
+            # different exception. ContractError is a ValueError, so the CLI refusal catches this.
+            entries = read_servers(source / "mcp.json")
             if entries.keys() & mcp["mcpServers"].keys():
                 raise ValueError("Duplicate MCP server names")
             mcp["mcpServers"].update(entries)
+            # Backstop rather than a live branch: load_manifest refuses any contract naming a
+            # server this source does not declare, so `owned` is always a subset of `entries`,
+            # and the check above keeps every source's `entries` disjoint. Two sources therefore
+            # cannot own one server name while that invariant holds -- which is why no test
+            # covers this line. Kept because relaxing load_manifest would make it live, and the
+            # consequence (one module silently replacing another's reviewed contract) is exactly
+            # what this function exists to prevent.
             owned = load_manifest(source / "mcp-contracts.json", entries)
             if owned.keys() & contracts.keys():
                 raise ValueError("Duplicate MCP contract ownership")
@@ -260,7 +290,7 @@ def reconcile_installed(runtime, modules):
     Back may still put that module's answer in play again.
     """
     registry = runtime / "installed-modules.json"
-    previous = json.loads(registry.read_text()) if registry.exists() else {}
+    previous = json.loads(registry.read_text(encoding="utf-8")) if registry.exists() else {}
     installed = {m["id"]: m.get("images", []) for m in modules}
     # Deferring rather than forgetting: an entry dropped from the registry is an image nobody will
     # ever remove again, and a rebuild the user can undo is the cheaper of the two mistakes.
@@ -316,11 +346,11 @@ def main():
     selection = runtime / "modules.json"
     if args.action == "select":
         previous = runtime / "last-modules.json"
-        previous = json.loads(previous.read_text()) if previous.exists() else []
+        previous = json.loads(previous.read_text(encoding="utf-8")) if previous.exists() else []
         state = flow.running(runtime)
         # The chosen list is its own record of the answer, so a replay reads it back rather than
         # asking again; re-running the command is still what re-publishes modules.list downstream.
-        chosen = json.loads(selection.read_text()) if selection.exists() else None
+        chosen = json.loads(selection.read_text(encoding="utf-8")) if selection.exists() else None
         if state and chosen is not None and not state.should_render(flow.MODULES):
             selected = chosen
         else:
@@ -341,9 +371,11 @@ def main():
             state.plan(flow.MODULE_VERSION, 0)
         reconcile_installed(runtime, modules)
         # Shell consumes identifiers only, never labels or arbitrary manifest strings.
-        (runtime / "modules.list").write_text("".join(name + "\n" for name in selected))
+        (runtime / "modules.list").write_text(
+            "".join(name + "\n" for name in selected), encoding="utf-8"
+        )
         return
-    selected = json.loads(selection.read_text())
+    selected = json.loads(selection.read_text(encoding="utf-8"))
     modules = [next(m for m in modules if m["id"] == name) for name in selected]
     if args.action == "assemble":
         assemble(root, runtime, modules, Path(os.environ["HARNESS_WORKSPACE"]))
@@ -370,7 +402,9 @@ def main():
     # launcher and an answer is not the same bytes on both sides of a quote.
     replaying = bool(state) and not state.should_render(flow.MODULE_VALUES)
     record = runtime / VALUES_FILE
-    carried = json.loads(record.read_text()) if replaying and record.exists() else {}
+    carried = (
+        json.loads(record.read_text(encoding="utf-8")) if replaying and record.exists() else {}
+    )
     # Two modules naming one unset variable are one question, not two, as before - but the
     # questions are counted up front now, because the step rail has to say which answer of how
     # many the user is giving.

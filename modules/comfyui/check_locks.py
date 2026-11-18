@@ -3,9 +3,15 @@
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+# Same idiom as ``resolve_locks.py``: the torch pins are one file with one reader, and this gate and
+# the install gate have to disagree about nothing but which two values they are comparing.
+sys.path.insert(0, str(ROOT))
+import resolution  # noqa: E402
+
 PINNED_REQUIREMENT = re.compile(r"^[A-Za-z0-9_.-]+==[^;\s]+(?:\s*;.*)?$")
 SEMVER = re.compile(r"v\d+\.\d+\.\d+$")
 # Each profile names the files its lock is built from, and each baseline records their digests. The
@@ -77,18 +83,11 @@ def check_profile(entry):
         relative = entry.get(field, "")
         if not relative or not (ROOT / relative).is_file():
             raise SystemExit(f"{platform}: {field}={relative!r} is not a shipped file")
-    # The version a profile advertises and the version the constraint layer will actually resolve
-    # are read by different code, so a mismatch would show up as an install failing a torch check.
-    pins = dict(
-        line.split("=", 1)
-        for line in (ROOT / entry["backend_lock"]).read_text().splitlines()
-        if "=" in line and not line.startswith("#")
-    )
-    for field, variable in (
-        ("torch", "TORCH_VERSION"),
-        ("torchvision", "TORCHVISION_VERSION"),
-        ("torchaudio", "TORCHAUDIO_VERSION"),
-    ):
+    # What the profile advertises and what the reviewed pin says are two different sources, and this
+    # is the only place they are compared; a mismatch would otherwise surface as an install failing
+    # the torch check in ``resolution.check_torch_text``.
+    pins = resolution.torch_pins(ROOT / entry["backend_lock"])
+    for field, variable in resolution.TORCH_PACKAGES:
         if entry.get(field) != pins.get(variable):
             raise SystemExit(
                 f"{platform}: {field} does not match {variable} in {entry['backend_lock']}"
@@ -134,7 +133,7 @@ def check_records(document):
 
 
 def check_custom(custom_input):
-    for number, raw in enumerate(custom_input.read_text().splitlines(), start=1):
+    for number, raw in enumerate(custom_input.read_text(encoding="utf-8").splitlines(), start=1):
         value = raw.strip()
         if value and not value.startswith("#") and not PINNED_REQUIREMENT.fullmatch(value):
             raise SystemExit(
@@ -143,13 +142,14 @@ def check_custom(custom_input):
 
 
 def main():
-    lock = json.loads((ROOT / "dependencies.lock.json").read_text())
+    lock = json.loads((ROOT / "dependencies.lock.json").read_text(encoding="utf-8"))
     check_python(lock["downloads"])
     check_resolver(lock["downloads"])
     for relative, expected in lock["files"].items():
         if expected != f"sha256:{digest(ROOT / relative)}":
             raise SystemExit(f"locked file digest is stale: {relative}")
-    compatibility = json.loads((ROOT / "backend" / "compatibility.json").read_text())
+    compatibility_path = ROOT / "backend" / "compatibility.json"
+    compatibility = json.loads(compatibility_path.read_text(encoding="utf-8"))
     profiles = compatibility.get("platforms", [])
     if not profiles:
         raise SystemExit("no ComfyUI backend profiles are declared")

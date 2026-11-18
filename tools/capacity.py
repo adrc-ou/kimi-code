@@ -400,7 +400,7 @@ def _memory_policy(engines: dict[str, Any], providers: dict[str, Any]) -> dict[s
     """The provider's declared memory strategy, refusing a mix of two different declarations."""
     declared = {
         json.dumps(
-            providers[model_provider(engines, engine_id)]["execution"].get("memory", {}),
+            providers[model_provider(engine_id)]["execution"].get("memory", {}),
             sort_keys=True,
         )
         for engine_id in engines
@@ -413,7 +413,7 @@ def _memory_policy(engines: dict[str, Any], providers: dict[str, Any]) -> dict[s
     return json.loads(declared.pop()) if declared else {}
 
 
-def model_provider(engines: dict[str, Any], engine_id: str) -> str:
+def model_provider(engine_id: str) -> str:
     """Which provider owns one engine id. Engine ids are qualified model ids, so this is a split."""
     return engine_id.split("/", 1)[0]
 
@@ -504,6 +504,7 @@ def prepare(
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise CapacityError("the managed local engines require Apple silicon Metal")
     # Observations are retained for diagnostics, never as an admission requirement.
+    measured: dict[str, Any]
     try:
         measured = host_caps.probe(root)
     except (OSError, ValueError):

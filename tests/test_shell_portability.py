@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Host shell runs on macOS as well as Linux, so it may not assume GNU userland.
 
-Two halves. The static half reads every launcher and module script the host executes and refuses
-the one operand order BSD ``getopt`` gets wrong; CI has only ever run these files against
-coreutils, where the same line is harmless, so nothing else would notice. The behavioural half
-runs the prompt-literal extraction against a ``chmod`` stub built the way Apple's is, because the
-static half can flag that call site but never exercise it.
+Three guards of the same shape, each covering something harmless on the one CI image and wrong
+on another kind of host. The static shell half reads every launcher and module script the host
+runs and refuses the one operand order BSD ``getopt`` gets wrong; CI has only ever run these
+files against coreutils, where the same line is harmless, so nothing else would notice. The
+behavioural shell half runs the prompt-literal extraction against a ``chmod`` stub built the way
+Apple's is, because the static half can flag that call site but never exercise it. The Python half
+refuses a text read that inherits the host's locale, for the same reason pointed the other way: CI
+is UTF-8 whatever the operator's machine says.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -45,6 +49,42 @@ MODE_FIRST_COMMANDS = frozenset({"chmod", "chown"})
 EXCLUDED_PARTS = frozenset({"container", "node_modules"})
 
 _COMMAND_SEPARATORS = re.compile(r"&&|\|\||;|\||\n")
+
+#: A text read or write that inherits the interpreter's ambient encoding. CI is one Linux container
+#: with UTF-8 already on, so such a call passes there and fails -- or, with ``errors="replace"``,
+#: silently corrupts -- on a host whose locale was never set to UTF-8, where Python answers in
+#: ANSI_X3.4-1968. The repository already states ``encoding="utf-8"`` in the large majority of its
+#: text calls, so the bare form is drift rather than a second convention, and only a sweep keeps it
+#: from creeping back. Matched on the syntax tree, not on a line pattern: a call carrying any other
+#: keyword is exactly the shape a regex misses, and that is how two sites survived the
+#: earlier version of this check.
+TEXT_CALLS = frozenset({"read_text", "write_text"})
+
+
+def unencoded_text_calls(source: str) -> list[tuple[int, str]]:
+    """The lines of one source file that read or write text at the host's ambient encoding.
+
+    The two calls differ in where their encoding goes: ``read_text(encoding, errors)`` takes it
+    first, so a positional argument satisfies it, while ``write_text(data, encoding, errors)``
+    takes the *content* first, so only the keyword counts. Getting this backwards is how a
+    line-pattern check let ``read_text(errors="replace")`` through.
+    """
+    found: list[tuple[int, str]] = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # pragma: no cover - real files are parsed by the compiler's own tests
+        return found
+    lines = source.splitlines()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in TEXT_CALLS):
+            continue
+        has_keyword = any(keyword.arg == "encoding" for keyword in node.keywords)
+        if has_keyword or (node.func.attr == "read_text" and node.args):
+            continue
+        snippet = lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
+        found.append((node.lineno, snippet))
+    return found
 
 
 def host_scripts() -> list[Path]:
@@ -104,7 +144,8 @@ def misplaced_separators(text: str) -> list[tuple[int, str]]:
 
 
 class HostShellPortabilityTests(unittest.TestCase):
-    """The operand order the prompt-cache call sites in both launchers once broke."""
+    """What CI's single image cannot see: the operand order that broke the prompt cache on BSD,
+    and the text reads that assume the interpreter already speaks UTF-8."""
 
     def test_the_suite_sees_the_host_scripts_and_not_the_image_ones(self):
         names = {path.relative_to(ROOT).as_posix() for path in host_scripts()}
@@ -143,6 +184,32 @@ class HostShellPortabilityTests(unittest.TestCase):
             'chown -R 1000:1000 -- "${tree}"',
         ):
             self.assertEqual([number for number, _ in misplaced_separators(line)], [1], line)
+
+    def test_no_production_source_reads_text_at_the_ambient_encoding(self):
+        # The suite's own files are exempt: they read fixtures this repository writes, in ASCII, and
+        # holding them to the launcher's failure mode would only teach the next author to weaken it.
+        offenders = [
+            f"{path.relative_to(ROOT)}:{number}: {line.strip()}"
+            for path in tracked_files(".py")
+            if "tests/" not in path.relative_to(ROOT).as_posix()
+            for number, line in unencoded_text_calls(path.read_text(encoding="utf-8"))
+        ]
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+    def test_the_text_guard_spells_out_every_shape(self):
+        # Each of these is a call the sweep must see; the third is the one a line-pattern check
+        # missed, and the fourth is correct because read_text takes encoding positionally.
+        for source, expected in (
+            ("x = path.read_text()", 1),
+            ("x = (root / n).read_text(  )", 1),
+            ('x = wire.read_text(errors="replace")', 1),
+            ('x = target.write_text(json.dumps(a))', 1),
+            ('x = path.read_text("utf-8")', 0),
+            ('x = path.read_text(encoding="utf-8")', 0),
+            ('x = target.write_text(body, encoding="utf-8")', 0),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(len(unencoded_text_calls(source)), expected, source)
 
 
 BSD_CHMOD_STUB = """

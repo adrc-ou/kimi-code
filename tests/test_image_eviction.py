@@ -199,7 +199,14 @@ class GuidanceAndGatingTests(unittest.TestCase):
 
 
 class ConsistencyTests(unittest.TestCase):
-    """Three files have to agree on one default, and drift would be invisible."""
+    """One decision, written down in four places that can each be edited alone.
+
+    The launch default appears in ``compose.yaml``'s interpolation, in the copied
+    ``.env.example``, in where the step sits in ``tools/tui/flow.py``'s sequence, and in whether
+    ``runtime/mcp.json`` registers the re-read tool enabled. Any one of them can be changed
+    without touching the others, and no single-file test would notice - so each pair is asserted
+    against the same ``STEP.FIRST_DEFAULT`` the screen itself opens on.
+    """
 
     def test_compose_defaults_to_the_same_answer_as_the_screen(self):
         compose = (ROOT / "compose.yaml").read_text()

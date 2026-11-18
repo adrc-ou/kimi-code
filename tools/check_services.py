@@ -49,6 +49,14 @@ SMOKE_CALLS = {
 }
 
 
+#: The services this tool probes on every run without ``--server``, before any module adds a
+#: ``service_<name>.py`` of its own. Each name must resolve inside :func:`service_probe` -- through
+#: the local-tools branch, a probe module, or the health-url map -- and nothing but this constant
+#: says so; a name added here without one of those is a KeyError that the worker reports as a
+#: quoted key name, which is how the web-search gap was found.
+BUILTIN_SERVICES = ("kimi-web", "model-proxy", "search", "local-tools")
+
+
 class NeedsSetup(Exception):
     """A reachable server needs operator configuration before it is useful."""
 
@@ -73,6 +81,20 @@ class SearchUnavailable(Exception):
 
 
 LANGUAGE_SERVER_STATUS = re.compile(r"^Language server status: (.*)$", re.MULTILINE)
+
+
+class UnconfiguredService(Exception):
+    """A probe needs an environment variable the selected stack was never configured to set.
+
+    Only the service and the variable *names* are carried, never their values, for the same reason
+    :class:`UnmountedBearerVariable` keeps to the name: this verdict is copied into a report that
+    leaves the container.
+    """
+
+    def __init__(self, service: str, variables: list[str]) -> None:
+        super().__init__(f"{service} is not configured on this stack")
+        self.service = service
+        self.variables = sorted(set(variables))
 
 
 class UnmountedBearerVariable(Exception):
@@ -152,6 +174,13 @@ def classify_error(error):
             f"reachable, but Kimi will not mount it: bearer variable {error.variable} is unset or "
             "empty, so a session gets no tools from it; give it a value or remove "
             "bearerTokenEnvVar and use the server anonymously"
+        )
+    if isinstance(error, UnconfiguredService):
+        return "SETUP", (
+            f"{error.service} is not configured on this stack: "
+            + " and ".join(error.variables)
+            + " are unset or empty; select the module that sets them, or check this service"
+            " without --full"
         )
     if isinstance(error, NeedsSetup):
         return "SETUP", "Serena needs an active coding project; see verification guide"
@@ -310,11 +339,18 @@ def service_probe(name, full):
     }
     request = urllib.request.Request(urls[name])
     if name == "search" and full:
+        # Both names come from compose.search.yaml, so a stack that did not select web search has
+        # neither. Read as a subscript here it raised KeyError, which the worker's blanket handler
+        # turned into a verdict quoting the bare key name; unset and blank both mean unconfigured.
+        variables = ("KIMI_WEB_SEARCH_BASE_URL", "KIMI_WEB_SEARCH_API_KEY")
+        missing = [key for key in variables if not os.environ.get(key, "").strip()]
+        if missing:
+            raise UnconfiguredService("web search", missing)
         request = urllib.request.Request(
-            os.environ["KIMI_WEB_SEARCH_BASE_URL"],
+            os.environ[variables[0]],
             data=json.dumps({"text_query": "Python official documentation"}).encode(),
             headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {os.environ['KIMI_WEB_SEARCH_API_KEY']}"},
+                     "Authorization": f"Bearer {os.environ[variables[1]]}"},
         )
     with urllib.request.urlopen(request, timeout=20) as response:
         payload = response.read(8 * 1024 * 1024)
@@ -466,7 +502,7 @@ def main():
         evidence = {"verdict": "unverified"}
         try:
             if args.worker == "mcp":
-                servers = json.loads(args.config.read_text())["mcpServers"]
+                servers = compatibility.read_servers(args.config)
                 contracts = compatibility.load_manifest(args.contracts, servers)
                 result = asyncio.run(mcp_probe(
                     args.name, servers[args.name], args.full, contracts.get(args.name),
@@ -483,15 +519,20 @@ def main():
         print(json.dumps(result))
         return 0
 
-    config = json.loads(args.config.read_text())["mcpServers"]
+    try:
+        config = compatibility.read_servers(args.config)
+    except compatibility.ContractError as error:
+        # parser.error is how this tool already refuses bad input: one line and exit 2, rather
+        # than a traceback out of a diagnostic whose whole job is to report cleanly.
+        parser.error(str(error))
     if args.server and args.server not in config:
         parser.error("--server must name a configured MCP server")
     mode = "compatibility" if args.compatibility_only else "full" if args.full else "quick"
     if args.report:
         write_report(args.report, mode, [], None, run_id, "pending")
-    jobs = [] if args.compatibility_only or args.server else [("service", name) for name in (
-        "kimi-web", "model-proxy", "search", "local-tools"
-    )]
+    jobs = [] if args.compatibility_only or args.server else [
+        ("service", name) for name in BUILTIN_SERVICES
+    ]
     if not args.compatibility_only and not args.server:
         jobs.extend(("service", path.stem.removeprefix("service_"))
                     for path in Path(__file__).parent.glob("service_*.py"))

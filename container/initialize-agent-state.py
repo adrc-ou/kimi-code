@@ -219,7 +219,7 @@ def merge_config(stage: Path, home: Path, merge_module: Path, uid: int, gid: int
     """Rebuild the agent's writable config from the baseline plus its user-owned keys."""
     module = load_merge_module(merge_module)
     try:
-        baseline = module.parse_config((stage / "kimi-config.toml").read_text())
+        baseline = module.parse_config((stage / "kimi-config.toml").read_text(encoding="utf-8"))
         policy = module.load_policy(stage / "config-policy.json")
     except (OSError, module.ConfigMergeError, module.ConfigPolicyError) as exc:
         raise StagingError(f"launcher config baseline is unusable: {exc}") from exc
@@ -228,7 +228,7 @@ def merge_config(stage: Path, home: Path, merge_module: Path, uid: int, gid: int
     outcome = "baseline"
     if target.is_file():
         try:
-            current = module.parse_config(target.read_text())
+            current = module.parse_config(target.read_text(encoding="utf-8"))
             outcome = "merged"
         except (OSError, module.ConfigMergeError):
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())

@@ -64,7 +64,6 @@ CONTROL_TIMEOUT_SECONDS = 30.0
 #: fallback that does.
 COUNT_TIMEOUT_SECONDS = 20.0
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
-MAX_STATUS_BYTES = 1024 * 1024
 #: SSE comments during a long prefill. Deliberately a comment line, not a chunk: a keepalive that
 #: looks like model output would be counted as progress by exactly the lease that exists to notice
 #: the absence of progress.
@@ -729,7 +728,7 @@ def make_handler(frontend: Frontend) -> type[BaseHTTPRequestHandler]:
             if path == "/v1/chat/completions/input_tokens":
                 self._count(payload)
                 return
-            if path in {"/v1/chat/completions", "/chat/completions"}:
+            if path == "/v1/chat/completions":
                 self._complete(payload)
                 return
             self._error(404, "not_found", f"no route {path}")
@@ -983,7 +982,7 @@ def main(argv: list[str] | None = None) -> int:
             # The receipt is written by the supervisor, after both identity verification and a real
             # generation have succeeded. Writing it here would repeat the mistake this replaced.
             Path(args.ready_file).write_text(
-                json.dumps({"ready": True, "pid": os.getpid()})
+                json.dumps({"ready": True, "pid": os.getpid()}), encoding="utf-8"
             )
         print(
             f"local engine listening on {args.host}:{args.port} "

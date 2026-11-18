@@ -42,14 +42,15 @@ class CounterFatal(RuntimeError):
 
 def build_tokenizer(model_dir: str) -> Any:
     """Load just the tokenizer for a pinned artifact directory."""
-    from mlx_lm import load_tokenizer
-
+    # Checked before the import, not after: an absent artifact directory is a configuration error,
+    # and naming it should not first cost loading MLX -- which on any host without the provisioned
+    # runtime would raise ImportError and hide the actual answer.
     if not Path(model_dir).is_dir():
         raise CounterFatal(f"artifact directory is not present: {model_dir}")
+    from mlx_lm import load_tokenizer
+
     try:
         return load_tokenizer(model_dir)
-    except CounterFatal:
-        raise
     except Exception as exc:  # noqa: BLE001 - a tokenizer that will not load has many causes
         raise CounterFatal(f"tokenizer could not be loaded: {exc}") from exc
 
@@ -82,7 +83,11 @@ def serve(stdin, stdout, tokenizer: Any) -> int:
             continue
         try:
             request = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
+            request = None
+        if not isinstance(request, dict):
+            # The same rule mlx_worker.serve states: a line that is not JSON, and a line that is
+            # valid JSON but not a request object, each cost a refusal rather than the counter.
             _write(
                 stdout,
                 {"kind": "refused", "code": str(mlx_worker.WorkerError.MALFORMED_REQUEST)},

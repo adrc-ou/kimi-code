@@ -68,11 +68,10 @@ GUIDE_WIDTH = 2
 #: The fewest label columns worth keeping before the numeric tail starts giving way. Below this a
 #: figure attached to half a name identifies nothing, so the tail is dropped instead of the label.
 MIN_LABEL = 12
-#: The floor on the gap between a label and its first right-hand column, shared with the plain
-#: panel so a wrapped label never lands against a number in either renderer.
-COLUMN_GAP = 3
-#: The gap between two tail columns.
-FIELD_GAP = 2
+#: Both gaps come from :mod:`layout`, the single owner shared with the plain panel, so the two
+#: renderers of one frame cannot be retuned apart from each other.
+COLUMN_GAP = L.LABEL_TAIL_GAP
+FIELD_GAP = L.FIELD_GAP
 #: The two characters the mark column puts between delimiters. ``x`` is the value every vocabulary
 #: here agrees means "in use", because ``[x]`` is the one mark nobody has to learn.
 ON_MARK = "x"

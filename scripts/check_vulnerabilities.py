@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,10 @@ APK_UPGRADE_RE = re.compile(r"apk add[^\n]*?--upgrade[^\n]*?\b([a-z0-9][a-z0-9._
 COPY_RE = re.compile(r"^\s*COPY\s+(?:--from=\S+\s+)?(\S+)\s+\S+", re.IGNORECASE | re.MULTILINE)
 LOCK_PIN_RE = re.compile(r"^([A-Za-z0-9._-]+)==([^ \\\\]+)")
 DIGEST_RE = re.compile(r"^(?P<ref>[^@\s]+)@(?P<digest>sha256:[0-9a-f]{64})$")
+
+#: One scan of a pinned base reference, returning the scanner's raw finding objects: grype itself in
+#: a real run, a stand-in in a test. ``check_bases`` judges the findings; this says how they arrive.
+Scanner = Callable[[str, Path], list[dict]]
 
 
 def gated_contexts() -> list[tuple[str, str]]:
@@ -128,7 +133,10 @@ def write_ignore(accepted: dict) -> Path:
             handle.write(f"  - vulnerability: {vulnerability}\n")
             handle.write(f"    package:\n      name: {package}\n")
     handle.close()
-    path.chmod(0o644)
+    # Left at tempfile's 0600. grype is spawned by this same user with no `user=`, so a wider
+    # mode bought nothing and put the accepted-vulnerability list — and each entry's expiry — in
+    # world-readable shared memory for the length of the scan. If a future invocation ever runs
+    # the scanner as somebody else, grype exits non-zero and grype_json names it.
     return path
 
 
@@ -145,7 +153,7 @@ def grype_json(reference: str, ignore_file: Path) -> list[dict]:
     return json.loads(result.stdout).get("matches", []) if result.stdout.strip() else []
 
 
-def check_bases(gate: list, accepted: dict, scanner: Path) -> list[str]:
+def check_bases(gate: list, accepted: dict, scanner: Scanner) -> list[str]:
     problems = []
     ignore_file = write_ignore(accepted)
     try:
@@ -298,15 +306,16 @@ def main() -> int:
         return 0
 
     problems = check_expires(accepted)
-    scanner = shutil.which("grype")
-    if scanner is None:
+    if shutil.which("grype") is None:
         problems.append(
             "grype is not on PATH, so the image layer was never checked. Install the version the "
             "security job pins, or trust the pipeline instead of this script - but do not read a "
             "run that scanned nothing as a pass."
         )
     else:
-        problems += check_bases(gate, accepted, lambda ref, ign: grype_json(ref, ign))
+        # Which grype runs is decided the same way here and inside grype_json, so the two cannot
+        # disagree about what "the scanner is present" meant.
+        problems += check_bases(gate, accepted, grype_json)
     problems += check_locks(locks_in_gate(gate), accepted)
 
     if problems:

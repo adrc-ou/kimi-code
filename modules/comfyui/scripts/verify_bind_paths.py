@@ -73,7 +73,7 @@ def main() -> None:
     parser.add_argument("manifest", type=Path)
     args = parser.parse_args()
     if args.mode == "emit":
-        current = json.loads(args.manifest.read_text())
+        current = json.loads(args.manifest.read_text(encoding="utf-8"))
         for name, item in current.items():
             print(f"COMFYUI_{name.upper()}_PATH={item['path']}")
         return
@@ -81,13 +81,13 @@ def main() -> None:
     if args.mode == "record":
         args.manifest.parent.mkdir(parents=True, exist_ok=True)
         temporary = args.manifest.with_suffix(".tmp")
-        temporary.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
+        temporary.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.chmod(temporary, 0o600)
         os.replace(temporary, args.manifest)
         for name, item in current.items():
             print(f"COMFYUI_{name.upper()}_PATH={item['path']}")
         return
-    expected = json.loads(args.manifest.read_text())
+    expected = json.loads(args.manifest.read_text(encoding="utf-8"))
     if current != expected:
         raise SystemExit("bind source changed after initialization")
 

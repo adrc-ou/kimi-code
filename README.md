@@ -410,8 +410,10 @@ produce a token. A model declaring `tool_use` is additionally asked to make a to
 call. A backend that answers questions about itself but cannot compute no longer
 passes: the launch fails and says so, instead of staging a session that retries an
 empty answer forever. Your own `python3 tools/local_llm.py status` line is
-unchanged; `--check` on the runtime tells you whether an MLX environment is
-provisioned.
+unchanged, and so is `tools/local_llm.py check <model-id>`: both answer about a
+model's weights and whether its engine is listening, a different question from the
+one the readiness gate above asks, and neither is a CLI for the provisioned MLX
+interpreter.
 
 After a launch, an engine that reports a device-level failure is latched and every
 later request for it is refused before it can reach the wire, because a retry

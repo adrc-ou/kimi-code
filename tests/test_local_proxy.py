@@ -74,6 +74,36 @@ def local_plan():
     return plan
 
 
+def two_lane_engine_plan():
+    """``local_plan()`` with the long lane bound to the SAME engine as subagent.
+
+    Two of validate_policy's refusals only exist once one engine serves more than one lane -- lanes
+    that disagree about where the engine lives, and a lane naming an engine the plan does not carry.
+    The single-lane fixture cannot reach either, so neither was ever exercised.
+    """
+    plan = local_plan()
+    source, lane = plan["lanes"]["subagent"], plan["lanes"]["long"]
+    lane.update(
+        model_id=ENGINE_ID,
+        provider="fixture",
+        credential="default",
+        provider_name="fixture-long",
+        model="fixture-model",
+        alias="fixture-long",
+        base_url=source["base_url"],
+        context_tokens=CONTEXT,
+        input_tokens=CONTEXT - plan["reserved_context_size"],
+        output_clamp_tokens=CONTEXT,
+        reservation=CONTEXT,
+        engine_id=ENGINE_ID,
+        output_mode="remaining_context",
+        token_accounting="engine",
+        counters=[ENGINE_COUNTER],
+    )
+    plan["counters"][ENGINE_COUNTER]["lanes"] = ["subagent", "long"]
+    return plan
+
+
 def props():
     return {
         "build_info": "fixture-build-fixturecommit",
@@ -157,11 +187,63 @@ class LocalPlanTests(unittest.TestCase):
                 policy = fixtures.loaded_policy(plan)
                 P.validate_policy(policy)
 
+    def test_an_engine_record_that_is_not_an_object_stops_startup(self):
+        plan = local_plan()
+        plan["engines"][ENGINE_ID] = "fixture/local"
+        with self.assertRaisesRegex(RuntimeError, "must be an object"):
+            P.validate_policy(fixtures.loaded_policy(plan))
+
+    def test_an_engine_without_a_usable_identity_field_stops_startup(self):
+        for key in ("build_commit", "model_alias", "model_path"):
+            plan = local_plan()
+            plan["engines"][ENGINE_ID][key] = ""
+            with self.subTest(field=key):
+                with self.assertRaisesRegex(RuntimeError, f"engine {ENGINE_ID}.{key} must be"):
+                    P.validate_policy(fixtures.loaded_policy(plan))
+
+    def test_a_counter_naming_an_absent_engine_stops_startup(self):
+        # An engine counter is what makes the proxy hold a slot per sequence. Left pointing at an
+        # engine the plan does not have, it would count nothing while every lane still believed it
+        # was bounded.
+        plan = local_plan()
+        ghost = f"ghost/{ENGINE_ID.rsplit('/', 1)[1]}"
+        plan["counters"][f"count:engine:{ghost}"] = dict(
+            plan["counters"][f"count:engine:{ENGINE_ID}"], subject=ghost
+        )
+        with self.assertRaisesRegex(RuntimeError, "references an unknown engine"):
+            P.validate_policy(fixtures.loaded_policy(plan))
+
+    def test_two_lanes_of_one_engine_must_agree_where_it_lives(self):
+        # One engine serving two lanes is the normal shape of a local launch, and the proxy holds a
+        # single connection set per engine: if the lanes disagreed on origin or credential there
+        # would be no honest answer to which upstream a request on this engine actually reaches.
+        # The shared-engine plan itself has to be servable, or the refusal below would only prove
+        # the fixture was broken.
+        P.validate_policy(fixtures.loaded_policy(two_lane_engine_plan()))
+        plan = two_lane_engine_plan()
+        plan["lanes"]["long"]["base_url"] = "http://elsewhere.invalid"
+        with self.assertRaisesRegex(RuntimeError, "lanes disagree on origin or credential"):
+            P.validate_policy(fixtures.loaded_policy(plan))
+
+    def test_a_lane_naming_an_engine_the_plan_does_not_carry_stops_startup(self):
+        plan = two_lane_engine_plan()
+        # Both moves are required to reach this check at all: _lane_from_plan refuses a lane whose
+        # engine_id differs from its model_id first, and the engine's own counter still lists the
+        # lane until it is narrowed -- so the earlier guards, not this one, would otherwise answer.
+        ghost = "fixture/ghost"
+        plan["lanes"]["long"]["engine_id"] = plan["lanes"]["long"]["model_id"] = ghost
+        plan["counters"][ENGINE_COUNTER]["lanes"] = ["subagent"]
+        with self.assertRaisesRegex(RuntimeError, f"references unknown engine {ghost}"):
+            P.validate_policy(fixtures.loaded_policy(plan))
+
     def test_an_unreferenced_engine_is_rejected_without_memory_accounting(self):
         plan = local_plan()
         engine = copy.deepcopy(plan["engines"][ENGINE_ID])
         plan["engines"]["fixture/other"] = engine
-        with self.assertRaises(RuntimeError):
+        # Named by message. The engine this adds has no sequence counter either, so with the
+        # "not referenced" guard deleted the very next check still raises RuntimeError and the test
+        # passes - leaving "rejected before any memory accounting" entirely untested.
+        with self.assertRaisesRegex(RuntimeError, "is not referenced by any lane"):
             P.validate_policy(fixtures.loaded_policy(plan))
 
 
@@ -184,7 +266,7 @@ class LocalPreparationTests(unittest.IsolatedAsyncioTestCase):
             content_type="application/json",
             headers={},
             transport=SimpleNamespace(is_closing=lambda: False),
-            app={"client": self.session},
+            app={P.CLIENT: self.session},
         )
         patcher = patch.object(P, "upstream_credential", return_value="fixture-key")
         patcher.start()
@@ -397,7 +479,7 @@ class FatalLatchTests(unittest.TestCase):
             content_type="application/json",
             headers={},
             transport=SimpleNamespace(is_closing=lambda: False),
-            app={"client": SimpleNamespace()},
+            app={P.CLIENT: SimpleNamespace()},
         )
         with (
             patch.object(P, "admission", LatchingAdmission),
@@ -446,7 +528,7 @@ class FatalLatchTests(unittest.TestCase):
             with self.assertRaises(P.web.HTTPServiceUnavailable):
                 asyncio.run(
                     self.manager.prepare(
-                        SimpleNamespace(app={"client": session}),
+                        SimpleNamespace(app={P.CLIENT: session}),
                         self.lane,
                         self.engine,
                         b'{"messages":[]}',
@@ -705,10 +787,6 @@ class ScannerOutcomeTests(unittest.TestCase):
         self.assertFalse(P.Attempt(outcome=P.Outcome.CONTENT).unusable_local_completion)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LocalRefusalTests(unittest.TestCase):
     """A local engine answering 4xx is refusing the request, not dying.
 
@@ -731,7 +809,9 @@ class LocalRefusalTests(unittest.TestCase):
         patcher = patch.object(P, "current_policy", return_value=self.policy)
         patcher.start()
         self.addCleanup(patcher.stop)
-        patch.object(P, "upstream_credential", lambda _name: "k" * 40).start()
+        credential = patch.object(P, "upstream_credential", lambda _name: "k" * 40)
+        credential.start()
+        self.addCleanup(credential.stop)
 
     def _attempt(self, status: int):
         class Content:
@@ -759,7 +839,7 @@ class LocalRefusalTests(unittest.TestCase):
             content_type="application/json",
             headers={},
             transport=SimpleNamespace(is_closing=lambda: False),
-            app={"client": SimpleNamespace()},
+            app={P.CLIENT: SimpleNamespace()},
         )
         manager = self.manager
 
@@ -805,3 +885,7 @@ class LocalRefusalTests(unittest.TestCase):
         outcome = self._attempt(500)
         self.assertEqual(outcome.failure, "upstream_error", outcome.failure)
         self.assertFalse(outcome.permanent)
+
+
+if __name__ == "__main__":
+    unittest.main()

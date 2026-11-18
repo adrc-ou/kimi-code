@@ -18,18 +18,34 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from local_engines.base import (
-    Artifact,
-    Computed,
-    EngineAdapterError,
-    EngineIdentity,
-    EngineStatus,
-    Launch,
-    Registry,
-    Runtime,
-    normalize_engine_document,
-    positive_int,
-)
+if __package__:
+    from .base import (
+        Artifact,
+        Computed,
+        EngineAdapterError,
+        EngineIdentity,
+        EngineStatus,
+        Launch,
+        Registry,
+        Runtime,
+        normalize_engine_document,
+        positive_int,
+        sibling_module,
+    )
+else:  # every launcher path imports these flat, from tools/ on sys.path
+    from local_engines.base import (
+        Artifact,
+        Computed,
+        EngineAdapterError,
+        EngineIdentity,
+        EngineStatus,
+        Launch,
+        Registry,
+        Runtime,
+        normalize_engine_document,
+        positive_int,
+        sibling_module,
+    )
 
 
 class LlamaCppAdapter:
@@ -40,7 +56,7 @@ class LlamaCppAdapter:
     # ---------------------------------------------------------------- provision
 
     def provision(self, *, install: bool = True) -> Runtime:
-        import local_llm
+        local_llm = sibling_module("local_llm")
 
         binary = local_llm.engine_binary(install=install)
         entry = local_llm.engine_plan()
@@ -56,7 +72,7 @@ class LlamaCppAdapter:
         )
 
     def identity(self, runtime: Runtime) -> EngineIdentity:
-        import local_llm
+        local_llm = sibling_module("local_llm")
 
         record = local_llm.capacity_identity(Path(runtime.executable))
         return EngineIdentity(
@@ -70,7 +86,7 @@ class LlamaCppAdapter:
     # ---------------------------------------------------------------- artifact
 
     def validate_artifact(self, model: Mapping[str, Any], lock: Mapping[str, Any]) -> Artifact:
-        import local_llm
+        local_llm = sibling_module("local_llm")
 
         directory = local_llm.weights_dir(model)
         paths = tuple(directory / entry["path"] for entry in lock["files"])
@@ -99,7 +115,7 @@ class LlamaCppAdapter:
         engine: Mapping[str, Any],
         token: str,
     ) -> Launch:
-        import local_llm
+        local_llm = sibling_module("local_llm")
 
         sequences = positive_int(engine.get("sequences"), "sequence slots")
         argv = tuple(
@@ -215,7 +231,7 @@ class LlamaCppAdapter:
     def canary(
         self, origin: str, token: str, model: Mapping[str, Any], engine: Mapping[str, Any]
     ) -> Computed:
-        import local_llm
+        local_llm = sibling_module("local_llm")
 
         host, _, port = origin.rpartition(":")
         record = local_llm.LocalModelCanary(
@@ -241,7 +257,7 @@ class LlamaCppAdapter:
         that removed harness RAM admission kept it as a diagnostic. It stays here rather than in the
         resolver so nothing can mistake a projection for an approval.
         """
-        import capacity
+        capacity = sibling_module("capacity")
 
         return {"projection_engine": capacity.projection_engine(install=False)[0].name}
 

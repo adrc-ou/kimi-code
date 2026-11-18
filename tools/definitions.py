@@ -52,7 +52,10 @@ def _no_secret_separator(value: str, where: str) -> str:
     return value
 
 
-SCHEMA_VERSION = 1
+#: Every manifest schema this reader understands. The shipped definitions use 1 and 3; 2 is the
+#: intermediate that introduced the ``[execution]`` and ``[capacity]`` tables and is still accepted,
+#: because dropping a version would refuse a checkout that resolves fine. What each version adds is
+#: read per version below, never assumed from the highest one.
 MANIFEST_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 LANES = ("primary", "long", "subagent")
 CREDENTIAL_LANES = ("primary", "subagent")
@@ -70,6 +73,14 @@ HOST_CAPABILITIES = frozenset({"metal", "cuda"})
 #: ``tools/local_llm.py``.
 WEIGHTS_DIR = "weights"
 WEIGHTS_LOCK = "weights.lock.json"
+
+#: The resolved policy plan: the one document whose writer and readers live in five different files
+#: (the version resolver writes it; the serving launcher, the capacity smoke, the qualification
+#: harness and the startup panel each read it), so the name belongs to one module rather than to
+#: whoever copied it last. Named once for the same reason ``tools/models.py`` names it in its own
+#: group of instance-document names: a reader looking for a plan nobody wrote fails as "this launch
+#: has no engines", which is a wrong answer rather than a visible one.
+MODEL_POLICY_FILE = "model-policy.json"
 
 #: Host floors a model may declare for itself. Both are GiB measured against the *host*, since a
 #: local server runs there and inside no container limit. Zero means no floor.
@@ -433,7 +444,11 @@ def _parse_profile(settings: Any, engine: str, where: str) -> dict[str, Any]:
     keys = integer | nonnegative | set(choices) | listed | set(fixed)
     if set(settings) != keys:
         raise DefinitionError(f"{here} must declare exactly {', '.join(sorted(keys))}")
-    result = {name: _positive_int(settings, name, here) for name in sorted(integer)}
+    # A profile is deliberately heterogeneous: integers from ``integer``, a non-negative count, one
+    # of a declared set of strings from ``choice``, and a sorted list from ``list``. The first
+    # comprehension would otherwise fix this as dict[str, int] and every later kind would be an
+    # error the checker invents rather than a defect in the document.
+    result: dict[str, Any] = {name: _positive_int(settings, name, here) for name in sorted(integer)}
     for name in sorted(nonnegative):
         value = settings[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -523,7 +538,7 @@ def _parse_memory(raw: Any, where: str) -> dict[str, Any]:
     }
 
 
-def _select_default_profile(profiles: dict[str, Any], where: str, version: int) -> str:
+def _select_default_profile(profiles: dict[str, Any], where: str) -> str:
     """Which profile a model that names none should get.
 
     A version-2 manifest has exactly one, so "default" is a fact rather than a guess. A version-3
@@ -533,6 +548,9 @@ def _select_default_profile(profiles: dict[str, Any], where: str, version: int) 
     """
     if len(profiles) == 1:
         return next(iter(profiles))
+    # Unreachable from either caller today: version 2 builds exactly one profile, and version 3
+    # never calls this. It is the shape of the rule, kept so that relaxing either half fails here
+    # rather than silently choosing an engine by key order.
     raise DefinitionError(
         f"{where}.execution declares {len(profiles)} profiles, so a model must name one: no "
         "implicit default may select an engine"
@@ -581,14 +599,14 @@ def _parse_execution(raw: Any, where: str, version: int) -> dict[str, Any]:
             )
         engines[name] = str(engine)
         settings[name] = _parse_profile(payload, str(engine), place)
-    if not engines:
+    if not engines:  # pragma: no cover - a non-empty `declared` appends one entry, or raises
         raise DefinitionError(f"{here} declares no profile")
     # A version-2 provider has one profile, so the singular keys below are simply that profile and
     # every existing reader keeps working unchanged. A version-3 provider deliberately leaves them
     # empty: choosing an engine by dictionary order would decide which runtime serves a model from a
     # key nobody wrote down, so a v3 reader must go through the model's bound serving profile and a
     # provider that offers several cannot be served by a reader that does not.
-    selected = _select_default_profile(engines, where, version) if version == 2 else None
+    selected = _select_default_profile(engines, where) if version == 2 else None
     # ``profile`` and ``engine`` stay populated for readers that predate named profiles. Normalising
     # here instead of at each call site is what keeps a version-2 provider and a version-3 one
     # indistinguishable to ``capacity.py``, so the schema bump carries no resolver blast radius.
@@ -857,6 +875,11 @@ def _parse_serving(raw: Any, where: str, version: int) -> dict[str, Any] | None:
     the provider cannot describe.
     """
     if version != 3:
+        # Unreachable today, and kept as a backstop rather than deleted: _parse_model is the only
+        # caller, and it adds "serving" to the accepted key set only for version 3, so a pre-v3
+        # manifest naming [serving] is refused earlier as an unknown root key. If that key set ever
+        # stops being version-gated, this is the branch that stops a version-2 model claiming a
+        # profile its single-profile provider cannot describe.
         if raw is not None:
             raise DefinitionError(
                 f"{where}.serving names a serving profile, which only a schema version 3 model "
@@ -1109,13 +1132,31 @@ def _parse_model(provider_id: str, model_id: str, path: Path) -> dict[str, Any]:
         "lanes": lanes,
         "capabilities": _string_list(document, "capabilities", where),
         "support_efforts": _string_list(document, "support_efforts", where),
-        "default_effort": document.get("default_effort", ""),
+        "default_effort": _effort(document, "default_effort", where),
         "requires": requires,
         "install": install,
         "serving": serving,
         "weights_dir": path / WEIGHTS_DIR,
         "lock_path": lock_path,
     }
+
+
+def _effort(table: dict[str, Any], key: str, where: str) -> str:
+    """Read an optional effort level: absence is ``""``, presence a bare lowercase word.
+
+    The value is copied verbatim into the generated Kimi model table by :mod:`policy`, and nothing
+    in this repository judges it afterwards, so a ``Medium`` would be shipped as-is. What Kimi then
+    does with it is outside this checkout and is deliberately not claimed here: it may reject it,
+    ignore it, or normalise it. Either way this is the only place that can hold the manifest
+    to the constraint its own message states, which is why it refuses rather than pass the
+    ambiguity on.
+    """
+    value = table.get(key)
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str) or not BARE.fullmatch(value) or not value.islower():
+        raise DefinitionError(f"{where}.{key} must be a bare lowercase word")
+    return value
 
 
 def _string_list(document: dict[str, Any], key: str, where: str) -> list[str]:
@@ -1159,9 +1200,7 @@ def _parse_lanes(raw: Any, where: str, *, version: int = 1) -> dict[str, dict[st
         for key in table:
             if key not in keys:
                 raise DefinitionError(f"{here} has unknown key {key!r}")
-        effort = table.get("default_effort", "")
-        if effort and (not isinstance(effort, str) or not BARE.fullmatch(effort)):
-            raise DefinitionError(f"{here}.default_effort must be a bare lowercase word")
+        effort = _effort(table, "default_effort", here)
         if version in (2, 3):
             if (
                 table.get("allocation") != "engine"

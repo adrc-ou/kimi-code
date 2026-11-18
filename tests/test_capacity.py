@@ -1,8 +1,10 @@
 """Native-context resolution does not admit or resize models using physical memory."""
 
+import ast
 import contextlib
 import copy
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -14,9 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(ROOT / "tools"))
 
-from local_engines.base import Artifact, EngineIdentity  # noqa: E402
-
 from tools import capacity  # noqa: E402
+from tools.local_engines.base import (  # noqa: E402
+    Artifact,
+    EngineAdapterError,
+    EngineIdentity,
+)
 
 PROFILE = {
     "context_granularity": 256,
@@ -120,6 +125,43 @@ class AllocationTests(unittest.TestCase):
         with mock.patch.object(capacity.host_caps, "probe") as probe:
             self.assertEqual(capacity.prepare(ROOT, ROOT, {}, {}, {}, 1024), {"engines": {}})
             probe.assert_not_called()
+
+
+class MemoryPolicyTests(unittest.TestCase):
+    """One device is bounded by one declaration.
+
+    ``_memory_policy`` reads the block off every selected engine's provider and requires agreement:
+    a mixed pair would mean two aggregate wiring targets for the same memory, and whichever one
+    won, the other engine would be wired by a rule nobody chose. Refusing is the whole behaviour,
+    and none of it was executed by any test before this class.
+    """
+
+    PROVIDERS = {
+        "local": {"execution": {"memory": {"strategy": "bounded_wiring", "target": "none"}}},
+        "other": {"execution": {"memory": {"strategy": "uncontrolled", "target": "none"}}},
+    }
+
+    def test_engines_sharing_one_declaration_get_it(self):
+        engines = {"local/a": {}, "local/b": {}}
+        self.assertEqual(
+            capacity._memory_policy(engines, self.PROVIDERS),
+            self.PROVIDERS["local"]["execution"]["memory"],
+        )
+
+    def test_two_different_declarations_are_refused(self):
+        with self.assertRaisesRegex(
+            capacity.CapacityError, "cannot be bounded by two aggregate targets"
+        ):
+            capacity._memory_policy({"local/a": {}, "other/b": {}}, self.PROVIDERS)
+
+    def test_a_provider_naming_no_memory_block_declares_an_empty_one(self):
+        # Absent means "wire nothing deliberately", not "this provider is missing": the first is a
+        # choice the manifest made, the second would be a loader bug surfacing as a capacity error.
+        providers = {"local": {"execution": {}}, "other": {"execution": {}}}
+        self.assertEqual(capacity._memory_policy({"local/a": {}, "other/b": {}}, providers), {})
+
+    def test_no_selected_engine_is_not_an_error(self):
+        self.assertEqual(capacity._memory_policy({}, {}), {})
 
 
 class PreparationTests(unittest.TestCase):
@@ -635,10 +677,6 @@ class ProjectionTests(unittest.TestCase):
                 capacity.parse_projection(output)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class WiringTests(unittest.TestCase):
     """Residency is bounded from measurements, and never becomes an admission test."""
 
@@ -856,3 +894,84 @@ class WiringTests(unittest.TestCase):
                     (engine["context_tokens"], engine["sequences"], engine["total_context_tokens"])
                 )
         self.assertEqual(len(set(observed)), 1, f"memory changed the plan: {observed}")
+
+
+class AdapterRegistrationTests(unittest.TestCase):
+    """An adapter that exists on disk has to be one the registry knows."""
+
+    PACKAGE = ROOT / "tools" / "local_engines"
+    KIND = re.compile(r'^ {4}kind = "([a-z_]+)"', re.MULTILINE)
+
+    def declared(self) -> dict[str, str]:
+        """Each adapter module in the package, keyed by the kind its own class declares."""
+        found = {}
+        for path in sorted(self.PACKAGE.glob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            if "def register(" in text:
+                for kind in self.KIND.findall(text):
+                    found[kind] = path.name
+        return found
+
+    def test_the_discovery_probe_sees_the_adapters_that_exist(self):
+        # Without this, a change to the marker above would leave the next test asserting nothing.
+        declared = self.declared()
+        self.assertGreaterEqual(len(declared), 2, declared)
+
+    def test_every_adapter_module_registers_its_kind(self):
+        # capacity.py imports each adapter inside `except ImportError: continue`. That is right for
+        # an optional dependency and wrong for a broken one: an adapter that fails to import on a
+        # host which does support it simply vanishes, and the only symptom is a refusal that reads
+        # like the operator chose an engine this platform cannot run.
+        for kind, module in self.declared().items():
+            with self.subTest(kind=kind, module=module):
+                self.assertIn(kind, capacity.engine_kinds())
+
+    def test_no_tools_module_binds_a_sibling_by_its_flat_name(self):
+        # A module writing `import local_llm` binds the flat copy even when the package was
+        # loaded as tools.local_engines, which drags a second copy of the engine module into the
+        # process -- its own EngineError, its own module state. A caller or a test then patches one
+        # copy while the adapter reads the other, and a fixture impersonating a harness root read
+        # the real repository through an unpatched ROOT while still reporting green. Checked
+        # against the source rather than by calling sibling_module(): a test of the helper would
+        # keep passing while a call site went back to the flat name. Scope is the whole
+        # tools/ tree, so a new sibling import cannot arrive unguarded at the far end.
+        siblings = {
+            path.stem for path in (ROOT / "tools").glob("*.py")
+        } | {"local_engines"}
+        offenders = []
+        for path in sorted((ROOT / "tools").rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            guarded = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.If) and "__package__" in ast.unparse(node.test):
+                    for inner in ast.walk(node):
+                        guarded.add(id(inner))
+            for node in ast.walk(tree):
+                names = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                         else [node.module] if isinstance(node, ast.ImportFrom) and not node.level
+                         and node.module else [])
+                for name in names:
+                    if name.split(".")[0] in siblings and id(node) not in guarded:
+                        offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}: import {name}")
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+    def test_a_registered_adapter_raises_the_error_a_caller_can_catch(self):
+        # The adapters bind EngineAdapterError from their own package. When those imports mixed a
+        # relative and a flat spelling, importing `tools.capacity` loaded `base` twice, the adapters
+        # raised the other copy, and catching the class named above let the error escape with two
+        # classes printing an identical name.
+        for kind in capacity.engine_kinds():
+            with self.subTest(kind=kind):
+                adapter = capacity.adapter_for(kind)
+                module = __import__(type(adapter).__module__, fromlist=["EngineAdapterError"])
+                self.assertIs(module.EngineAdapterError, EngineAdapterError)
+
+    def test_an_unregistered_kind_is_refused_naming_the_registered_ones(self):
+        with self.assertRaises(EngineAdapterError) as caught:
+            capacity.adapter_for("no-such-engine")
+        self.assertIn("no-such-engine", str(caught.exception))
+        self.assertIn("registered:", str(caught.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -7,7 +7,6 @@ returned are the bytes the model was originally shown.
 
 import base64
 import hashlib
-import importlib.util
 import json
 import os
 import subprocess
@@ -22,17 +21,9 @@ for _directory in (ROOT, ROOT / "tools"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
+from tests.helpers import load_script  # noqa: E402
 
-def load_module(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-TOOL = load_module("analyze_image", ROOT / "tools" / "analyze_image.py")
+TOOL = load_script("analyze_image", Path("tools/analyze_image.py"))
 
 # Only the two cross-component tests need the proxy, and importing it is expensive in a
 # specific way: test_model_proxy raises SkipTest at module level when aiohttp is absent, and

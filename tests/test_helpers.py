@@ -273,5 +273,42 @@ class StageCrossTreeImportTests(unittest.TestCase):
         self.assertEqual(second, [])
 
 
+class SuiteOrderIndependenceTests(unittest.TestCase):
+    """Two suites that share one dynamically loaded module must pass in either order.
+
+    ``tests.test_local_proxy`` imports ``tests.test_model_proxy`` for its fixtures and reaches the
+    same loaded proxy module object, so the two are one process's state, not two. That is by design
+    - the proxy needs aiohttp and loading it twice would double the fixture cost - but it means a
+    patch left unstopped in either file silently changes what the other asserts. The suite was in
+    exactly that state: one ``patch(...).start()`` with no cleanup made nine credential tests fail,
+    and ``discover`` happened to run them so that it stayed invisible.
+
+    Reversed order is included because it is the cheap half of the proof: a leak that only shows in
+    one direction is still a leak, and running only the known-bad order would let the next one hide
+    behind whichever order the suite happens to use.
+    """
+
+    SHARED = ("tests.test_local_proxy", "tests.test_model_proxy")
+
+    def _run(self, modules: tuple[str, ...]) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "unittest", *modules],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"{modules} failed in this order; a test left state behind for the next one:\n"
+            f"{result.stderr[-2500:]}",
+        )
+
+    def test_both_orders_of_the_shared_proxy_suites_pass(self):
+        self._run(self.SHARED)
+        self._run(tuple(reversed(self.SHARED)))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

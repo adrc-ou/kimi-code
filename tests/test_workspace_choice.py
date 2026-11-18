@@ -2,7 +2,7 @@
 """Choosing the workspace: what is remembered, what counts as an answer, and how the screen
 behaves.
 
-Four groups, in the order the code is layered.
+Six groups, in the order the code is layered.
 
 ``RegistryTests`` reads and writes the durable list in ``.local/workspaces.json`` — the file that
 has to outlive the instance it selects, and whose ordering is load-bearing twice over: it is the
@@ -13,12 +13,19 @@ because every rule it enforces is a rule about what the operating system will le
 next, and a fake that agrees with the code instead of with the disk proves nothing. Where a rule
 depends on permissions this host will not honour, the case says so and steps aside.
 
+``CompletionTests`` covers ``Tab``, to the extent bash does: directories, one level, and the word
+under the caret.
+
 ``WorkspaceScreenTests`` drives the step through the same scripted terminal the engine's own suite
 uses, and asserts on what the frame *shows* — the mark, the caret, the panel, the question — since
 that is the contract the operator reads.
 
-``ChoiceTests`` runs the tool the launcher calls, which is where the one-line promise on standard
-output is either kept or broken.
+``ChoiceToolTests`` runs the tool the launcher calls, which is where the one-line promise on
+standard output is either kept or broken.
+
+``PtyWorkspaceTests`` sends real bytes rather than scripted keypresses, because ``Tab``, ``Escape``
+and the arrows are all escape sequences and only the decoder turns them into one keypress instead of
+several.
 """
 
 from __future__ import annotations

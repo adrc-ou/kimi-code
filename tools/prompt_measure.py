@@ -171,27 +171,38 @@ def lane_audiences(plan: dict[str, Any]) -> dict[str, str]:
     return aliases
 
 
-def bind_records(path: Path) -> list[dict[str, Any]]:
-    """Every ``profile.bind`` record in one agent's wire log, oldest first.
+def _wire_records(path: Path, marker: str) -> Iterable[Any]:
+    """Each JSON record one wire log holds whose line contains ``marker``, oldest first.
 
-    Malformed lines are skipped, not fatal: this reads a live log that the running UI is appending
-    to, so a torn final line is a normal thing to find.
+    Both readers below walk the same tree, so the tolerance lives here once: a wire log is a live
+    process's append-only file, the fallback glob matches the name at any depth so a directory can
+    carry it, and a session directory can go away mid-scan. A log that cannot be opened, a torn
+    final line, and a line that parses as JSON but is not a record object are therefore all skipped
+    rather than raised. A measurement is a number in a table; the cost of losing one row is that
+    row, never the launch that asked for it.
     """
-    records: list[dict[str, Any]] = []
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return records
+        return
     for line in text.splitlines():
-        if f'"{BIND_TYPE}"' not in line:
+        if marker not in line:
             continue
         try:
             record = json.loads(line)
         except ValueError:
             continue
-        if record.get("type") == BIND_TYPE and isinstance(record.get("systemPrompt"), str):
-            records.append(record)
-    return records
+        if isinstance(record, dict):
+            yield record
+
+
+def bind_records(path: Path) -> list[dict[str, Any]]:
+    """Every ``profile.bind`` record in one agent's wire log, oldest first."""
+    return [
+        record
+        for record in _wire_records(path, f'"{BIND_TYPE}"')
+        if record.get("type") == BIND_TYPE and isinstance(record.get("systemPrompt"), str)
+    ]
 
 
 def newest_binds(root: Path, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -220,13 +231,7 @@ def newest_tools(root: Path) -> dict[str, dict[str, int]]:
     found: dict[str, dict[str, int]] = {}
     for wire in sorted(root.glob(WIRE_GLOB)) or sorted(root.rglob(WIRE_NAME)):
         agent = wire.parent.name
-        for line in wire.read_text(errors="replace").splitlines():
-            if f'"{TOOLS_TYPE}"' not in line:
-                continue
-            try:
-                record = json.loads(line)
-            except ValueError:
-                continue
+        for record in _wire_records(wire, f'"{TOOLS_TYPE}"'):
             tools = record.get("tools")
             # Absent, malformed, or genuinely empty all mean the same thing to a reader: there is
             # no schema set here to price. Sanitising happens here rather than inside

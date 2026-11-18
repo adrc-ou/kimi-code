@@ -46,7 +46,7 @@ def make_passes(**overrides):
 
 
 def make_app(passes=None):
-    return {"token": TOKEN, "passes": passes or make_passes()}
+    return {BRIDGE.TOKEN: TOKEN, BRIDGE.PASSES: passes or make_passes()}
 
 
 class Request:
@@ -301,6 +301,75 @@ class FrontendFlowTests(unittest.TestCase):
                 )
                 await api.read()
                 check(api.status == 200, "the bearer token stopped working on its own plane")
+        finally:
+            await bridge.close()
+            await upstream.close()
+        return failures
+
+
+class WebSocketProxyTests(unittest.TestCase):
+    """A browser that vanishes mid-stream still has to give the upstream socket back.
+
+    Both pumps raise on an abrupt disconnect, which is the ordinary way a frontend tab closes
+    rather than a fault. Before the two closes moved into a ``finally``, that raise travelled out
+    of the handler and left the upstream connection held by the bridge's own long-lived client
+    session, so ComfyUI kept a dead frontend open until garbage collection got to it.
+    """
+
+    def test_an_abrupt_client_disconnect_still_closes_the_upstream(self):
+        self.assertEqual(asyncio.run(self._run()), [])
+
+    @staticmethod
+    async def _run():
+        failures = []
+        closed = asyncio.Event()
+        opened = asyncio.Event()
+
+        async def upstream_handler(request):
+            websocket = web.WebSocketResponse()
+            await websocket.prepare(request)
+            opened.set()
+            async for _message in websocket:
+                pass
+            closed.set()
+            return websocket
+
+        upstream_app = web.Application()
+        upstream_app.router.add_get("/ws", upstream_handler)
+        upstream = TestServer(upstream_app)
+        await upstream.start_server()
+        options = argparse.Namespace(
+            max_body=1024 * 1024,
+            max_ws_message=1024 * 1024,
+            max_connections=4,
+            upstream=str(upstream.make_url("/")),
+            grant_ttl=60,
+            session_ttl=3600,
+            max_grants=4,
+            max_sessions=4,
+        )
+        bridge = TestServer(BRIDGE.build_app(options, TOKEN))
+        await bridge.start_server()
+        try:
+            browser = ClientSession()
+            websocket = await browser.ws_connect(
+                bridge.make_url("/ws"), headers={"Authorization": f"Bearer {TOKEN}"}
+            )
+            await websocket.send_str("hello")
+            try:
+                await asyncio.wait_for(opened.wait(), 5)
+            except TimeoutError:
+                failures.append("the bridge never carried a frame to the upstream")
+            # Not a clean CLOSE handshake: the transport goes away, which is what a closed tab, a
+            # killed process, or a dropped VPN looks like from the bridge's side.
+            await browser.close()
+            try:
+                await asyncio.wait_for(closed.wait(), 5)
+            except TimeoutError:
+                failures.append(
+                    "the upstream still holds a websocket whose browser is gone; the bridge "
+                    "raised past its own close calls"
+                )
         finally:
             await bridge.close()
             await upstream.close()

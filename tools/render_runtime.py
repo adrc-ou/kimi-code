@@ -41,7 +41,7 @@ if __package__:
     from .env_values import read_env_values
     from .kimi_prompts import substitutions as kimi_substitutions
     from .model_config import render as render_model_tables
-    from .models import POLICY_FILE, load_plan, materialise_credentials
+    from .models import MODEL_POLICY_FILE, load_plan, materialise_credentials
     from .private_file import write_private
     from .tui import screen
 else:
@@ -53,7 +53,7 @@ else:
     from private_file import write_private
     from tui import screen
 
-    from models import POLICY_FILE, load_plan, materialise_credentials
+    from models import MODEL_POLICY_FILE, load_plan, materialise_credentials
 
 #: Marker comment in runtime/config.toml that the generated tables replace.
 MODEL_MARKER = "#__KIMI_MODEL_CONFIG__"
@@ -73,7 +73,7 @@ def write_runtime_file(path: Path, value: str) -> None:
 
 def ensure_secret(path: Path, generator) -> str:
     if path.is_file():
-        value = path.read_text().strip()
+        value = path.read_text(encoding="utf-8").strip()
         if len(value) >= 32:
             return value
     value = generator()
@@ -194,7 +194,7 @@ def main() -> None:
     )
     runtime_env = {
         "SEARCH_ADAPTER_TOKEN": ephemeral["search-token"],
-        "MODEL_PROXY_POLICY_FILE": str(args.runtime_dir / POLICY_FILE),
+        "MODEL_PROXY_POLICY_FILE": str(args.runtime_dir / MODEL_POLICY_FILE),
         "MODEL_PROXY_INTERNAL_TOKEN_FILE": str(args.runtime_dir / "proxy-token"),
         "MODEL_PROXY_CACHE_SALT_FILE": str(args.runtime_dir / "cache-salt"),
         "KIMI_RENDERED_CONFIG": str(args.runtime_dir / "kimi-config.toml"),

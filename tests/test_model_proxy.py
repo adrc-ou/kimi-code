@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import copy
 import dataclasses
-import importlib.util
 import io
 import json
 import logging
@@ -35,21 +34,10 @@ for _directory in (ROOT, ROOT / "tools"):
         sys.path.insert(0, str(_directory))
 
 
-def load_module(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    # dataclasses resolves string annotations through sys.modules, so the module
-    # has to be registered before it is executed.
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+from tests.helpers import load_script, shipped_plan  # noqa: E402
 
-
-from tests.helpers import shipped_plan  # noqa: E402
-
-CONFIG_MERGE = load_module("kimi_config_merge", ROOT / "tools" / "kimi_config_merge.py")
-RENDER = load_module("render_runtime", ROOT / "tools" / "render_runtime.py")
+CONFIG_MERGE = load_script("kimi_config_merge", Path("tools/kimi_config_merge.py"))
+RENDER = load_script("render_runtime", Path("tools/render_runtime.py"))
 
 INTERNAL_TOKEN = "i" * 32
 CACHE_SALT = "c" * 43
@@ -107,7 +95,7 @@ os.environ.update(
 )
 
 try:
-    PROXY = load_module("model_proxy", ROOT / "proxy" / "model_proxy.py")
+    PROXY = load_script("model_proxy", Path("proxy/model_proxy.py"))
 except ImportError as exc:
     # Without this, unittest discovery replaces every test in this module with a single reported
     # *error*, so a host missing aiohttp looks like a host with one broken test while the whole
@@ -379,7 +367,7 @@ class RequestValidationTests(unittest.TestCase):
             "MODEL_PROXY_CACHE_SALT": CACHE_SALT,
         }
         with patch.dict(os.environ, environment):
-            variant = load_module(name, ROOT / "proxy" / "model_proxy.py")
+            variant = load_script(name, Path("proxy/model_proxy.py"))
         self.addCleanup(sys.modules.pop, name, None)
 
         self.assertNotIn("long", variant.BASELINE_POLICY.lanes)
@@ -752,7 +740,6 @@ class ValidationTests(unittest.TestCase):
     could not be served fails every test in this file rather than one of them.
     """
 
-
     def test_a_lane_that_could_never_be_admitted_stops_startup(self):
         plan = mutated()
         lane = plan["lanes"]["primary"]
@@ -764,6 +751,24 @@ class ValidationTests(unittest.TestCase):
         lane["input_tokens"] = reservation - lane["output_clamp_tokens"]
         lane["context_tokens"] = reservation + plan["reserved_context_size"]
         plan["counters"][CONTEXT_ID]["exclusive_at"] = None
+        policy = loaded_policy(plan)
+        with self.assertRaisesRegex(RuntimeError, "could ever be admitted"):
+            PROXY.validate_policy(policy)
+
+    def test_a_budget_with_no_published_ceiling_stops_startup_by_name(self):
+        # The larger figure a lone request may occupy is what bounds a reservation the budget
+        # cannot hold, and a provider is free to publish the budget without it. `ceiling` is then
+        # absent, so deciding this lane's fate compared `int <= None` and died as a TypeError
+        # traceback out of startup rather than the sentence that names the lane and the counter -
+        # the same refusal the test above pins, reached from the other missing number.
+        plan = mutated()
+        plan["counters"][CONTEXT_ID]["ceiling"] = None
+        plan["counters"][CONTEXT_ID]["exclusive_at"] = None
+        lane = plan["lanes"]["primary"]
+        reservation = BUDGET + 1
+        lane["output_clamp_tokens"] = reservation // 2
+        lane["input_tokens"] = reservation - lane["output_clamp_tokens"]
+        lane["context_tokens"] = reservation + plan["reserved_context_size"]
         policy = loaded_policy(plan)
         with self.assertRaisesRegex(RuntimeError, "could ever be admitted"):
             PROXY.validate_policy(policy)
@@ -817,6 +822,43 @@ class ValidationTests(unittest.TestCase):
         with patch.object(PROXY, "MAX_QUEUED", 0):
             with self.assertRaisesRegex(RuntimeError, "MODEL_PROXY_MAX_QUEUED must be positive"):
                 PROXY.validate_policy(POLICY)
+
+    def test_a_request_deadline_that_is_neither_zero_nor_positive_stops_startup(self):
+        with patch.object(PROXY, "MAX_REQUEST_SECONDS", -1):
+            with self.assertRaisesRegex(
+                RuntimeError, "MAX_REQUEST_SECONDS must be 0 for unlimited or a positive number"
+            ):
+                PROXY.validate_policy(POLICY)
+
+    def test_a_negative_backup_count_stops_startup(self):
+        with patch.object(PROXY, "LOG_BACKUPS", -1):
+            with self.assertRaisesRegex(RuntimeError, "LOG_BACKUPS must not be negative"):
+                PROXY.validate_policy(POLICY)
+
+    def test_a_lane_cannot_claim_engine_accounting_without_an_engine(self):
+        # Token accounting and output mode have to agree, or a lane would be measured by a rule the
+        # plan never gave it: remaining_context is only meaningful against an engine's own window.
+        plan = mutated()
+        plan["lanes"]["subagent"]["output_mode"] = "remaining_context"
+        with self.assertRaisesRegex(RuntimeError, "needs an engine for local token accounting"):
+            PROXY.validate_policy(loaded_policy(plan))
+
+    def test_a_window_smaller_than_input_plus_reservation_stops_startup(self):
+        plan = mutated()
+        lane = plan["lanes"]["primary"]
+        lane["context_tokens"] = lane["input_tokens"] - 1
+        with self.assertRaisesRegex(RuntimeError, "reserved does not fit its"):
+            PROXY.validate_policy(loaded_policy(plan))
+
+    def test_a_clamp_that_cannot_fit_beside_its_input_stops_startup(self):
+        # Exactly at input + reserved the previous check passes, so this is the only bound left that
+        # can notice a clamp with nowhere to go -- a fixed lane would otherwise promise more output
+        # tokens than its own window can ever hold.
+        plan = mutated()
+        lane = plan["lanes"]["primary"]
+        lane["context_tokens"] = lane["input_tokens"] + plan["reserved_context_size"]
+        with self.assertRaisesRegex(RuntimeError, "output clamp does not fit its"):
+            PROXY.validate_policy(loaded_policy(plan))
 
     def test_an_input_guard_below_the_window_stops_startup(self):
         with patch.object(PROXY, "INPUT_GUARD_PERCENT", 99):
@@ -1534,7 +1576,7 @@ class ForwardChatTests(unittest.IsolatedAsyncioTestCase):
             method="POST",
             content_type="application/json",
             transport=transport,
-            app={"client": SimpleNamespace()},
+            app={PROXY.CLIENT: SimpleNamespace()},
             headers={},
         )
 
@@ -2263,7 +2305,7 @@ class ProxyLogTests(unittest.IsolatedAsyncioTestCase):
             content_type="application/json",
             headers={},
             transport=SimpleNamespace(is_closing=lambda: False),
-            app={"client": SimpleNamespace()},
+            app={PROXY.CLIENT: SimpleNamespace()},
         )
 
     async def attempt(self, status: int, body: bytes, headers=None):

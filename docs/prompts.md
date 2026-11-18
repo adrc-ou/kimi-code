@@ -45,8 +45,8 @@ obeys only them must deal with tiers two and three as well as tier one.
 | 6 | Plugin contributions | bundle `127779602` | both | `${plugin_sections}` placement; no plugins installed | yes (already nil) |
 | 7 | Additional directories | bundle `127778552` | both | `/add-dir`, `.kimi-code/local.toml` | yes (already nil) |
 | 8 | Reply style, notify guidance | bundle `127774158`, `127777711` | both | CLI/server only, not file or env | no |
-| 9 | Harness envelope | `tools/policy.py:768-1085` | split: limits both, table+parallelism **main only** | the launch panel, per block | yes, per block |
-| 10 | Module guidance | `tools/modules.py:188` | all lanes | deselect the module or switch the block off | yes |
+| 9 | Harness envelope | `tools/policy.py::guidance_sections` | split: limits both, table+parallelism **main only** | the launch panel, per block | yes, per block |
+| 10 | Module guidance | `tools/modules.py::module_agents_text` | all lanes | deselect the module or switch the block off | yes |
 | 11 | Subagent role files | `runtime/agents/*.md` | that subagent only | project `.kimi-code/agents/` + `override: true` | yes, delete the file |
 | 12 | Per-step injections | bundle `132970005` registry | each agent separately | one kill switch exists, for `permission_mode` | **no** |
 | 13 | Tool schemas | bundle tool catalogue + MCP servers | per profile | `[tools]`, `tools:`/`disallowedTools:`, `runtime/mcp.json` | partially |
@@ -106,7 +106,7 @@ template contains the literal substring `${base_prompt}`, and it then expands to
 `this.user.getDefaultProfile().renderSystemPrompt(context)` — that is, to Kimi's
 `system_default` fully rendered. So in our `SYSTEM.md.example`, `${base_prompt}`
 means "wrap", and its absence means "replace", exactly as the four-row table in
-`prompt_context.compose_system_document()` (`tools/prompt_context.py:669-720`) specifies.
+`prompt_context.compose_system_document()` (`tools/prompt_context.py::compose_system_document`) specifies.
 
 `renderPrompt` (bundle `127763660`, `_base/utils/render-prompt.ts`) substitutes
 with `/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g`, replacing only `string` and `number`
@@ -131,7 +131,7 @@ built-in. `--agent <other>` bypasses `SYSTEM.md` entirely.
 **Emptiness.** A blank file is discarded (`systemFile.ts`,
 `text.trim().length === 0`) and the built-in is used instead. This is documented
 behaviour, not a quirk, and it is the sole reason `EMPTY_PROMPT_SENTINEL`
-(`tools/prompt_context.py:95`) exists.
+(`tools/prompt_context.py::EMPTY_PROMPT_SENTINEL`) exists.
 
 ### 2. Role overlay — `${role_additional}`
 
@@ -214,9 +214,11 @@ from context cleanly. Contrast surface 1, where emptiness means "use Kimi's".
 
 **Harness responsibility.** The composed document is written to
 `.local/runtime/<instance>/AGENTS.md`, published to Compose as
-`KIMI_RENDERED_AGENTS_MD`, bound to `/stage/AGENTS.md:ro` (`compose.yaml:11`), and
+`KIMI_RENDERED_AGENTS_MD`, bound to `/stage/AGENTS.md:ro` (in `compose.yaml`'s `agent-state-init`
+`volumes`), and
 installed by the root-only initializer at `0440` with the ext4 immutable flag
-(`container/initialize-agent-state.py:29,41,74`). It is *not* a verbatim copy of
+(`container/initialize-agent-state.py`'s `MANAGED_FILES`, `STAGED_FILE_MODE` and
+`require_immutable`). It is *not* a verbatim copy of
 `runtime/AGENTS.md`: that file is only the tier-two source, and the enabled blocks
 are composed after it. The file is always written, even when it composes to empty,
 because Docker turns a missing bind source into a directory and that fails at
@@ -347,8 +349,9 @@ reported rather than silently ignored.
 **Where the composition lands.** The contract goes to
 `.local/runtime/<instance>/AGENTS.md` and is published as
 `KIMI_RENDERED_AGENTS_MD`; the prompt goes to `.../SYSTEM.md` and is published as
-`KIMI_SYSTEM_MD` (`tools/render_runtime.py:183-184`). Both are bound read-only into
-the initializer (`compose.yaml:11,15`) and installed `0440` and immutable. Both are
+`KIMI_SYSTEM_MD` (the `KIMI_SYSTEM_MD` entry in `tools/render_runtime.py`). Both are bound
+read-only into the initializer (`compose.yaml`, the same `volumes` list) and installed `0440`
+and immutable. Both are
 regenerated every launch, so in-session edits do nothing until the next start, and
 neither is on the cleanup delete-list: they are re-stamped rather than secret, and
 the launcher's checks read them after the session ends.
@@ -387,10 +390,11 @@ prompt template**, rendered by `agentProfileFromFile` →
 `renderPromptTemplateResult(definition.prompt, context, { skillActive },
 basePrompt)`.
 
-**Delivery.** `assemble()` (`tools/modules.py:202`) merges `runtime/{skills,
+**Delivery.** `assemble()` (`tools/modules.py::assemble`) merges `runtime/{skills,
 agents, tools}` and every selected module's `runtime/{skills, agents, tools}`
 into `.local/runtime/<instance>/assets/` (duplicates raise), which reaches the
-container as volume `kimi-assets` → `/opt/kimi-runtime` (`compose.yaml:194-195`),
+container as volume `kimi-assets` → `/opt/kimi-runtime` (`compose.yaml`, the `kimi-assets`
+volume),
 read by `extra_agent_dirs` in `runtime/config.toml`.
 
 **Selection.** Entirely model-driven. Each discoverable agent becomes an enum
@@ -401,9 +405,10 @@ configuration.
 
 **The consequence nobody has written down.** Because the body is the template, a
 body containing no `${...}` gets *only its own text* — no surface 1, no
-`${agents_md}`, no envelope. Both shipped bodies avoid that fate by half: each
-ends with `${agents_md}` (`runtime/agents/debug-runner.md:14`,
-`runtime/agents/repo-researcher.md:19`) and neither names `${base_prompt}`. A
+`${agents_md}`, no envelope. Both shipped bodies avoid that fate by half: each names
+`${agents_md}` and then continues in its own prose
+(`runtime/agents/debug-runner.md`, `runtime/agents/repo-researcher.md`); neither ends with it, and
+neither names `${base_prompt}`. A
 `debug-runner` subagent therefore gets the composed all-lane contract, including
 the fair-use limits that bind its lane, and does not get Kimi's built-in prompt
 or the main-only lane table.
@@ -753,7 +758,8 @@ write; `tools/managed_section.py` is deleted and
 `tests/test_configuration.py::test_runtime_agents_md_carries_no_model_number` keeps
 the contract pointing at the generated headings rather than at the workspace file.
 `module-guidance.md` and `extension-snapshot/` are
-both on the launcher's cleanup list now (`start.sh:128,131`), and `${now}`, which the
+both on the launcher's cleanup list now (`HARNESS_SESSION_RESIDUE` in `tools/runtime.sh`, swept by
+`harness_sweep_secrets`), and `${now}`, which the
 upstream docs advertise and `systemPromptVars()` does not implement, is unused
 anywhere in this repository — `${harness.date}` is the name we do resolve.
 

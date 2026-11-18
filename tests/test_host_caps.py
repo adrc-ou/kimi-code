@@ -188,10 +188,48 @@ class LauncherCapsFileTests(unittest.TestCase):
             path.write_text(payload)
             with self.subTest(payload=payload):
                 measured = host_caps.caps(self.runtime)
+                # A probe emits keys no payload in this list contains, so this is what actually says
+                # "probed": asserting only the capabilities shape is satisfied by a cached document
+                # that was accepted when it should not have been, which is how the non-numeric case
+                # below survived while this loop stayed green.
+                self.assertIn("memory_bytes", measured)
                 self.assertIn("capabilities", measured)
                 self.assertIsInstance(measured["capabilities"], list)
             path.unlink()
         self.assertIsInstance(host_caps.caps(self.runtime)["capabilities"], list)
+
+    def test_a_cached_probe_with_a_non_numeric_figure_is_not_used(self):
+        # read() has always claimed to take the file only "if it is shaped right", but it
+        # checked three fields and not the two every eligibility test casts with int(). A cached
+        # probe whose memory_gib had been edited into a string therefore reached model_supported()
+        # and stopped the resolver with a ValueError no caller catches, while the launch line
+        # printed `memory=autoGiB` as though it were a reading.
+        sentinel = "capability-no-probe-can-report"
+        for key in ("memory_gib", "free_disk_gib"):
+            for value in ('"auto"', "[64]", "true"):
+                with self.subTest(key=key, value=value):
+                    document = dict(M1_MAX, capabilities=[sentinel])
+                    document[key] = json.loads(value)
+                    path = self.runtime / host_caps.CAPS_FILE
+                    path.write_text(json.dumps(document))
+                    measured = host_caps.caps(self.runtime)
+                    # Asserting a usable shape would pass on the poisoned document, which is how the
+                    # loop above it missed this; asserting the sentinel is gone proves the file did
+                    # not answer.
+                    self.assertNotIn(sentinel, measured["capabilities"])
+                    self.assertIsInstance(measured["memory_gib"], int)
+                    self.assertIsInstance(measured["free_disk_gib"], int)
+                    path.unlink()
+
+    def test_a_cached_probe_may_omit_a_figure_without_being_discarded(self):
+        # Absent has always meant zero downstream, not "no cache", so a document predating the field
+        # stays honoured. Without this case the check above would be free to discard anything it did
+        # not recognise, and a discard is a fresh probe on a host that cached one for a reason.
+        document = {key: value for key, value in M1_MAX.items() if key != "memory_gib"}
+        path = self.runtime / host_caps.CAPS_FILE
+        path.write_text(json.dumps(document))
+        measured = host_caps.caps(self.runtime)
+        self.assertEqual(measured["capabilities"], ["metal"])
 
     def test_a_probe_of_this_machine_reports_no_accelerator_it_cannot_use(self):
         measured = host_caps.probe()

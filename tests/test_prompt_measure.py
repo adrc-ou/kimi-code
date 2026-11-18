@@ -193,6 +193,26 @@ class BindLogTests(unittest.TestCase):
     def test_a_missing_log_reads_as_nothing_rather_than_an_error(self):
         self.assertEqual(pm.bind_records(self.root / "absent.jsonl"), [])
 
+    def test_a_log_that_cannot_be_opened_costs_only_its_own_agent(self):
+        # The fallback glob matches a name at any depth, so a directory called wire.jsonl is a thing
+        # a real scan meets, and a log this process cannot open meets it too. Either way the survey
+        # keeps going: a missing row is the price, never the launch that asked for the number.
+        stray = self.root / "sessions" / "wd_x" / "session_y" / "agents" / "stray"
+        (stray / pm.WIRE_NAME).mkdir(parents=True)
+        self.write("main", [self.bind("main", "readable", 5)])
+        self.assertEqual(pm.bind_records(stray / pm.WIRE_NAME), [])
+        self.assertEqual(
+            {audience: row["systemPrompt"] for audience, row in
+             pm.newest_binds(self.root, self.plan).items()},
+            {"main": "readable"},
+        )
+
+    def test_a_line_that_is_json_but_not_a_record_is_skipped(self):
+        # A bare array mentioning the type is well-formed JSON and no one's record. The reader
+        # reaches for .get() on whatever it parses, so the shape has to be checked, not assumed.
+        wire = self.write("main", ['["profile.bind"]', self.bind("main", "kept", 6)])
+        self.assertEqual([row["systemPrompt"] for row in pm.bind_records(wire)], ["kept"])
+
     def test_the_newest_prompt_per_audience_wins_across_files(self):
         self.write("main", [self.bind("main", "older", 1000), self.bind("main", "newer", 2000)])
         self.write(
@@ -250,7 +270,7 @@ class ToolSchemaTests(unittest.TestCase):
         self.addCleanup(self._dir.cleanup)
         self.root = Path(self._dir.name)
 
-    def write(self, agent: str, *records: dict) -> None:
+    def write(self, agent: str, *records: object) -> None:
         wire = self.root / "sessions" / "wd_x" / "s" / "agents" / agent / pm.WIRE_NAME
         wire.parent.mkdir(parents=True, exist_ok=True)
         wire.write_text(
@@ -264,6 +284,22 @@ class ToolSchemaTests(unittest.TestCase):
             "time": when,
             "tools": [{"name": n, "description": "", "parameters": {}} for n in names],
         }
+
+    def test_a_log_that_cannot_be_opened_costs_only_its_own_agent(self):
+        # The prompt reader survives an unopenable log because bind_records tolerates one; this
+        # reader walks the same tree with the same glob and had to be given the same tolerance.
+        stray = self.root / "sessions" / "wd_x" / "s" / "agents" / "stray"
+        (stray / pm.WIRE_NAME).mkdir(parents=True)
+        self.write("main", self.snapshot(["Read", "Write"]))
+        self.assertEqual(
+            {agent: row["count"] for agent, row in pm.newest_tools(self.root).items()},
+            {"main": 2},
+        )
+
+    def test_a_line_that_is_json_but_not_a_record_is_skipped(self):
+        self.write("main", [pm.TOOLS_TYPE], self.snapshot(["Read"]))
+        self.assertEqual({agent: row["count"] for agent, row in pm.newest_tools(self.root).items()},
+                         {"main": 1})
 
     def test_a_snapshot_is_priced_by_the_same_arithmetic_kimi_uses(self):
         self.write("main", self.snapshot(["Read", "Write"]))

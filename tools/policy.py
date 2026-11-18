@@ -23,6 +23,8 @@ from a number in ``.env``.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import urlsplit, urlunsplit
 
@@ -35,7 +37,6 @@ if __package__:
         PER_REQUEST_RULE_KINDS,
         RATE_RULE_KINDS,
         RATE_RULE_UNITS,
-        SCHEMA_VERSION,
         DefinitionError,
     )
 else:
@@ -47,9 +48,21 @@ else:
         PER_REQUEST_RULE_KINDS,
         RATE_RULE_KINDS,
         RATE_RULE_UNITS,
-        SCHEMA_VERSION,
         DefinitionError,
     )
+
+# The schema number stamped on the plan this resolver writes is a fact shared with every reader of
+# that plan - the proxy that enforces it and the host tools that attest an engine against it - so it
+# comes from the one standard-library module those readers already import instead of being restated
+# here. proxy/ is not a sibling of tools/, so this file names the path the way each reader does.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT / "proxy") not in sys.path:
+    sys.path.insert(0, str(_ROOT / "proxy"))
+
+from local_engine_contract import (  # noqa: E402
+    PLAN_SCHEMA_VERSION,
+    PLAN_SCHEMA_VERSION_LOCAL,
+)
 
 #: The human-facing name of each lane, shown wherever a person chooses or reads a model entry.
 #: The ids stay ``primary``/``long``/``subagent`` because they name the route, the alias and the
@@ -269,8 +282,13 @@ def _model_output_cap(provider: dict[str, Any], model: dict[str, Any]) -> int | 
 
 def _effective_count(
     provider: dict[str, Any], model: dict[str, Any]
-) -> tuple[int | None, str | None]:
+) -> tuple[int, str] | None:
     """One model's request-count ceiling, and how the resolver came to it.
+
+    ``None`` means the provider states no applicable count rule at all. The ceiling and its basis
+    arrive as a pair or not at all, and the return type says so, because a counter carrying a
+    number and no explanation of where it came from is exactly the unsourced floor this docstring
+    exists to rule out.
 
     A provider publishes concurrency *per model*, so a model-scoped rule is that provider's
     specific answer about the traffic in question, and a looser-scope rule marked ``default`` is
@@ -291,7 +309,7 @@ def _effective_count(
     fallback = [rule["value"] for rule in rules if rule.get("default")]
     if fallback:
         return min(fallback), "harness default from the provider's tightest published row"
-    return None, None
+    return None
 
 
 def _model_count_counter(
@@ -326,17 +344,18 @@ def _context_counter(
     provider: dict[str, Any],
     model: dict[str, Any],
     lanes: list[dict[str, Any]],
-    count: int | None,
-    count_basis: str | None,
+    effective: tuple[int, str] | None,
 ) -> dict[str, Any] | None:
     """Aggregate-context and exclusivity thresholds for one model-scoped counter.
 
     The model's request-count ceiling rides along here when one exists, because both describe
-    the same set of in-flight requests and one admission should take one permit. A model with no
-    context rule at all gets no counter of this family rather than a budget-less one: every
-    ceiling is a number of tokens, and a caller that renders "budget" from it would have nothing
-    true to say.
+    the same set of in-flight requests and one admission should take one permit. It arrives as the
+    pair :func:`_effective_count` produced, so this cannot be handed a number whose basis was left
+    behind. A model with no context rule at all gets no counter of this family rather than a
+    budget-less one: every ceiling is a number of tokens, and a caller that renders "budget" from
+    it would have nothing true to say.
     """
+    count, count_basis = effective if effective is not None else (None, None)
     aggregate = [
         rule
         for rule in _provider_rules(provider, CONTEXT_RULE_KINDS)
@@ -657,12 +676,12 @@ def resolve(
     for (provider_id, _model_name), lane_entries in lanes_by_model.items():
         model = next(models[entry["model_id"]] for entry in lane_entries)
         provider = providers[provider_id]
-        count, count_basis = _effective_count(provider, model)
-        context = _context_counter(provider, model, lane_entries, count, count_basis)
+        effective = _effective_count(provider, model)
+        context = _context_counter(provider, model, lane_entries, effective)
         if context is not None:
             counters[context["id"]] = context
-        elif count is not None:
-            standalone = _model_count_counter(provider, model, lane_entries, count, count_basis)
+        elif effective is not None:
+            standalone = _model_count_counter(provider, model, lane_entries, *effective)
             counters[standalone["id"]] = standalone
         for scope in COUNTER_SCOPES:
             groups = _identity_groups(models, scope, lane_entries)
@@ -710,7 +729,7 @@ def resolve(
     limits = _derive_limits(selected, counters)
 
     result = {
-        "schema_version": 4 if engines else SCHEMA_VERSION,
+        "schema_version": PLAN_SCHEMA_VERSION_LOCAL if engines else PLAN_SCHEMA_VERSION,
         "reserved_context_size": reserved_context_size,
         "selection": dict(selection),
         "agent_lane": agent_lane,
@@ -978,11 +997,12 @@ def _derive_limits(
         limits["subagent_concurrency"] = 1
         limits["subagent_concurrency_basis"] = "each subagent request runs alone"
         return limits
-    candidates = (
-        [limits["lane_concurrency"]["subagent"]]
-        if limits["lane_concurrency"].get("subagent")
-        else []
-    )
+    # `is not None`, not truthiness: a provider rule is parsed as a positive integer, so a lane
+    # concurrency bound is either absent or at least one, and today the two spellings agree. They
+    # stop agreeing the moment a provider is ever allowed to say "no concurrent requests" - a
+    # truthy test would drop that zero and publish a fan-out the provider refused.
+    lane_cap = limits["lane_concurrency"].get("subagent")
+    candidates = [lane_cap] if lane_cap is not None else []
     for counter_id in subagent["counters"]:
         counter = counters.get(counter_id)
         if counter is None or counter.get("budget") is None:
@@ -1000,7 +1020,10 @@ def _derive_limits(
     limits["subagent_concurrency"] = max(1, min(candidates))
     limits["subagent_concurrency_basis"] = (
         "validated engine sequence capacity"
-        if any(counters[key].get("source") == "engine_capacity" for key in subagent["counters"])
+        if any(
+            (counters.get(key) or {}).get("source") == "engine_capacity"
+            for key in subagent["counters"]
+        )
         else "the tightest provider rule"
     )
     return limits

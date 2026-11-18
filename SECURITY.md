@@ -60,8 +60,8 @@ mount:
   flag, set by the initializer after it writes them. Ownership and mode cannot
   protect them: unlinking is governed by the ownership of the containing
   directory and not of the entry, so an agent that owns its home can delete a
-  root-owned file inside it, as `container/initialize-agent-state.py:4-6`
-  records. The flag survives the container and outlives the
+  root-owned file inside it, as the module docstring of
+  `container/initialize-agent-state.py` records. The flag survives the container and outlives the
   session, and the agent cannot clear it because it does not hold
   `LINUX_IMMUTABLE`. Staging fails closed if the volume filesystem does not
   honour the flag;

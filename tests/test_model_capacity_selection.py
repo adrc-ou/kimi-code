@@ -60,7 +60,7 @@ class NativePickerTests(CapacityFixture):
         selected = json.loads((self.runtime / models.SELECTION).read_text())
         self.assertEqual(selected["primary"], self.local)
         self.assertEqual(selected["subagent"], self.local)
-        self.assertFalse((self.runtime / models.POLICY_FILE).exists())
+        self.assertFalse((self.runtime / models.MODEL_POLICY_FILE).exists())
 
     def test_remembered_selection_and_overrides_work_without_memory_measurements(self):
         previous = {"primary": self.local, "subagent": self.local}
@@ -125,7 +125,7 @@ class NativePickerTests(CapacityFixture):
                     self.assertEqual(engine["sequences"], 1)
 
     def test_stale_local_plan_requires_a_relaunch(self):
-        (self.runtime / models.POLICY_FILE).write_text(json.dumps({"schema_version": 2}))
+        (self.runtime / models.MODEL_POLICY_FILE).write_text(json.dumps({"schema_version": 2}))
         with self.assertRaisesRegex(models.DefinitionError, "relaunch"):
             models.load_plan(self.runtime)
 

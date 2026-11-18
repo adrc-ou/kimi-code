@@ -83,9 +83,7 @@ def check_credentials(
         raise SystemExit(f"provider credential {expect_secret} did not reach {PROXY} alone")
 
 
-def check_agent_mounts(
-    services: dict[str, dict[str, Any]], workspace: str, runtime_dir: str
-) -> None:
+def check_agent_mounts(services: dict[str, dict[str, Any]], workspace: str) -> None:
     agent = services.get(AGENT)
     if agent is None:
         raise SystemExit("the configuration has no kimi-agent service")
@@ -161,7 +159,7 @@ def main() -> None:
     runtime_dir = os.path.realpath(args.runtime_dir)
     check_read_only_roots(services)
     check_credentials(services, runtime_dir, args.expect_secret)
-    check_agent_mounts(services, os.path.realpath(args.workspace), runtime_dir)
+    check_agent_mounts(services, os.path.realpath(args.workspace))
     check_loopback_ports(services)
     print(f"{args.label}: agent mounts, credentials, ports and root filesystems are confined")
 

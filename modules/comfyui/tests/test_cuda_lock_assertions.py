@@ -1,6 +1,6 @@
 """The lock assertions the CUDA image makes about itself, run the way the build runs them.
 
-`Dockerfile.cuda` re-checks the lock inside the image after `resolution.py` refused an unfit one,
+`Dockerfile.cuda` re-checks the lock inside the image after `resolve_locks.py` refused an unfit one,
 because which CUDA flavour a torch wheel carries is this image's own claim and nothing upstream can
 vouch for it. Those checks are shell inside a Dockerfile, which no other test executes, so this one
 lifts the assertion block out of the file and runs it against locks: the release the harness ships,

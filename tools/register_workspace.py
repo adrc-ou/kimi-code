@@ -88,7 +88,7 @@ def prepare_agent_state(directory: Path) -> str:
 
 def register_workspace():
     home = Path(os.environ.get("KIMI_CODE_HOME", "/home/agent/.kimi-code"))
-    token = (home / "server.token").read_text().strip()
+    token = (home / "server.token").read_text(encoding="utf-8").strip()
     if not token:
         raise ValueError("Missing server credential")
     request = urllib.request.Request(

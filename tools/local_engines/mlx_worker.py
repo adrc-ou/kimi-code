@@ -148,8 +148,9 @@ class Engine:
         #: process exists to respect are about stream and cache state, and reading a byte off a
         #: pipe is neither, so this stays the one atom the generation loop consults.
         self.cancel_requested = False
-        # The resolver stores its decision as engine["wiring"]["wired_bytes"] (capacity.py:540), the
-        # plan document carries that key through whitelisted as-is, and policy.py reads it back from
+        # The resolver stores its decision as engine["wiring"]["wired_bytes"]
+        # (`capacity.py::wiring_targets`), the plan document carries that key through
+        # whitelisted as-is, and policy.py reads it back from
         # the same nesting. A top-level read here found nothing, applied zero, and left the guard
         # below permanently unreachable because both sides were consistently absent.
         self.declared_wired_limit_bytes = int(
@@ -389,7 +390,14 @@ def check_request(payload: dict[str, Any]) -> None:
     latter *before* it writes ``begin``: a request-level refusal that arrives after the stream has
     started can only reach the client as an in-band error object on a response that already said
     HTTP 200, which is what let one malformed client request look like engine damage.
+
+    The payload's own shape is checked first for the same reason. Every field read below is a
+    ``.get``, so a payload that is not an object raises ``AttributeError`` instead, and the command
+    loop can only tell ``WorkerRefused`` from device damage — which would retire a healthy engine
+    over a request it should simply have refused.
     """
+    if not isinstance(payload, dict):
+        raise WorkerRefused(WorkerError.MALFORMED_REQUEST, "request payload must be an object")
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         raise WorkerRefused(WorkerError.MALFORMED_REQUEST, "no messages in request")
@@ -626,7 +634,13 @@ def serve(stdin, stdout, expected: dict[str, Any], cancel_fd: int = -1) -> int:
             continue
         try:
             request = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # Nesting deep enough to exhaust the stack escapes json.loads as a RecursionError, which
+            # is not a ValueError; tools/analyze_image.py answers the same hazard the same way.
+            request = None
+        if not isinstance(request, dict):
+            # Valid JSON that is not an object is the same kind of bad request as JSON that is not
+            # valid, and gets the same answer.
             _write(stdout, {"kind": "refused", "code": WorkerError.MALFORMED_REQUEST})
             continue
         sequence = request.get("sequence")

@@ -56,6 +56,9 @@ class ProbeError(RuntimeError):
     """The probe could not run, or ran and could not answer one of its questions."""
 
 
+from local_engine_contract import strip_engine_policy  # noqa: E402
+
+
 def _require_mac() -> dict[str, Any]:
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise ProbeError(
@@ -68,7 +71,10 @@ def _require_mac() -> dict[str, Any]:
 
 def _provision_runtime() -> dict[str, Any]:
     """Build the candidate runtime, or fail saying why. Never silently use the host's Python."""
-    import local_mlx_runtime
+    if __package__:
+        from . import local_mlx_runtime
+    else:  # run as a loose script, with tools/ on sys.path
+        import local_mlx_runtime
 
     record = local_mlx_runtime.provision(install=True)
     return {
@@ -89,9 +95,10 @@ def _run_in_runtime(runtime: dict[str, Any], source: str, *, timeout: int = 900)
     """
     environment = dict(os.environ)
     # Anything the operator's shell happens to export would change what the probe measures, and the
-    # measurement is the deliverable.
-    for key in [name for name in environment if name.startswith(("MLX_", "GGML_", "LLAMA_"))]:
-        environment.pop(key, None)
+    # measurement is the deliverable. Cleared with the same list the adapter blocks at launch: a
+    # probe that runs under PYTORCH_*, CUDA* or METAL_* the engine would never see is certifying an
+    # environment the launch will not repeat.
+    environment = dict(strip_engine_policy(environment))
     environment["PYTHONPATH"] = site_packages(runtime)
     try:
         result = subprocess.run(
@@ -119,7 +126,7 @@ def _interpreter(runtime: dict[str, Any]) -> str:
     """The interpreter the provisioned record names.
 
     ``provision()`` already writes the full path to ``environment/bin/python3`` into ``executable``
-    (local_mlx_runtime.py:315), so re-splicing that suffix produced
+    (`local_mlx_runtime.py::provision`), so re-splicing that suffix produced
     ``.../environment/bin/environment/bin/python3`` and the probe refused a runtime that was in
     fact installed. Deriving the layout here was always a second opinion on a path the producer
     chose; the record is the single source of truth.
@@ -367,7 +374,9 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
     if args.output:
         destination = Path(args.output)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        destination.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         destination.chmod(0o600)
     return result
 
@@ -391,7 +400,10 @@ def metal_probe() -> int:
         "'low_power_mode': None}))"
     )
     try:
-        import local_mlx_runtime
+        if __package__:
+            from . import local_mlx_runtime
+        else:  # run as a loose script, with tools/ on sys.path
+            import local_mlx_runtime
 
         record = local_mlx_runtime.provision(install=False)
         print(_run_in_runtime(record, source, timeout=60).get("device_count"))

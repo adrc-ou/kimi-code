@@ -29,6 +29,7 @@ if str(ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(ROOT / "tools"))
 
 import local_llm  # noqa: E402
+import local_mlx_runtime  # noqa: E402
 
 from tests.helpers import resolved_engine_record  # noqa: E402
 
@@ -400,6 +401,25 @@ class InstallTests(InstallFixture):
         # digest was matched, and a world-readable artifact invites someone else to trust it.
         self.assertEqual((directory / local_llm.STATE_FILE).stat().st_mode & 0o777, 0o600)
 
+    def test_a_partial_longer_than_the_pinned_size_is_discarded_not_resumed(self):
+        # A `.part` is only resumable while it is a prefix of the file the lock asks for. If it is
+        # as long as, or longer than, that size - a re-pinned artifact that shrank, or a run whose
+        # server over-sent - the tail it would request does not exist, so resuming can only ever
+        # report the same mismatch. The documented "leave the partial, the next run resumes from
+        # it" recovery becomes a permanent failure unless the impossible prefix is dropped here.
+        self.hub()
+        name, blob = next(iter(self.shards.items()))
+        part = self.weights / (name + ".part")
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(blob + b"trailing bytes from a longer artifact")
+        before = part.stat().st_size
+        self.assertGreater(before, len(blob))
+
+        self.assertTrue(local_llm.install(self.model))
+
+        self.assertEqual((self.weights / name).read_bytes(), blob)
+        self.assertFalse(part.exists(), "the unusable partial outlived a completed install")
+
     def test_a_reinstall_of_verified_bytes_asks_for_nothing(self):
         base, seen = self.hub()
         local_llm.install(self.model)
@@ -448,6 +468,28 @@ class InstallTests(InstallFixture):
         with self.assertRaises(local_llm.LocalModelError) as caught:
             local_llm.install(self.model)
         self.assertIn("incomplete", str(caught.exception))
+
+    def test_a_partial_that_is_a_real_prefix_is_resumed_not_redownloaded(self):
+        # The counterpart to the guard above, and the reason that guard is safe to add: a partial
+        # shorter than the pinned size IS a prefix, so the tail is all that may be asked for. On a
+        # hundred-gigabyte shard restarting instead of resuming is not a slow bug but an unusable
+        # one, and nothing here proved the 206 path worked until now - the truncated-body case
+        # never reaches it, because its first attempt starts at zero.
+        base, seen = self.hub()
+        name, blob = next(iter(self.shards.items()))
+        self.weights.mkdir(parents=True, exist_ok=True)
+        head = blob[: len(blob) // 2]
+        (self.weights / (name + ".part")).write_bytes(head)
+        url = local_llm.download_url(
+            json.loads(self.model["lock_path"].read_text())["source"], name
+        )
+        target = self.weights / name
+        local_llm.transfer(url, target, len(blob), name)
+
+        self.assertEqual(target.read_bytes(), blob, "a resumed transfer produced wrong bytes")
+        ranges = [headers.get("Range") for _path, headers in seen]
+        self.assertIn(f"bytes={len(head)}-", ranges, f"never asked for the tail: {ranges}")
+        self.assertFalse((self.weights / (name + ".part")).exists())
 
     def test_a_mirror_gets_the_bytes_but_never_the_token(self):
         # The lock's `base` is the private-mirror hook. The digest still decides whether the
@@ -1005,6 +1047,11 @@ class ServeTests(InstallFixture):
         engine = resolved_engine_record(
             engine_kind="mlx_lm", model_path="/fixture", model_alias="fixture",
             context_tokens=4096, sequences=1, total_context_tokens=4096,
+            # The shared record is a llama.cpp shape, and this test switches only the engine kind.
+            # A resolved MLX plan names the artifact its loader actually reads, and the adapter
+            # compares that against the worker's own document, so leaving "gguf" here describes an
+            # allocation that could never have started this engine.
+            artifact_format="mlx",
         )
         with (
             mock.patch.object(local_llm.urllib.request, "urlopen", side_effect=urlopen),
@@ -1131,6 +1178,36 @@ class ServeTests(InstallFixture):
                 spawn.assert_called_once()
                 child.terminate.assert_called_once()
             self.assertFalse(local_llm.readiness_path(runtime, self.model["id"]).exists())
+
+    def test_serve_refuses_an_unset_instance_directory_rather_than_the_current_one(self):
+        # ``Path("")`` is the current directory, so this command used to read whatever file in the
+        # directory it was started from happened to be named like the plan. One is planted there on
+        # purpose: the refusal has to come from the missing variable, not from a missing file.
+        elsewhere = self.directory / "someone-elses-instance"
+        elsewhere.mkdir()
+        (elsewhere / "model-policy.json").write_text(json.dumps({"lanes": {}, "engines": {}}))
+        original = os.getcwd()
+        os.chdir(elsewhere)
+        self.addCleanup(os.chdir, original)
+        environment = {
+            key: value for key, value in os.environ.items() if key != "HARNESS_RUNTIME_DIR"
+        }
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            mock.patch.object(local_llm, "require_model", return_value=self.model),
+            self.assertRaisesRegex(local_llm.LocalModelError, "HARNESS_RUNTIME_DIR"),
+        ):
+            local_llm.cmd_serve([self.model["id"]])
+
+    def test_serve_names_the_plan_a_set_directory_is_missing(self):
+        runtime = self.directory / "runtime-without-a-plan"
+        runtime.mkdir()
+        with (
+            mock.patch.dict(os.environ, {"HARNESS_RUNTIME_DIR": str(runtime)}),
+            mock.patch.object(local_llm, "require_model", return_value=self.model),
+            self.assertRaisesRegex(local_llm.LocalModelError, "no resolved plan"),
+        ):
+            local_llm.cmd_serve([self.model["id"]])
 
     def test_missing_resolved_local_definition_prevents_engine_enumeration(self):
         runtime = self.directory / "runtime"
@@ -1314,10 +1391,29 @@ class ServeTests(InstallFixture):
             local_llm.lane_sizes(self.model, plan)
 
     def test_inherited_llama_settings_cannot_override_the_plan(self):
-        with mock.patch.dict(os.environ, {"LLAMA_ARG_CTX_SIZE": "999", "KEEP_FIXTURE": "yes"}):
+        # The name always claimed more than the single ``LLAMA_ARG_`` assertion checked, and the gap
+        # was real: ggml reads ``GGML_METAL_*`` as residency policy and macOS exposes bare ``Metal``
+        # names, both of which reached the engine untouched while the plan and its fingerprint still
+        # claimed the profile's numbers - the override the MLX adapter on the same device had
+        # already been stripping.
+        blocked = {
+            "LLAMA_ARG_CTX_SIZE": "999",
+            "LLAMA_SEED": "7",
+            "GGML_METAL_USE_BF16": "1",
+            "GGML_CPU_NTHREADS": "2",
+            "METAL_DEVICE_WRAPPER_TYPE": "1",
+            "MetalSampleBufferCacheSizeLimit": "1",
+            "MLX_MAX_RECOMMENDED_WORKING_SET_SIZE": "1",
+        }
+        operational = {"KEEP_FIXTURE": "yes", "LANG": "en_US.UTF-8"}
+        with mock.patch.dict(os.environ, {**blocked, **operational}, clear=True):
             environment = local_llm.engine_environment()
-        self.assertNotIn("LLAMA_ARG_CTX_SIZE", environment)
-        self.assertEqual(environment["KEEP_FIXTURE"], "yes")
+        for name in blocked:
+            self.assertNotIn(name, environment, f"{name} reached the engine environment")
+        for name, value in operational.items():
+            self.assertEqual(
+                environment.get(name), value, f"{name} was stripped as if it were policy"
+            )
 
     def test_a_model_in_no_counter_gets_one_slot_rather_than_none(self):
         plan = self.plan()
@@ -1475,6 +1571,46 @@ class AttestationTests(unittest.TestCase):
         document["attested"] = []
         self.assertEqual(MlxLmAdapter().normalize_status(document).attested, frozenset())
 
+    def test_the_host_reader_refuses_an_engine_from_another_launch(self):
+        # The fingerprint hashes the resolved allocation and the launch identity is regenerated per
+        # launch, so an engine left over from the previous one matches every number and differs on
+        # exactly these two. The proxy refused both on every request while the adapter the launcher
+        # and the capacity smoke tool attest through compared neither, so a passing evidence run
+        # could describe an engine the proxy would refuse.
+        from local_engines.base import EngineAdapterError
+        from local_engines.mlx_lm import MlxLmAdapter
+
+        adapter = MlxLmAdapter()
+        engine = {
+            "model_alias": "fixture",
+            "model_path": "/fixture",
+            "sequences": 1,
+            "context_tokens": 4096,
+            "fingerprint": "f" * 64,
+            "snapshot_id": "s" * 32,
+            "artifact_format": "mlx",
+            "protocol_version": 4,
+            "tokenizer_identity": "t" * 64,
+        }
+        adapter.verify_status(adapter.normalize_status(dict(READY_STATUS_DOCUMENT)), engine)
+
+        for status_key, plan_key in (
+            ("fingerprint", "fingerprint"),
+            ("launch_identity", "snapshot_id"),
+        ):
+            document = json.loads(json.dumps(READY_STATUS_DOCUMENT))
+            document[status_key] = "not-this-launch"
+            with (
+                self.subTest(status_key=status_key),
+                self.assertRaisesRegex(EngineAdapterError, status_key),
+            ):
+                adapter.verify_status(adapter.normalize_status(document), engine)
+            # The plan field is the one named in the message's source, and an engine that reports
+            # neither is tolerated rather than invented: absence is unknown, not a mismatch.
+            del engine[plan_key]
+            adapter.verify_status(adapter.normalize_status(document), engine)
+            engine[plan_key] = READY_STATUS_DOCUMENT[status_key]
+
 
 READY_STATUS_DOCUMENT = {
     "engine_kind": "mlx_lm",
@@ -1499,3 +1635,130 @@ READY_STATUS_DOCUMENT = {
     "declared": [],
     "fatal": None,
 }
+
+
+class ArchiveConfinementTests(unittest.TestCase):
+    """The archive vetting both fetchers run before unpacking, executed rather than read.
+
+    ``local_llm.extract_archive()`` and ``local_mlx_runtime._extract_safely()`` are two copies of
+    one decision - what a member of a third-party archive may name and where it may point - and
+    until now neither had a test, so dropping one of the four checks would have shipped silently.
+    They are asserted here against the *same* member set so a divergence between the two is a
+    failure rather than a difference somebody has to notice by eye.
+    """
+
+    @staticmethod
+    def _bundle(members: list[tuple[str, str, str]]) -> io.BytesIO:
+        """One gzip tar built from (name, kind, payload-or-link) triples, in memory."""
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+            for name, kind, value in members:
+                info = tarfile.TarInfo(name)
+                if kind == "file":
+                    payload = value.encode()
+                    info.size = len(payload)
+                    info.type = tarfile.REGTYPE
+                    bundle.addfile(info, io.BytesIO(payload))
+                elif kind == "dir":
+                    info.type = tarfile.DIRTYPE
+                    info.mode = 0o755
+                    bundle.addfile(info)
+                elif kind == "link":
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = value
+                    bundle.addfile(info)
+                elif kind == "hardlink":
+                    info.type = tarfile.LNKTYPE
+                    info.linkname = value
+                    bundle.addfile(info)
+                elif kind == "fifo":
+                    info.type = tarfile.FIFOTYPE
+                    bundle.addfile(info)
+                else:  # pragma: no cover - guards the fixture itself
+                    raise AssertionError(f"unknown member kind {kind!r}")
+        archive.seek(0)
+        return archive
+
+    #: A release laid out the way a real one is: a nested directory, a binary, and the versioned
+    #: dylib symlink that macOS builds ship and that must survive.
+    GOOD = [
+        ("runtime", "dir", ""),
+        ("runtime/lib", "dir", ""),
+        ("runtime/lib/libllama.0.7.0.dylib", "file", "binary"),
+        ("runtime/lib/libllama.0.dylib", "link", "libllama.0.7.0.dylib"),
+        ("runtime/bin/llama-server", "file", "server"),
+    ]
+
+    ESCAPES = [
+        ("absolute member name", ("/etc/passwd", "file", "x")),
+        ("dot-dot member name", ("../escaped", "file", "x")),
+        ("dot-dot deeper in the name", ("a/../../escaped", "file", "x")),
+        ("absolute symlink", ("runtime/lib/evil", "link", "/etc/passwd")),
+        ("symlink escaping through dot-dot", ("runtime/lib/evil", "link", "../../../etc/passwd")),
+        ("hardlink escaping through dot-dot", ("runtime/bin/evil", "hardlink", "../../outside")),
+        ("special member", ("runtime/dev/null", "fifo", "")),
+    ]
+
+    TARGETS = (
+        ("extract", local_llm.extract_archive, local_llm.EngineError, "local_llm"),
+        ("safely", local_mlx_runtime._extract_safely, local_mlx_runtime.ProvisionError,
+         "local_mlx_runtime"),
+    )
+
+    def test_a_well_formed_release_unpacks_including_its_versioned_symlink(self):
+        # Only the first two fields matter here: nothing raises on the accepted path.
+        for label, extract, *_ in self.TARGETS:
+            with self.subTest(extract=label), tempfile.TemporaryDirectory() as raw:
+                into = Path(raw) / "out"
+                into.mkdir()
+                bundle = tarfile.open(fileobj=self._bundle(self.GOOD), mode="r:gz")
+                with bundle:
+                    extract(bundle, into)
+                self.assertEqual((into / "runtime/bin/llama-server").read_text(), "server")
+                link = into / "runtime/lib/libllama.0.dylib"
+                self.assertTrue(link.is_symlink(), f"{label} dropped the dylib symlink")
+                self.assertEqual(os.readlink(link), "libllama.0.7.0.dylib")
+                self.assertEqual((into / "runtime/lib/libllama.0.7.0.dylib").read_text(), "binary")
+
+    def test_every_member_that_would_write_outside_is_refused_by_both(self):
+        for label, extract, error, _owner in self.TARGETS:
+            for reason, member in self.ESCAPES:
+                with (
+                    self.subTest(extract=label, reason=reason),
+                    tempfile.TemporaryDirectory() as raw,
+                ):
+                    into = Path(raw) / "out"
+                    into.mkdir()
+                    members = [("runtime", "dir", ""), member]
+                    bundle = tarfile.open(fileobj=self._bundle(members), mode="r:gz")
+                    with bundle:
+                        with self.assertRaises(error):
+                            extract(bundle, into)
+                    # Refused means nothing written: a partial unpack would leave the caller with a
+                    # tree that looks provisioned.
+                    self.assertEqual(list(into.iterdir()), [], f"{label} extracted anyway")
+                    self.assertFalse((Path(raw) / "escaped").exists())
+
+    def test_the_two_vetters_reject_the_same_names(self):
+        # The point of asserting them together: these are one policy in two files, and only the
+        # divergence is invisible in review.
+        def refused(extract, error):
+            outcomes = set()
+            for reason, member in self.ESCAPES:
+                with tempfile.TemporaryDirectory() as raw:
+                    into = Path(raw) / "out"
+                    into.mkdir()
+                    bundle = tarfile.open(
+                        fileobj=self._bundle([("runtime", "dir", ""), member]), mode="r:gz"
+                    )
+                    with bundle:
+                        try:
+                            extract(bundle, into)
+                        except error:
+                            outcomes.add(reason)
+            return outcomes
+
+        first = refused(local_llm.extract_archive, local_llm.EngineError)
+        second = refused(local_mlx_runtime._extract_safely, local_mlx_runtime.ProvisionError)
+        self.assertEqual(first, {reason for reason, _ in self.ESCAPES})
+        self.assertEqual(second, first)

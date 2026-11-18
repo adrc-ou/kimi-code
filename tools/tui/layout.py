@@ -32,6 +32,15 @@ SCROLL_SLACK = 1
 #: focus gutter. Both are reserved whether or not anything is currently using them, so neither a
 #: resize nor a focus move can reflow the content.
 SCROLLBAR_WIDTH = 1
+#: Blank cells between a label and the first right-hand column that carries a figure for it.
+#: One value because the list panel and the tree are two renderers of the same frame, and a label
+#: that wraps against its own number in one of them while clearing it in the other reads as a
+#: rendering bug in the prose. Both used to type their own `3` and a comment claimed the sharing.
+LABEL_TAIL_GAP = 3
+#: Blank cells between two data columns of a table or a tail. Narrower than
+#: :data:`LABEL_TAIL_GAP` because a table has more seams to pay for, and the point of one is to be
+#: read across.
+FIELD_GAP = 2
 GUTTER_WIDTH = 2
 #: The fewest body rows worth drawing. Below this the chrome starts giving way.
 MIN_BODY = 2
@@ -622,19 +631,22 @@ def layout(
             break
 
     cursor = 0
-    title = rail = status = Rect()
+    # Named apart from the ``rail`` parameter above: that one is a bool the chrome set has already
+    # consumed, and letting a region take its name mid-function is how a later reader ends up
+    # testing a Rect for truthiness.
+    title_rect = rail_rect = status_rect = Rect()
     if "title" in shown:
-        title = Rect(cursor, 0, 1, columns)
+        title_rect = Rect(cursor, 0, 1, columns)
         cursor += 1
     if "rail" in shown:
-        rail = Rect(cursor, 0, 1, columns)
+        rail_rect = Rect(cursor, 0, 1, columns)
         cursor += 1
     rule_top = Rect(cursor, 0, 1, columns)
     cursor += 1
     footer = Rect(rows - footer_rows, 0, footer_rows, columns)
     rule_bottom = Rect()
     if "status" in shown:
-        status = Rect(footer.top - status_rows, 0, status_rows, columns)
+        status_rect = Rect(footer.top - status_rows, 0, status_rows, columns)
         rule_bottom = Rect(footer.top - status_rows - 1, 0, 1, columns)
         body_end = rule_bottom.top
     else:
@@ -649,11 +661,11 @@ def layout(
         body = body.shrink(right=pane.width + DETAIL_SPEND)
     return Frame(
         screen=Rect(0, 0, rows, columns),
-        title=title,
-        rail=rail,
+        title=title_rect,
+        rail=rail_rect,
         body=body,
         detail=pane,
-        status=status,
+        status=status_rect,
         footer=footer,
         rule_top=rule_top,
         rule_bottom=rule_bottom,

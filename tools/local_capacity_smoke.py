@@ -15,6 +15,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -28,24 +29,34 @@ from typing import Any
 
 if __package__:
     from . import capacity, host_caps, local_llm
+    from .definitions import MODEL_POLICY_FILE
     from .local_engines.base import EngineAdapterError
     from .private_file import write_private_json
 else:
     import capacity
     import host_caps
     import local_llm
+    from definitions import MODEL_POLICY_FILE
     from local_engines.base import EngineAdapterError
     from private_file import write_private_json
 
-METADATA_BYTES = 65536
+# The plan-schema vocabulary is shared with the proxy, which cannot be imported here because it
+# needs aiohttp; the standard-library module beside it is what both sides state the numbers in.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT / "proxy") not in sys.path:
+    sys.path.insert(0, str(_ROOT / "proxy"))
+
+from local_engine_contract import (  # noqa: E402
+    LOCAL_METADATA_BYTES,
+    PLAN_SCHEMA_VERSION_LOCAL,
+    STALE_LOCAL_PLAN_SCHEMAS,
+)
+
+# The metadata bound is the shared one: this tool attests the same /props and status documents the
+# proxy serves, and it used to carry 65536 here while both other readers allowed 1 MiB — so on an
+# engine with a large chat template it failed the smoke test against a service that was healthy.
 RESPONSE_BYTES = 8 * 1024**2
 RECORD_DIRECTORY = "capacity-smoke"
-
-#: Mirrored from ``proxy/model_proxy.py``, which cannot be imported here: the proxy needs aiohttp
-#: and this tool runs on the host's own interpreter. A drift between the two is caught by
-#: ``tests/test_local_capacity_smoke``, which feeds both the same stale plan.
-PLAN_SCHEMA_VERSION_LOCAL = 4
-STALE_LOCAL_PLAN_SCHEMAS = frozenset({2, 3})
 
 
 class SmokeError(ValueError):
@@ -82,7 +93,7 @@ class EngineClient:
                 "Accept-Encoding": "identity",
             },
         )
-        maximum = RESPONSE_BYTES if path == "/v1/chat/completions" else METADATA_BYTES
+        maximum = RESPONSE_BYTES if path == "/v1/chat/completions" else LOCAL_METADATA_BYTES
         try:
             with self.opener.open(req, timeout=self.timeout) as response:
                 if response.status != 200:
@@ -291,7 +302,8 @@ def exercise_engine(
 
 def owned_receipt(runtime: Path, engine_id: str, engine: dict) -> dict:
     try:
-        receipt = json.loads(local_llm.readiness_path(runtime, engine_id).read_text())
+        receipt_path = local_llm.readiness_path(runtime, engine_id)
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         pid, supervisor = receipt["engine_pid"], receipt["supervisor_pid"]
         if type(pid) is not int or type(supervisor) is not int or min(pid, supervisor) <= 0:
             raise SmokeError("readiness receipt has invalid owned process identities")
@@ -355,7 +367,7 @@ def checked_runtime(value: str) -> Path:
 
 
 def run_smoke(runtime: Path, output_tokens: int, timeout: float) -> Path:
-    plan_bytes = (runtime / "model-policy.json").read_bytes()
+    plan_bytes = (runtime / MODEL_POLICY_FILE).read_bytes()
     plan = json.loads(plan_bytes)
     if plan.get("schema_version") in STALE_LOCAL_PLAN_SCHEMAS:
         raise SmokeError(
@@ -392,7 +404,7 @@ def run_smoke(runtime: Path, output_tokens: int, timeout: float) -> Path:
             secret_name = f"{lane['provider']}__{lane['credential']}"
             if not all(character.isalnum() or character == "_" for character in secret_name):
                 raise SmokeError("resolved credential identity is malformed")
-            token = (runtime / "credentials" / secret_name).read_text().strip()
+            token = (runtime / "credentials" / secret_name).read_text(encoding="utf-8").strip()
             if not token:
                 raise SmokeError("resolved engine credential is unavailable")
             port = urllib.parse.urlsplit(lane["base_url"]).port
@@ -404,7 +416,7 @@ def run_smoke(runtime: Path, output_tokens: int, timeout: float) -> Path:
                 client, engine, receipt["engine_pid"], output_tokens, timeout
             )
             owned_receipt(runtime, engine_id, engine)
-            if (runtime / "model-policy.json").read_bytes() != plan_bytes:
+            if (runtime / MODEL_POLICY_FILE).read_bytes() != plan_bytes:
                 raise SmokeError("resolved plan changed during synthetic evidence collection")
     except BaseException as exc:
         record["status"] = "failed"
@@ -473,8 +485,8 @@ def main(argv: list[str] | None = None) -> int:
             source = Path(args.event).resolve()
             if not source.is_relative_to(runtime):
                 raise SmokeError("shutdown event must remain instance-scoped")
-            record = json.loads(path.read_text())
-            compare_shutdown(record, args.engine, source.read_text())
+            record = json.loads(path.read_text(encoding="utf-8"))
+            compare_shutdown(record, args.engine, source.read_text(encoding="utf-8"))
             write_private_json(path, record)
         print(path)
         print("Evidence recorded; native qualification remains pending review.")

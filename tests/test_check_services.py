@@ -137,6 +137,61 @@ class ServiceCheckTests(unittest.TestCase):
         self.assertIn("no results", detail)
         self.assertIn("CAPTCHAs", detail)
 
+    def test_every_builtin_service_name_reaches_a_probe(self):
+        # BUILTIN_SERVICES and the surfaces service_probe() can actually read are two separate
+        # lists. Drift between them is the web-search failure in another guise: a KeyError that the
+        # worker's blanket handler turns into a verdict quoting a bare key name. Network and
+        # subprocess are stubbed because only the dispatch is under test, not the answer.
+        for name in checks.BUILTIN_SERVICES:
+            with (
+                self.subTest(name=name),
+                patch("urllib.request.urlopen") as opened,
+                patch("subprocess.run") as runner,
+            ):
+                response = Mock()
+                response.__enter__ = Mock(return_value=response)
+                response.__exit__ = Mock(return_value=False)
+                response.read.return_value = b'{"status":"ok"}'
+                opened.return_value = response
+                runner.return_value = Mock(returncode=0, stdout="", stderr="")
+                outcome = None
+                try:
+                    checks.service_probe(name, False)
+                except BaseException as error:  # noqa: BLE001 - the type IS the finding here
+                    outcome = error
+                # A refusal, a missing executable or an unreachable host are all answers this
+                # probe is entitled to give; only an unresolvable name means the lists drifted.
+                self.assertNotIsInstance(
+                    outcome, KeyError, f"{name} has no probe path: {outcome!r}"
+                )
+
+    def test_unconfigured_web_search_is_a_setup_verdict_not_a_crash(self):
+        # Both variables arrive from compose.search.yaml, so a stack that did not select web search
+        # has neither. The probe subscripted them, so the check died with a KeyError; through the
+        # worker's blanket handler that became a verdict quoting the bare key name, which is neither
+        # an action nor a status an operator can use.
+        for label, environment in (
+            ("both unset", {}),
+            ("token empty", {"KIMI_WEB_SEARCH_BASE_URL": "http://search/search",
+                             "KIMI_WEB_SEARCH_API_KEY": "   "}),
+        ):
+            with (
+                self.subTest(case=label),
+                # patch.dict snapshots and restores the whole environment, so nothing this case
+                # removes can leak into a later test in the same process.
+                patch.dict(os.environ, environment, clear=False),
+            ):
+                for name in ("KIMI_WEB_SEARCH_BASE_URL", "KIMI_WEB_SEARCH_API_KEY"):
+                    if name not in environment:
+                        os.environ.pop(name, None)
+                with self.assertRaises(checks.UnconfiguredService) as raised:
+                    checks.service_probe("search", True)
+                status, detail = checks.classify_error(raised.exception)
+                self.assertEqual(status, "SETUP")
+                self.assertIn("KIMI_WEB_SEARCH_API_KEY", detail)
+                # The verdict is reportable, so it names variables and never their values.
+                self.assertNotIn("http://search/search", detail)
+
     def test_empty_allowlist_does_not_enable_everything(self):
         self.assertEqual(checks.selected_tools(
             {"enabledTools": []}, [SimpleNamespace(name="write")]

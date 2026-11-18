@@ -30,9 +30,11 @@ import argparse
 import os
 import secrets
 import sys
+from pathlib import Path
 
 if __package__ in (None, ""):  # pragma: no cover - launched as a script, not imported
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
     from tui import busy
     from tui.cells import ALT_OFF, ALT_ON, CLEAR, HIDE_CURSOR, RESET, SHOW_CURSOR
@@ -46,6 +48,15 @@ else:
 #: :class:`~tui.term.Terminal` reads it, so this module and that one agree on held mode without
 #: either importing the other's lifecycle logic.
 HELD = "HARNESS_TUI_SCREEN"
+
+# The same duality busy.py resolves: imported through ``tools.tui`` the parent package is on the
+# path, imported as ``tui`` (which is how the launcher's own module graph resolves it, and how
+# ``screen.py`` runs as a script) ``tools/`` is the root, so a relative ``..`` would escape it.
+if __package__ and __package__.startswith("tools."):
+    from ..private_file import write_private
+else:
+    from private_file import write_private
+
 #: The value that means "the screen is already borrowed; do not hand it back".
 HELD_VALUE = "held"
 #: Recorded by ``enter`` so a later ``leave`` knows whether there is anything to give back.
@@ -111,8 +122,7 @@ def _claim(runtime_dir: str, on: bool) -> None:
         return
     try:
         if on:
-            with open(claim_path(runtime_dir), "w", encoding="ascii") as source:
-                source.write(secrets.token_hex(16))
+            write_private(Path(claim_path(runtime_dir)), secrets.token_hex(16))
         else:
             os.unlink(claim_path(runtime_dir))
     except OSError:

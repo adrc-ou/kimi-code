@@ -110,7 +110,7 @@ def scan(workspace: Path) -> dict[str, object]:
 def atomic_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
 
@@ -135,7 +135,7 @@ def require_approval(workspace: Path, manifest: Path) -> dict[str, object]:
                 "./extensions.sh list, approve with ./extensions.sh approve, then rerun ./start.sh"
             )
         return current
-    approved = json.loads(manifest.read_text())
+    approved = json.loads(manifest.read_text(encoding="utf-8"))
     if approved.get("workspace", {}).get("path") != current["workspace"]["path"]:
         raise SystemExit("extension approval belongs to a different workspace")
     entries = approved.get("extensions")
@@ -163,7 +163,7 @@ def copy_snapshot(source: Path, target: Path, relative: str) -> tuple[Path, str]
         return destination, "file"
     if relative.endswith(".json"):
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text("{}\n")
+        destination.write_text("{}\n", encoding="utf-8")
         os.chmod(destination, 0o600)
         return destination, "file"
     destination.mkdir(parents=True, exist_ok=True)
@@ -245,6 +245,9 @@ def prepare(workspace: Path, manifest: Path, state_dir: Path, output: Path) -> P
             for relative in PRIVILEGED:
                 archive.add(snapshot_root / relative, arcname=relative)
     volume = extension_volume.VOLUME
+    # Embedded as text rather than bind-mounted: kimi-agent may receive no host bind but the
+    # workspace, so the staging script arrives inside this document.
+    staging_script = Path(extension_volume.__file__).read_text(encoding="utf-8")
     fragment = {
         "services": {
             "kimi-agent": {"volumes": [
@@ -259,7 +262,7 @@ def prepare(workspace: Path, manifest: Path, state_dir: Path, output: Path) -> P
                 "read_only": True, "cap_drop": ["ALL"],
                 "cap_add": ["CHOWN", "DAC_OVERRIDE", "FOWNER"],
                 "security_opt": ["no-new-privileges:true"], "pids_limit": 64,
-                "entrypoint": ["python3", "-c", Path(extension_volume.__file__).read_text()],
+                "entrypoint": ["python3", "-c", staging_script],
                 "command": ["--gid", "${LOCAL_GID:-1000}"],
                 "volumes": [{"type": "volume", "source": volume, "target": "/extensions",
                              "volume": {"nocopy": True}}],
@@ -269,7 +272,7 @@ def prepare(workspace: Path, manifest: Path, state_dir: Path, output: Path) -> P
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".tmp")
-    temporary.write_text(json.dumps(fragment, indent=2) + "\n")
+    temporary.write_text(json.dumps(fragment, indent=2) + "\n", encoding="utf-8")
     os.chmod(temporary, 0o600)
     os.replace(temporary, output)
     return snapshot_root

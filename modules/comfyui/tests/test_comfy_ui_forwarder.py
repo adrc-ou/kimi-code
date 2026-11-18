@@ -150,13 +150,15 @@ class ForwarderConfigurationTests(unittest.TestCase):
         self.ca, _ = make_certificate(self.directory)
 
     def test_a_missing_authority_stops_the_service_rather_than_disabling_verification(self):
-        with self.assertRaises(SystemExit):
+        # Pinned to the sentence, not the type: argparse also exits for a renamed flag, so a
+        # bare SystemExit would keep passing while the forwarder silently lost its CA.
+        with self.assertRaisesRegex(SystemExit, "bridge certificate is unreadable"):
             FWD.parse_args(["--tls-ca", str(self.directory / "absent.crt")])
 
     def test_an_empty_authority_is_equally_fatal(self):
         blank = self.directory / "blank.crt"
         blank.write_bytes(b"")
-        with self.assertRaises(SystemExit):
+        with self.assertRaisesRegex(SystemExit, "bridge certificate is unusable"):
             FWD.parse_args(["--tls-ca", str(blank)])
 
     def test_the_listener_is_loopback_unless_a_private_network_is_asked_for(self):
@@ -167,8 +169,15 @@ class ForwarderConfigurationTests(unittest.TestCase):
         self.assertEqual(options.tls_server_name, "bridge.internal")
 
     def test_limits_cannot_be_zeroed_into_an_unbounded_or_dead_listener(self):
-        for flag in ("--max-connections", "--connect-timeout", "--idle-timeout", "--port"):
-            with self.subTest(flag=flag), self.assertRaises(SystemExit):
+        # Each flag is refused by its own sentence, so the test names it: a bare SystemExit is
+        # also what argparse raises for a flag that no longer exists.
+        for flag, refused in (
+            ("--max-connections", "limits must be positive"),
+            ("--connect-timeout", "limits must be positive"),
+            ("--idle-timeout", "limits must be positive"),
+            ("--port", "ports must be positive"),
+        ):
+            with self.subTest(flag=flag), self.assertRaisesRegex(SystemExit, refused):
                 FWD.parse_args(["--tls-ca", str(self.ca), flag, "0"])
 
 

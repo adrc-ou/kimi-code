@@ -16,10 +16,19 @@ So this module owns one thing - the names - and deliberately owns no I/O.
 ``model_proxy.py`` imports aiohttp at module scope, so anything defined inside it is unreachable
 from the host side: ``tools/local_llm.py`` runs the launcher, and the engine worker runs the model,
 and neither has the proxy's dependencies. A vocabulary invented in step 2 of the implementation and
-re-invented in step 3's contract module drifts, and this repository already demonstrates the cost:
-``tools/local_llm.py`` ``validate_properties()`` is a hand copy of ``verify()`` in the proxy, same
-fields, same strictness, different exception type. This file is the standard-library-only place both
-sides state the same fact, which is the only reason both sides can state it at all.
+re-invented in step 3's contract module drifts, and this repository paid for that lesson: the
+launcher's engine-properties check began as a hand copy of the proxy's, same fields, same
+strictness, different exception type.
+
+That copy is gone - the host side now reads through the engine's own adapter
+(``normalize_status()`` then ``verify_status()``) - but the lesson did not retire with it, because
+the proxy still keeps its own per-kind table (``ENGINE_STATUS_READERS``) beside the adapter rather
+than sharing it. Two readers of one document is where the divergence comes back, and it did: the
+adapter stopped comparing the plan's ``fingerprint`` and ``launch_identity``, so the capacity smoke
+tool attested an engine the proxy would have refused on every request. What this module covers is
+the facts no single owner can hold - the completion vocabulary, the accepted request fields, and the
+plan schema every writer and reader must name alike - and the remaining status comparison is the
+place a future change has to keep both readers in step.
 
 ## Two observers, and which question each may answer
 
@@ -52,6 +61,13 @@ from typing import Any
 __all__ = [
     "OUTCOMES",
     "STATUS_REQUIRED_FIELDS",
+    "PLAN_SCHEMA_VERSION",
+    "PLAN_SCHEMA_VERSION_LOCAL",
+    "SUPPORTED_PLAN_SCHEMAS",
+    "STALE_LOCAL_PLAN_SCHEMAS",
+    "LOCAL_METADATA_BYTES",
+    "ENGINE_POLICY_ENV_PREFIXES",
+    "strip_engine_policy",
     "LOCAL_ACCEPTED_REQUEST_FIELDS",
     "LOCAL_UNSUPPORTED_REQUEST_FIELDS",
     "unsupported_request_fields",
@@ -268,11 +284,16 @@ def validate_status_document(payload: Any) -> dict[str, Any]:
     return payload
 
 
-def is_usable_completion(outcome: Outcome) -> bool:
+def is_usable_completion(outcome: Outcome | None) -> bool:
     """Whether the caller received something an agent can act on.
 
     Deliberately narrower than "the request succeeded". Reasoning without an answer and truncation
     without a decision are both cases where retrying or surfacing beats pretending.
+
+    ``None`` is an attempt that never reached a body, so no completion was observed to classify. It
+    is not usable, and it is stated here rather than left to ``None`` failing to match an outcome:
+    callers hold an optional outcome on the retry path, and a predicate that silently swallows it is
+    one whose None behaviour nobody chose.
     """
     return outcome in (Outcome.CONTENT, Outcome.TOOL_ONLY)
 
@@ -310,6 +331,73 @@ class StreamEvidence:
 
     def damage_observed(self) -> bool:
         return implies_engine_damage(classify(self))
+
+
+#: ------------------------------------------------------------------ plan schema
+#:
+#: The version stamp on the document ``tools/policy.py`` resolves and every engine reader checks
+#: before it trusts one. It lives here for the same reason the request field set does: the writer,
+#: the proxy and the host-side tools must name the same numbers, and a mirror that drifts is not a
+#: cosmetic problem - it is a launch that refuses its own plan, or worse, one that reinterprets a
+#: stale file left by the previous launch.
+#:
+#: Versions 2 and 3 are retired rather than upgraded in place, because reinterpreting an on-disk
+#: plan is how a stale launch silently mis-serves. Version 1 stays supported: it is what every
+#: remote-only selection emits today, byte for byte, and the NRP reference fixtures in CI are what
+#: hold that line.
+PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION_LOCAL = 4
+SUPPORTED_PLAN_SCHEMAS = frozenset({PLAN_SCHEMA_VERSION, PLAN_SCHEMA_VERSION_LOCAL})
+STALE_LOCAL_PLAN_SCHEMAS = frozenset({2, 3})
+
+
+#: ------------------------------------------------------------------ metadata bound
+#:
+#: What one engine metadata response may weigh — ``/props`` for llama.cpp and
+#: ``/v1/harness/status`` for MLX-LM. Four processes read those same documents and must not
+#: disagree, because a bound that is too small makes a perfectly healthy engine be reported as
+#: broken: the launcher (``local_llm``, before a plan is final and again in its compute canary), the
+#: proxy on every preparation call, the capacity smoke tool while attesting an engine, and the
+#: qualification tool while reading the declared context length.
+#:
+#: The engine's token-counting replies are bounded here by the first three. The qualification tool
+#: reads them under its own larger completion bound instead, which is more permissive rather than
+#: inconsistent - it is sizing a prompt, not attesting a device - but it is why this line does not
+#: claim to cover every read of every engine response.
+#:
+#: This was 64 KiB. ``/props`` embeds the model's entire chat template, so a template large enough
+#: to cross 64 KiB made a working engine answer "exceeded metadata byte limit" and refuse all
+#: traffic — raised here well clear of any plausible template, and still bounded because the value
+#: is read into memory on a request path from a process the harness started but does not control.
+#: The capacity smoke tool disagreed with both readers that existed when this was first unified,
+#: which is the failure the single bound exists to prevent: at 64 KiB it reported an oversize
+#: response against an engine the proxy was serving normally.
+LOCAL_METADATA_BYTES = 1024 * 1024
+
+
+#: ------------------------------------------------------------------ engine environment
+#:
+#: Environment-variable families an inference engine reads as *policy* rather than as operations -
+#: residency, compute, thread and device choices it would apply on top of the allocation the plan
+#: resolved. Two host processes launch engines (llama.cpp and the harness-written MLX worker) and a
+#: third measures the hardware before either is built, and all three must clear the same set:
+#: an ambient ``GGML_METAL_*`` or ``MLX_MAX_RECOMMENDED_WORKING_SET_SIZE`` silently changes
+#: residency on one operator's machine while the plan, and the engine fingerprint derived from it,
+#: still claim the profile's numbers. A denylist that differs per engine means the native probe
+#: certifies an environment the launch will not repeat.
+#:
+#: Folded to upper case by whoever matches, because macOS exposes both ``METAL_`` and ``Metal``
+#: spellings. Stripping ``CUDA`` and ``PYTORCH_`` is inert for these engines today - the provider
+#: declares ``requires = ["metal"]`` and ``capacity.py`` refuses anything else - and one shared list
+#: is preferable to two that silently diverge; a future CUDA-local provider should decide this
+#: openly here rather than discover a launcher that filtered differently.
+ENGINE_POLICY_ENV_PREFIXES = ("MLX_", "GGML_", "LLAMA_", "PYTORCH_", "CUDA", "METAL")
+
+
+def strip_engine_policy(environment: dict[str, str]) -> dict[str, str]:
+    """``environment`` without any key an engine would read as policy."""
+    blocked = tuple(prefix.upper() for prefix in ENGINE_POLICY_ENV_PREFIXES)
+    return {k: v for k, v in environment.items() if not k.upper().startswith(blocked)}
 
 
 #: ------------------------------------------------------------------ request policy
@@ -387,12 +475,16 @@ def _produced_anything(evidence: StreamEvidence) -> bool:
     )
 
 
-def partition_for_outcome(outcome: Outcome) -> FailureClass | None:
+def partition_for_outcome(outcome: Outcome | None) -> FailureClass | None:
     """The retry consequence of a completion that ended this way, or ``None`` if it is no failure.
 
     Unusable-but-intact outcomes return ``None`` on purpose. The proxy must stop treating them as
     successes, which is what :func:`is_usable_completion` is for, but classifying them as a failure
     class invites the fatal latch that this design keeps under the worker.
+
+    ``None`` - nothing was ever classified - returns ``None`` for the same reason it does there: an
+    attempt that never produced a completion is not evidence about the device, and the one caller
+    that could latch on it must not.
     """
     if outcome in (Outcome.ERROR_OBJECT, Outcome.FRAMING_FAILURE, Outcome.UNKNOWN):
         return FailureClass.FATAL

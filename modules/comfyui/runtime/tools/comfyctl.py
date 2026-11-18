@@ -28,7 +28,8 @@ CA_FILE = os.environ.get("COMFYUI_CA_FILE", "")
 #: talks to: on an MPS host they are two planes of the same ComfyUI.
 UI_URL = os.environ.get("COMFYUI_UI_URL", "").rstrip("/")
 #: The bridge's frontend routes. The bridge owns these names; they are repeated here because this
-#: client runs in another container and cannot import it. tests/test_comfyctl.py keeps them equal.
+#: client runs in another container and cannot import it. Kept equal by
+#: modules/comfyui/tests/test_comfyctl.py::test_grant_path_matches_the_bridge_source.
 GRANT_PATH = "/__bridge/grant"
 SESSION_PATH = "/__bridge/session"
 

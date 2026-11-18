@@ -86,6 +86,11 @@ from aiohttp import (
 )
 
 from local_engine_contract import (  # noqa: E402
+    LOCAL_METADATA_BYTES,
+    PLAN_SCHEMA_VERSION,
+    PLAN_SCHEMA_VERSION_LOCAL,
+    STALE_LOCAL_PLAN_SCHEMAS,
+    SUPPORTED_PLAN_SCHEMAS,
     partition_for_status,
     FailureClass as EngineFailureClass,
     Outcome,
@@ -101,7 +106,11 @@ LEDGER_UNITS = frozenset({"output_tokens", "input_tokens", "total_tokens", "requ
 
 def secret(file_variable: str, value_variable: str, *, min_length: int = 32) -> str:
     path = os.environ.get(file_variable, "")
-    value = (Path(path).read_text() if path else os.environ.get(value_variable, "")).strip()
+    value = (
+        Path(path).read_text(encoding="utf-8")
+        if path
+        else os.environ.get(value_variable, "")
+    ).strip()
     if len(value) < min_length:
         raise RuntimeError(
             f"{file_variable} must reference a secret of at least {min_length} characters"
@@ -109,28 +118,19 @@ def secret(file_variable: str, value_variable: str, *, min_length: int = 32) -> 
     return value
 
 
-#: The plan schema this proxy understands; ``tools/policy.py`` publishes the matching constant.
-PLAN_SCHEMA_VERSION = 1
-#: A plan carrying managed local engines. Version 4 added the engine-kind, runtime-identity,
-#: protocol, serving-profile and artifact fields; versions 2 and 3 are retired rather than
-#: upgraded in place, because reinterpreting an on-disk plan is how a stale launch silently
-#: mis-serves. Version 1 stays supported: it is what every remote-only selection emits today,
-#: byte for byte, and the NRP reference fixtures in CI are what hold that line.
-PLAN_SCHEMA_VERSION_LOCAL = 4
-SUPPORTED_PLAN_SCHEMAS = frozenset({1, PLAN_SCHEMA_VERSION_LOCAL})
-STALE_LOCAL_PLAN_SCHEMAS = frozenset({2, 3})
+#: The plan schema versions this proxy accepts are imported from ``local_engine_contract`` rather
+#: than restated here, because the launcher that writes the plan, the proxy that serves it and the
+#: smoke tool that attests an engine all read the same numbers from the same file. What a plan
+#: carrying managed local engines must additionally contain is checked at load in ``load_plan``.
+
+#: The one session every lane shares. A bare string works — a misspelled read raises KeyError
+#: just as it would on any dict — but aiohttp warns on every start about the untyped state, and
+#: an AppKey carries the value type, so the session is named and typed in one place.
+CLIENT: web.AppKey[ClientSession] = web.AppKey("client", ClientSession)
 
 # Preparation never holds an execution permit. Both endpoints return small JSON objects;
 # their independent deadline and byte bound keep a failed local engine from blocking a lane.
 LOCAL_PREPARATION_TIMEOUT = 30.0
-#: What one engine metadata response may weigh. ``/props`` embeds the model's entire chat template,
-#: so this has to clear the largest plausible template rather than a round number: at the previous
-#: 64 KiB a healthy engine with a large tools template reported "exceeded metadata byte limit" and
-#: refused all traffic. Still bounded, because the value is read into memory on the request path
-#: from a process this harness started but does not control. Kept in step with LOCAL_PROPS_BYTES in
-#: tools/local_llm.py, which reads the same document from the launcher.
-LOCAL_METADATA_BYTES = 1024 * 1024
-
 #: How long a local generation may hold an execution slot while producing nothing the model
 #: actually made. Measured on generated content rather than bytes on the wire: an engine wedged
 #: inside a Metal call keeps emitting SSE keepalives, and a timeout that resets on those converts a
@@ -773,7 +773,9 @@ def load_plan(path: str | None = None) -> dict:
             f"schema {PLAN_SCHEMA_VERSION_LOCAL} local policy requires engines without physical "
             "resource budgets"
         )
-    if plan["schema_version"] == 1 and (plan.get("engines") or plan.get("resources")):
+    if plan["schema_version"] == PLAN_SCHEMA_VERSION and (
+        plan.get("engines") or plan.get("resources")
+    ):
         raise PolicyDrift(
             f"local engines require schema {PLAN_SCHEMA_VERSION_LOCAL} model policy"
         )
@@ -1122,7 +1124,7 @@ def validate_policy(policy: RuntimePolicy | None = None) -> None:
             # ceiling that the threshold nonetheless does not licence to run alone; the two
             # numbers coincide for NRP, so only contradictory provider terms can produce it.
             if lane.reservation > budget and not (
-                lane.reservation <= ceiling
+                (ceiling is not None and lane.reservation <= ceiling)
                 or (exclusive_at is not None and lane.reservation >= exclusive_at)
             ):
                 raise RuntimeError(
@@ -1649,9 +1651,9 @@ class LocalEngines:
                 queue_ms=round((time.monotonic() - queued) * 1000),
             )
             try:
-                await self.verify(request.app["client"], lane, engine)
+                await self.verify(request.app[CLIENT], lane, engine)
                 result = await local_metadata(
-                    request.app["client"], lane, "/v1/chat/completions/input_tokens", body
+                    request.app[CLIENT], lane, "/v1/chat/completions/input_tokens", body
                 )
                 tokens = result.get("input_tokens")
                 if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
@@ -1714,7 +1716,7 @@ class LocalEngines:
             # the first result would trade a real restart-detection guarantee for one round trip on
             # a path that is already serialized per engine and bounded by LOCAL_PREPARATION_TIMEOUT.
             try:
-                await self.verify(request.app["client"], lane, engine)
+                await self.verify(request.app[CLIENT], lane, engine)
             except LocalEngineUnavailable as exc:
                 raise self.failed(lane, exc) from exc
 
@@ -3906,7 +3908,7 @@ async def _forward_chat(request, lane, body, started, inbound_body, cost, reserv
     global USAGE_SUPPORTED
     cost_of_permit = lane.reservation if reservation is None else reservation
     attempt_number = 0
-    session = request.app["client"]
+    session = request.app[CLIENT]
     while True:
         if request.transport is None or request.transport.is_closing():
             raise asyncio.CancelledError
@@ -4119,7 +4121,7 @@ async def _forward_chat(request, lane, body, started, inbound_body, cost, reserv
 
 
 async def create_client(app: web.Application) -> None:
-    app["client"] = ClientSession(
+    app[CLIENT] = ClientSession(
         timeout=ClientTimeout(
             total=None,
             connect=60,
@@ -4131,7 +4133,7 @@ async def create_client(app: web.Application) -> None:
 
 
 async def close_client(app: web.Application) -> None:
-    await app["client"].close()
+    await app[CLIENT].close()
 
 
 async def open_prompt_archive(app: web.Application) -> None:

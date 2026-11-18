@@ -9,15 +9,11 @@ Selecting on anything other than the declared kind turns a configuration fact in
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
-
-#: Engine kinds with an implementation in this package. A profile naming anything else is refused
-#: at parse time rather than at launch, because "unknown engine" discovered after a multi-gigabyte
-#: download is an expensive way to say "typo".
-KNOWN_KINDS = ("llama_cpp", "mlx_lm")
 
 
 class EngineAdapterError(ValueError):
@@ -161,9 +157,11 @@ class EngineAdapter(Protocol):
         Eligibility probing calls this on every picker keystroke, so a missing runtime with
         ``install=False`` is a normal answer and not an error to surface as a failure.
         """
+        ...
 
     def identity(self, runtime: Runtime) -> EngineIdentity:
         """Ask the runtime what it is. Used to bind the plan to these exact bytes."""
+        ...
 
     def device_observations(self, runtime: Runtime) -> dict[str, Any]:
         """Device facts this engine's own runtime can report about this host.
@@ -180,6 +178,7 @@ class EngineAdapter(Protocol):
 
     def validate_artifact(self, model: Mapping[str, Any], lock: Mapping[str, Any]) -> Artifact:
         """Check the verified bytes are loadable *by this engine* and describe them."""
+        ...
 
     def launch(
         self,
@@ -190,12 +189,25 @@ class EngineAdapter(Protocol):
         token: str,
     ) -> Launch:
         """Build the command line from the resolved plan. Reads policy, never sets it."""
+        ...
 
     def normalize_status(self, payload: Mapping[str, Any]) -> EngineStatus:
         """Convert one engine's own status document into the canonical fields."""
+        ...
+
+    def status_path(self) -> str:
+        """Where this engine's status document lives.
+
+        Declared because a caller outside the launcher needs it too: the capacity smoke tool runs
+        its own bounded client and must ask the adapter rather than guess a path per engine. An
+        adapter that omits this fails the contract instead of raising ``AttributeError`` from a
+        tool whose own comment promises it will report an engine failure, not its own bug.
+        """
+        ...
 
     def status_request(self, base: str, token: str) -> Any:
         """The request that fetches the status document, or raise if this engine has none."""
+        ...
 
     def verify_status(self, status: EngineStatus, engine: Mapping[str, Any]) -> None:
         """Refuse a running engine that differs from the plan it was launched from."""
@@ -204,9 +216,11 @@ class EngineAdapter(Protocol):
         self, origin: str, token: str, model: Mapping[str, Any], engine: Mapping[str, Any]
     ) -> Computed:
         """Prove the engine can compute. Metadata agreement is not readiness."""
+        ...
 
     def diagnostics(self, model: Mapping[str, Any], engine: Mapping[str, Any]) -> Mapping[str, Any]:
         """Optional adapter-specific evidence. Must never be required for a launch."""
+        ...
 
 
 class Registry:
@@ -230,6 +244,22 @@ class Registry:
 
     def kinds(self) -> Sequence[str]:
         return sorted(self._adapters)
+
+
+def sibling_module(name: str):
+    """One ``tools/`` module, bound through whichever identity loaded this package.
+
+    Adapters delegate to engine code that lives beside them and import it at call time to keep the
+    import graph acyclic. A bare ``import local_llm`` binds the flat copy even when this package was
+    loaded as ``tools.local_engines``, which drags a second copy of the engine module -- its own
+    ``EngineError`` class, its own module state -- into the same process, so a raised exception or a
+    test patch then reaches one copy and not the other.
+    """
+    # Two dots is only reachable from a package that HAS a parent: loaded flat the package
+    # is top-level `local_engines`, and the siblings this returns are then top-level names too.
+    if __package__ and "." in __package__:
+        return importlib.import_module(f"..{name}", __package__)
+    return importlib.import_module(name)
 
 
 #: The process-wide registry. Adapters register themselves at import so a missing optional

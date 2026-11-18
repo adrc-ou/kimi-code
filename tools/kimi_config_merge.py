@@ -16,7 +16,9 @@ import argparse
 import copy
 import datetime as dt
 import json
+import os
 import re
+import secrets
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
@@ -37,7 +39,7 @@ class ConfigMergeError(ValueError):
 def load_policy(path: Path) -> frozenset[str]:
     """Return the top-level config keys the agent is allowed to own."""
     try:
-        document = json.loads(path.read_text())
+        document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ConfigPolicyError(f"unreadable config policy {path}: {exc}") from exc
     if not isinstance(document, dict):
@@ -169,14 +171,30 @@ def main() -> None:
     parser.add_argument("--current", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    current_text = args.current.read_text() if args.current and args.current.is_file() else None
+    current_text = (
+        args.current.read_text(encoding="utf-8")
+        if args.current and args.current.is_file()
+        else None
+    )
     text = merge_text(
-        args.baseline.read_text(),
+        args.baseline.read_text(encoding="utf-8"),
         load_policy(args.policy),
         current_text,
     )
-    temporary = args.output.with_name(f"{args.output.name}.tmp")
-    temporary.write_text(text)
+    # Same discipline as ``private_file.write_private``, restated because this module is mounted
+    # into the initializer's container on its own (compose.yaml maps only
+    # tools/kimi_config_merge.py to /stage/) and so must keep importing nothing from tools/.
+    # A unique name, 0600 at create time, and a rename as the publish: the merged document sits on
+    # top of a rendered baseline that carries the model-proxy bearer token, and the container path
+    # that writes this same file already uses mode 0600.
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    name = f".{args.output.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    temporary = args.output.parent / name
+    descriptor = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as sink:
+        sink.write(text)
     temporary.replace(args.output)
     print(f"merged_config_bytes={len(text.encode())}")
 

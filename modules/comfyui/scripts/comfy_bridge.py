@@ -96,7 +96,7 @@ def bootstrap_page() -> str:
 
 
 def bearer_authorized(request: web.Request) -> bool:
-    expected = f"Bearer {request.app['token']}"
+    expected = f"Bearer {request.app[TOKEN]}"
     supplied = request.headers.get("Authorization", "")
     return hmac.compare_digest(supplied, expected)
 
@@ -112,7 +112,7 @@ def authorized(request: web.Request) -> bool:
     """
     if bearer_authorized(request):
         return True
-    passes: FrontendPasses = request.app["passes"]
+    passes: FrontendPasses = request.app[PASSES]
     return passes.session_active(
         request.cookies.get(SESSION_COOKIE, ""), request.headers.get("Host", "")
     )
@@ -210,6 +210,19 @@ class FrontendPasses:
         )
 
 
+#: The bridge's whole application state, named once each. A misspelled string key would raise
+#: KeyError rather than return the wrong thing, so this is not a safety fix; it is the form
+#: aiohttp asks for (it warns about bare strings on every start) and it puts each value's type
+#: beside its name. These seven are all the bridge carries.
+TOKEN: web.AppKey[str] = web.AppKey("token", str)
+UPSTREAM: web.AppKey[str] = web.AppKey("upstream", str)
+MAX_WS_MESSAGE: web.AppKey[int] = web.AppKey("max_ws_message", int)
+MAX_RESPONSE: web.AppKey[int] = web.AppKey("max_response", int)
+CONNECTIONS: web.AppKey[asyncio.Semaphore] = web.AppKey("connections", asyncio.Semaphore)
+PASSES: web.AppKey[FrontendPasses] = web.AppKey("passes", FrontendPasses)
+CLIENT: web.AppKey[ClientSession] = web.AppKey("client", ClientSession)
+
+
 def request_headers(request: web.Request) -> dict[str, str]:
     nominated = {
         value.strip().lower()
@@ -235,10 +248,10 @@ def response_headers(headers) -> dict[str, str]:
 
 
 async def websocket_proxy(request: web.Request, upstream_url: str) -> web.StreamResponse:
-    maximum = request.app["max_ws_message"]
+    maximum = request.app[MAX_WS_MESSAGE]
     downstream = web.WebSocketResponse(heartbeat=30, max_msg_size=maximum)
     await downstream.prepare(request)
-    session: ClientSession = request.app["client"]
+    session: ClientSession = request.app[CLIENT]
 
     try:
         upstream = await session.ws_connect(
@@ -273,14 +286,19 @@ async def websocket_proxy(request: web.Request, upstream_url: str) -> web.Stream
         asyncio.create_task(client_to_upstream()),
         asyncio.create_task(upstream_to_client()),
     }
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for task in pending:
-        task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
-    for task in done:
-        task.result()
-    await upstream.close()
-    await downstream.close()
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
+    finally:
+        # Both ends close whichever way this leaves, because the ordinary way out is a pump that
+        # raised: a browser that vanishes mid-stream makes the downstream write fail, and the
+        # upstream socket still has to be given back before the error travels.
+        await upstream.close()
+        await downstream.close()
     return downstream
 
 
@@ -314,7 +332,7 @@ async def frontend_grant(request: web.Request) -> web.Response:
     """
     if not bearer_authorized(request):
         raise web.HTTPUnauthorized()
-    passes: FrontendPasses = request.app["passes"]
+    passes: FrontendPasses = request.app[PASSES]
     grant = passes.mint_grant()
     if grant is None:
         raise web.HTTPServiceUnavailable(text="no frontend grant slots are free")
@@ -326,7 +344,7 @@ async def frontend_grant(request: web.Request) -> web.Response:
 
 async def frontend_session(request: web.Request) -> web.Response:
     """Redeem a grant for an HttpOnly session cookie scoped to this frontend origin."""
-    passes: FrontendPasses = request.app["passes"]
+    passes: FrontendPasses = request.app[PASSES]
     declared = request.content_length
     if not declared or declared > SESSION_BODY_LIMIT:
         raise web.HTTPBadRequest(text="a short JSON body with a length is required")
@@ -357,12 +375,12 @@ async def proxy(request: web.Request) -> web.StreamResponse:
     if not authorized(request):
         raise web.HTTPUnauthorized()
 
-    upstream_url = f"{request.app['upstream']}{request.rel_url}"
-    async with request.app["connections"]:
+    upstream_url = f"{request.app[UPSTREAM]}{request.rel_url}"
+    async with request.app[CONNECTIONS]:
         websocket = web.WebSocketResponse().can_prepare(request)
         if websocket.ok:
             return await websocket_proxy(request, upstream_url)
-        session: ClientSession = request.app["client"]
+        session: ClientSession = request.app[CLIENT]
         async with session.request(
             request.method,
             upstream_url,
@@ -372,7 +390,7 @@ async def proxy(request: web.Request) -> web.StreamResponse:
         ) as upstream:
             if (
                 upstream.content_length is not None
-                and upstream.content_length > request.app["max_response"]
+                and upstream.content_length > request.app[MAX_RESPONSE]
             ):
                 raise web.HTTPBadGateway(text="upstream response exceeds byte limit")
             downstream = web.StreamResponse(
@@ -384,7 +402,7 @@ async def proxy(request: web.Request) -> web.StreamResponse:
             output_bytes = 0
             async for chunk in upstream.content.iter_any():
                 output_bytes += len(chunk)
-                if output_bytes > request.app["max_response"]:
+                if output_bytes > request.app[MAX_RESPONSE]:
                     upstream.close()
                     if request.transport is not None:
                         request.transport.close()
@@ -395,14 +413,14 @@ async def proxy(request: web.Request) -> web.StreamResponse:
 
 
 async def create_client(app: web.Application) -> None:
-    app["client"] = ClientSession(
+    app[CLIENT] = ClientSession(
         timeout=ClientTimeout(total=None, sock_connect=30, sock_read=None),
         auto_decompress=False,
     )
 
 
 async def close_client(app: web.Application) -> None:
-    await app["client"].close()
+    await app[CLIENT].close()
 
 
 def build_app(options: argparse.Namespace, token: str) -> web.Application:
@@ -412,12 +430,12 @@ def build_app(options: argparse.Namespace, token: str) -> web.Application:
     a route added after it would never be reached.
     """
     app = web.Application(client_max_size=options.max_body)
-    app["token"] = token
-    app["upstream"] = options.upstream.rstrip("/")
-    app["max_ws_message"] = options.max_ws_message
-    app["max_response"] = options.max_body
-    app["connections"] = asyncio.Semaphore(options.max_connections)
-    app["passes"] = FrontendPasses(
+    app[TOKEN] = token
+    app[UPSTREAM] = options.upstream.rstrip("/")
+    app[MAX_WS_MESSAGE] = options.max_ws_message
+    app[MAX_RESPONSE] = options.max_body
+    app[CONNECTIONS] = asyncio.Semaphore(options.max_connections)
+    app[PASSES] = FrontendPasses(
         grant_ttl=options.grant_ttl,
         session_ttl=options.session_ttl,
         max_grants=options.max_grants,

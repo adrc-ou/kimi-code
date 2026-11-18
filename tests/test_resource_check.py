@@ -168,6 +168,10 @@ class ResourceCheckTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 resource_check.main()
         self.assertEqual(caught.exception.code, 2)
+        # Exit 2 is what argparse gives for ANY usage error, so the code alone would also be
+        # returned by a different mistake; the captured text is the part that names this one, and it
+        # was already being redirected and then thrown away.
+        self.assertIn("the following arguments are required: workspace", stderr.getvalue())
 
     def test_extra_argument_exits_two(self) -> None:
         stderr = io.StringIO()
@@ -179,6 +183,10 @@ class ResourceCheckTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 resource_check.main()
         self.assertEqual(caught.exception.code, 2)
+        # Distinguished from the case above on purpose: both exit 2, and only the text says which
+        # usage error the launcher would have to act on.
+        self.assertIn("unrecognized arguments: extra", stderr.getvalue())
+        self.assertNotIn("required: workspace", stderr.getvalue())
 
     def report_unreadable(self, *, disk_env: str, memory_env: str) -> str:
         """The real syscall on a path that cannot be statvfs'd, with no disk stub at all.

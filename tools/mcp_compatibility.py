@@ -101,7 +101,15 @@ def selected_names(config, names):
 
 
 class Catalog:
-    """Incremental page accounting: failures never yield a partial snapshot."""
+    """Incremental page accounting across a server's tool listing.
+
+    A refusal inside :meth:`add_page` is raised with the page's earlier tools ALREADY recorded --
+    this class keeps no transaction, so callers must not read :attr:`tools` after a failure. Both
+    present callers do fail closed (the MCP probe lets the error end the whole check), which is
+    where "never a partial snapshot" actually comes from; it is not a property of this class, and a
+    caller that caught the error and pressed on would publish a truncated catalog that still hashes
+    as if it were complete.
+    """
 
     def __init__(self):
         self.tools = {}
@@ -148,6 +156,29 @@ class Catalog:
             "catalog_names": sorted(self.tools),
             "tools": {name: self.tools[name] for name in sorted(selected)},
         }
+
+
+def read_servers(path):
+    """The ``mcpServers`` mapping one configuration declares, refused by name when it has none.
+
+    Three tools read these files: the module assembler, this module's own offline CI validation,
+    and the service checker. Each used to subscript the parsed document directly, so a hand-edited
+    ``mcp.json`` without its ``mcpServers`` object stopped them as a ``KeyError``, a ``TypeError``
+    or a ``ContractError``, depending on which noticed first. One reader makes the answer the same
+    in all three. An empty mapping is a real answer; a document that is not an object holding an
+    object of servers is not.
+
+    The message names the path and never the content: these files legitimately carry server headers
+    and environment values, and the exception text reaches a report.
+    """
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ContractError(f"invalid MCP configuration {path}") from exc
+    servers = document.get("mcpServers") if isinstance(document, dict) else None
+    if not isinstance(servers, dict):
+        raise ContractError(f"MCP configuration {path} has no mcpServers object")
+    return servers
 
 
 def load_manifest(path, servers):
@@ -276,7 +307,7 @@ def validate_sources(root: Path):
             if (directory / "mcp-contracts.json").exists():
                 raise ContractError("MCP contract has no owning configuration")
             continue
-        servers = json.loads(path.read_text())["mcpServers"]
+        servers = read_servers(path)
         contracts = load_manifest(directory / "mcp-contracts.json", servers)
         required = {name for name, config in servers.items()
                     if "command" not in config and config.get("enabled", True)

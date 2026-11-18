@@ -226,7 +226,7 @@ class StreamingFaultTests(unittest.IsolatedAsyncioTestCase):
         port = self.raw.sockets[0].getsockname()[1]
         self.lane = dataclasses.replace(SUBAGENT, base_url=f"http://127.0.0.1:{port}")
         app = web.Application()
-        app["client"] = self.upstream
+        app[PROXY.CLIENT] = self.upstream
         app.router.add_post("/chat", self.handle_proxy)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
